@@ -8,6 +8,8 @@
 
 int plugin_is_GPL_compatible;
 
+emacs_value Qnil, Qcons;
+
 #define MAX(a, b) ({ __typeof__(a) _a = (a), _b = (b); _a > _b ? _a : _b; })
 
 /** An Emacs string made accessible by copying. */
@@ -78,8 +80,7 @@ static struct EmacsStr *copy_emacs_string(emacs_env *env, struct Bump **bump, em
 }
 
 emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__unused__)), emacs_value args[], void *data_ptr) {
-  emacs_value nil = env->intern(env, "nil");
-  emacs_value result = nil;
+  emacs_value result = Qnil;
 
   // Short-circuit if QUERY is empty
   ptrdiff_t query_len;
@@ -96,8 +97,6 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
     result = env->make_integer(env, 0);
     return result;
   }
-
-  emacs_value fcons = env->intern(env, "cons");
 
   struct Bump *bump = NULL;
 
@@ -125,12 +124,12 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   if (pos) {
     for (size_t i = 0; i < pos->size; i++) {
       emacs_value p = env->make_integer(env, pos->data[i]);
-      result = env->funcall(env, fcons, 2, (emacs_value[]){p, result});
+      result = env->funcall(env, Qcons, 2, (emacs_value[]){p, result});
     }
   }
 
   emacs_value s = env->make_integer(env, score);
-  result = env->funcall(env, fcons, 2, (emacs_value[]) {s, result});
+  result = env->funcall(env, Qcons, 2, (emacs_value[]) {s, result});
 
   fzf_free_positions(pos);
   fzf_free_pattern(pattern);
@@ -160,6 +159,9 @@ int emacs_module_init(struct emacs_runtime *rt) {
 
   env->funcall(env, env->intern(env, "provide"), 1,
                (emacs_value[]) { env->intern(env, "fzf-native-module") });
+
+  Qnil = env->make_global_ref(env, env->intern(env, "nil"));
+  Qcons = env->make_global_ref(env, env->intern(env, "cons"));
 
   return 0;
 }
