@@ -121,7 +121,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   fzf_position_t *pos = fzf_get_positions(str->b, pattern, slab);
 
   if (pos) {
-    for (size_t i = pos->size; i-- > 0;) {
+    for (size_t i = 0; i < pos->size; i++) {
       emacs_value p = env->make_integer(env, pos->data[i]);
       result = env->funcall(env, fcons, 2, (emacs_value[]){p, result});
     }
