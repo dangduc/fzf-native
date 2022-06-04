@@ -8,7 +8,10 @@ dynamic module for a native C implementation of fzf,
 
 #+begin_src emacs-lisp
 (fzf-native-score "Hot-Topic" "hp")
-;; 41
+;; (41 6 0)
+
+(fzf-native-score "Hot-Topic" "2")
+;; (0)
 #+end_src
 
 ** Credit

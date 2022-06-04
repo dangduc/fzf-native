@@ -97,6 +97,8 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
     return result;
   }
 
+  emacs_value fcons = env->intern(env, "cons");
+
   struct Bump *bump = NULL;
 
   struct EmacsStr *str = copy_emacs_string(env, &bump, args[0]);
@@ -118,11 +120,19 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   int score = fzf_get_score(str->b, pattern, slab);
   fzf_position_t *pos = fzf_get_positions(str->b, pattern, slab);
 
+  if (pos) {
+    for (size_t i = pos->size; i-- > 0;) {
+      emacs_value p = env->make_integer(env, pos->data[i]);
+      result = env->funcall(env, fcons, 2, (emacs_value[]){p, result});
+    }
+  }
+
+  emacs_value s = env->make_integer(env, score);
+  result = env->funcall(env, fcons, 2, (emacs_value[]) {s, result});
+
   fzf_free_positions(pos);
   fzf_free_pattern(pattern);
   fzf_free_slab(slab);
-
-  result = env->make_integer(env, score);
 
  error:
   return result;
