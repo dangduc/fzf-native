@@ -18,10 +18,20 @@ dynamic module for a native C implementation of fzf,
 
 #+begin_src bash
 # Linux
-mkdir build && cd build && cmake -G 'Unix Makefiles' -DCMAKE_C_FLAGS='-O3 -march=native' .. && make
+mkdir build \
+  && cd build \
+  && cmake -G 'Unix Makefiles' \
+           -DCMAKE_C_FLAGS='-O3 -march=native' \
+           .. \
+  && make
 
 # MacOS
-TODO
+mkdir build \
+  && cd build \
+  && cmake -DEMACS_INCLUDE_DIR='YOUR_EMACS_SOURCECODE_PARENT_DIR/emacs/src' \
+           -DCMAKE_C_FLAGS='-O3 -march=native' \
+           .. \
+  && cmake --build .
 #+end_src
 
 ** Credit
