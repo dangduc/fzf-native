@@ -20,7 +20,7 @@
   :group 'minibuffer
   :link '(url-link :tag "GitHub" "https://github.com/dangduc/fzf-native"))
 
-(declare-function fzf-native--score-c "fzf-native-module")
+(declare-function fzf-native-score "fzf-native-module")
 
 (defconst fzf-native--dyn-name "fzf-native-module"
   "Dynamic module name.")
@@ -40,9 +40,6 @@
          (dyn-path (concat fzf-native--bin-dir dyn-name)))
     (module-load dyn-path)
     (message "[INFO] Successfully load dynamic module, `%s`" dyn-name)))
-
-(defun fzf-native-score (str query)
-  (fzf-native--score-c str query))
 
 (provide 'fzf-native)
 ;;; fzf-native.el ends here

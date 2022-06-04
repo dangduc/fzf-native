@@ -148,11 +148,11 @@ int emacs_module_init(struct emacs_runtime *rt) {
   static struct Data data;
 
   env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native--score-c"),
+      env->intern(env, "fzf-native-score"),
       env->make_function(env, 2, 2, fzf_native_score,
-                         "Filter and sort CANDIDATES that match STRING.\n"
+                         "Score STR matching QUERY.\n"
                          "\n"
-                         "\(fn STRING CANDIDATES)",
+                         "\(fn STR QUERY)",
                          &data),
     });
 
