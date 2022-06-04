@@ -81,18 +81,18 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   emacs_value nil = env->intern(env, "nil");
   emacs_value result = nil;
 
-  // Short-circuit if STR is empty
-  ptrdiff_t str_len;
-  env->copy_string_contents(env, args[0], NULL, &str_len);
-  if (str_len == /* solely null byte */ 1) {
-    result = env->make_integer(env, 0);
-    return result;
-  }
-
   // Short-circuit if QUERY is empty
   ptrdiff_t query_len;
   env->copy_string_contents(env, args[1], NULL, &query_len);
   if (query_len == /* solely null byte */ 1) {
+    result = env->make_integer(env, 0);
+    return result;
+  }
+
+  // Short-circuit if STR is empty
+  ptrdiff_t str_len;
+  env->copy_string_contents(env, args[0], NULL, &str_len);
+  if (str_len == /* solely null byte */ 1) {
     result = env->make_integer(env, 0);
     return result;
   }
