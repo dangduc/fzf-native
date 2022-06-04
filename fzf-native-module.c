@@ -4,8 +4,6 @@
 #include <string.h>
 #include <ctype.h>
 #include <emacs-module.h>
-#include <pthread.h>
-#include <sys/sysinfo.h>
 #include "fzf.h"
 
 int plugin_is_GPL_compatible;
@@ -19,21 +17,8 @@ struct EmacsStr {
   char b[]; ///< The null-terminated copied string.
 };
 
-struct Worker {
-  pthread_t thread;
-  struct Shared *shared;
-  struct Batch *batch; ///< The initial batch to work on.
-};
-
-static enum JobRetVal {
-  JOB_FINISHED,
-  JOB_FAILED
-} job_finished = JOB_FINISHED, job_failed = JOB_FAILED;
-
 /** Module userdata that gets allocated once at initialization. */
 struct Data {
-  unsigned max_workers;
-  struct Worker *workers;
 };
 
 /** Intrusive linked list of bump allocation blocks. */
@@ -151,9 +136,6 @@ int emacs_module_init(struct emacs_runtime *rt) {
     return 2;
 
   static struct Data data;
-  data.max_workers = get_nprocs();
-  if (!(data.workers = malloc(data.max_workers * sizeof *data.workers)))
-    return 1;
 
   env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
       env->intern(env, "fzf-native--score-c"),
