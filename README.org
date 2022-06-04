@@ -1,0 +1,15 @@
+#+TITLE: fzf-native
+#+STARTUP: noindent
+
+Candidate scoring binding backed by the native fzf implementation in
+[[https://github.com/nvim-telescope/telescope-fzf-native.nvim][telescope-fzf-native.nvim]].
+#+begin_src emacs-lisp
+(fzf-native-score "Hot-Topic" "hp")
+;; 41
+#+end_src
+
+** Credit
+All credit for fzf.c goes to the
+[[https://github.com/nvim-telescope/telescope-fzf-native.nvim][telescope-fzf-native.nvim]]
+project. Much credit for Emacs module binding code goes to the
+[[https://github.com/axelf4/hotfuzz][hotfuzz]] project.
