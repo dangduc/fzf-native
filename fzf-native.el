@@ -38,7 +38,7 @@
   (interactive)
   (let* ((dyn-name (cl-case system-type
                      ((windows-nt ms-dos cygwin) (concat fzf-native--dyn-name ".dll"))
-                     (`darwin (concat fzf-native--dyn-name ".dylib"))
+                     (`darwin (concat "Darwin/" fzf-native--dyn-name ".so"))
                      (t (concat fzf-native--dyn-name ".so"))))
          (dyn-path (concat fzf-native--bin-dir dyn-name)))
     (module-load dyn-path)
