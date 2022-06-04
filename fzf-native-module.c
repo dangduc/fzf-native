@@ -102,9 +102,11 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   struct Bump *bump = NULL;
 
   struct EmacsStr *str = copy_emacs_string(env, &bump, args[0]);
+  // In this case result will be Qnil, indicating an error.
   if (!str) goto error;
 
   struct EmacsStr *query = copy_emacs_string(env, &bump, args[1]);
+  // In this case result will be Qnil, indicating an error.
   if (!query) goto error;
 
   fzf_slab_t *slab = fzf_make_default_slab();
