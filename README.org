@@ -14,6 +14,16 @@ dynamic module for a native C implementation of fzf,
 ;; (0)
 #+end_src
 
+** Building the native libraries
+
+#+begin_src bash
+# Linux
+mkdir build && cd build && cmake -G 'Unix Makefiles' -DCMAKE_C_FLAGS='-O3 -march=native' .. && make
+
+# MacOS
+TODO
+#+end_src
+
 ** Credit
 All credit for fzf.c goes to the
 [[https://github.com/nvim-telescope/telescope-fzf-native.nvim][telescope-fzf-native.nvim]]
