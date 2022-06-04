@@ -21,7 +21,6 @@
   :link '(url-link :tag "GitHub" "https://github.com/dangduc/fzf-native"))
 
 (declare-function fzf-native--score-c "fzf-native-module")
-;; If the dynamic module is available: Load it
 
 (defconst fzf-native--dyn-name "fzf-native-module"
   "Dynamic module name.")
@@ -29,8 +28,6 @@
 (defconst fzf-native--bin-dir
   (concat (file-name-directory load-file-name) "bin/")
   "Pre-built binaries directory path.")
-
-;(require 'fzf-native-module nil nil)
 
 ;;;###autoload
 (defun fzf-native-load-dyn ()
