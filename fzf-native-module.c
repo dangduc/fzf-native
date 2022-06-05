@@ -8,7 +8,7 @@
 
 int plugin_is_GPL_compatible;
 
-emacs_value Qnil, Qcons;
+emacs_value Qnil, Qcons, Flist;
 
 #define MAX(a, b) ({ __typeof__(a) _a = (a), _b = (b); _a > _b ? _a : _b; })
 
@@ -122,10 +122,13 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   fzf_position_t *pos = fzf_get_positions(str->b, pattern, slab);
 
   if (pos) {
-    for (size_t i = 0; i < pos->size; i++) {
-      emacs_value p = env->make_integer(env, pos->data[i]);
-      result = env->funcall(env, Qcons, 2, (emacs_value[]){p, result});
+    size_t len = pos->size;
+    emacs_value positions[len];
+    for (size_t i = 0; i < len; i++) {
+      positions[i] = env->make_integer(env, pos->data[len - (i + 1)]);
     }
+
+    result = env->funcall(env, Flist, len, positions);
   }
 
   emacs_value s = env->make_integer(env, score);
@@ -162,6 +165,7 @@ int emacs_module_init(struct emacs_runtime *rt) {
 
   Qnil = env->make_global_ref(env, env->intern(env, "nil"));
   Qcons = env->make_global_ref(env, env->intern(env, "cons"));
+  Flist = env->make_global_ref(env, env->intern(env, "list"));
 
   return 0;
 }
