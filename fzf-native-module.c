@@ -125,18 +125,21 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   int score = fzf_get_score(str->b, pattern, slab);
   fzf_position_t *pos = fzf_get_positions(str->b, pattern, slab);
 
+  size_t offset = 1;
+  size_t len = 0;
   if (pos) {
-    size_t len = pos->size;
-    emacs_value positions[len];
-    for (size_t i = 0; i < len; i++) {
-      positions[i] = env->make_integer(env, pos->data[len - (i + 1)]);
-    }
-
-    result = env->funcall(env, Flist, len, positions);
+    len = pos->size;
   }
 
-  emacs_value s = env->make_integer(env, score);
-  result = env->funcall(env, Qcons, 2, (emacs_value[]) {s, result});
+  emacs_value result_array[offset + len];
+
+  result_array[0] = env->make_integer(env, score);
+
+  for (size_t i = 0; i < len; i++) {
+    result_array[offset + i] = env->make_integer(env, pos->data[len - (i + 1)]);
+  }
+
+  result = env->funcall(env, Flist, offset + len, result_array);
 
   fzf_free_positions(pos);
   fzf_free_pattern(pattern);
