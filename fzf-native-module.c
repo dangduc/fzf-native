@@ -102,11 +102,15 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
 
   struct EmacsStr *str = copy_emacs_string(env, &bump, args[0]);
   // In this case result will be Qnil, indicating an error.
-  if (!str) goto error;
+  if (!str) {
+    return result;
+  };
 
   struct EmacsStr *query = copy_emacs_string(env, &bump, args[1]);
   // In this case result will be Qnil, indicating an error.
-  if (!query) goto error;
+  if (!query) {
+    return result;
+  }
 
   fzf_slab_t *slab = fzf_make_default_slab();
   /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
@@ -138,7 +142,6 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   fzf_free_pattern(pattern);
   fzf_free_slab(slab);
 
- error:
   return result;
 }
 int emacs_module_init(struct emacs_runtime *rt) {
