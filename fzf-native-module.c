@@ -112,7 +112,15 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
     return result;
   }
 
-  fzf_slab_t *slab = fzf_make_default_slab();
+  fzf_slab_t *slab;
+  if (nargs > 2) {
+    // Re-use paramterized slab.
+    slab = env->get_user_ptr(env, args[2]);
+  } else {
+    // Create a one-time use slab.
+    slab = fzf_make_default_slab();
+  }
+
   /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
    * normalize bool     : always set to false because its not implemented yet.
    *                      This is reserved for future use
@@ -143,10 +151,31 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
 
   fzf_free_positions(pos);
   fzf_free_pattern(pattern);
-  fzf_free_slab(slab);
+
+  if (nargs > 2) {
+    // Parameterized slab should not immediately be freed.
+  } else {
+    // Free one-time use slab.
+    fzf_free_slab(slab);
+  }
 
   return result;
 }
+
+void slab_finalize(void *object) {
+  fzf_slab_t *slab = (fzf_slab_t *)object;
+  fzf_free_slab(slab);
+}
+
+emacs_value fzf_native_make_default_slab(emacs_env *env,
+                                         ptrdiff_t nargs
+                                         __attribute__((__unused__)),
+                                         emacs_value args[], void *data_ptr) {
+  fzf_slab_t *slab = fzf_make_default_slab();
+
+  return env->make_user_ptr(env, slab_finalize, slab);
+}
+
 int emacs_module_init(struct emacs_runtime *rt) {
   // Verify compatability with Emacs executable loading this module
   if ((size_t) rt->size < sizeof *rt)
@@ -157,18 +186,33 @@ int emacs_module_init(struct emacs_runtime *rt) {
 
   static struct Data data;
 
+  // fzf-native-score STR QUERY &optional SLAB
   env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
       env->intern(env, "fzf-native-score"),
-      env->make_function(env, 2, 2, fzf_native_score,
+      env->make_function(env, 2, 3, fzf_native_score,
                          "Score STR matching QUERY.\n"
                          "\n"
-                         "\(fn STR QUERY)",
+                         "\(fn STR QUERY &optional SLAB)",
                          &data),
     });
 
   env->funcall(env, env->intern(env, "provide"), 1,
                (emacs_value[]) { env->intern(env, "fzf-native-module") });
 
+  // fzf-native-make-default-slab
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-make-default-slab"),
+      env->make_function(env, 0, 0, fzf_native_make_default_slab,
+                         "Instantiate and return a default fzf slab.\n"
+                         "\n"
+                         "\(fn)",
+                         &data),
+    });
+
+  env->funcall(env, env->intern(env, "provide"), 1,
+               (emacs_value[]) { env->intern(env, "fzf-native-make-default-slab") });
+
+  // Get a few common lisp functions.
   Qnil = env->make_global_ref(env, env->intern(env, "nil"));
   Qcons = env->make_global_ref(env, env->intern(env, "cons"));
   Flist = env->make_global_ref(env, env->intern(env, "list"));
