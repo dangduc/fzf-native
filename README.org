@@ -12,6 +12,11 @@ dynamic module for a native C implementation of fzf,
 
 (fzf-native-score "Hot-Topic" "2")
 ;; (0)
+
+(let ((slab (fzf-native-make-default-slab)))
+  (fzf-native-score "Hello World" "er" slab)
+  (fzf-native-score "Example of slab re-use" "xu" slab))
+;; (24 1 19)
 #+end_src
 
 ** Installation
