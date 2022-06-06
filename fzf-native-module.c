@@ -82,7 +82,7 @@ static struct EmacsStr *copy_emacs_string(emacs_env *env, struct Bump **bump, em
 emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__unused__)), emacs_value args[], void *data_ptr) {
   emacs_value result = Qnil;
 
-  // Short-circuit if QUERY is empty
+  // Short-circuit if QUERY is empty.
   ptrdiff_t query_len;
   env->copy_string_contents(env, args[1], NULL, &query_len);
   if (query_len == /* solely null byte */ 1) {
@@ -90,7 +90,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
     return result;
   }
 
-  // Short-circuit if STR is empty
+  // Short-circuit if STR is empty.
   ptrdiff_t str_len;
   env->copy_string_contents(env, args[0], NULL, &str_len);
   if (str_len == /* solely null byte */ 1) {
@@ -114,7 +114,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
 
   fzf_slab_t *slab;
   if (nargs > 2) {
-    // Re-use paramterized slab.
+    // Re-use parameterized slab.
     slab = env->get_user_ptr(env, args[2]);
   } else {
     // Create a one-time use slab.
@@ -122,14 +122,14 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   }
 
   /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
-   * normalize bool     : always set to false because its not implemented yet.
+   * normalize bool     : Always set to false because its not implemented yet.
    *                      This is reserved for future use
-   * pattern char*      : pattern you want to match. e.g. "src | lua !.c$
-   * fuzzy bool         : enable or disable fuzzy matching
+   * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
+   * fuzzy bool         : Enable or disable fuzzy matching
    */
   fzf_pattern_t *pattern = fzf_parse_pattern(CaseSmart, false, query->b, true);
 
-  /* you can get the score/position for as many items as you want */
+  /* You can get the score/position for as many items as you want */
   int score = fzf_get_score(str->b, pattern, slab);
   fzf_position_t *pos = fzf_get_positions(str->b, pattern, slab);
 
