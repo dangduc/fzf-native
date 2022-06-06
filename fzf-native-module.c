@@ -114,7 +114,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
 
   fzf_slab_t *slab;
   if (nargs > 2) {
-    // Re-use parameterized slab.
+    // Re-use SLAB argument.
     slab = env->get_user_ptr(env, args[2]);
   } else {
     // Create a one-time use slab.
@@ -154,7 +154,7 @@ error:
   fzf_free_pattern(pattern);
 
   if (nargs > 2) {
-    // Parameterized slab should not immediately be freed.
+    // SLAB argument should not immediately be freed.
   } else {
     // Free one-time use slab.
     fzf_free_slab(slab);
