@@ -87,7 +87,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   env->copy_string_contents(env, args[1], NULL, &query_len);
   if (query_len == /* solely null byte */ 1) {
     result = env->make_integer(env, 0);
-    return result;
+    goto error;
   }
 
   // Short-circuit if STR is empty.
@@ -95,7 +95,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   env->copy_string_contents(env, args[0], NULL, &str_len);
   if (str_len == /* solely null byte */ 1) {
     result = env->make_integer(env, 0);
-    return result;
+    goto error;
   }
 
   struct Bump *bump = NULL;
@@ -109,7 +109,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   struct EmacsStr *query = copy_emacs_string(env, &bump, args[1]);
   // In this case result will be Qnil, indicating an error.
   if (!query) {
-    return result;
+    goto error;
   }
 
   fzf_slab_t *slab;
@@ -139,7 +139,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
     len = pos->size;
   }
 
-  emacs_value result_array[offset + len];
+  emacs_value *result_array = malloc(sizeof(emacs_value) * (offset + len));
 
   result_array[0] = env->make_integer(env, score);
 
@@ -149,6 +149,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
 
   result = env->funcall(env, Flist, offset + len, result_array);
 
+error:
   fzf_free_positions(pos);
   fzf_free_pattern(pattern);
 
@@ -159,6 +160,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
     fzf_free_slab(slab);
   }
 
+  bump_free(bump);
   return result;
 }
 
