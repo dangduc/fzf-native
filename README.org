@@ -30,8 +30,18 @@ Clone / download this repository and modify your `load-path`:
 (add-to-list 'load-path (expand-file-name "/path/to/fzf-native/" user-emacs-directory))
 #+end_src
 
-*** Straight Example
+*** Straight Examples
 #+begin_src emacs-lisp
+; Configuration that builds dynamic module locally.
+(use-package fzf-native
+  :straight
+  (:repo "dangduc/fzf-native"
+   :host github
+   :files (:defaults "*.c" "*.h" "*.txt"))
+  :config
+  (fzf-native-load-own-build-dyn))
+
+; Configuration that uses pre-built dynamic module.
 (use-package fzf-native
   :straight
   (:repo "dangduc/fzf-native"
