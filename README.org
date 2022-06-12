@@ -24,7 +24,7 @@ dynamic module for a native C implementation of fzf,
 Not yet on MELPA.
 
 *** Manually
-Clone / download this repository and modify your `load-path`:
+Clone / download this repository and modify your ~load-path~:
 
 #+begin_src emacs-lisp
 (add-to-list 'load-path (expand-file-name "/path/to/fzf-native/" user-emacs-directory))
@@ -53,9 +53,9 @@ Clone / download this repository and modify your `load-path`:
 
 ** Use-Cases
 
-[[https://github.com/jojojames/fussy][Fussy]]: `fzf-native` is used as
-one of several choose-your-own scoring backends in `fussy`, a package
-that provides a `completing-style` for intelligent matching and
+[[https://github.com/jojojames/fussy][Fussy]]: ~fzf-native~ is used as
+one of several choose-your-own scoring backends in ~fussy~, a package
+that provides a ~completing-style~ for intelligent matching and
 sorting.
 
 ** Building the native libraries
