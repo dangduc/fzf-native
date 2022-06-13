@@ -38,6 +38,8 @@ Clone / download this repository and modify your ~load-path~:
   (:repo "dangduc/fzf-native"
    :host github
    :files (:defaults "*.c" "*.h" "*.txt"))
+  :init
+  (setq fzf-native-always-compile-module t)
   :config
   (fzf-native-load-own-build-dyn))
 
