@@ -3,7 +3,7 @@
 #include <stdalign.h>
 #include <string.h>
 #include <ctype.h>
-#include <emacs-module.h>
+#include "emacs-module.h"
 #include "fzf.h"
 
 int plugin_is_GPL_compatible;
