@@ -1,2 +1,5 @@
+*.elc
 build
 .ccls-cache
+/.eask/
+/dist/
