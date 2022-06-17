@@ -1,14 +1,18 @@
-name: CI
+name: Build
 
 on:
-  workflow_dispatch:
   pull_request:
-  push:
     branches:
-      - main
+      - compile
+    paths:
+      - '**.c'
+      - '**.h'
+
+env:
+  REPO: 'compile'
 
 jobs:
-  test:
+  build:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -18,26 +22,22 @@ jobs:
           - 28.1
           - snapshot
     steps:
-      - uses: actions/checkout@v2
-
-      - uses: jcs090218/setup-emacs@master
-        with:
-          version: ${{ matrix.emacs-version }}
-
-      - uses: actions/setup-node@v2
-        with:
-          node-version: '14'
-
-      - uses: emacs-eask/setup-eask@master
-        with:
-          version: 'snapshot'
-
-      - name: Print emacs version
-        run: |
-          emacs --version
-
-      - run: echo "$HOME/.cask/bin" >> $GITHUB_PATH
-      - run: make install
-      - run: make compile
-      - run: make lint
-      - run: make test
+    - uses: actions/checkout@v2
+    - name: Set git config
+      run: |
+        git config user.name github-actions
+        git config user.email github-actions@github.com
+  
+    - name: Commit
+      continue-on-error: true
+      run: |
+        git pull
+        git add .
+        git commit -m "Update modules ${{ matrix.targets }}"
+    - name: Push
+      uses: ad-m/github-push-action@master
+      with:
+        repository: ${{ env.REPO }}
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        branch: compile
+        retry: 7
