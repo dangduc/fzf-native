@@ -6,6 +6,7 @@
 #include "emacs-module.h"
 #include "fzf.h"
 
+
 int plugin_is_GPL_compatible;
 
 emacs_value Qnil, Qcons, Flist;
