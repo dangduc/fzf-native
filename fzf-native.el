@@ -92,7 +92,7 @@ the executable."
   "Load dynamic module."
   (interactive)
   (let* ((dyn-name (cl-case system-type
-                     ((windows-nt ms-dos cygwin) (concat fzf-native--dyn-name ".dll"))
+                     ((windows-nt ms-dos cygwin) (concat "Windows/Release/" fzf-native--dyn-name ".dll"))
                      (`darwin (concat "Darwin/" fzf-native--dyn-name ".so"))
                      (t (concat "Linux/" fzf-native--dyn-name ".so"))))
          (dyn-path (concat fzf-native--bin-dir dyn-name)))
