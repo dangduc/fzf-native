@@ -1,16 +1,23 @@
 #include <stdlib.h>
 #include <stdbool.h>
-#include <stdalign.h>
 #include <string.h>
 #include <ctype.h>
 #include "emacs-module.h"
 #include "fzf.h"
 
+#ifdef _WIN32
+#  define EXPORT __declspec(dllexport)
+#else
+#  define EXPORT
+#endif
+
+EXPORT
 int plugin_is_GPL_compatible;
 
-emacs_value Qnil, Qcons, Flist;
+/** See https://wambold.com/Martin/writings/alignof.html */
+#define ALIGNOF(type) offsetof (struct { char c; type member; }, member)
 
-#define MAX(a, b) ({ __typeof__(a) _a = (a), _b = (b); _a > _b ? _a : _b; })
+emacs_value Qnil, Qcons, Flist;
 
 /** An Emacs string made accessible by copying. */
 struct EmacsStr {
@@ -21,6 +28,7 @@ struct EmacsStr {
 
 /** Module userdata that gets allocated once at initialization. */
 struct Data {
+  size_t placeholder; ///< C requires that a struct or union has at least one member.
 };
 
 /** Intrusive linked list of bump allocation blocks. */
@@ -37,7 +45,8 @@ struct Bump {
  */
 static void *bump_alloc(struct Bump **head, size_t len) {
   if (!*head || (*head)->capacity - (*head)->index < len) {
-    size_t capacity = MAX(*head ? 2 * (*head)->capacity : 1024, len);
+    size_t double_capacity = *head ? 2 * (*head)->capacity : (size_t) 1024;
+    size_t capacity = double_capacity > len ? double_capacity : len;
     struct Bump *new_head;
     if (!(new_head = malloc(sizeof *new_head + capacity)))
       return NULL;
@@ -70,16 +79,18 @@ static struct EmacsStr *copy_emacs_string(emacs_env *env, struct Bump **bump, em
   // Note: Since only EmacsStr:s are allocated with bump_alloc we
   // may use its smaller alignment rather than the scalar maximum.
   if (!(result = bump_alloc(bump, sizeof *result + len
-                            + alignof(struct EmacsStr) - 1 & ~(alignof(struct EmacsStr) - 1))))
+                            + ALIGNOF(struct EmacsStr) - 1 & ~(ALIGNOF(struct EmacsStr) - 1)))) {
     return NULL;
+  }
 
   result->value = value;
   result->len = len - 1;
   env->copy_string_contents(env, value, result->b, &len);
+
   return result;
 }
 
-emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__unused__)), emacs_value args[], void *data_ptr) {
+emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data_ptr) {
   emacs_value result = Qnil;
 
   // Short-circuit if QUERY is empty.
@@ -170,8 +181,7 @@ void slab_finalize(void *object) {
 }
 
 emacs_value fzf_native_make_default_slab(emacs_env *env,
-                                         ptrdiff_t nargs
-                                         __attribute__((__unused__)),
+                                         ptrdiff_t nargs,
                                          emacs_value args[], void *data_ptr) {
   fzf_slab_t *slab = fzf_make_default_slab();
 
@@ -194,7 +204,7 @@ int emacs_module_init(struct emacs_runtime *rt) {
       env->make_function(env, 2, 3, fzf_native_score,
                          "Score STR matching QUERY.\n"
                          "\n"
-                         "\(fn STR QUERY &optional SLAB)",
+                         "\\(fn STR QUERY &optional SLAB)",
                          &data),
     });
 
@@ -207,7 +217,7 @@ int emacs_module_init(struct emacs_runtime *rt) {
       env->make_function(env, 0, 0, fzf_native_make_default_slab,
                          "Instantiate and return a default fzf slab.\n"
                          "\n"
-                         "\(fn)",
+                         "\\(fn)",
                          &data),
     });
 
