@@ -1,4 +1,4 @@
-name: CMake-Binaries
+name: Build And Publish Binaries
 
 on:
   workflow_dispatch:
