@@ -36,6 +36,14 @@
      (equal (fzf-native-score "sfsjoc" "jo" slab)
         '(36 3 4)))))
 
+(ert-deftest fzf-native-score-empty-query-test ()
+  (let ((result (fzf-native-score "abcdefghi" "")))
+    (should (equal result '(0)))))
+
+(ert-deftest fzf-native-score-empty-str-test ()
+  (let ((result (fzf-native-score "" "acef")))
+    (should (equal result '(0)))))
+
 (ert-deftest fzf-native-score-with-default-slab-benchmark-test ()
   "Test scoring with slab is faster."
   (let* ((slab (fzf-native-make-default-slab))

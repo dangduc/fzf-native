@@ -86,16 +86,16 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   ptrdiff_t query_len;
   env->copy_string_contents(env, args[1], NULL, &query_len);
   if (query_len == /* solely null byte */ 1) {
-    result = env->make_integer(env, 0);
-    goto error;
+    result = env->funcall(env, Qcons, 2, (emacs_value[]){env->make_integer(env, 0), result});
+    return result;
   }
 
   // Short-circuit if STR is empty.
   ptrdiff_t str_len;
   env->copy_string_contents(env, args[0], NULL, &str_len);
   if (str_len == /* solely null byte */ 1) {
-    result = env->make_integer(env, 0);
-    goto error;
+    result = env->funcall(env, Qcons, 2, (emacs_value[]){env->make_integer(env, 0), result});
+    return result;
   }
 
   struct Bump *bump = NULL;
@@ -103,7 +103,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs __attribute__ ((__u
   struct EmacsStr *str = copy_emacs_string(env, &bump, args[0]);
   // In this case result will be Qnil, indicating an error.
   if (!str) {
-    return result;
+    goto error;
   };
 
   struct EmacsStr *query = copy_emacs_string(env, &bump, args[1]);
