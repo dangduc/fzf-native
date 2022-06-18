@@ -2,6 +2,7 @@
 #+STARTUP: noindent
 
 [[https://github.com/dangduc/fzf-native/actions/workflows/build.yaml][https://github.com/dangduc/fzf-native/actions/workflows/build.yaml/badge.svg]]
+[[https://github.com/dangduc/fzf-native/actions/workflows/cmake.yaml][https://github.com/dangduc/fzf-native/actions/workflows/cmake.yml/badge.svg]]
 
 This is a package that provides fuzzy matching scoring based on the
 fzf algorithm (by [[https://github.com/junegunn][junegunn]]) through a
