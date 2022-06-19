@@ -44,6 +44,18 @@
   (let ((result (fzf-native-score "" "acef")))
     (should (equal result '(0)))))
 
+(ert-deftest fzf-native-score-long-str-test ()
+  (let* ((len 4096)
+         (str (concat (make-string len ?s) "d"))
+         (result (fzf-native-score str "d")))
+    (should (equal result `(16 ,len)))))
+
+(ert-deftest fzf-native-score-very-long-str-test ()
+  (let* ((len 65536)
+         (str (concat (make-string len ?s) "d"))
+         (result (fzf-native-score str "d")))
+    (should (equal result `(16 ,len)))))
+
 (ert-deftest fzf-native-score-with-default-slab-benchmark-test ()
   "Test scoring with slab is faster."
   (let* ((slab (fzf-native-make-default-slab))
