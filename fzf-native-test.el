@@ -44,6 +44,22 @@
   (let ((result (fzf-native-score "" "acef")))
     (should (equal result '(0)))))
 
+(ert-deftest fzf-native-score-str-wrong-type-int-test ()
+  (should-error (fzf-native-score 1 "1")
+                :type 'wrong-type-argument))
+
+(ert-deftest fzf-native-score-query-wrong-type-int-test ()
+  (should-error (fzf-native-score "1" 1)
+                :type 'wrong-type-argument))
+
+(ert-deftest fzf-native-score-str-wrong-type-nil-test ()
+  (should-error (fzf-native-score nil "1")
+                :type 'wrong-type-argument))
+
+(ert-deftest fzf-native-score-query-wrong-type-nil-test ()
+  (should-error (fzf-native-score "1" nil)
+                :type 'wrong-type-argument))
+
 (ert-deftest fzf-native-score-long-str-test ()
   (let* ((len 4096)
          (str (concat (make-string len ?s) "d"))
