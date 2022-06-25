@@ -11,13 +11,20 @@
 #  define EXPORT
 #endif
 
-EXPORT
-int plugin_is_GPL_compatible;
-
 /** See https://wambold.com/Martin/writings/alignof.html */
 #define ALIGNOF(type) offsetof (struct { char c; type member; }, member)
 
-emacs_value Qnil, Qcons, Flist;
+/** MSVC does not recognize __attribute__((unused)), so define it away. */
+#ifdef _MSC_VER
+    #define UNUSED(x) x
+#else
+    #define UNUSED(x) __attribute__((unused)) x
+#endif
+
+EXPORT
+int plugin_is_GPL_compatible;
+
+emacs_value Qnil, Qlistofzero, Qcons, Flist;
 
 /** An Emacs string made accessible by copying. */
 struct EmacsStr {
@@ -28,6 +35,7 @@ struct EmacsStr {
 
 /** Module userdata that gets allocated once at initialization. */
 struct Data {
+  // NOLINTNEXTLINE: Ignore warning for unused declaration (clang).
   size_t placeholder; ///< C requires that a struct or union has at least one member.
 };
 
@@ -90,37 +98,32 @@ static struct EmacsStr *copy_emacs_string(emacs_env *env, struct Bump **bump, em
   return result;
 }
 
-emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data_ptr) {
-  emacs_value result = Qnil;
-
+emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void UNUSED(*data_ptr)) {
   // Short-circuit if QUERY is empty.
   ptrdiff_t query_len;
   env->copy_string_contents(env, args[1], NULL, &query_len);
   if (query_len == /* solely null byte */ 1) {
-    result = env->funcall(env, Qcons, 2, (emacs_value[]){env->make_integer(env, 0), result});
-    return result;
+    return Qlistofzero;
   }
 
   // Short-circuit if STR is empty.
   ptrdiff_t str_len;
   env->copy_string_contents(env, args[0], NULL, &str_len);
   if (str_len == /* solely null byte */ 1) {
-    result = env->funcall(env, Qcons, 2, (emacs_value[]){env->make_integer(env, 0), result});
-    return result;
+    return Qlistofzero;
   }
 
   struct Bump *bump = NULL;
 
   struct EmacsStr *str = copy_emacs_string(env, &bump, args[0]);
-  // In this case result will be Qnil, indicating an error.
   if (!str) {
-    goto error;
-  };
-
+    bump_free(bump);
+    return Qnil;
+  }
   struct EmacsStr *query = copy_emacs_string(env, &bump, args[1]);
-  // In this case result will be Qnil, indicating an error.
   if (!query) {
-    goto error;
+    bump_free(bump);
+    return Qnil;
   }
 
   fzf_slab_t *slab;
@@ -158,9 +161,8 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
     result_array[offset + i] = env->make_integer(env, pos->data[len - (i + 1)]);
   }
 
-  result = env->funcall(env, Flist, offset + len, result_array);
+  emacs_value result = env->funcall(env, Flist, offset + len, result_array);
 
-error:
   fzf_free_positions(pos);
   fzf_free_pattern(pattern);
 
@@ -180,9 +182,10 @@ void slab_finalize(void *object) {
   fzf_free_slab(slab);
 }
 
-emacs_value fzf_native_make_default_slab(emacs_env *env,
-                                         ptrdiff_t nargs,
-                                         emacs_value args[], void *data_ptr) {
+emacs_value fzf_native_make_default_slab(emacs_env UNUSED(*env),
+                                         ptrdiff_t UNUSED(nargs),
+                                         emacs_value UNUSED(args[]),
+                                         void UNUSED(*data_ptr)) {
   fzf_slab_t *slab = fzf_make_default_slab();
 
   return env->make_user_ptr(env, slab_finalize, slab);
@@ -228,6 +231,10 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qnil = env->make_global_ref(env, env->intern(env, "nil"));
   Qcons = env->make_global_ref(env, env->intern(env, "cons"));
   Flist = env->make_global_ref(env, env->intern(env, "list"));
+
+  Qlistofzero = env->make_global_ref(
+      env, env->funcall(env, Qcons, 2,
+                        (emacs_value[]){env->make_integer(env, 0), Qnil}));
 
   return 0;
 }
