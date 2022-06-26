@@ -66,21 +66,7 @@ sorting.
 ** Building the native libraries
 
 #+begin_src bash
-# Linux
-mkdir build \
-  && cd build \
-  && cmake -G 'Unix Makefiles' \
-           -DCMAKE_C_FLAGS='-O3 -march=native' \
-           .. \
-  && make
-
-# MacOS
-mkdir build \
-  && cd build \
-  && cmake -DEMACS_INCLUDE_DIR='YOUR_EMACS_SOURCECODE_PARENT_DIR/emacs/src' \
-           -DCMAKE_C_FLAGS='-O3 -march=native' \
-           .. \
-  && cmake --build .
+mkdir build && cmake -B build -DCMAKE_C_FLAGS='-O3 -march=native' && cmake --build build
 #+end_src
 
 ** Credit
