@@ -36,6 +36,23 @@
      (equal (fzf-native-score "sfsjoc" "jo" slab)
         '(36 3 4)))))
 
+(ert-deftest fzf-native-score-with-slab-test ()
+  "Test slab can be reused."
+  (let* ((slab (fzf-native-make-slab (* 100 1024) 2048))
+         (result (fzf-native-score "abcdefghi" "acef" slab)))
+    (should
+     (equal (fzf-native-score "abcdefghi" "acef" slab)
+            '(78 0 2 4 5)))
+    (should
+     (equal (fzf-native-score "abc" "acef" slab)
+            '(0)))
+    (should
+     (equal (fzf-native-score "zzzzzabc" "z" slab)
+            '(32 0)))
+    (should
+     (equal (fzf-native-score "sfsjoc" "jo" slab)
+            '(36 3 4)))))
+
 (ert-deftest fzf-native-score-empty-query-test ()
   (let ((result (fzf-native-score "abcdefghi" "")))
     (should (equal result '(0)))))
@@ -85,3 +102,18 @@
       (car
        (benchmark-run 10000
          (fzf-native-score str query)))))))
+
+(ert-deftest fzf-native-score-with-small-slab-versus-large-slab-benchmark-test ()
+  "Test scoring which slab is faster."
+  (let* ((small-slab (fzf-native-make-slab (* 1 1024) (* 1 2048)))
+         (large-slab (fzf-native-make-slab (* 100 1024) (* 1 2048)))
+         (str (concat (make-string 4096 ?s) "d"))
+         (query "d"))
+    (should
+     (>
+      (car
+       (benchmark-run 10000
+         (fzf-native-score str query small-slab)))
+      (car
+       (benchmark-run 10000
+         (fzf-native-score str query large-slab)))))))

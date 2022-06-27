@@ -22,6 +22,7 @@
 
 (declare-function fzf-native-score "fzf-native-module")
 (declare-function fzf-native-make-default-slab "fzf-native-module")
+(declare-function fzf-native-make-slab "fzf-native-module")
 
 (defconst fzf-native--dyn-name "fzf-native-module"
   "Dynamic module name.")

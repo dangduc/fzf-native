@@ -191,6 +191,18 @@ emacs_value fzf_native_make_default_slab(emacs_env UNUSED(*env),
   return env->make_user_ptr(env, slab_finalize, slab);
 }
 
+emacs_value fzf_native_make_slab(emacs_env UNUSED(*env),
+                                 ptrdiff_t UNUSED(nargs),
+                                 emacs_value UNUSED(args[]),
+                                 void UNUSED(*data_ptr)) {
+  size_t slab16Size = env->extract_integer(env, args[0]);
+  size_t slab32Size = env->extract_integer(env, args[1]);
+
+  fzf_slab_t *slab = fzf_make_slab((fzf_slab_config_t){slab16Size, slab32Size});
+
+  return env->make_user_ptr(env, slab_finalize, slab);
+}
+
 int emacs_module_init(struct emacs_runtime *rt) {
   // Verify compatability with Emacs executable loading this module
   if ((size_t) rt->size < sizeof *rt)
@@ -226,6 +238,19 @@ int emacs_module_init(struct emacs_runtime *rt) {
 
   env->funcall(env, env->intern(env, "provide"), 1,
                (emacs_value[]) { env->intern(env, "fzf-native-make-default-slab") });
+
+  // fzf-native-make-slab
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-make-slab"),
+      env->make_function(env, 2, 2, fzf_native_make_slab,
+                         "Instantiate and return a fzf slab.\n"
+                         "\n"
+                         "\\(fn SIZE16 SIZE32)",
+                         &data),
+    });
+
+  env->funcall(env, env->intern(env, "provide"), 1,
+               (emacs_value[]) { env->intern(env, "fzf-native-make-slab") });
 
   // Get a few common lisp functions.
   Qnil = env->make_global_ref(env, env->intern(env, "nil"));
