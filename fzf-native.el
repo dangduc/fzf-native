@@ -52,7 +52,6 @@ confirmation before compiling."
   "Return t if cmake is available.
 CMake is needed to build fzf-native, here we check that we can find
 the executable."
-
   (unless (executable-find "cmake")
     (error "Fzf-Native needs CMake to be compiled.  Please, install CMake"))
   t)

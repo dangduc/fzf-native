@@ -25,16 +25,16 @@
          (result (fzf-native-score "abcdefghi" "acef" slab)))
     (should
      (equal (fzf-native-score "abcdefghi" "acef" slab)
-        '(78 0 2 4 5)))
+            '(78 0 2 4 5)))
     (should
      (equal (fzf-native-score "abc" "acef" slab)
-        '(0)))
+            '(0)))
     (should
      (equal (fzf-native-score "zzzzzabc" "z" slab)
-        '(32 0)))
+            '(32 0)))
     (should
      (equal (fzf-native-score "sfsjoc" "jo" slab)
-        '(36 3 4)))))
+            '(36 3 4)))))
 
 (ert-deftest fzf-native-score-with-slab-test ()
   "Test slab can be reused."
