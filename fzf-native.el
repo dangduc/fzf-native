@@ -10,8 +10,8 @@
 
 ;;; Commentary:
 
-;; This is a fuzzy Emacs completion style similar to the built-in
-;; `flex' style, but with a better scoring algorithm.
+;; This is a package that provides fuzzy match scoring
+;; based on the fzf algorithm by junegunn.
 
 (require 'cl-lib)
 
