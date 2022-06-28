@@ -4,29 +4,44 @@
 [[https://github.com/dangduc/fzf-native/actions/workflows/test.yaml][https://github.com/dangduc/fzf-native/actions/workflows/test.yaml/badge.svg]]
 [[https://github.com/dangduc/fzf-native/actions/workflows/cmake.yaml][https://github.com/dangduc/fzf-native/actions/workflows/cmake.yaml/badge.svg]]
 
-This is a package that provides fuzzy matching scoring based on the
-fzf algorithm (by [[https://github.com/junegunn][junegunn]]) through a
-dynamic module for a native C implementation of fzf,
+This is a package that provides fuzzy match scoring based on the
+fzf algorithm by [[https://github.com/junegunn][junegunn]]. The
+main contribution is a wrapper over the C implementation of fzf from the project
 [[https://github.com/nvim-telescope/telescope-fzf-native.nvim][telescope-fzf-native.nvim]].
+Elisp functions for scoring are exported through an Emacs dynamic module.
+
+This package /does one thing well/ --For a given STR and QUERY compute and return a score and matched indices. If you're looking for a fuzzy auto-completion engine, see the Use Cases section for how this package can be used as a ~completion-style~.
 
 #+begin_src emacs-lisp
+;; Example of basic usage
 (fzf-native-score "Hot-Topic" "hp")
 ;; (41 0 6)
 
+;; Example of no match
 (fzf-native-score "Hot-Topic" "2")
 ;; (0)
 
+;; Example of slab re-use
 (let ((slab (fzf-native-make-default-slab)))
   (fzf-native-score "Hello World" "er" slab)
   (fzf-native-score "Example of slab re-use" "xu" slab))
 ;; (24 1 19)
 #+end_src
 
+See [[fzf-native-test.el][test cases]] for more examples.
+
+** Supported Platforms
+
+Linux, macOS, and Windows are all supported. /Although to be fair the package isn't well tested on Windows, so bug reports are more than welcome./ Pre-built shared libraries for x86_64 architecture are kept up-to-date in the [[bin][bin/]] directory.
+
 ** Installation
+
 *** MELPA
+
 Not yet on MELPA.
 
 *** Manually
+
 Clone / download this repository and modify your ~load-path~:
 
 #+begin_src emacs-lisp
@@ -34,6 +49,7 @@ Clone / download this repository and modify your ~load-path~:
 #+end_src
 
 *** Straight Examples
+
 #+begin_src emacs-lisp
 ; Configuration that builds dynamic module locally.
 (use-package fzf-native
@@ -45,7 +61,9 @@ Clone / download this repository and modify your ~load-path~:
   (setq fzf-native-always-compile-module t)
   :config
   (fzf-native-load-own-build-dyn))
+#+end_src
 
+#+begin_src emacs-lisp
 ; Configuration that uses pre-built dynamic module.
 (use-package fzf-native
   :straight
@@ -56,14 +74,14 @@ Clone / download this repository and modify your ~load-path~:
   (fzf-native-load-dyn))
 #+end_src
 
-** Use-Cases
+** Use Cases
 
 [[https://github.com/jojojames/fussy][Fussy]]: ~fzf-native~ is used as
 one of several choose-your-own scoring backends in ~fussy~, a package
 that provides a ~completing-style~ for intelligent matching and
 sorting.
 
-** Building the native libraries
+** Building the Native Libraries
 
 #+begin_src bash
 mkdir build && cmake -B build -DCMAKE_C_FLAGS='-O3 -march=native' && cmake --build build
