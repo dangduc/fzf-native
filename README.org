@@ -4,13 +4,18 @@
 [[https://github.com/dangduc/fzf-native/actions/workflows/test.yaml][https://github.com/dangduc/fzf-native/actions/workflows/test.yaml/badge.svg]]
 [[https://github.com/dangduc/fzf-native/actions/workflows/cmake.yaml][https://github.com/dangduc/fzf-native/actions/workflows/cmake.yaml/badge.svg]]
 
-This is a package that provides fuzzy match scoring based on the
-fzf algorithm by [[https://github.com/junegunn][junegunn]]. The
-main contribution is a wrapper over the C implementation of fzf from the project
+This is a package that provides fuzzy match scoring based on the fzf
+algorithm by [[https://github.com/junegunn][junegunn]]. The main
+contribution is a wrapper over the C implementation of fzf from the
+project
 [[https://github.com/nvim-telescope/telescope-fzf-native.nvim][telescope-fzf-native.nvim]].
-Elisp functions for scoring are exported through an Emacs dynamic module.
+Elisp functions for scoring are exported through an Emacs dynamic
+module.
 
-This package /does one thing well/ --For a given STR and QUERY compute and return a score and matched indices. If you're looking for a fuzzy auto-completion engine, see the Use Cases section for how this package can be used as a ~completion-style~.
+This package /does one thing well/ -- For a given STR and QUERY compute
+and return a score and matching indices. If you're looking for a fuzzy
+auto-completion engine, see the Use Cases section for how this package
+can be used in a ~completion-style~.
 
 #+begin_src emacs-lisp
 ;; Example of basic usage
@@ -32,7 +37,10 @@ See [[fzf-native-test.el][test cases]] for more examples.
 
 ** Supported Platforms
 
-Linux, macOS, and Windows are all supported. /Although to be fair the package isn't well tested on Windows, so bug reports are more than welcome./ Pre-built shared libraries for x86_64 architecture are kept up-to-date in the [[bin][bin/]] directory.
+Linux, macOS, and Windows are all supported.
+/(To be fair the package isn't well tested on Windows, so bug reports are more than welcome.)/
+Pre-built shared libraries for x86_64 architecture are kept up-to-date
+in the [[bin][bin/]] directory.
 
 ** Installation
 
