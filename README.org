@@ -38,7 +38,7 @@ See [[fzf-native-test.el][test cases]] for more examples.
 ** Supported Platforms
 
 Linux, macOS, and Windows are all supported.
-/(To be fair the package isn't well tested on Windows, so bug reports are more than welcome.)/
+/(To be fair the package isn't well tested on Windows, so bug reports are welcome.)/
 Pre-built shared libraries for x86_64 architecture are kept up-to-date
 in the [[bin][bin/]] directory.
 
