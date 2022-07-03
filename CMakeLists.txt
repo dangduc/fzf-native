@@ -3,6 +3,7 @@ project(fzf-native C)
 
 # Check compilers
 MESSAGE( STATUS ">>>>>>>> ${CMAKE_CXX_COMPILER_ID}")
+MESSAGE( STATUS ">>>>>>>> ${CMAKE_HOST_SYSTEM_PROCESSOR}")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "Setting build type to 'RelWithDebInfo' as none was specified.")
@@ -25,7 +26,13 @@ endif()
 set(PLATFORM_DIR ${CMAKE_HOST_SYSTEM_NAME})
 
 if(NOT DEFINED FZF_NATIVE_MODULE_OUTPUT_DIR)
-  set(FZF_NATIVE_MODULE_OUTPUT_DIR bin/${PLATFORM_DIR})
+  if((CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
+     AND (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64"))
+    # Assume Apple Silicon.
+    set(FZF_NATIVE_MODULE_OUTPUT_DIR bin/${PLATFORM_DIR}/arm64)
+  else()
+    set(FZF_NATIVE_MODULE_OUTPUT_DIR bin/${PLATFORM_DIR})
+  endif()
 endif()
 
 # To build shared libraries in Windows, we set CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS to TRUE.
