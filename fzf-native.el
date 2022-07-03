@@ -35,7 +35,7 @@
   "Name of the buffer used for compiling fzf-native-module.")
 
 (defcustom fzf-native-module-cmake-args
-  "-DCMAKE_C_FLAGS='-O3 -march=native'"
+  "-DCMAKE_C_FLAGS='-O3'"
   "Arguments given to CMake to compile fzf-native-module."
   :type 'string
   :group 'fzf-native)
@@ -71,14 +71,9 @@ the executable."
              (file-name-directory (locate-library "fzf-native.el" t))))
            (make-commands
             (concat
-             "cd " fzf-native-directory "; \
-             mkdir -p build; \
-             cd build; \
-             cmake -G 'Unix Makefiles' "
-             fzf-native-module-cmake-args
-             " ..; \
-             make; \
-             cd -"))
+             "cd " fzf-native-directory " ; "
+             "cmake -B build/ " fzf-native-module-cmake-args " && "
+             "cmake --build build/"))
            (buffer (get-buffer-create fzf-native-module-install-buffer-name)))
       (pop-to-buffer buffer)
       (compilation-mode)
@@ -93,7 +88,11 @@ the executable."
   (interactive)
   (let* ((dyn-name (cl-case system-type
                      ((windows-nt ms-dos cygwin) (concat "Windows/Release/" fzf-native--dyn-name ".dll"))
-                     (`darwin (concat "Darwin/" fzf-native--dyn-name ".so"))
+                     ('darwin (if (string-prefix-p "x86_64" system-configuration)
+                                  ; Intel
+                                  (concat "Darwin/" fzf-native--dyn-name ".so")
+                                ; Apple Silicon
+                                (concat "Darwin/arm64/" fzf-native--dyn-name ".so")))
                      (t (concat "Linux/" fzf-native--dyn-name ".so"))))
          (dyn-path (concat fzf-native--bin-dir dyn-name)))
     (module-load dyn-path)
