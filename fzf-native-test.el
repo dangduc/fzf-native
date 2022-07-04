@@ -117,3 +117,8 @@
       (car
        (benchmark-run 10000
          (fzf-native-score str query large-slab)))))))
+
+(ert-deftest fzf-native-score-indices-multibyte-test ()
+  (should
+   (equal (cdr (fzf-native-score "ポケモン.txt" "txt"))
+          '(5 6 7))))
