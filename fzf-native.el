@@ -113,5 +113,19 @@ the executable."
           (require 'fzf-native-module))
       (error "Fzf-Native will not work until `fzf-native-module' is compiled!"))))
 
+(defun fzf-native--fix-score-indices (fn str &rest args)
+  "An around advice to fix score indices if STR is multibyte.
+FN should be `fzf-native-score'."
+  (let ((score (apply fn str args)))
+    (if (or (null score) (not (multibyte-string-p str)))
+        score
+      ;; fzf-native makes score indices as byte position.
+      ;; But we want it as character position.
+      (let ((idx (cl-loop for i from 0 to (1- (length str))
+                          vconcat (make-vector (string-bytes (char-to-string (aref str i))) i))))
+        (cons (car score) (mapcar (lambda (x) (aref idx x)) (cdr score)))))))
+
+(advice-add 'fzf-native-score :around #'fzf-native--fix-score-indices)
+
 (provide 'fzf-native)
 ;;; fzf-native.el ends here
