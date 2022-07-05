@@ -12,7 +12,7 @@ project
 Elisp functions for scoring are exported through an Emacs dynamic
 module.
 
-This package /does one thing well/ -- For a given STR and QUERY compute
+This package /does one thing/ -- For a given STR and QUERY compute
 and return a score and matching indices. If you're looking for a fuzzy
 auto-completion engine, see the Use Cases section for how this package
 can be used in a ~completion-style~.
@@ -37,10 +37,8 @@ See [[fzf-native-test.el][test cases]] for more examples.
 
 ** Supported Platforms
 
-Linux, macOS, and Windows are all supported.
-/(To be fair the package isn't well tested on Windows, so bug reports are welcome.)/
-Pre-built shared libraries for x86_64 architecture are kept up-to-date
-in the [[bin][bin/]] directory.
+Linux, macOS, and Windows are supported.
+Pre-built shared libraries are in the [[bin][bin/]] directory.
 
 ** Installation
 
