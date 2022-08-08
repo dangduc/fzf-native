@@ -21,11 +21,15 @@ can be used in a ~completion-style~.
 ;; Example of basic usage
 (fzf-native-score "Hot-Topic" "hp")
 ;; (41 0 6)
+#+end_src
 
+#+begin_src emacs-lisp
 ;; Example of no match
 (fzf-native-score "Hot-Topic" "2")
 ;; (0)
+#+end_src
 
+#+begin_src emacs-lisp
 ;; Example of slab re-use
 (let ((slab (fzf-native-make-default-slab)))
   (fzf-native-score "Hello World" "er" slab)
