@@ -124,11 +124,11 @@ FN should be `fzf-native-score'."
                           vconcat (make-vector (string-bytes (char-to-string (aref str i))) i))))
         (cons (car score) (mapcar (lambda (x) (aref idx x)) (cdr score)))))))
 
-;; Work around the lib's lack of support for multibyte chars. Keep
-;; this advice if you want accurate indices for multibyte chars.
-;; Remove this advice if you want better performance or you don't need
-;; accurate indices for multibyte chars.
-(advice-add 'fzf-native-score :around #'fzf-native--fix-score-indices)
+;; Work around the lib's lack of support for multibyte chars. Add this
+;; advice if you want accurate indices for multibyte chars.  Don't add
+;; this advice if you want better run time performance or you don't
+;; need accurate indices for multibyte chars.
+; e.g. (advice-add 'fzf-native-score :around #'fzf-native--fix-score-indices)
 
 (provide 'fzf-native)
 ;;; fzf-native.el ends here

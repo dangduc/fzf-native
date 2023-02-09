@@ -118,7 +118,16 @@
        (benchmark-run 10000
          (fzf-native-score str query large-slab)))))))
 
-(ert-deftest fzf-native-score-indices-multibyte-test ()
+(ert-deftest fzf-native-score-indices-multibyte-not-supported-test ()
   (should
    (equal (cdr (fzf-native-score "ポケモン.txt" "txt"))
-          '(5 6 7))))
+          '(13 14 15))))
+
+(ert-deftest fzf-native-score-indices-multibyte-support-through-advice-test ()
+  ; Assume advice not yet added. Setup advice environment.
+  (advice-add 'fzf-native-score :around #'fzf-native--fix-score-indices)
+  (should
+   (equal (cdr (fzf-native-score "ポケモン.txt" "txt"))
+          '(5 6 7)))
+  ; Reset advice environment.
+  (advice-remove 'fzf-native-score #'fzf-native--fix-score-indices))

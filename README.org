@@ -41,7 +41,7 @@ See [[fzf-native-test.el][test cases]] for more examples.
 
 ** Supported Platforms
 
-Linux, macOS, and Windows are supported.
+Linux, macOS (incl. Apple silicon), and Windows are supported.
 Pre-built shared libraries are in the [[bin][bin/]] directory.
 
 ** Installation
@@ -82,6 +82,17 @@ Clone / download this repository and modify your ~load-path~:
    :files (:defaults "bin"))
   :config
   (fzf-native-load-dyn))
+#+end_src
+
+*** Multibyte character support
+
+Work around the lib's lack of support for multibyte chars. Add this
+advice if you want accurate indices for multibyte chars.  Don't add
+this advice if you want better run time performance or you don't need
+accurate indices for multibyte chars.
+
+#+begin_src emacs-lisp
+(advice-add 'fzf-native-score :around #'fzf-native--fix-score-indices)
 #+end_src
 
 ** Use Cases
