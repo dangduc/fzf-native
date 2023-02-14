@@ -2,13 +2,15 @@ cmake_minimum_required(VERSION 3.19)
 project(fzf-native C)
 
 # Check compilers
-MESSAGE( STATUS ">>>>>>>> ${CMAKE_CXX_COMPILER_ID}")
-MESSAGE( STATUS ">>>>>>>> ${CMAKE_HOST_SYSTEM_PROCESSOR}")
+message(STATUS ">>>>>>>> ${CMAKE_CXX_COMPILER_ID}")
+message(STATUS ">>>>>>>> ${CMAKE_HOST_SYSTEM_PROCESSOR}")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-  message(STATUS "Setting build type to 'RelWithDebInfo' as none was specified.")
-  set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE
-	STRING "Choose the type of build." FORCE)
+  message(
+    STATUS "Setting build type to 'RelWithDebInfo' as none was specified.")
+  set(CMAKE_BUILD_TYPE
+      "RelWithDebInfo"
+      CACHE STRING "Choose the type of build." FORCE)
 endif()
 
 find_program(EMACS_PROGRAM emacs)
@@ -26,8 +28,8 @@ endif()
 set(PLATFORM_DIR ${CMAKE_HOST_SYSTEM_NAME})
 
 if(NOT DEFINED FZF_NATIVE_MODULE_OUTPUT_DIR)
-  if((CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
-     AND (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64"))
+  if((CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin") AND (CMAKE_HOST_SYSTEM_PROCESSOR
+                                                     STREQUAL "arm64"))
     # Assume Apple Silicon.
     set(FZF_NATIVE_MODULE_OUTPUT_DIR bin/${PLATFORM_DIR}/arm64)
   else()
@@ -40,29 +42,29 @@ endif()
 # See https://blog.kitware.com/create-dlls-on-windows-without-declspec-using-new-cmake-export-all-feature/
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
-if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
   # Assume compiler MSVC.
   add_library(fzf-native-module SHARED fzf-native-module.c fzf.c fzf.h)
 else()
   add_library(fzf-native-module MODULE fzf-native-module.c fzf.c fzf.h)
 endif()
 
-set_target_properties(fzf-native-module PROPERTIES
-  C_STANDARD 99
-  POSITION_INDEPENDENT_CODE ON
-  PREFIX ""
-  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/${FZF_NATIVE_MODULE_OUTPUT_DIR})
+set(OUTPUT_DIR ${CMAKE_SOURCE_DIR}/${FZF_NATIVE_MODULE_OUTPUT_DIR})
+set_target_properties(
+  fzf-native-module
+  PROPERTIES C_STANDARD 99
+             POSITION_INDEPENDENT_CODE ON
+             PREFIX ""
+             LIBRARY_OUTPUT_DIRECTORY ${OUTPUT_DIR})
 target_include_directories(fzf-native-module PUBLIC ${EMACS_INCLUDE_DIR})
 
 # Set output directory for the library.
 # See https://github.com/RoukaVici/LibRoukaVici
-set(OUTPUT_DIR ${CMAKE_SOURCE_DIR}/${FZF_NATIVE_MODULE_OUTPUT_DIR})
-set_target_properties(fzf-native-module
-PROPERTIES
-    ARCHIVE_OUTPUT_DIRECTORY ${OUTPUT_DIR}
-    LIBRARY_OUTPUT_DIRECTORY ${OUTPUT_DIR}
-    RUNTIME_OUTPUT_DIRECTORY ${OUTPUT_DIR}
-)
+set_target_properties(
+  fzf-native-module
+  PROPERTIES ARCHIVE_OUTPUT_DIRECTORY ${OUTPUT_DIR}
+             LIBRARY_OUTPUT_DIRECTORY ${OUTPUT_DIR}
+             RUNTIME_OUTPUT_DIRECTORY ${OUTPUT_DIR})
 
 # See https://gernotklingler.com/blog/creating-using-shared-libraries-different-compilers-different-operating-systems/
 include(GenerateExportHeader)
