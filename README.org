@@ -3,6 +3,7 @@
 
 [[https://github.com/dangduc/fzf-native/actions/workflows/test.yaml][https://github.com/dangduc/fzf-native/actions/workflows/test.yaml/badge.svg]]
 [[https://github.com/dangduc/fzf-native/actions/workflows/cmake.yaml][https://github.com/dangduc/fzf-native/actions/workflows/cmake.yaml/badge.svg]]
+[[https://github.com/dangduc/fzf-native/actions/workflows/format.yaml][https://github.com/dangduc/fzf-native/actions/workflows/format.yaml/badge.svg]]
 
 This is a package that provides fuzzy match scoring based on the fzf
 algorithm by [[https://github.com/junegunn][junegunn]]. The main

@@ -1,0 +1,21 @@
+name: Format
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: ["main", "develop"]
+    paths: ["CMakeLists.txt"]
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Run cmake-format
+        uses: PuneetMatharu/cmake-format-lint-action@a7e22edff1347b154dc1a0e8f900c450303efdf7
+        with:
+          args: --check --enable-markup
