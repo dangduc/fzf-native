@@ -16,9 +16,9 @@
 
 /** MSVC does not recognize __attribute__((unused)), so define it away. */
 #ifdef _MSC_VER
-    #define UNUSED(x) x
+#define UNUSED(x) x
 #else
-    #define UNUSED(x) __attribute__((unused)) x
+#define UNUSED(x) __attribute__((unused)) x
 #endif
 
 EXPORT
