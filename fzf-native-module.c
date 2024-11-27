@@ -100,6 +100,110 @@ static struct EmacsStr *copy_emacs_string(emacs_env *env, struct Bump **bump, em
   return result;
 }
 
+// fzf-native-score-all COLLECTION QUERY &optional SLAB
+emacs_value fzf_native_score_all(emacs_env *env,
+                                 ptrdiff_t nargs,
+                                 emacs_value args[],
+                                 void UNUSED(*data_ptr)) {
+  emacs_value COLLECTION = args[0];
+  emacs_value QUERY = args[1];
+
+  // Early exit if QUERY is empty.
+  ptrdiff_t query_len;
+  env->copy_string_contents(env, QUERY, NULL, &query_len);
+  if (query_len == /* solely null byte */ 1) {
+    emacs_value log1 = env->make_string (env, "QUERY is nil.", 13);
+    env->funcall(env, Fmessage, 1, &log1);
+    return Qnil;
+  }
+
+  // Early exit if COLLECTION is NULL.
+  if (!env->is_not_nil(env, COLLECTION)) {
+    emacs_value log1 = env->make_string (env, "COLLECTION is nil.", 18);
+    env->funcall(env, Fmessage, 1, &log1);
+    return Qnil;
+  }
+
+  fzf_slab_t *slab;
+  if (nargs > 2) {
+    // Re-use SLAB argument.
+    slab = env->get_user_ptr(env, args[2]);
+  } else {
+    // Create a one-time use slab.
+    slab = fzf_make_default_slab();
+  }
+
+  emacs_value *results_array;
+  struct Bump *bump = NULL;
+  ptrdiff_t results_offset = 0;
+
+  emacs_value length_result = env->funcall(env, Flength, 1, &COLLECTION);
+  ptrdiff_t collection_size = env->extract_integer(env, length_result);
+  results_array = malloc(sizeof(emacs_value) * collection_size);
+
+  ptrdiff_t idx = 0;
+  emacs_value candidate_str;
+
+  while (idx < collection_size) {
+    emacs_value collection_idx =  env->make_integer(env, idx++);
+    candidate_str = env->funcall(env, Fnth, 2, (emacs_value[]) {
+        collection_idx,
+        COLLECTION,
+      });
+
+    struct EmacsStr *str = copy_emacs_string(env, &bump, candidate_str);
+    if (!str) {
+      bump_free(bump);
+      return Qnil;
+    }
+
+    struct EmacsStr *query = copy_emacs_string(env, &bump, QUERY);
+    if (!query) {
+      bump_free(bump);
+      return Qnil;
+    }
+
+    /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
+     * normalize bool     : Always set to false because its not implemented yet.
+     *                      This is reserved for future use
+     * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
+     * fuzzy bool         : Enable or disable fuzzy matching
+     */
+    fzf_pattern_t *pattern = fzf_parse_pattern(CaseIgnore, false, query->b, true);
+
+    /* You can get the score/position for as many items as you want */
+    int score = fzf_get_score(str->b, pattern, slab);
+    fzf_position_t *pos = fzf_get_positions(str->b, pattern, slab);
+
+    size_t offset = 2; // The candidate string and its score.
+    size_t len = 0;
+    if (pos) {
+      len = pos->size;
+    }
+
+    emacs_value *result_array = malloc(sizeof(emacs_value) * (offset + len));
+
+    result_array[0] = str->value;
+    result_array[1] = env->make_integer(env, score);
+
+    for (size_t i = 0; i < len; i++) {
+      result_array[offset + i] = env->make_integer(env, pos->data[len - (i + 1)]);
+    }
+
+    emacs_value result = env->funcall(env, Flist, offset + len, result_array);
+
+    results_array[results_offset++] = result;
+
+    fzf_free_positions(pos);
+  }
+
+  emacs_value final_result = env->funcall(env,
+                                          Flist,
+                                          results_offset,
+                                          results_array);
+  return final_result;
+}
+
 // fzf-native-score STR QUERY &optional SLAB
 emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void UNUSED(*data_ptr)) {
   // Short-circuit if QUERY is empty.
@@ -215,6 +319,16 @@ int emacs_module_init(struct emacs_runtime *rt) {
     return 2;
 
   static struct Data data;
+
+  // fzf-native-score-all COLLECTION QUERY &optional SLAB
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-score-all"),
+      env->make_function(env, 2, 3, fzf_native_score_all,
+                         "Score COLLECTION matching QUERY.\n"
+                         "\n"
+                         "\\(fn COLLECTION QUERY &optional SLAB)",
+                         &data),
+    });
 
   // fzf-native-score STR QUERY &optional SLAB
   env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
