@@ -100,6 +100,7 @@ static struct EmacsStr *copy_emacs_string(emacs_env *env, struct Bump **bump, em
   return result;
 }
 
+// fzf-native-score STR QUERY &optional SLAB
 emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void UNUSED(*data_ptr)) {
   // Short-circuit if QUERY is empty.
   ptrdiff_t query_len;
