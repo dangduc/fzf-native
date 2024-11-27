@@ -24,7 +24,9 @@
 EXPORT
 int plugin_is_GPL_compatible;
 
-emacs_value Qnil, Qlistofzero, Qcons, Flist;
+emacs_value Qnil, Qlistofzero, Qcons, Flist, Qt;
+emacs_value Fhashtablep, Fmessage, Fvectorp, Fconsp, Ffunctionp, Fsymbolp, Fsymbolname, Flength, Fnth, Fprinc;
+
 
 /** An Emacs string made accessible by copying. */
 struct EmacsStr {
@@ -253,9 +255,20 @@ int emacs_module_init(struct emacs_runtime *rt) {
                (emacs_value[]) { env->intern(env, "fzf-native-make-slab") });
 
   // Get a few common lisp functions.
+  Qt = env->make_global_ref(env, env->intern(env, "t"));
   Qnil = env->make_global_ref(env, env->intern(env, "nil"));
   Qcons = env->make_global_ref(env, env->intern(env, "cons"));
   Flist = env->make_global_ref(env, env->intern(env, "list"));
+  Fhashtablep = env->make_global_ref(env, env->intern(env, "hash-table-p"));
+  Fmessage = env->make_global_ref(env, env->intern(env, "message"));
+  Fvectorp = env->make_global_ref(env, env->intern(env, "vectorp"));
+  Fconsp = env->make_global_ref(env, env->intern(env, "consp"));
+  Ffunctionp = env->make_global_ref(env, env->intern(env, "functionp"));
+  Fsymbolp = env->make_global_ref(env, env->intern(env, "symbolp"));
+  Fsymbolname = env->make_global_ref(env, env->intern(env, "symbol-name"));
+  Flength = env->make_global_ref(env, env->intern(env, "length"));
+  Fnth = env->make_global_ref(env, env->intern(env, "nth"));
+  Fprinc = env->make_global_ref(env, env->intern(env, "princ"));
 
   Qlistofzero = env->make_global_ref(
       env, env->funcall(env, Qcons, 2,
