@@ -109,6 +109,78 @@ sorting.
 mkdir build && cmake -B build -DCMAKE_C_FLAGS='-O3 -march=native' && cmake --build build
 #+end_src
 
+** Debugging fzf-native with emacs/lldb (EXAMPLE)
+*** Building Emacs
+#+begin_src shell :tangle yes
+cd Code/emacs
+brew install autoconf automake pkg-config ncurses gnutls libjpeg libgif libtiff libxpm libx11 libxt libxml2
+autoreconf -isvf
+./autogen.sh
+./configure CFLAGS="-g -O0" LDFLAGS="-g" --with-ns
+make bootstrap
+#+end_src :tangle yes
+*** Building fzf-native
+#+begin_src shell :tangle yes
+$ pwd
+~/.emacs.d/packages/emacs_31/elpaca/repos/fzf-native
+$ rm -Rf build; mkdir build && cmake -B build -DCMAKE_C_FLAGS='-O0 -g -march=native' && cmake --build build
+#+end_src
+*** From LLDB
+#+begin_src shell :tangle yes
+$ pwd
+~/Code/emacs/src
+$ lldb --local-lldbinit ./emacs
+#+end_src
+*** From Emacs
+Refer to https://github.com/svaante/dape?tab=readme-ov-file#c-c-and-rust---lldb-dap
+on how to install LLDB-dap.
+
+#+begin_src sh :tangle yes
+$ brew install llvm
+($(brew --prefix --installed llvm)/bin)  # PREPEND (OSX already has a binary on $PATH) to $PATH.
+#+end_src
+
+#+begin_src emacs-lisp :tangle yes
+(use-package dape
+  :init
+  ;; Enable repeat mode for more ergonomic `dape' use
+  (use-package repeat
+    :ensure nil
+    :config
+    (repeat-mode))
+  :config
+  (push
+   '(lldb-dap
+     modes (c-mode c-ts-mode c++-mode c++-ts-mode)
+     command "lldb-dap"
+     command-args ["--local-lldbinit"]
+     ensure dape-ensure-command
+     :type "lldb-dap"
+     :cwd "/Users/james/Code/emacs/src"
+     :program "/Users/james/Code/emacs/src/emacs")
+   dape-configs)
+  ;; Turn on global bindings for setting breakpoints with mouse
+  (dape-breakpoint-global-mode)
+  ;; Info buffers to the right
+  (setq dape-buffer-window-arrangement 'right)
+  ;; Info buffers like gud (gdb-mi)
+  (setq dape-buffer-window-arrangement 'gud)
+  (setq dape-info-hide-mode-line nil)
+  ;; Pulse source line (performance hit)
+  (add-hook 'dape-display-source-hook 'pulse-momentary-highlight-one-line)
+  ;; Showing inlay hints
+  (setq dape-inlay-hints t)
+  ;; Save buffers on startup, useful for interpreted languages
+  (add-hook 'dape-start-hook (lambda () (save-some-buffers t t)))
+  ;; Kill compile buffer on build success
+  (add-hook 'dape-compile-hook 'kill-buffer)
+  ;; Projectile users
+  (setq dape-cwd-fn 'projectile-project-root))
+
+;; M-x dape in fzf-native-module.c
+;; Set breakpoints with mouse.
+#+end_src
+
 ** Credit
 All credit for fzf.c goes to the
 [[https://github.com/nvim-telescope/telescope-fzf-native.nvim][telescope-fzf-native.nvim]]
