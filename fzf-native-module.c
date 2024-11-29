@@ -284,12 +284,12 @@ err_join_threads:
     /*        env->extract_integer(env, Qone), */
     /*        xs[i].score); */
     /* e.g. (put-text-property 0 1 'completion-score score x) */
-    /* env->funcall(env, Fput_text_property, 5, */
-    /*              (emacs_value[]) { */
-    /*                Qzero, Qone, Qcompletion_score, */
-    /*                env->make_integer(env, xs[i].score), */
-    /*                xs[i].value, */
-    /*              }); */
+    env->funcall(env, Fput_text_property, 5,
+                 (emacs_value[]) {
+                   Qzero, Qone, Qcompletion_score,
+                   env->make_integer(env, xs[i].score),
+                   xs[i].value,
+                 });
 
     result = env->funcall(env, Fcons, 2, (emacs_value[]) { xs[i].value, result });
   }
