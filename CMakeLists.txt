@@ -52,7 +52,7 @@ endif()
 set(OUTPUT_DIR ${CMAKE_SOURCE_DIR}/${FZF_NATIVE_MODULE_OUTPUT_DIR})
 set_target_properties(
   fzf-native-module
-  PROPERTIES C_STANDARD 99
+  PROPERTIES C_STANDARD 11
              POSITION_INDEPENDENT_CODE ON
              PREFIX ""
              LIBRARY_OUTPUT_DIRECTORY ${OUTPUT_DIR})
