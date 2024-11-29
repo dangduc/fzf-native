@@ -124,10 +124,42 @@
           '(13 14 15))))
 
 (ert-deftest fzf-native-score-indices-multibyte-support-through-advice-test ()
-  ; Assume advice not yet added. Setup advice environment.
+  ;; Assume advice not yet added. Setup advice environment.
   (advice-add 'fzf-native-score :around #'fzf-native--fix-score-indices)
   (should
    (equal (cdr (fzf-native-score "ポケモン.txt" "txt"))
           '(5 6 7)))
-  ; Reset advice environment.
+  ;; Reset advice environment.
   (advice-remove 'fzf-native-score #'fzf-native--fix-score-indices))
+
+(ert-deftest fzf-native-score-all-big-collection-test ()
+  (let ((collection (all-completions "" 'help--symbol-completion-table nil)))
+    (should
+     (fzf-native-score-all collection "a"))))
+
+(ert-deftest fzf-native-score-all-benchmark-test ()
+  (let ((collection (all-completions "" 'help--symbol-completion-table nil)))
+    (should
+     (<
+      (car (benchmark-run 10 (fzf-native-score-all collection "a")))
+      (car (benchmark-run 10 (dolist (c collection)
+                               (fzf-native-score c "a"))))))))
+
+(ert-deftest fzf-native-score-all-basic-tests ()
+  (let ((_ (should
+            (equal '("a")
+                   (fzf-native-score-all '("a" "b" "c") "a"))))
+        (_ (should
+            (equal '("a" "adsfdsa")
+                   (fzf-native-score-all '("a" "b" "c" "adsfdsa") "a"))))
+        (_ (should
+            (equal '("a" "FAST" "Fast")
+                   (fzf-native-score-all '("a" "b" "c" "FAST" "Fast") "a"))))
+        (_ (should
+            (equal '("FAST" "Fast")
+                   (fzf-native-score-all '("a" "b" "c" "FAST" "Fast") "at"))))
+        (_ (should
+            (equal '("abc.txt" "ポケモン.txt" "tビビxt")
+                   (fzf-native-score-all
+                    '("abc.txt" "ポケモン.txt" "tビビxt" "tビ") "txt")))))
+    t))

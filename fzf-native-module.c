@@ -1,11 +1,15 @@
+#include <ctype.h>
+#include <pthread.h>
 #include <stdalign.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
+#include <unistd.h>
 #include "emacs-module.h"
 #include "fzf.h"
+#include <stdatomic.h>
+#include <stdio.h>
 
 #ifdef _WIN32
 #  define EXPORT __declspec(dllexport)
@@ -23,11 +27,17 @@
 #define UNUSED(x) __attribute__((unused)) x
 #endif
 
+
+#define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
+#define BATCH_SIZE 2048
+
 EXPORT
 int plugin_is_GPL_compatible;
 
-emacs_value Qnil, Qlistofzero, Qcons, Flist, Qt;
-emacs_value Fhashtablep, Fmessage, Fvectorp, Fconsp, Ffunctionp, Fsymbolp, Fsymbolname, Flength, Fnth, Fprinc;
+emacs_value Qnil, Qlistofzero, Fcons, Flist, Qt;
+emacs_value Fhashtablep, Fmessage, Fvectorp, Fconsp, Fcdr, Fcar;
+emacs_value Ffunctionp, Fsymbolp, Fsymbolname, Flength, Fnth, Fprinc, Freverse;
+emacs_value Qcompletion_score, Fput_text_property, Qzero, Qone;
 
 
 /** An Emacs string made accessible by copying. */
@@ -35,8 +45,8 @@ struct Str { char *b; size_t len; };
 
 /** Module userdata that gets allocated once at initialization. */
 struct Data {
-  // NOLINTNEXTLINE: Ignore warning for unused declaration (clang).
-  size_t placeholder; ///< C requires that a struct or union has at least one member.
+  unsigned max_workers;
+  pthread_t threads[];
 };
 
 /** Intrusive linked list of bump allocation blocks. */
@@ -53,6 +63,35 @@ static void bump_free(struct Bump *head) {
   }
 }
 
+// Deep copy function
+struct Str copy_str(const struct Str *src) {
+  struct Str dest = { NULL, 0 };
+
+  // Check if the source string is valid
+  if (src && src->b && src->len > 0) {
+    // Allocate memory for the destination string
+    dest.b = malloc(src->len + 1); // +1 for null terminator
+    if (dest.b) {
+      // Copy the string contents
+      memcpy(dest.b, src->b, src->len + 1);
+      dest.b[src->len] = '\0'; // Ensure null termination
+      dest.len = src->len;
+    }
+  }
+
+  return dest;
+}
+
+// Function to free the deep copy
+void free_str(struct Str *str) {
+  if (str && str->b) {
+    free(str->b);
+    str->b = NULL;
+    str->len = 0;
+  }
+}
+
+// Copied from https://github.com/axelf4/hotfuzz
 /** Copies the Emacs string to make its contents accessible. */
 static struct Str copy_emacs_string(emacs_env *env, struct Bump **bump, emacs_value value) {
   char *buf = NULL;
@@ -84,110 +123,186 @@ success:
   return (struct Str) { buf, len - 1 };
 }
 
+struct Candidate {
+  emacs_value value;
+  union {
+    struct Str s;
+    int score;
+  };
+};
+
+static int cmp_candidate(const void *a, const void *b) {
+  // This way to get fzf sorted correctly with qsort.
+  return ((struct Candidate *) b)->score - ((struct Candidate *) a)->score;
+  /* return ((struct Candidate *) a)->score - ((struct Candidate *) b)->score; */
+}
+
+struct Batch {
+  unsigned len;
+  struct Candidate xs[BATCH_SIZE];
+};
+
+struct Shared {
+  const struct Str query;
+  struct Batch *const batches;
+  _Atomic ssize_t remaining;
+};
+
+// Most of the threading lifted from https://github.com/axelf4/hotfuzz
+static void *worker_routine(void *ptr) {
+  /* printf("-----\nStarting Worker Routine\n-----\n"); */
+  // Create a one-time use slab.
+  fzf_slab_t *slab = fzf_make_default_slab();
+
+  struct Shared *shared = ptr;
+  struct Str shared_query = shared->query;
+  // Create a deep copy of the original string.
+  // fzf_parse_pattern mutilates the char* in Str so using the original string
+  // is unsafe in a multithreaded context.
+  struct Str query = copy_str(&shared_query);
+  ssize_t batch_idx;
+
+  // Atomic fetch-and-decrement for shared->remaining
+  // --shared->remaining would return the decremented value whereas
+  // atomic_fetch_sub_explicit returns the original value before decrement.
+  // So, use batch_idx - 1 when handling the idx.
+  while ((batch_idx = atomic_fetch_sub_explicit(&shared->remaining,
+                                                1,
+                                                memory_order_seq_cst) - 1) >= 0) {
+    struct Batch *batch = shared->batches + batch_idx;
+    unsigned n = 0;
+    for (unsigned i = 0; i < batch->len; ++i) {
+      struct Candidate x = batch->xs[i];
+      /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
+       * normalize bool     : Always set to false because its not implemented yet.
+       *                      This is reserved for future use
+       * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
+       * fuzzy bool         : Enable or disable fuzzy matching
+       */
+      fzf_pattern_t *pattern = fzf_parse_pattern(CaseIgnore, false, query.b, true);
+      /* You can get the score/position for as many items as you want */
+      int score = fzf_get_score(x.s.b, pattern, slab);
+      if (score > 0) {
+        /* printf("Str: %s # = %d | i = %d, batch->len = %d, batch_idx = %zd\n", */
+        /*        x.s.b, score, i, batch->len, batch_idx); */
+        x.score = score;
+        batch->xs[n++] = x;
+      }
+      fzf_free_pattern(pattern);
+    }
+    batch->len = n;
+  }
+
+  free_str(&query);
+  // Free one-time use slab.
+  fzf_free_slab(slab);
+  /* printf("-----\nEnding Worker Routine\n-----\n"); */
+  return NULL;
+}
+
 // fzf-native-score-all COLLECTION QUERY &optional SLAB
 emacs_value fzf_native_score_all(emacs_env *env,
                                  ptrdiff_t nargs,
                                  emacs_value args[],
                                  void UNUSED(*data_ptr)) {
-  emacs_value COLLECTION = args[0];
-  emacs_value QUERY = args[1];
-
-  // Early exit if QUERY is empty.
-  ptrdiff_t query_len;
-  env->copy_string_contents(env, QUERY, NULL, &query_len);
-  if (query_len == /* solely null byte */ 1) {
-    emacs_value log1 = env->make_string (env, "QUERY is nil.", 13);
-    env->funcall(env, Fmessage, 1, &log1);
-    return Qnil;
-  }
-
-  // Early exit if COLLECTION is NULL.
-  if (!env->is_not_nil(env, COLLECTION)) {
-    emacs_value log1 = env->make_string (env, "COLLECTION is nil.", 18);
-    env->funcall(env, Fmessage, 1, &log1);
-    return Qnil;
-  }
-
-  fzf_slab_t *slab;
-  if (nargs > 2) {
-    // Re-use SLAB argument.
-    slab = env->get_user_ptr(env, args[2]);
-  } else {
-    // Create a one-time use slab.
-    slab = fzf_make_default_slab();
-  }
-
-  int success = false;
-  emacs_value *results_array;
+  struct Data *data = NULL;
   struct Bump *bump = NULL;
-  ptrdiff_t results_offset = 0;
+  int success = false;
+  emacs_value result = Qnil;
 
-  emacs_value length_result = env->funcall(env, Flength, 1, &COLLECTION);
-  ptrdiff_t collection_size = env->extract_integer(env, length_result);
-  results_array = malloc(sizeof(emacs_value) * collection_size);
-
-  ptrdiff_t idx = 0;
-  emacs_value candidate_str;
-
-  while (idx < collection_size) {
-    emacs_value collection_idx =  env->make_integer(env, idx++);
-    candidate_str = env->funcall(env, Fnth, 2, (emacs_value[]) {
-        collection_idx,
-        COLLECTION,
-      });
-
-    struct Str str = copy_emacs_string(env, &bump, candidate_str);
-    if (!str.b) { goto err; }
-
-    struct Str query = copy_emacs_string(env, &bump, QUERY);
-    if (!query.b) { goto err; }
-
-    /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
-     * normalize bool     : Always set to false because its not implemented yet.
-     *                      This is reserved for future use
-     * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
-     * fuzzy bool         : Enable or disable fuzzy matching
-     */
-    fzf_pattern_t *pattern = fzf_parse_pattern(CaseIgnore, false, query.b, true);
-
-    /* You can get the score/position for as many items as you want */
-    int score = fzf_get_score(str.b, pattern, slab);
-    fzf_position_t *pos = fzf_get_positions(str.b, pattern, slab);
-
-    size_t offset = 2; // The candidate string and its score.
-    size_t len = 0;
-    if (pos) {
-      len = pos->size;
+  // Collect all candidates
+  struct Batch *batches = NULL;
+  size_t batch_idx = 0, capacity;
+  for (emacs_value list = args[0]; env->is_not_nil(env, list);
+       list = env->funcall(env, Fcdr, 1, (emacs_value[]) { list })) {
+    if (!batches || (batches[batch_idx].len >= BATCH_SIZE && ++batch_idx >= capacity)) {
+      capacity = batches ? 2 * capacity : 1;
+      struct Batch *new_batches;
+      if (!(new_batches = realloc(batches, capacity * sizeof *batches))) goto err;
+      batches = new_batches;
+      for (size_t i = batch_idx; i < capacity; ++i) batches[i].len = 0;
     }
 
-    emacs_value *result_array = malloc(sizeof(emacs_value) * (offset + len));
+    emacs_value value = env->funcall(env, Fcar, 1, (emacs_value[]) { list });
+    struct Batch *batch = batches + batch_idx;
+    struct Candidate *x = batch->xs + batch->len++;
+    if (!(x->s = copy_emacs_string(env, &bump, x->value = value)).b) goto err;
+  }
 
-    result_array[0] = candidate_str;
-    result_array[1] = env->make_integer(env, score);
+  if (!batches) {
+    return Qnil;
+  }
 
-    for (size_t i = 0; i < len; i++) {
-      result_array[offset + i] = env->make_integer(env, pos->data[len - (i + 1)]);
-    }
+  /* struct Str query = copy_emacs_string(env, &bump, QUERY); */
+  struct Str query = copy_emacs_string(env, &bump, args[1]);
+  if (!query.b) { goto err; }
 
-    emacs_value result = env->funcall(env, Flist, offset + len, result_array);
+  struct Shared shared = {
+    .query = query,
+    .batches = batches,
+    .remaining = batch_idx + 1,
+  };
 
-    results_array[results_offset++] = result;
+  // Print the shared value.
+  /* ssize_t value = atomic_load(&shared.remaining); */
+  /* printf("shared Remaining: %zd\n", value); */
 
-    fzf_free_positions(pos);
-    success = true;
+  // Set up max number of workers according to processor.
+  // It's 8 on M1 Macbook.
+  unsigned max_workers = sysconf(_SC_NPROCESSORS_ONLN);
+  if (!(data = malloc(sizeof *data + max_workers * sizeof *data->threads))) {
+    goto err;
+  }
+  *data = (struct Data) { max_workers };
+
+  unsigned num_workers = 0;
+  for (; num_workers < MIN(data->max_workers, batch_idx + 1); ++num_workers)
+    if (pthread_create(data->threads + num_workers, NULL, worker_routine, &shared))
+      // Join all workers in order to at least safely free memory
+      goto err_join_threads;
+  success = true;
+
+err_join_threads:
+  // Wait for all worker threads
+  for (unsigned i = 0; i < num_workers; ++i) pthread_join(data->threads[i], NULL);
+  if (!success) goto err;
+  if (env->process_input(env) == emacs_process_input_quit) goto err;
+
+  // Compact all batches
+  size_t len = batches[0].len;
+  struct Candidate *xs = batches[0].xs;
+  for (struct Batch *b = batches + 1; b <= batches + batch_idx; ++b) {
+    unsigned n = b->len;
+    memmove(xs + len, b->xs, n * sizeof *b->xs);
+    len += n;
+  }
+  qsort(xs, len, sizeof *xs, cmp_candidate); // Sort the completions
+
+  for (size_t i = len; i-- > 0;) {
+    /* printf("zero: %jd one: %jd score: %d", */
+    /*        env->extract_integer(env, Qzero), */
+    /*        env->extract_integer(env, Qone), */
+    /*        xs[i].score); */
+    /* e.g. (put-text-property 0 1 'completion-score score x) */
+    /* env->funcall(env, Fput_text_property, 5, */
+    /*              (emacs_value[]) { */
+    /*                Qzero, Qone, Qcompletion_score, */
+    /*                env->make_integer(env, xs[i].score), */
+    /*                xs[i].value, */
+    /*              }); */
+
+    result = env->funcall(env, Fcons, 2, (emacs_value[]) { xs[i].value, result });
   }
 
 err:
+  free(batches);
   bump_free(bump);
+  free(data);
+
   if (!success) {
     env->non_local_exit_signal(env, env->intern(env, "error"), Qnil);
   }
-
-  emacs_value final_result = env->funcall(env,
-                                          Flist,
-                                          results_offset,
-                                          results_array);
-  return final_result;
+  return result;
 }
 
 // fzf-native-score STR QUERY &optional SLAB
@@ -359,7 +474,7 @@ int emacs_module_init(struct emacs_runtime *rt) {
   // Get a few common lisp functions.
   Qt = env->make_global_ref(env, env->intern(env, "t"));
   Qnil = env->make_global_ref(env, env->intern(env, "nil"));
-  Qcons = env->make_global_ref(env, env->intern(env, "cons"));
+  Fcons = env->make_global_ref(env, env->intern(env, "cons"));
   Flist = env->make_global_ref(env, env->intern(env, "list"));
   Fhashtablep = env->make_global_ref(env, env->intern(env, "hash-table-p"));
   Fmessage = env->make_global_ref(env, env->intern(env, "message"));
@@ -371,10 +486,18 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Flength = env->make_global_ref(env, env->intern(env, "length"));
   Fnth = env->make_global_ref(env, env->intern(env, "nth"));
   Fprinc = env->make_global_ref(env, env->intern(env, "princ"));
+  Freverse = env->make_global_ref(env, env->intern(env, "reverse"));
+  Fcdr = env->make_global_ref(env, env->intern(env, "cdr"));
+  Fcar = env->make_global_ref(env, env->intern(env, "car"));
+  Qcompletion_score = env->make_global_ref(env, env->intern(env, "completion-score"));
+  Fput_text_property = env->make_global_ref(env, env->intern(env, "put-text-property"));
 
   Qlistofzero = env->make_global_ref(
-    env, env->funcall(env, Qcons, 2,
+    env, env->funcall(env, Fcons, 2,
                       (emacs_value[]){env->make_integer(env, 0), Qnil}));
+
+  Qzero = env->make_global_ref(env, env->make_integer(env, 0));
+  Qone = env->make_global_ref(env, env->make_integer(env, 1));
 
   return 0;
 }
