@@ -1,5 +1,7 @@
-#include <stdlib.h>
+#include <stdalign.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include "emacs-module.h"
@@ -29,11 +31,7 @@ emacs_value Fhashtablep, Fmessage, Fvectorp, Fconsp, Ffunctionp, Fsymbolp, Fsymb
 
 
 /** An Emacs string made accessible by copying. */
-struct EmacsStr {
-  emacs_value value; ///< The original string value.
-  size_t len; ///< The length of the string minus the null byte.
-  char b[]; ///< The null-terminated copied string.
-};
+struct Str { char *b; size_t len; };
 
 /** Module userdata that gets allocated once at initialization. */
 struct Data {
@@ -44,30 +42,8 @@ struct Data {
 /** Intrusive linked list of bump allocation blocks. */
 struct Bump {
   struct Bump *next;
-  size_t index, capacity;
-  char b[];
+  char *cursor, *limit, b[];
 };
-
-/**
- * Allocates the specified number of bytes.
- *
- * Returns NULL on failure.
- */
-static void *bump_alloc(struct Bump **head, size_t len) {
-  if (!*head || (*head)->capacity - (*head)->index < len) {
-    size_t double_capacity = *head ? 2 * (*head)->capacity : (size_t) 1024;
-    size_t capacity = double_capacity > len ? double_capacity : len;
-    struct Bump *new_head;
-    if (!(new_head = malloc(sizeof *new_head + capacity)))
-      return NULL;
-    *new_head = (struct Bump) { .next = *head, .index = 0, .capacity = capacity };
-    *head = new_head;
-  }
-
-  void *p = (*head)->b + (*head)->index;
-  (*head)->index += len;
-  return p;
-}
 
 static void bump_free(struct Bump *head) {
   while (head) {
@@ -77,27 +53,35 @@ static void bump_free(struct Bump *head) {
   }
 }
 
-/**
- * Copies the Emacs string to make its lifetime that of the allocator.
- */
-static struct EmacsStr *copy_emacs_string(emacs_env *env, struct Bump **bump, emacs_value value) {
-  ptrdiff_t len;
+/** Copies the Emacs string to make its contents accessible. */
+static struct Str copy_emacs_string(emacs_env *env, struct Bump **bump, emacs_value value) {
+  char *buf = NULL;
+  ptrdiff_t origlen, len;
+  if (*bump) {
+    // Opportunistically try to copy into remaining space
+    buf = (*bump)->cursor;
+    len = origlen = (*bump)->limit - (*bump)->cursor;
+  }
   // Determine the size of the string (including null-terminator)
-  env->copy_string_contents(env, value, NULL, &len);
-
-  struct EmacsStr *result;
-  // Note: Since only EmacsStr:s are allocated with bump_alloc we
-  // may use its smaller alignment rather than the scalar maximum.
-  if (!(result = bump_alloc(bump, sizeof *result + len
-                            + ALIGNOF(struct EmacsStr) - 1 & ~(ALIGNOF(struct EmacsStr) - 1)))) {
-    return NULL;
+  if (env->copy_string_contents(env, value, buf, &len)) {
+    if (buf) goto success;
+  } else {
+    if (!buf || len == origlen) return (struct Str) { 0 };
+    env->non_local_exit_clear(env);
   }
 
-  result->value = value;
-  result->len = len - 1;
-  env->copy_string_contents(env, value, result->b, &len);
+  size_t capacity = *bump ? 2 * ((*bump)->limit - (*bump)->b) : 2048;
+  if (capacity < (size_t) len) capacity = len + alignof(uint64_t) - 1;
+  struct Bump *new;
+  if (!(new = malloc(sizeof *new + capacity))) return (struct Str) { 0 };
+  *new = (struct Bump) { .next = *bump, .cursor = new->b, .limit = new->b + capacity };
+  *bump = new;
 
-  return result;
+  env->copy_string_contents(env, value, buf = new->cursor, &len);
+success:
+  (*bump)->cursor = (char *) (((uintptr_t) (*bump)->cursor + len
+                               + alignof(uint64_t) - 1) & ~(alignof(uint64_t) - 1));
+  return (struct Str) { buf, len - 1 };
 }
 
 // fzf-native-score-all COLLECTION QUERY &optional SLAB
@@ -133,6 +117,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
     slab = fzf_make_default_slab();
   }
 
+  int success = false;
   emacs_value *results_array;
   struct Bump *bump = NULL;
   ptrdiff_t results_offset = 0;
@@ -151,17 +136,11 @@ emacs_value fzf_native_score_all(emacs_env *env,
         COLLECTION,
       });
 
-    struct EmacsStr *str = copy_emacs_string(env, &bump, candidate_str);
-    if (!str) {
-      bump_free(bump);
-      return Qnil;
-    }
+    struct Str str = copy_emacs_string(env, &bump, candidate_str);
+    if (!str.b) { goto err; }
 
-    struct EmacsStr *query = copy_emacs_string(env, &bump, QUERY);
-    if (!query) {
-      bump_free(bump);
-      return Qnil;
-    }
+    struct Str query = copy_emacs_string(env, &bump, QUERY);
+    if (!query.b) { goto err; }
 
     /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
      * normalize bool     : Always set to false because its not implemented yet.
@@ -169,11 +148,11 @@ emacs_value fzf_native_score_all(emacs_env *env,
      * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
      * fuzzy bool         : Enable or disable fuzzy matching
      */
-    fzf_pattern_t *pattern = fzf_parse_pattern(CaseIgnore, false, query->b, true);
+    fzf_pattern_t *pattern = fzf_parse_pattern(CaseIgnore, false, query.b, true);
 
     /* You can get the score/position for as many items as you want */
-    int score = fzf_get_score(str->b, pattern, slab);
-    fzf_position_t *pos = fzf_get_positions(str->b, pattern, slab);
+    int score = fzf_get_score(str.b, pattern, slab);
+    fzf_position_t *pos = fzf_get_positions(str.b, pattern, slab);
 
     size_t offset = 2; // The candidate string and its score.
     size_t len = 0;
@@ -183,7 +162,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
 
     emacs_value *result_array = malloc(sizeof(emacs_value) * (offset + len));
 
-    result_array[0] = str->value;
+    result_array[0] = candidate_str;
     result_array[1] = env->make_integer(env, score);
 
     for (size_t i = 0; i < len; i++) {
@@ -195,6 +174,13 @@ emacs_value fzf_native_score_all(emacs_env *env,
     results_array[results_offset++] = result;
 
     fzf_free_positions(pos);
+    success = true;
+  }
+
+err:
+  bump_free(bump);
+  if (!success) {
+    env->non_local_exit_signal(env, env->intern(env, "error"), Qnil);
   }
 
   emacs_value final_result = env->funcall(env,
@@ -220,18 +206,14 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
     return Qlistofzero;
   }
 
+  int success = false;
   struct Bump *bump = NULL;
 
-  struct EmacsStr *str = copy_emacs_string(env, &bump, args[0]);
-  if (!str) {
-    bump_free(bump);
-    return Qnil;
-  }
-  struct EmacsStr *query = copy_emacs_string(env, &bump, args[1]);
-  if (!query) {
-    bump_free(bump);
-    return Qnil;
-  }
+  struct Str str = copy_emacs_string(env, &bump, args[0]);
+  if (!str.b) { goto err; }
+
+  struct Str query = copy_emacs_string(env, &bump, args[1]);
+  if (!query.b) { goto err; }
 
   fzf_slab_t *slab;
   if (nargs > 2) {
@@ -248,11 +230,11 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
    * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
    * fuzzy bool         : Enable or disable fuzzy matching
    */
-  fzf_pattern_t *pattern = fzf_parse_pattern(CaseSmart, false, query->b, true);
+  fzf_pattern_t *pattern = fzf_parse_pattern(CaseSmart, false, query.b, true);
 
   /* You can get the score/position for as many items as you want */
-  int score = fzf_get_score(str->b, pattern, slab);
-  fzf_position_t *pos = fzf_get_positions(str->b, pattern, slab);
+  int score = fzf_get_score(str.b, pattern, slab);
+  fzf_position_t *pos = fzf_get_positions(str.b, pattern, slab);
 
   size_t offset = 1;
   size_t len = 0;
@@ -269,7 +251,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
   }
 
   emacs_value result = env->funcall(env, Flist, offset + len, result_array);
-
+  success = true;
   fzf_free_positions(pos);
   fzf_free_pattern(pattern);
 
@@ -280,7 +262,12 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
     fzf_free_slab(slab);
   }
 
+err:
   bump_free(bump);
+  if (!success) {
+    env->non_local_exit_signal(env, env->intern(env, "error"), Qnil);
+  }
+
   return result;
 }
 
@@ -386,8 +373,8 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Fprinc = env->make_global_ref(env, env->intern(env, "princ"));
 
   Qlistofzero = env->make_global_ref(
-      env, env->funcall(env, Qcons, 2,
-                        (emacs_value[]){env->make_integer(env, 0), Qnil}));
+    env, env->funcall(env, Qcons, 2,
+                      (emacs_value[]){env->make_integer(env, 0), Qnil}));
 
   return 0;
 }
