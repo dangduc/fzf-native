@@ -1,15 +1,25 @@
 #include <ctype.h>
-#include <pthread.h>
 #include <stdalign.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include "emacs-module.h"
 #include "fzf.h"
 #include <stdatomic.h>
 #include <stdio.h>
+
+// Windows pthread.h conflicts with the system Time.
+// e.g. 'timespec': 'struct' type redefinition
+#ifdef _WIN32
+#define _TIMESPEC_DEFINED
+#endif
+#include <pthread.h>
+
+#if defined(__APPLE__) || defined(__linux__)
+// for sysconf(_SC_NPROCESSORS_ONLN);
+#include <unistd.h>
+#endif
 
 #ifdef _WIN32
 #  define EXPORT __declspec(dllexport)
@@ -27,6 +37,9 @@
 #define UNUSED(x) __attribute__((unused)) x
 #endif
 
+#ifdef _WIN32
+typedef long ssize_t;
+#endif
 
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
 #define BATCH_SIZE 2048
@@ -246,10 +259,14 @@ emacs_value fzf_native_score_all(emacs_env *env,
   // Print the shared value.
   /* ssize_t value = atomic_load(&shared.remaining); */
   /* printf("shared Remaining: %zd\n", value); */
-
+#if defined(__APPLE__) || defined(__linux__)
   // Set up max number of workers according to processor.
   // It's 8 on M1 Macbook.
   unsigned max_workers = sysconf(_SC_NPROCESSORS_ONLN);
+#else
+  unsigned max_workers = 4; // Random safe guess number.
+#endif
+
   if (!(data = malloc(sizeof *data + max_workers * sizeof *data->threads))) {
     goto err;
   }
