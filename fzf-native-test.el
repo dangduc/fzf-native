@@ -132,13 +132,31 @@
   ;; Reset advice environment.
   (advice-remove 'fzf-native-score #'fzf-native--fix-score-indices))
 
+(defun fzf-native-generate-random-string (length)
+  "Generate a random string of LENGTH using alphanumeric characters."
+  (let ((chars "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"))
+    (apply #'string
+           (cl-loop repeat length
+                    collect (elt chars (random (length chars)))))))
+
+(defun fzf-native-generate-random-string-list (list-size string-length)
+  "Generate a list of LIST-SIZE random strings, each of STRING-LENGTH."
+  (cl-loop repeat list-size
+           collect (fzf-native-generate-random-string string-length)))
+
+(defvar fzf-native-large-random-string-list
+  (fzf-native-generate-random-string-list 50000 10)
+  "A mock list of 50,000 random strings, each of length 10.")
+
 (ert-deftest fzf-native-score-all-big-collection-test ()
-  (let ((collection (all-completions "" 'help--symbol-completion-table nil)))
+  (let ((collection (all-completions
+                     "" fzf-native-large-random-string-list nil)))
     (should
      (fzf-native-score-all collection "a"))))
 
 (ert-deftest fzf-native-score-all-benchmark-test ()
-  (let ((collection (all-completions "" 'help--symbol-completion-table nil)))
+  (let ((collection (all-completions
+                     "" fzf-native-large-random-string-list nil)))
     (should
      (<
       (car (benchmark-run 10 (fzf-native-score-all collection "a")))
