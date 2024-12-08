@@ -1,5 +1,9 @@
 name: Format
 
+# Checks for whether CMakeLists.txt is formatted. Fails
+# pipeline if misformatted.
+# To format, run % cmake-format --in-place CMakeLists.txt
+
 on:
   workflow_dispatch:
   pull_request:
