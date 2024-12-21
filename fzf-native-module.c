@@ -6,17 +6,11 @@
 #include <string.h>
 #include "emacs-module.h"
 #include "fzf.h"
-#include <stdatomic.h>
 #include <stdio.h>
 
-// Windows pthread.h conflicts with the system Time.
-// e.g. 'timespec': 'struct' type redefinition
-#ifdef _WIN32
-#define _TIMESPEC_DEFINED
-#endif
-#include <pthread.h>
-
 #if defined(__APPLE__) || defined(__linux__)
+#include <stdatomic.h>
+#include <pthread.h>
 // for sysconf(_SC_NPROCESSORS_ONLN);
 #include <unistd.h>
 #endif
@@ -59,7 +53,9 @@ struct Str { char *b; size_t len; };
 /** Module userdata that gets allocated once at initialization. */
 struct Data {
   unsigned max_workers;
+#if defined(__APPLE__) || defined(__linux__)
   pthread_t threads[];
+#endif
 };
 
 /** Intrusive linked list of bump allocation blocks. */
@@ -158,7 +154,11 @@ struct Batch {
 struct Shared {
   const struct Str query;
   struct Batch *const batches;
+#if defined(__APPLE__) || defined(__linux__)
   _Atomic ssize_t remaining;
+#else
+  ssize_t remaining;
+#endif
 };
 
 // Most of the threading lifted from https://github.com/axelf4/hotfuzz
@@ -175,13 +175,18 @@ static void *worker_routine(void *ptr) {
   struct Str query = copy_str(&shared_query);
   ssize_t batch_idx;
 
+#ifdef _WIN32
+  while ((batch_idx = --shared->remaining) >= 0) {
+#endif
   // Atomic fetch-and-decrement for shared->remaining
   // --shared->remaining would return the decremented value whereas
   // atomic_fetch_sub_explicit returns the original value before decrement.
   // So, use batch_idx - 1 when handling the idx.
+#if defined(__APPLE__) || defined(__linux__)
   while ((batch_idx = atomic_fetch_sub_explicit(&shared->remaining,
                                                 1,
                                                 memory_order_seq_cst) - 1) >= 0) {
+#endif
     struct Batch *batch = shared->batches + batch_idx;
     unsigned n = 0;
     for (unsigned i = 0; i < batch->len; ++i) {
@@ -256,16 +261,16 @@ emacs_value fzf_native_score_all(emacs_env *env,
     .remaining = batch_idx + 1,
   };
 
+#ifdef _WIN32
+  worker_routine(&shared);
+#endif
+#if defined(__APPLE__) || defined(__linux__)
   // Print the shared value.
   /* ssize_t value = atomic_load(&shared.remaining); */
   /* printf("shared Remaining: %zd\n", value); */
-#if defined(__APPLE__) || defined(__linux__)
   // Set up max number of workers according to processor.
   // It's 8 on M1 Macbook.
   unsigned max_workers = sysconf(_SC_NPROCESSORS_ONLN);
-#else
-  unsigned max_workers = 4; // Random safe guess number.
-#endif
 
   if (!(data = malloc(sizeof *data + max_workers * sizeof *data->threads))) {
     goto err;
@@ -277,11 +282,14 @@ emacs_value fzf_native_score_all(emacs_env *env,
     if (pthread_create(data->threads + num_workers, NULL, worker_routine, &shared))
       // Join all workers in order to at least safely free memory
       goto err_join_threads;
+#endif
   success = true;
 
 err_join_threads:
+#if defined(__APPLE__) || defined(__linux__)
   // Wait for all worker threads
   for (unsigned i = 0; i < num_workers; ++i) pthread_join(data->threads[i], NULL);
+#endif
   if (!success) goto err;
   if (env->process_input(env) == emacs_process_input_quit) goto err;
 
