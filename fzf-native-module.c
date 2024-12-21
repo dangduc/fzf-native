@@ -8,7 +8,7 @@
 #include "fzf.h"
 #include <stdio.h>
 
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <stdatomic.h>
 #include <pthread.h>
 // for sysconf(_SC_NPROCESSORS_ONLN);
@@ -53,7 +53,7 @@ struct Str { char *b; size_t len; };
 /** Module userdata that gets allocated once at initialization. */
 struct Data {
   unsigned max_workers;
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
   pthread_t threads[];
 #endif
 };
@@ -154,7 +154,7 @@ struct Batch {
 struct Shared {
   const struct Str query;
   struct Batch *const batches;
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
   _Atomic ssize_t remaining;
 #else
   ssize_t remaining;
@@ -182,7 +182,7 @@ static void *worker_routine(void *ptr) {
   // --shared->remaining would return the decremented value whereas
   // atomic_fetch_sub_explicit returns the original value before decrement.
   // So, use batch_idx - 1 when handling the idx.
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
   while ((batch_idx = atomic_fetch_sub_explicit(&shared->remaining,
                                                 1,
                                                 memory_order_seq_cst) - 1) >= 0) {
@@ -264,7 +264,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
 #ifdef _WIN32
   worker_routine(&shared);
 #endif
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
   // Print the shared value.
   /* ssize_t value = atomic_load(&shared.remaining); */
   /* printf("shared Remaining: %zd\n", value); */
@@ -286,7 +286,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
   success = true;
 
 err_join_threads:
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
   // Wait for all worker threads
   for (unsigned i = 0; i < num_workers; ++i) pthread_join(data->threads[i], NULL);
 #endif
