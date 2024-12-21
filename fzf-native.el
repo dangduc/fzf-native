@@ -94,6 +94,7 @@ the executable."
                                   (concat "Darwin/" fzf-native--dyn-name ".so")
                                 ; Apple Silicon
                                 (concat "Darwin/arm64/" fzf-native--dyn-name ".so")))
+                     ('berkeley-unix (concat  "FreeBSD/" fzf-native--dyn-name ".so"))
                      (t (concat "Linux/" fzf-native--dyn-name ".so"))))
          (dyn-path (concat fzf-native--bin-dir dyn-name)))
     (module-load dyn-path)

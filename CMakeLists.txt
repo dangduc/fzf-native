@@ -45,61 +45,13 @@ endif()
 # https://blog.kitware.com/create-dlls-on-windows-without-declspec-using-new-cmake-export-all-feature/
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
-# Enable experimental C11 atomics for MSVC
-# https://developercommunity.visualstudio.com/t/C11-atomic-types-are-broken-in-CL/10560673?sort=newest
-# Needed for #include <stdatomic.h>
-if(MSVC)
-  # Add /experimental:c11atomics for MSVC (C11 atomic operations)
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /experimental:c11atomics")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /experimental:c11atomics")
-
-  # Ensure the compiler uses C11 standard (MSVC may default to an older
-  # standard)
-  add_compile_options(/std:c11)
-
-  # Optionally, ensure that C11 is used for C and C++ separately
-  set(CMAKE_C_STANDARD 11)
-  set(CMAKE_CXX_STANDARD 11)
-endif()
-
-# Add pthreads-w32 on Windows
 if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
-  # Path to the pthreads-w32 directory
-  set(PTHREADS_W32_DIR
-      "${CMAKE_SOURCE_DIR}/pthreads-w32-2-9-1-release/Pre-built.2")
-
-  # Determine architecture
-  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(ARCH_DIR "x64")
-  else()
-    set(ARCH_DIR "x86")
-  endif()
-
-  # Assume compiler MSVC. Link the appropriate library Use pthreadVC2.lib for
-  # Visual Studio, pthreadGC2.lib for MinGW Conditionally select the correct
-  # library based on the compiler
-  if(MSVC)
-    message(STATUS "Setting ${PTHREADS_W32_DIR}/lib/${ARCH_DIR}/pthreadVC2.lib")
-    set(PTHREADS_W32_LIB "${PTHREADS_W32_DIR}/lib/${ARCH_DIR}/pthreadVC2.lib")
-  elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    message(
-      STATUS "Setting ${PTHREADS_W32_DIR}/lib/${ARCH_DIR}/libpthreadGC2.a")
-    set(PTHREADS_W32_LIB "${PTHREADS_W32_DIR}/lib/${ARCH_DIR}/libpthreadGC2.a")
-  else()
-    message(FATAL_ERROR "Unsupported compiler: ${CMAKE_CXX_COMPILER_ID}")
-  endif()
-
+  # Assume compiler MSVC.
   add_library(fzf-native-module SHARED fzf-native-module.c fzf.c fzf.h)
-  # Include the pthreads-w32 directory for Windows
-  target_include_directories(fzf-native-module
-                             PRIVATE ${PTHREADS_W32_DIR}/include)
-  # Link pthreads to fzf-native-module
-  target_link_libraries(fzf-native-module PRIVATE ${PTHREADS_W32_LIB})
 else()
   add_library(fzf-native-module MODULE fzf-native-module.c fzf.c fzf.h)
 endif()
 
-# Set library output directory
 set(OUTPUT_DIR ${CMAKE_SOURCE_DIR}/${FZF_NATIVE_MODULE_OUTPUT_DIR})
 set_target_properties(
   fzf-native-module
