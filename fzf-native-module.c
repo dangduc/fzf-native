@@ -72,33 +72,6 @@ static void bump_free(struct Bump *head) {
   }
 }
 
-// Deep copy function
-struct Str copy_str(const struct Str *src) {
-  struct Str dest = { NULL, 0 };
-
-  // Check if the source string is valid
-  if (src && src->b && src->len > 0) {
-    // Allocate memory for the destination string
-    dest.b = malloc(src->len + 1); // +1 for null terminator
-    if (dest.b) {
-      // Copy the string contents
-      memcpy(dest.b, src->b, src->len + 1);
-      dest.b[src->len] = '\0'; // Ensure null termination
-      dest.len = src->len;
-    }
-  }
-
-  return dest;
-}
-
-// Function to free the deep copy
-void free_str(struct Str *str) {
-  if (str && str->b) {
-    free(str->b);
-    str->b = NULL;
-    str->len = 0;
-  }
-}
 
 // Copied from https://github.com/axelf4/hotfuzz
 /** Copies the Emacs string to make its contents accessible. */
@@ -169,10 +142,13 @@ static void *worker_routine(void *ptr) {
 
   struct Shared *shared = ptr;
   struct Str shared_query = shared->query;
-  // Create a deep copy of the original string.
   // fzf_parse_pattern mutilates the char* in Str so using the original string
   // is unsafe in a multithreaded context.
-  struct Str query = copy_str(&shared_query);
+  char *query_scratch = NULL;
+  if (shared_query.b) {
+    query_scratch = malloc(shared_query.len + 1);
+  }
+
   ssize_t batch_idx;
 
 #ifdef _WIN32
@@ -191,27 +167,37 @@ static void *worker_routine(void *ptr) {
     unsigned n = 0;
     for (unsigned i = 0; i < batch->len; ++i) {
       struct Candidate x = batch->xs[i];
-      /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
-       * normalize bool     : Always set to false because its not implemented yet.
-       *                      This is reserved for future use
-       * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
-       * fuzzy bool         : Enable or disable fuzzy matching
-       */
-      fzf_pattern_t *pattern = fzf_parse_pattern(CaseIgnore, false, query.b, true);
       /* You can get the score/position for as many items as you want */
-      int score = fzf_get_score(x.s.b, pattern, slab);
+      int score = 0;
+      if (query_scratch) {
+        // Create a fresh copy of the query string for this pattern,
+        // since fzf_parse_pattern mutilates the string it parses.
+        memcpy(query_scratch, shared_query.b, shared_query.len + 1);
+       /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
+        * normalize bool     : Always set to false because its not implemented yet.
+        *                      This is reserved for future use
+        * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
+        * fuzzy bool         : Enable or disable fuzzy matching
+        */
+        fzf_pattern_t *pattern = fzf_parse_pattern(CaseIgnore, false, query_scratch, true);
+        if (pattern) {
+          score = fzf_get_score(x.s.b, pattern, slab);
+          fzf_free_pattern(pattern);
+        }
+      }
       if (score > 0) {
         /* printf("Str: %s # = %d | i = %d, batch->len = %d, batch_idx = %zd\n", */
         /*        x.s.b, score, i, batch->len, batch_idx); */
         x.score = score;
         batch->xs[n++] = x;
       }
-      fzf_free_pattern(pattern);
     }
     batch->len = n;
   }
 
-  free_str(&query);
+  if (query_scratch) {
+    free(query_scratch);
+  }
   // Free one-time use slab.
   fzf_free_slab(slab);
   /* printf("-----\nEnding Worker Routine\n-----\n"); */
