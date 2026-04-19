@@ -107,10 +107,8 @@ success:
 
 struct Candidate {
   emacs_value value;
-  union {
-    struct Str s;
-    int score;
-  };
+  struct Str s;
+  int score;
 };
 
 static int cmp_candidate(const void *a, const void *b) {
