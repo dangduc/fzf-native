@@ -411,7 +411,7 @@ void slab_finalize(void *object) {
   fzf_free_slab(slab);
 }
 
-emacs_value fzf_native_make_default_slab(emacs_env UNUSED(*env),
+emacs_value fzf_native_make_default_slab(emacs_env *env,
                                          ptrdiff_t UNUSED(nargs),
                                          emacs_value UNUSED(args[]),
                                          void UNUSED(*data_ptr)) {
@@ -420,9 +420,9 @@ emacs_value fzf_native_make_default_slab(emacs_env UNUSED(*env),
   return env->make_user_ptr(env, slab_finalize, slab);
 }
 
-emacs_value fzf_native_make_slab(emacs_env UNUSED(*env),
+emacs_value fzf_native_make_slab(emacs_env *env,
                                  ptrdiff_t UNUSED(nargs),
-                                 emacs_value UNUSED(args[]),
+                                 emacs_value args[],
                                  void UNUSED(*data_ptr)) {
   size_t slab16Size = env->extract_integer(env, args[0]);
   size_t slab32Size = env->extract_integer(env, args[1]);
