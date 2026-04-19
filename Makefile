@@ -20,6 +20,10 @@ test:
 lint:
 	eask lint package
 
+.PHONY: format
+format:
+	cmake-format --in-place CMakeLists.txt
+
 # --- Native module build targets ---
 
 # Standard release build (RelWithDebInfo, same as the cmake default)
