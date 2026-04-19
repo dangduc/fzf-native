@@ -277,14 +277,22 @@ err_join_threads:
   if (!success) goto err;
   if (env->process_input(env) == emacs_process_input_quit) goto err;
 
-  // Compact all batches
-  size_t len = batches[0].len;
-  struct Candidate *xs = batches[0].xs;
-  for (struct Batch *b = batches + 1; b <= batches + batch_idx; ++b) {
-    unsigned n = b->len;
-    memmove(xs + len, b->xs, n * sizeof *b->xs);
-    len += n;
+  // Compact all batches into one flat array
+  size_t len = 0;
+  for (size_t i = 0; i <= batch_idx; ++i) {
+    len += batches[i].len;
   }
+
+  struct Candidate *xs = malloc(len * sizeof *xs);
+  if (!xs) goto err;
+
+  size_t pos = 0;
+  for (size_t i = 0; i <= batch_idx; ++i) {
+    size_t n = batches[i].len;
+    memcpy(xs + pos, batches[i].xs, n * sizeof *xs);
+    pos += n;
+  }
+
   qsort(xs, len, sizeof *xs, cmp_candidate); // Sort the completions
 
   for (size_t i = len; i-- > 0;) {
@@ -302,6 +310,8 @@ err_join_threads:
 
     result = env->funcall(env, Fcons, 2, (emacs_value[]) { xs[i].value, result });
   }
+
+  free(xs);
 
 err:
   free(batches);
