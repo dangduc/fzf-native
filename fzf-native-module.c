@@ -341,6 +341,15 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
   struct Str query = copy_emacs_string(env, &bump, args[1]);
   if (!query.b) { goto err; }
 
+  /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
+   * normalize bool     : Always set to false because its not implemented yet.
+   *                      This is reserved for future use
+   * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
+   * fuzzy bool         : Enable or disable fuzzy matching
+   */
+  fzf_pattern_t *pattern = fzf_parse_pattern(CaseSmart, false, query.b, true);
+  if (!pattern) { goto err; }
+
   fzf_slab_t *slab;
   if (nargs > 2) {
     // Re-use SLAB argument.
@@ -349,14 +358,6 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
     // Create a one-time use slab.
     slab = fzf_make_default_slab();
   }
-
-  /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
-   * normalize bool     : Always set to false because its not implemented yet.
-   *                      This is reserved for future use
-   * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
-   * fuzzy bool         : Enable or disable fuzzy matching
-   */
-  fzf_pattern_t *pattern = fzf_parse_pattern(CaseSmart, false, query.b, true);
 
   /* You can get the score/position for as many items as you want */
   int score = fzf_get_score(str.b, pattern, slab);
