@@ -20,10 +20,10 @@
   :group 'minibuffer
   :link '(url-link :tag "GitHub" "https://github.com/dangduc/fzf-native"))
 
-(declare-function fzf-native-score-all "fzf-native-module")
-(declare-function fzf-native-score "fzf-native-module")
-(declare-function fzf-native-make-default-slab "fzf-native-module")
-(declare-function fzf-native-make-slab "fzf-native-module")
+(declare-function fzf-native-score-all "fzf-native-module" (collection query &optional slab))
+(declare-function fzf-native-score "fzf-native-module" (str query &optional slab))
+(declare-function fzf-native-make-default-slab "fzf-native-module" ())
+(declare-function fzf-native-make-slab "fzf-native-module" (size16 size32))
 
 (defconst fzf-native--dyn-name "fzf-native-module"
   "Dynamic module name.")
