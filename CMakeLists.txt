@@ -13,7 +13,8 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
       CACHE STRING "Choose the type of build." FORCE)
 endif()
 
-# Option to enable AddressSanitizer (catches segfaults, heap overflows, use-after-free, etc.)
+# Option to enable AddressSanitizer (catches segfaults, heap overflows,
+# use-after-free, etc.)
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 
 # Option to enable UndefinedBehaviorSanitizer
@@ -82,18 +83,12 @@ if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
   # keeps stack frames intact for better backtraces, -O0 disables optimizations
   # so gdb sees exactly what the source says.
   if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_options(fzf-native-module PRIVATE
-      -g3
-      -O0
-      -fno-omit-frame-pointer
-      -fno-optimize-sibling-calls   # improves call-stack accuracy in gdb
-      -Wall
-      -Wextra
-    )
-    target_link_options(fzf-native-module PRIVATE
-      -g
-      -fno-omit-frame-pointer
-    )
+    target_compile_options(
+      fzf-native-module
+      PRIVATE -g3 -O0 -fno-omit-frame-pointer
+              -fno-optimize-sibling-calls # improves call-stack accuracy in gdb
+              -Wall -Wextra)
+    target_link_options(fzf-native-module PRIVATE -g -fno-omit-frame-pointer)
     message(STATUS "Debug build: full symbols, no optimization")
   endif()
 
@@ -101,29 +96,19 @@ if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
   # use-after-return, and gives a precise crash report with source locations.
   # Enable with: cmake -DENABLE_ASAN=ON -DCMAKE_BUILD_TYPE=Debug ..
   if(ENABLE_ASAN)
-    target_compile_options(fzf-native-module PRIVATE
-      -fsanitize=address
-      -fno-omit-frame-pointer
-      -g
-    )
-    target_link_options(fzf-native-module PRIVATE
-      -fsanitize=address
-    )
+    target_compile_options(fzf-native-module PRIVATE -fsanitize=address
+                                                     -fno-omit-frame-pointer -g)
+    target_link_options(fzf-native-module PRIVATE -fsanitize=address)
     message(STATUS "AddressSanitizer enabled")
   endif()
 
   # UndefinedBehaviorSanitizer: catches signed overflow, null dereference,
-  # misaligned access, out-of-bounds shifts, etc.
-  # Enable with: cmake -DENABLE_UBSAN=ON -DCMAKE_BUILD_TYPE=Debug ..
+  # misaligned access, out-of-bounds shifts, etc. Enable with: cmake
+  # -DENABLE_UBSAN=ON -DCMAKE_BUILD_TYPE=Debug ..
   if(ENABLE_UBSAN)
-    target_compile_options(fzf-native-module PRIVATE
-      -fsanitize=undefined
-      -fno-omit-frame-pointer
-      -g
-    )
-    target_link_options(fzf-native-module PRIVATE
-      -fsanitize=undefined
-    )
+    target_compile_options(fzf-native-module PRIVATE -fsanitize=undefined
+                                                     -fno-omit-frame-pointer -g)
+    target_link_options(fzf-native-module PRIVATE -fsanitize=undefined)
     message(STATUS "UndefinedBehaviorSanitizer enabled")
   endif()
 
