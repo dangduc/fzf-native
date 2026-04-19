@@ -140,14 +140,26 @@ static void *worker_routine(void *ptr) {
 
   struct Shared *shared = ptr;
   struct Str shared_query = shared->query;
-  // fzf_parse_pattern mutilates the char* in Str so using the original string
-  // is unsafe in a multithreaded context.
+  fzf_pattern_t *pattern = NULL;
   char *query_scratch = NULL;
+  ssize_t batch_idx;
+
   if (shared_query.b) {
     query_scratch = malloc(shared_query.len + 1);
-  }
+    if (query_scratch) {
+      // Create a fresh copy of the query string for this pattern,
+      // since fzf_parse_pattern mutilates the string it parses.
+      memcpy(query_scratch, shared_query.b, shared_query.len + 1);
 
-  ssize_t batch_idx;
+     /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
+      * normalize bool     : Always set to false because its not implemented yet.
+      *                      This is reserved for future use
+      * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
+      * fuzzy bool         : Enable or disable fuzzy matching
+      */
+      pattern = fzf_parse_pattern(CaseIgnore, false, query_scratch, true);
+    }
+  }
 
 #ifdef _WIN32
   while ((batch_idx = --shared->remaining) >= 0) {
@@ -163,34 +175,25 @@ static void *worker_routine(void *ptr) {
 #endif
     struct Batch *batch = shared->batches + batch_idx;
     unsigned n = 0;
-    for (unsigned i = 0; i < batch->len; ++i) {
-      struct Candidate x = batch->xs[i];
-      /* You can get the score/position for as many items as you want */
-      int score = 0;
-      if (query_scratch) {
-        // Create a fresh copy of the query string for this pattern,
-        // since fzf_parse_pattern mutilates the string it parses.
-        memcpy(query_scratch, shared_query.b, shared_query.len + 1);
-       /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
-        * normalize bool     : Always set to false because its not implemented yet.
-        *                      This is reserved for future use
-        * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
-        * fuzzy bool         : Enable or disable fuzzy matching
-        */
-        fzf_pattern_t *pattern = fzf_parse_pattern(CaseIgnore, false, query_scratch, true);
-        if (pattern) {
-          score = fzf_get_score(x.s.b, pattern, slab);
-          fzf_free_pattern(pattern);
+
+    if (pattern) {
+      for (unsigned i = 0; i < batch->len; ++i) {
+        struct Candidate x = batch->xs[i];
+        /* You can get the score/position for as many items as you want */
+        int score = fzf_get_score(x.s.b, pattern, slab);
+        if (score > 0) {
+          /* printf("Str: %s # = %d | i = %d, batch->len = %d, batch_idx = %zd\n", */
+          /*        x.s.b, score, i, batch->len, batch_idx); */
+          x.score = score;
+          batch->xs[n++] = x;
         }
-      }
-      if (score > 0) {
-        /* printf("Str: %s # = %d | i = %d, batch->len = %d, batch_idx = %zd\n", */
-        /*        x.s.b, score, i, batch->len, batch_idx); */
-        x.score = score;
-        batch->xs[n++] = x;
       }
     }
     batch->len = n;
+  }
+
+  if (pattern) {
+    fzf_free_pattern(pattern);
   }
 
   if (query_scratch) {
