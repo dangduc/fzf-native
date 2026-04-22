@@ -22,7 +22,7 @@
 (ert-deftest fzf-native-score-with-default-slab-test ()
   "Test slab can be reused."
   (let* ((slab (fzf-native-make-default-slab))
-         (result (fzf-native-score "abcdefghi" "acef" slab)))
+         (_result (fzf-native-score "abcdefghi" "acef" slab)))
     (should
      (equal (fzf-native-score "abcdefghi" "acef" slab)
             '(78 0 2 4 5)))
@@ -39,7 +39,7 @@
 (ert-deftest fzf-native-score-with-slab-test ()
   "Test slab can be reused."
   (let* ((slab (fzf-native-make-slab (* 100 1024) 2048))
-         (result (fzf-native-score "abcdefghi" "acef" slab)))
+         (_result (fzf-native-score "abcdefghi" "acef" slab)))
     (should
      (equal (fzf-native-score "abcdefghi" "acef" slab)
             '(78 0 2 4 5)))
@@ -181,3 +181,7 @@
                    (fzf-native-score-all
                     '("abc.txt" "ポケモン.txt" "tビビxt" "tビ") "txt")))))
     t))
+
+(ert-deftest fzf-native-score-all-empty-string-candidate-test ()
+  (let ((result (fzf-native-score-all '("") "")))
+    (should (equal result '("")))))
