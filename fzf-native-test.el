@@ -119,18 +119,31 @@
          (fzf-native-score str query large-slab)))))))
 
 (ert-deftest fzf-native-score-indices-multibyte-not-supported-test ()
-  (should
-   (equal (cdr (fzf-native-score "ポケモン.txt" "txt"))
-          '(13 14 15))))
+  ;; Force `str' to be unambiguously multibyte regardless of the coding
+  ;; system used to load this file (eask may differ from an interactive
+  ;; session). Without the advice, the C module returns BYTE positions.
+  (let ((str (decode-coding-string
+              (encode-coding-string "ポケモン.txt" 'utf-8) 'utf-8)))
+    (should (multibyte-string-p str))
+    (should
+     (equal (cdr (fzf-native-score str "txt"))
+            '(13 14 15)))))
 
 (ert-deftest fzf-native-score-indices-multibyte-support-through-advice-test ()
-  ;; Assume advice not yet added. Setup advice environment.
+  ;; Force `str' to be multibyte (see `...not-supported-test' above).
+  ;; With the advice, byte positions are mapped back to character
+  ;; positions, so we expect (5 6 7) instead of (13 14 15).
   (advice-add 'fzf-native-score :around #'fzf-native--fix-score-indices)
-  (should
-   (equal (cdr (fzf-native-score "ポケモン.txt" "txt"))
-          '(5 6 7)))
-  ;; Reset advice environment.
-  (advice-remove 'fzf-native-score #'fzf-native--fix-score-indices))
+  (unwind-protect
+      (let ((str (decode-coding-string
+                  (encode-coding-string "ポケモン.txt" 'utf-8) 'utf-8)))
+        (should (multibyte-string-p str))
+        (should
+         (equal (cdr (fzf-native-score str "txt"))
+                '(5 6 7))))
+    ;; Always remove the advice, even if the assertions above failed.
+    ;; Otherwise the advice leaks into subsequent tests.
+    (advice-remove 'fzf-native-score #'fzf-native--fix-score-indices)))
 
 (defun fzf-native-generate-random-string (length)
   "Generate a random string of LENGTH using alphanumeric characters."
@@ -185,3 +198,71 @@
 (ert-deftest fzf-native-score-all-empty-string-candidate-test ()
   (let ((result (fzf-native-score-all '("") "")))
     (should (equal result '("")))))
+
+;;
+;; Multibyte / invalid unibyte handling
+;;
+;; These exercise the C-side `copy_emacs_string' fallback through
+;; `encode-coding-string'. Pre-fix, an invalid-unibyte input made
+;; `copy_string_contents' signal `unicode-string-p' and abort the whole
+;; batch.
+;;
+;; On Emacs 30+ the coercion path almost always succeeds: raw bytes get
+;; round-tripped to a valid byte sequence that fzf can score normally.
+;; The interesting guarantee is therefore "no input causes the call to
+;; signal", not any specific score value. We previously assigned a
+;; sentinel score of 1 to uncoerceable inputs; that path is now treated
+;; the same as "did not match" and the candidate is silently dropped.
+
+(defconst fzf-native-test--bad-bytes
+  (string-as-multibyte ";; Copyright 2022 Jo Be�����")
+  "Raw-byte string used as a reproducer for the `unicode-string-p' bug.
+Note: on Emacs 30+ this WILL coerce successfully through
+`encode-coding-string', so it scores like any other string. The tests
+below assert the absence of a signal, not any particular score.")
+
+(ert-deftest fzf-native-score-invalid-unibyte-test ()
+  "`fzf-native-score' does not signal on a byte-junk candidate."
+  (let ((result (fzf-native-score fzf-native-test--bad-bytes "C")))
+    (should (listp result))
+    (should (numberp (car result)))))
+
+(ert-deftest fzf-native-score-invalid-unibyte-query-test ()
+  "`fzf-native-score' does not signal when the QUERY is byte-junk."
+  (let ((result (fzf-native-score "hello" fzf-native-test--bad-bytes)))
+    (should (listp result))
+    (should (numberp (car result)))))
+
+(ert-deftest fzf-native-score-chinese-match-test ()
+  "`fzf-native-score' scores a Chinese substring match."
+  (let ((result (fzf-native-score "你好世界 hello" "你好")))
+    (should (listp result))
+    (should (> (car result) 0))))
+
+(ert-deftest fzf-native-score-all-invalid-unibyte-test ()
+  "`fzf-native-score-all' handles a byte-junk candidate without signaling."
+  (let* ((result (fzf-native-score-all
+                  (list "CCCCC" fzf-native-test--bad-bytes "xyzzy")
+                  "C"))
+         (good (car (member "CCCCC" result))))
+    (should (listp result))
+    ;; The clean match survives and gets a numeric score attached.
+    (should good)
+    (should (numberp (get-text-property 0 'completion-score good)))
+    ;; Non-matching candidates are filtered as usual.
+    (should-not (member "xyzzy" result))))
+
+(ert-deftest fzf-native-score-all-chinese-test ()
+  "`fzf-native-score-all' scores Chinese candidates against a Chinese query."
+  (let ((result (fzf-native-score-all '("你好世界" "Hello" "你是") "你")))
+    (should (member "你好世界" result))
+    (should (member "你是" result))
+    (should-not (member "Hello" result))))
+
+(ert-deftest fzf-native-score-all-preserves-object-identity-test ()
+  "Returned strings are the same object as the input (for text properties)."
+  (let* ((orig "你好")
+         (result (fzf-native-score-all (list orig) "你")))
+    (should (eq (car result) orig))
+    ;; `completion-score' is attached to the original object.
+    (should (get-text-property 0 'completion-score (car result)))))
