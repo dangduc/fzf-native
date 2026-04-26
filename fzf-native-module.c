@@ -42,7 +42,7 @@ EXPORT
 int plugin_is_GPL_compatible;
 
 emacs_value Qnil, Qlistofzero, Fcons, Flist, Qt;
-emacs_value Fhashtablep, Fmessage, Fvectorp, Fconsp, Fcdr, Fcar;
+emacs_value Fhashtablep, Fmessage, Fvectorp, Fconsp, Fcdr, Fcar, Fvconcat;
 emacs_value Ffunctionp, Fsymbolp, Fsymbolname, Flength, Fnth, Fprinc, Freverse;
 emacs_value Qcompletion_score, Fput_text_property, Qzero, Qone;
 emacs_value Fencode_coding_string, Qutf_8;
@@ -253,12 +253,26 @@ emacs_value fzf_native_score_all(emacs_env *env,
   int success = false;
   emacs_value result = Qnil;
 
-  // Collect all candidates
+  // Collect all candidates.
+  // Convert list to vector to minimize calls back to Emacs.
+  emacs_value collection = args[0];
+  if (!env->eq(env, env->type_of(env, collection), env->intern(env, "vector"))) {
+    collection = env->funcall(env, Fvconcat, 1, (emacs_value[]) { args[0] });
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+      goto err;
+    }
+  }
+
   struct Batch *batches = NULL;
   size_t batch_idx = 0, capacity;
-  for (emacs_value list = args[0]; env->is_not_nil(env, list);
-       list = env->funcall(env, Fcdr, 1, (emacs_value[]) { list })) {
-    emacs_value value = env->funcall(env, Fcar, 1, (emacs_value[]) { list });
+
+  ptrdiff_t n = env->vec_size(env, collection);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    n = 0;
+  }
+  for (ptrdiff_t i = 0; i < n; i++) {
+    emacs_value value = env->vec_get(env, collection, i);
     struct Str s = copy_emacs_string(env, &bump, value);
     /* If s.b is NULL here, the candidate could not be decoded even
        after `encode-coding-string' coercion. Drop it now so it doesn't
@@ -271,7 +285,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
       struct Batch *new_batches;
       if (!(new_batches = realloc(batches, capacity * sizeof *batches))) goto err;
       batches = new_batches;
-      for (size_t i = batch_idx; i < capacity; ++i) batches[i].len = 0;
+      for (size_t k = batch_idx; k < capacity; ++k) batches[k].len = 0;
     }
 
     struct Batch *batch = batches + batch_idx;
@@ -584,6 +598,7 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Fhashtablep = env->make_global_ref(env, env->intern(env, "hash-table-p"));
   Fmessage = env->make_global_ref(env, env->intern(env, "message"));
   Fvectorp = env->make_global_ref(env, env->intern(env, "vectorp"));
+  Fvconcat = env->make_global_ref(env, env->intern(env, "vconcat"));
   Fconsp = env->make_global_ref(env, env->intern(env, "consp"));
   Ffunctionp = env->make_global_ref(env, env->intern(env, "functionp"));
   Fsymbolp = env->make_global_ref(env, env->intern(env, "symbolp"));
