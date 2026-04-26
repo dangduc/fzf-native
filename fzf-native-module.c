@@ -42,9 +42,10 @@ EXPORT
 int plugin_is_GPL_compatible;
 
 emacs_value Qnil, Qlistofzero, Fcons, Flist, Qt;
-emacs_value Fhashtablep, Fmessage, Fvectorp, Fconsp, Fcdr, Fcar;
+emacs_value Fhashtablep, Fmessage, Fvectorp, Fconsp, Fcdr, Fcar, Fvconcat;
 emacs_value Ffunctionp, Fsymbolp, Fsymbolname, Flength, Fnth, Fprinc, Freverse;
 emacs_value Qcompletion_score, Fput_text_property, Qzero, Qone;
+emacs_value Fencode_coding_string, Qutf_8;
 
 
 /** An Emacs string made accessible by copying. */
@@ -75,7 +76,7 @@ static void bump_free(struct Bump *head) {
 
 // Copied from https://github.com/axelf4/hotfuzz
 /** Copies the Emacs string to make its contents accessible. */
-static struct Str copy_emacs_string(emacs_env *env, struct Bump **bump, emacs_value value) {
+static struct Str copy_valid_emacs_string(emacs_env *env, struct Bump **bump, emacs_value value) {
   char *buf = NULL;
   ptrdiff_t origlen, len;
   if (*bump) {
@@ -103,6 +104,43 @@ success:
   (*bump)->cursor = (char *) (((uintptr_t) (*bump)->cursor + len
                                + alignof(uint64_t) - 1) & ~(alignof(uint64_t) - 1));
   return (struct Str) { buf, len - 1 };
+}
+
+/**
+ * Like copy_emacs_string, but if the direct copy fails (e.g. because VALUE is
+ * an invalid unibyte string that Emacs's module API refuses to hand out via
+ * copy_string_contents, signaling `unicode-string-p'), fall back to encoding
+ * VALUE through `encode-coding-string' with UTF-8 and retry. This lets us
+ * accept arbitrary multibyte and byte-junk candidates without aborting the
+ * whole batch. The original VALUE is never mutated; the encoding happens on a
+ * fresh Emacs string that we then copy into the bump. Returns a zero Str if
+ * even the coerced copy fails, in which case callers should skip the
+ * candidate.
+ */
+static struct Str copy_emacs_string(emacs_env *env, struct Bump **bump,
+                                            emacs_value value) {
+  struct Str s = copy_valid_emacs_string(env, bump, value);
+  if (s.b) return s;
+
+  /* copy_string_contents signaled (likely unicode-string-p). Clear the
+     pending non-local exit and try to coerce the string through
+     encode-coding-string, which handles the raw-byte case. */
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+  }
+
+  emacs_value encode_args[] = { value, Qutf_8, Qt };
+  emacs_value encoded = env->funcall(env, Fencode_coding_string, 3, encode_args);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    return (struct Str) { 0 };
+  }
+
+  s = copy_emacs_string(env, bump, encoded);
+  if (!s.b && env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+  }
+  return s;
 }
 
 struct Candidate {
@@ -215,23 +253,45 @@ emacs_value fzf_native_score_all(emacs_env *env,
   int success = false;
   emacs_value result = Qnil;
 
-  // Collect all candidates
+  // Collect all candidates.
+  // Convert list to vector to minimize calls back to Emacs.
+  emacs_value collection = args[0];
+  if (!env->eq(env, env->type_of(env, collection), env->intern(env, "vector"))) {
+    collection = env->funcall(env, Fvconcat, 1, (emacs_value[]) { args[0] });
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+      goto err;
+    }
+  }
+
   struct Batch *batches = NULL;
   size_t batch_idx = 0, capacity;
-  for (emacs_value list = args[0]; env->is_not_nil(env, list);
-       list = env->funcall(env, Fcdr, 1, (emacs_value[]) { list })) {
+
+  ptrdiff_t n = env->vec_size(env, collection);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    n = 0;
+  }
+  for (ptrdiff_t i = 0; i < n; i++) {
+    emacs_value value = env->vec_get(env, collection, i);
+    struct Str s = copy_emacs_string(env, &bump, value);
+    /* If s.b is NULL here, the candidate could not be decoded even
+       after `encode-coding-string' coercion. Drop it now so it doesn't
+       occupy a batch slot. In practice this is rarely reached on
+       Emacs 30+: the coercion path accepts almost any input. */
+    if (!s.b) continue;
+
     if (!batches || (batches[batch_idx].len >= BATCH_SIZE && ++batch_idx >= capacity)) {
       capacity = batches ? 2 * capacity : 1;
       struct Batch *new_batches;
       if (!(new_batches = realloc(batches, capacity * sizeof *batches))) goto err;
       batches = new_batches;
-      for (size_t i = batch_idx; i < capacity; ++i) batches[i].len = 0;
+      for (size_t k = batch_idx; k < capacity; ++k) batches[k].len = 0;
     }
 
-    emacs_value value = env->funcall(env, Fcar, 1, (emacs_value[]) { list });
     struct Batch *batch = batches + batch_idx;
     struct Candidate *x = batch->xs + batch->len++;
-    if (!(x->s = copy_emacs_string(env, &bump, x->value = value)).b) goto err;
+    x->value = value;
+    x->s = s;
   }
 
   if (!batches) {
@@ -323,30 +383,65 @@ err:
   bump_free(bump);
   free(data);
 
-  if (!success) {
+  if (!success
+      && env->non_local_exit_check(env) == emacs_funcall_exit_return) {
+    /* Only signal a generic error if no more specific signal (such as
+       a `wrong-type-argument' from candidate validation) is already
+       pending. Otherwise we'd clobber the better diagnostic. */
     env->non_local_exit_signal(env, env->intern(env, "error"), Qnil);
   }
   return result;
 }
 
+/* Signal `(wrong-type-argument stringp VALUE)' if VALUE is not a string.
+   Returns true on failure (caller should return immediately). */
+static bool signal_if_not_string(emacs_env *env, emacs_value value) {
+  if (env->eq(env, env->type_of(env, value), env->intern(env, "string"))) {
+    return false;
+  }
+  emacs_value data_args[] = { env->intern(env, "stringp"), value };
+  env->non_local_exit_signal(env, env->intern(env, "wrong-type-argument"),
+                              env->funcall(env, Flist, 2, data_args));
+  return true;
+}
+
 // fzf-native-score STR QUERY &optional SLAB
 emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void UNUSED(*data_ptr)) {
+  if (signal_if_not_string(env, args[0]) || signal_if_not_string(env, args[1])) {
+    return Qnil;
+  }
+
   // Short-circuit if QUERY is empty.
   ptrdiff_t query_len;
-  env->copy_string_contents(env, args[1], NULL, &query_len);
-  if (query_len == /* solely null byte */ 1) {
+  if (!env->copy_string_contents(env, args[1], NULL, &query_len)) {
+    /* Length probe failed (likely unicode-string-p on invalid unibyte).
+       Clear the exit and let the full copy path try coercion below. */
+    env->non_local_exit_clear(env);
+    query_len = 0;
+  } else if (query_len == /* solely null byte */ 1) {
     return Qlistofzero;
   }
 
   // Short-circuit if STR is empty.
   ptrdiff_t str_len;
-  env->copy_string_contents(env, args[0], NULL, &str_len);
-  if (str_len == /* solely null byte */ 1) {
+  if (!env->copy_string_contents(env, args[0], NULL, &str_len)) {
+    env->non_local_exit_clear(env);
+    str_len = 0;
+  } else if (str_len == /* solely null byte */ 1) {
     return Qlistofzero;
   }
 
-  int success = false;
   struct Bump *bump = NULL;
+  /* Default result on coercion failure: `(0)' - same shape as the
+     empty-string short-circuit, meaning "no match". A string that
+     cannot be coerced through `encode-coding-string' is treated as
+     equivalent to a string with no matchable content. (In practice
+     this path is rarely reached on Emacs 30+: encode-coding-string
+     accepts almost any input and round-trips it to a byte sequence
+     that fzf can score normally. Keeping the fallback as a safety
+     net for the truly pathological case.) Also fixes a latent UB
+     where `result' was used uninitialized on goto err. */
+  emacs_value result = Qlistofzero;
 
   struct Str str = copy_emacs_string(env, &bump, args[0]);
   if (!str.b) { goto err; }
@@ -390,8 +485,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
     result_array[offset + i] = env->make_integer(env, pos->data[len - (i + 1)]);
   }
 
-  emacs_value result = env->funcall(env, Flist, offset + len, result_array);
-  success = true;
+  result = env->funcall(env, Flist, offset + len, result_array);
   fzf_free_positions(pos);
   fzf_free_pattern(pattern);
 
@@ -404,10 +498,10 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
 
 err:
   bump_free(bump);
-  if (!success) {
-    env->non_local_exit_signal(env, env->intern(env, "error"), Qnil);
-  }
-
+  /* On coercion failure we return Qlistofzero (no match) rather than
+     signaling, so a single un-coerceable input doesn't blow up a
+     larger completion batch. Empty STR/QUERY short-circuit to the
+     same value above. */
   return result;
 }
 
@@ -504,6 +598,7 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Fhashtablep = env->make_global_ref(env, env->intern(env, "hash-table-p"));
   Fmessage = env->make_global_ref(env, env->intern(env, "message"));
   Fvectorp = env->make_global_ref(env, env->intern(env, "vectorp"));
+  Fvconcat = env->make_global_ref(env, env->intern(env, "vconcat"));
   Fconsp = env->make_global_ref(env, env->intern(env, "consp"));
   Ffunctionp = env->make_global_ref(env, env->intern(env, "functionp"));
   Fsymbolp = env->make_global_ref(env, env->intern(env, "symbolp"));
@@ -516,11 +611,11 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Fcar = env->make_global_ref(env, env->intern(env, "car"));
   Qcompletion_score = env->make_global_ref(env, env->intern(env, "completion-score"));
   Fput_text_property = env->make_global_ref(env, env->intern(env, "put-text-property"));
-
+  Fencode_coding_string = env->make_global_ref(env, env->intern(env, "encode-coding-string"));
+  Qutf_8 = env->make_global_ref(env, env->intern(env, "utf-8"));
   Qlistofzero = env->make_global_ref(
     env, env->funcall(env, Fcons, 2,
                       (emacs_value[]){env->make_integer(env, 0), Qnil}));
-
   Qzero = env->make_global_ref(env, env->make_integer(env, 0));
   Qone = env->make_global_ref(env, env->make_integer(env, 1));
 
