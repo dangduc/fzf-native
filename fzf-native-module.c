@@ -250,8 +250,18 @@ emacs_value fzf_native_score_all(emacs_env *env,
                                  void UNUSED(*data_ptr)) {
   struct Data *data = NULL;
   struct Bump *bump = NULL;
+  struct Batch *batches = NULL;
   int success = false;
   emacs_value result = Qnil;
+
+  struct Str query = copy_emacs_string(env, &bump, args[1]);
+  if (!query.b) { goto err; }
+
+  if (query.len == 0) {
+    result = args[0];
+    success = true;
+    goto err;
+  }
 
   // Collect all candidates.
   // Convert list to vector to minimize calls back to Emacs.
@@ -263,7 +273,6 @@ emacs_value fzf_native_score_all(emacs_env *env,
     }
   }
 
-  struct Batch *batches = NULL;
   size_t batch_idx = 0, capacity;
 
   ptrdiff_t n = env->vec_size(env, collection);
@@ -297,10 +306,6 @@ emacs_value fzf_native_score_all(emacs_env *env,
   if (!batches) {
     return Qnil;
   }
-
-  /* struct Str query = copy_emacs_string(env, &bump, QUERY); */
-  struct Str query = copy_emacs_string(env, &bump, args[1]);
-  if (!query.b) { goto err; }
 
   struct Shared shared = {
     .query = query,

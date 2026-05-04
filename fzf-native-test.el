@@ -266,3 +266,8 @@ below assert the absence of a signal, not any particular score.")
     (should (eq (car result) orig))
     ;; `completion-score' is attached to the original object.
     (should (get-text-property 0 'completion-score (car result)))))
+
+(ert-deftest fzf-native-score-all-empty-query-test ()
+  (let* ((coll ["a" "b" "c"])
+         (result (fzf-native-score-all coll "")))
+    (should (equal result coll))))
