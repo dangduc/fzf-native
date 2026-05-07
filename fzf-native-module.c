@@ -294,6 +294,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
   struct Str query = copy_emacs_string(env, &bump, args[1]);
   if (!query.b) { goto err; }
 
+  fzf_log("fzf_native_score_all START: query='%.*s'\n", (int)query.len, query.b);
 
   // Return all candidates if query is empty with doing anything else.
   if (query.len == 0) {
@@ -420,6 +421,7 @@ err_join_threads:
     result = env->funcall(env, Fcons, 2, (emacs_value[]) { xs[i].value, result });
   }
 
+  fzf_log("fzf_native_score_all DONE: query='%.*s' count=%zu\n", (int)query.len, query.b, n);
   free(xs);
 
 err:
@@ -492,6 +494,8 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
 
   struct Str query = copy_emacs_string(env, &bump, args[1]);
   if (!query.b) { goto err; }
+
+  fzf_log("fzf_native_score: str='%.*s' query='%.*s'\n", (int)str.len, str.b, (int)query.len, query.b);
 
   /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
    * normalize bool     : Always set to false because its not implemented yet.
