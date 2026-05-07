@@ -192,6 +192,39 @@ static int cmp_candidate(const void *a, const void *b) {
   /* return ((struct Candidate *) a)->score - ((struct Candidate *) b)->score; */
 }
 
+/* Counting sort of xs[0..n-1] by score, descending.
+   O(n + max_score). Falls back to qsort if allocations fail.
+   Stable: same-score candidates keep input order.
+   Caller must ensure every xs[i].score >= 0; negative scores would
+   index count[] out of bounds (undefined behavior). */
+static void counting_sort_candidates(struct Candidate *xs, size_t n) {
+  if (n <= 1) return;
+  /* For tiny inputs, qsort beats counting sort because the malloc/calloc
+     round-trip dominates. Threshold chosen empirically; below ~64 the two
+     are within noise on M-series and recent x86. */
+  if (n < 64) { qsort(xs, n, sizeof *xs, cmp_candidate); return; }
+  int max_score = 0;
+  for (size_t i = 0; i < n; i++)
+    if (xs[i].score > max_score) max_score = xs[i].score;
+
+  int *count = calloc((size_t)(max_score + 1), sizeof *count);
+  if (!count) { qsort(xs, n, sizeof *xs, cmp_candidate); return; }
+
+  for (size_t i = 0; i < n; i++) count[xs[i].score]++;
+
+  /* Convert counts to start positions for descending order. */
+  int pos = 0;
+  for (int s = max_score; s >= 0; s--) { int c = count[s]; count[s] = pos; pos += c; }
+
+  struct Candidate *out = malloc(n * sizeof *out);
+  if (!out) { free(count); qsort(xs, n, sizeof *xs, cmp_candidate); return; }
+
+  for (size_t i = 0; i < n; i++) out[count[xs[i].score]++] = xs[i];
+  memcpy(xs, out, n * sizeof *xs);
+  free(out);
+  free(count);
+}
+
 struct Batch {
   unsigned len;
   struct Candidate xs[BATCH_SIZE];
@@ -378,7 +411,7 @@ err_join_threads:
     pos += n;
   }
 
-  qsort(xs, len, sizeof *xs, cmp_candidate); // Sort the completions
+  counting_sort_candidates(xs, len);
 
   for (size_t i = len; i-- > 0;) {
     /* printf("zero: %jd one: %jd score: %d", */
