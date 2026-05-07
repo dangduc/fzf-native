@@ -89,6 +89,30 @@ the executable."
         (error "Compilation of `fzf-native' module failed!")))))
 
 ;;;###autoload
+(defun fzf-native-module-compile-with-logging ()
+  "Compile fzf-native-module with file logging enabled.
+Sets FZF_NATIVE_DEBUG=1 so CMake compiles in the log-to-file path.
+Logs are written to ~/.emacs.d/fzf-native.log and truncated on each
+module load."
+  (interactive)
+  (when (fzf-native-module--cmake-is-available)
+    (let* ((fzf-native-directory
+            (shell-quote-argument
+             (file-name-directory (locate-library "fzf-native.el" t))))
+           (make-commands
+            (concat
+             "cd " fzf-native-directory " ; "
+             "FZF_NATIVE_DEBUG=1 cmake -B build/ " fzf-native-module-cmake-args " && "
+             "cmake --build build/"))
+           (buffer (get-buffer-create fzf-native-module-install-buffer-name)))
+      (pop-to-buffer buffer)
+      (compilation-mode)
+      (if (zerop (let ((inhibit-read-only t))
+                   (call-process "sh" nil buffer t "-c" make-commands)))
+          (message "Compilation of `fzf-native' module with logging succeeded")
+        (error "Compilation of `fzf-native' module with logging failed!")))))
+
+;;;###autoload
 (defun fzf-native-load-dyn ()
   "Load dynamic module."
   (interactive)
