@@ -623,7 +623,7 @@ typedef struct {
   pthread_t     reader;
   pid_t         pid;
   FILE         *fp;
-  volatile bool stop;
+  _Atomic bool stop;
 
   pthread_mutex_t mu;
   char          **cands;
@@ -639,7 +639,7 @@ static void *async_reader(void *arg) {
   AsyncSession *s = arg;
   fzf_log("async_reader START: pid=%d\n", (int)s->pid);
   char line[ASYNC_LINE_MAX];
-  while (!s->stop && s->fp && fgets(line, sizeof line, s->fp)) {
+  while (!atomic_load_explicit(&s->stop, memory_order_relaxed) && s->fp && fgets(line, sizeof line, s->fp)) {
     size_t len = strlen(line);
     while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
       line[--len] = '\0';
@@ -671,7 +671,7 @@ static void async_session_destroy(void *ptr) {
   AsyncSession *s = ptr;
   if (!s) return;
   fzf_log("async_session_destroy: pid=%d count=%zu\n", (int)s->pid, s->count);
-  s->stop = true;
+  atomic_store_explicit(&s->stop, true, memory_order_relaxed);
   /* SIGTERM → child exits → pipe EOF → fgets returns NULL → reader exits */
   if (s->pid > 0) kill(s->pid, SIGTERM);
   pthread_join(s->reader, NULL);
