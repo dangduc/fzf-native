@@ -24,6 +24,11 @@
 (declare-function fzf-native-score "fzf-native-module" (str query &optional slab))
 (declare-function fzf-native-make-default-slab "fzf-native-module" ())
 (declare-function fzf-native-make-slab "fzf-native-module" (size16 size32))
+(declare-function fzf-native-async-start "fzf-native-module" (command &optional dir))
+(declare-function fzf-native-async-stop "fzf-native-module" (handle))
+(declare-function fzf-native-async-generation "fzf-native-module" (handle))
+(declare-function fzf-native-async-candidates "fzf-native-module" (handle filter &optional limit))
+(declare-function fzf-native-async-stats "fzf-native-module" (handle))
 
 (defconst fzf-native--dyn-name "fzf-native-module"
   "Dynamic module name.")
