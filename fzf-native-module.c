@@ -294,6 +294,8 @@ emacs_value fzf_native_score_all(emacs_env *env,
   struct Str query = copy_emacs_string(env, &bump, args[1]);
   if (!query.b) { goto err; }
 
+
+  // Return all candidates if query is empty with doing anything else.
   if (query.len == 0) {
     result = args[0];
     success = true;
