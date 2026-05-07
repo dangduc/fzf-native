@@ -76,6 +76,14 @@ set_target_properties(
              LIBRARY_OUTPUT_DIRECTORY ${OUTPUT_DIR}
              RUNTIME_OUTPUT_DIRECTORY ${OUTPUT_DIR})
 
+# Compile-time logging gate. fzf_log() is compiled out of the module by
+# default. Enable with: FZF_NATIVE_DEBUG=1 cmake -B build
+# When toggling, run `make clean` first so CMake reconfigures cleanly.
+if(DEFINED ENV{FZF_NATIVE_DEBUG})
+  target_compile_definitions(fzf-native-module PRIVATE FZF_NATIVE_DEBUG)
+  message(STATUS "FZF_NATIVE_DEBUG enabled — file logging compiled in")
+endif()
+
 # --- Debug / Sanitizer flags (Linux/GCC/Clang only) ---
 if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
 

@@ -26,10 +26,19 @@ format:
 
 # --- Native module build targets ---
 
-# Standard release build (RelWithDebInfo, same as the cmake default)
+# Standard release build (RelWithDebInfo, same as the cmake default).
+# Logging is compiled out unless FZF_NATIVE_DEBUG=1 is set in the env.
 .PHONY: build
 build:
 	cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=RelWithDebInfo
+	cmake --build $(BUILD_DIR)
+
+# Release build with file logging compiled in. Logs to ~/.emacs.d/fzf-native.log,
+# truncated on each module load. Cleans first so CMake re-reads the env var.
+.PHONY: build-log
+build-log:
+	rm -rf $(BUILD_DIR)
+	FZF_NATIVE_DEBUG=1 cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=RelWithDebInfo
 	cmake --build $(BUILD_DIR)
 
 # Full debug build: symbols, no optimization, accurate stack frames

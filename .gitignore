@@ -3,3 +3,4 @@ build
 .ccls-cache
 /.eask/
 /dist/
+fzf-native.log
