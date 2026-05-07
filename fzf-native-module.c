@@ -198,7 +198,7 @@ struct Batch {
 };
 
 struct Shared {
-  const struct Str query;
+  fzf_pattern_t *pattern;
   struct Batch *const batches;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
   _Atomic ssize_t remaining;
@@ -214,27 +214,8 @@ static void *worker_routine(void *ptr) {
   fzf_slab_t *slab = fzf_make_default_slab();
 
   struct Shared *shared = ptr;
-  struct Str shared_query = shared->query;
-  fzf_pattern_t *pattern = NULL;
-  char *query_scratch = NULL;
+  fzf_pattern_t *pattern = shared->pattern;
   ssize_t batch_idx;
-
-  if (shared_query.b) {
-    query_scratch = malloc(shared_query.len + 1);
-    if (query_scratch) {
-      // Create a fresh copy of the query string for this pattern,
-      // since fzf_parse_pattern mutilates the string it parses.
-      memcpy(query_scratch, shared_query.b, shared_query.len + 1);
-
-     /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
-      * normalize bool     : Always set to false because its not implemented yet.
-      *                      This is reserved for future use
-      * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
-      * fuzzy bool         : Enable or disable fuzzy matching
-      */
-      pattern = fzf_parse_pattern(CaseIgnore, false, query_scratch, true);
-    }
-  }
 
 #ifdef _WIN32
   while ((batch_idx = --shared->remaining) >= 0) {
@@ -267,13 +248,6 @@ static void *worker_routine(void *ptr) {
     batch->len = n;
   }
 
-  if (pattern) {
-    fzf_free_pattern(pattern);
-  }
-
-  if (query_scratch) {
-    free(query_scratch);
-  }
   // Free one-time use slab.
   fzf_free_slab(slab);
   /* printf("-----\nEnding Worker Routine\n-----\n"); */
@@ -347,8 +321,9 @@ emacs_value fzf_native_score_all(emacs_env *env,
     return Qnil;
   }
 
+  fzf_pattern_t *pattern = fzf_parse_pattern(CaseIgnore, false, query.b, true);
   struct Shared shared = {
-    .query = query,
+    .pattern = pattern,
     .batches = batches,
     .remaining = batch_idx + 1,
   };
@@ -365,6 +340,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
   unsigned max_workers = sysconf(_SC_NPROCESSORS_ONLN);
 
   if (!(data = malloc(sizeof *data + max_workers * sizeof *data->threads))) {
+    fzf_free_pattern(pattern);
     goto err;
   }
   *data = (struct Data) { max_workers };
@@ -382,6 +358,7 @@ err_join_threads:
   // Wait for all worker threads
   for (unsigned i = 0; i < num_workers; ++i) pthread_join(data->threads[i], NULL);
 #endif
+  if (pattern) fzf_free_pattern(pattern);
   if (!success) goto err;
   if (env->process_input(env) == emacs_process_input_quit) goto err;
 
