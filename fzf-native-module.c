@@ -952,6 +952,13 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
   for (size_t i = emit; i-- > 0;) {
     emacs_value str = env->make_string(env, flat[i].str,
                                        (ptrdiff_t)strlen(flat[i].str));
+    /* make_string signals if the shell emitted non-UTF-8 bytes (e.g. a
+       Latin-1 filename on a non-UTF-8 filesystem).  Skip the offending
+       candidate rather than truncating the rest of the list. */
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+      env->non_local_exit_clear(env);
+      continue;
+    }
     result = env->funcall(env, Fcons, 2, (emacs_value[]){ str, result });
   }
 
