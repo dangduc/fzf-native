@@ -7,6 +7,7 @@
 #include "emacs-module.h"
 #include "fzf.h"
 #include <stdio.h>
+#include <stdarg.h>
 
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <stdatomic.h>
@@ -19,6 +20,42 @@
 #  define EXPORT __declspec(dllexport)
 #else
 #  define EXPORT
+#endif
+
+/* Compile-time logging gate. Build with FZF_NATIVE_DEBUG=1 to enable
+   file logging; otherwise fzf_log() is a no-op macro and all call-site
+   args are discarded by the preprocessor (zero runtime cost). */
+#ifdef FZF_NATIVE_DEBUG
+static FILE *fzf_log_file = NULL;
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+static pthread_mutex_t fzf_log_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+static void fzf_log(const char *format, ...) {
+  if (!fzf_log_file) return;
+
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+  pthread_mutex_lock(&fzf_log_mu);
+#endif
+
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  char tstr[64];
+  strftime(tstr, sizeof(tstr), "%Y-%m-%d %H:%M:%S", t);
+
+  fprintf(fzf_log_file, "[%s] ", tstr);
+  va_list args;
+  va_start(args, format);
+  vfprintf(fzf_log_file, format, args);
+  va_end(args);
+  fflush(fzf_log_file);
+
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+  pthread_mutex_unlock(&fzf_log_mu);
+#endif
+}
+#else
+#define fzf_log(...) ((void)0)
 #endif
 
 /** See https://wambold.com/Martin/writings/alignof.html */
@@ -543,6 +580,25 @@ int emacs_module_init(struct emacs_runtime *rt) {
   emacs_env *env = rt->get_environment(rt);
   if ((size_t) env->size < sizeof *env)
     return 2;
+
+#ifdef FZF_NATIVE_DEBUG
+  /* Bootstrap the log file at ~/.emacs.d/fzf-native.log. Truncate on each
+     module load so logs don't grow unboundedly across Emacs sessions. */
+  if (!fzf_log_file) {
+    const char *home = getenv("HOME");
+    if (home) {
+      char path[1024];
+      int n = snprintf(path, sizeof(path), "%s/.emacs.d/fzf-native.log", home);
+      if (n > 0 && (size_t)n < sizeof(path)) {
+        remove(path); /* delete prior log if present; ignore error */
+        fzf_log_file = fopen(path, "a");
+        if (fzf_log_file) {
+          fzf_log("--- fzf-native module initialized ---\n");
+        }
+      }
+    }
+  }
+#endif
 
   static struct Data data;
 
