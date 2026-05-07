@@ -14,6 +14,9 @@
 #include <pthread.h>
 // for sysconf(_SC_NPROCESSORS_ONLN);
 #include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 #endif
 
 #ifdef _WIN32
@@ -57,6 +60,8 @@ static void fzf_log(const char *format, ...) {
 #else
 #define fzf_log(...) ((void)0)
 #endif
+
+static struct emacs_runtime *global_rt;
 
 /** See https://wambold.com/Martin/writings/alignof.html */
 #define ALIGNOF(type) offsetof (struct { char c; type member; }, member)
@@ -589,6 +594,392 @@ emacs_value fzf_native_make_slab(emacs_env *env,
   return env->make_user_ptr(env, slab_finalize, slab);
 }
 
+/* ================================================================
+   Async shell completion
+   ================================================================ */
+
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+
+#define ASYNC_INIT_CAP 4096
+#define ASYNC_LINE_MAX 8192
+
+/* Strip ANSI CSI escape sequences (ESC [ ... m) in-place. */
+static size_t async_strip_ansi(char *s, size_t len) {
+  size_t r = 0, w = 0;
+  while (r < len) {
+    if (s[r] == 0x1b && r + 1 < len && s[r + 1] == '[') {
+      r += 2;
+      while (r < len && s[r] != 'm') r++;
+      if (r < len) r++;
+    } else {
+      s[w++] = s[r++];
+    }
+  }
+  s[w] = '\0';
+  return w;
+}
+
+typedef struct {
+  pthread_t     reader;
+  pid_t         pid;
+  FILE         *fp;
+  volatile bool stop;
+
+  pthread_mutex_t mu;
+  char          **cands;
+  size_t          count;
+  size_t          cap;
+  _Atomic int     gen;
+
+  size_t          last_filtered;   /* candidates matching last filter */
+  size_t          last_total;      /* total candidates at last call */
+} AsyncSession;
+
+static void *async_reader(void *arg) {
+  AsyncSession *s = arg;
+  fzf_log("async_reader START: pid=%d\n", (int)s->pid);
+  char line[ASYNC_LINE_MAX];
+  while (!s->stop && s->fp && fgets(line, sizeof line, s->fp)) {
+    size_t len = strlen(line);
+    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len] = '\0';
+    len = async_strip_ansi(line, len);
+    if (!len) continue;
+
+    char *dup = strdup(line);
+    if (!dup) continue;
+
+    pthread_mutex_lock(&s->mu);
+    if (s->count >= s->cap) {
+      size_t  ncap = s->cap * 2;
+      fzf_log("async_reader: reallocating candidates %zu -> %zu\n", s->cap, ncap);
+      char  **nc   = realloc(s->cands, ncap * sizeof *nc);
+      if (!nc) { free(dup); pthread_mutex_unlock(&s->mu); continue; }
+      s->cands = nc;
+      s->cap   = ncap;
+    }
+    s->cands[s->count++] = dup;
+    pthread_mutex_unlock(&s->mu);
+    atomic_fetch_add_explicit(&s->gen, 1, memory_order_relaxed);
+  }
+  fzf_log("async_reader EXIT: total=%zu gen=%d\n",
+          s->count, (int)atomic_load_explicit(&s->gen, memory_order_relaxed));
+  return NULL;
+}
+
+static void async_session_destroy(void *ptr) {
+  AsyncSession *s = ptr;
+  if (!s) return;
+  fzf_log("async_session_destroy: pid=%d count=%zu\n", (int)s->pid, s->count);
+  s->stop = true;
+  /* SIGTERM → child exits → pipe EOF → fgets returns NULL → reader exits */
+  if (s->pid > 0) kill(s->pid, SIGTERM);
+  pthread_join(s->reader, NULL);
+  if (s->fp)      { fclose(s->fp); s->fp = NULL; }
+  if (s->pid > 0) { waitpid(s->pid, NULL, 0); s->pid = -1; }
+  pthread_mutex_lock(&s->mu);
+  for (size_t i = 0; i < s->count; i++) free(s->cands[i]);
+  free(s->cands);
+  pthread_mutex_unlock(&s->mu);
+  pthread_mutex_destroy(&s->mu);
+  free(s);
+}
+
+/* fzf-native-async-start COMMAND &optional DIR -> session handle */
+static emacs_value
+fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
+                       emacs_value args[], void *UNUSED(data)) {
+  ptrdiff_t len = 0;
+  env->copy_string_contents(env, args[0], NULL, &len);
+  char *cmd = malloc((size_t)len);
+  if (!cmd) return Qnil;
+  env->copy_string_contents(env, args[0], cmd, &len);
+
+  char *dir = NULL;
+  if (nargs > 1 && !env->eq(env, args[1], Qnil)) {
+    ptrdiff_t dlen = 0;
+    env->copy_string_contents(env, args[1], NULL, &dlen);
+    dir = malloc((size_t)dlen);
+    if (dir) env->copy_string_contents(env, args[1], dir, &dlen);
+  }
+
+  int pfd[2];
+  if (pipe(pfd) != 0) {
+    fzf_log("async_start: pipe failed\n");
+    free(cmd);
+    free(dir);
+    return Qnil;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    fzf_log("async_start: fork failed\n");
+    close(pfd[0]);
+    close(pfd[1]);
+    free(cmd);
+    free(dir);
+    return Qnil;
+  }
+
+  if (pid == 0) {
+    close(pfd[0]);
+    dup2(pfd[1], STDOUT_FILENO);
+    close(pfd[1]);
+    int dn = open("/dev/null", O_WRONLY);
+    if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+    if (dir) chdir(dir);
+    execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+    _exit(127);
+  }
+  close(pfd[1]);
+
+  AsyncSession *s = calloc(1, sizeof *s);
+  if (!s) {
+    fzf_log("async_start: calloc failed\n");
+    close(pfd[0]);
+    kill(pid, SIGTERM);
+    waitpid(pid, NULL, 0);
+    free(cmd);
+    free(dir);
+    return Qnil;
+  }
+
+  fzf_log("async_start: cmd='%s' dir='%s' pid=%d\n",
+          cmd, dir ? dir : ".", (int)pid);
+
+  free(cmd);
+  free(dir);
+
+  s->pid   = pid;
+  s->fp    = fdopen(pfd[0], "r");
+  s->cap   = ASYNC_INIT_CAP;
+  s->cands = malloc(s->cap * sizeof *s->cands);
+  pthread_mutex_init(&s->mu, NULL);
+  atomic_store(&s->gen, 0);
+
+  if (!s->fp || !s->cands ||
+      pthread_create(&s->reader, NULL, async_reader, s) != 0) {
+    async_session_destroy(s);
+    return Qnil;
+  }
+  return env->make_user_ptr(env, async_session_destroy, s);
+}
+
+/* fzf-native-async-stop HANDLE */
+static emacs_value
+fzf_native_async_stop(emacs_env *env, ptrdiff_t nargs,
+                      emacs_value args[], void *UNUSED(data)) {
+  (void)nargs;
+  AsyncSession *s = env->get_user_ptr(env, args[0]);
+  if (s) {
+    fzf_log("async_stop: pid=%d total=%zu\n", (int)s->pid, s->count);
+    env->set_user_ptr(env, args[0], NULL);
+    async_session_destroy(s);
+  }
+  return Qnil;
+}
+
+/* fzf-native-async-generation HANDLE -> integer */
+static emacs_value
+fzf_native_async_generation(emacs_env *env, ptrdiff_t nargs,
+                             emacs_value args[], void *UNUSED(data)) {
+  (void)nargs;
+  AsyncSession *s = env->get_user_ptr(env, args[0]);
+  if (!s) return Qnil;
+  return env->make_integer(env,
+    atomic_load_explicit(&s->gen, memory_order_relaxed));
+}
+
+typedef struct { char *str; int score; } ScoredStr;
+static int cmp_scored_desc(const void *a, const void *b) {
+  return ((const ScoredStr *)b)->score - ((const ScoredStr *)a)->score;
+}
+
+/* Counting sort of xs[0..n-1] by score, descending.
+   O(n + max_score). Falls back to qsort if allocations fail. */
+static void counting_sort_scored(ScoredStr *xs, size_t n) {
+  if (n <= 1) return;
+  int max_score = 0;
+  for (size_t i = 0; i < n; i++)
+    if (xs[i].score > max_score) max_score = xs[i].score;
+
+  int *count = calloc((size_t)(max_score + 1), sizeof *count);
+  if (!count) { qsort(xs, n, sizeof *xs, cmp_scored_desc); return; }
+
+  for (size_t i = 0; i < n; i++) count[xs[i].score]++;
+
+  /* Convert counts to start positions for descending order. */
+  int pos = 0;
+  for (int s = max_score; s >= 0; s--) { int c = count[s]; count[s] = pos; pos += c; }
+
+  ScoredStr *out = malloc(n * sizeof *out);
+  if (!out) { free(count); qsort(xs, n, sizeof *xs, cmp_scored_desc); return; }
+
+  for (size_t i = 0; i < n; i++) out[count[xs[i].score]++] = xs[i];
+  memcpy(xs, out, n * sizeof *xs);
+  free(out);
+  free(count);
+}
+
+struct AsyncScoringBatch {
+  unsigned len;
+  ScoredStr xs[BATCH_SIZE];
+};
+
+struct AsyncScoringShared {
+  fzf_pattern_t            *pattern;
+  struct AsyncScoringBatch *batches;
+  _Atomic ssize_t           remaining;
+};
+
+static void *async_scoring_worker(void *ptr) {
+  struct AsyncScoringShared *shared = ptr;
+  fzf_slab_t    *slab         = fzf_make_default_slab();
+  fzf_pattern_t *pattern      = shared->pattern;
+
+  ssize_t bi;
+  while ((bi = atomic_fetch_sub_explicit(&shared->remaining, 1,
+                                         memory_order_seq_cst) - 1) >= 0) {
+    struct AsyncScoringBatch *batch = shared->batches + bi;
+    unsigned n = 0;
+    for (unsigned i = 0; i < batch->len; i++) {
+      int sc = pattern ? fzf_get_score(batch->xs[i].str, pattern, slab) : 1;
+      if (!pattern || sc > 0) {
+        batch->xs[n]         = batch->xs[i];
+        batch->xs[n++].score = sc;
+      }
+    }
+    batch->len = n;
+  }
+
+  fzf_free_slab(slab);
+  return NULL;
+}
+
+/* fzf-native-async-candidates HANDLE FILTER &optional LIMIT -> list of strings, scored */
+static emacs_value
+fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
+                             emacs_value args[], void *UNUSED(data)) {
+  AsyncSession *s = env->get_user_ptr(env, args[0]);
+  if (!s) return Qnil;
+
+  ptrdiff_t flen = 0;
+  env->copy_string_contents(env, args[1], NULL, &flen);
+  char *filter = malloc((size_t)flen);
+  if (!filter) return Qnil;
+  env->copy_string_contents(env, args[1], filter, &flen);
+
+  fzf_log("async_candidates START: filter='%s' gen=%d\n",
+          filter, (int)atomic_load_explicit(&s->gen, memory_order_relaxed));
+
+  /* Snapshot candidate pointers under lock.
+     Strings are strdup'd and never freed until session destroy,
+     so pointers remain valid after we release the lock. */
+  pthread_mutex_lock(&s->mu);
+  size_t  count = s->count;
+  char  **snap  = count ? malloc(count * sizeof *snap) : NULL;
+  if (snap) memcpy(snap, s->cands, count * sizeof *snap);
+  pthread_mutex_unlock(&s->mu);
+
+  if (count && !snap) { free(filter); return Qnil; }
+
+  /* Distribute snap into BATCH_SIZE batches (same pattern as fzf_native_score_all) */
+  struct AsyncScoringBatch *batches = NULL;
+  size_t bi = 0, cap = 0;
+  for (size_t i = 0; i < count; i++) {
+    if (!batches || (batches[bi].len >= BATCH_SIZE && ++bi >= cap)) {
+      cap = cap ? cap * 2 : 1;
+      struct AsyncScoringBatch *nb = realloc(batches, cap * sizeof *nb);
+      if (!nb) { free(snap); free(filter); free(batches); return Qnil; }
+      for (size_t k = bi; k < cap; k++) nb[k].len = 0;
+      batches = nb;
+    }
+    batches[bi].xs[batches[bi].len].str   = snap[i];
+    batches[bi].xs[batches[bi].len].score = 0;
+    batches[bi].len++;
+  }
+
+  unsigned num_batches = count ? (unsigned)(bi + 1) : 0;
+  unsigned max_workers = (unsigned)sysconf(_SC_NPROCESSORS_ONLN);
+
+  fzf_pattern_t *pattern = (flen > 1) ? fzf_parse_pattern(CaseIgnore, false, filter, true) : NULL;
+  struct AsyncScoringShared shared = {
+    .pattern   = pattern,
+    .batches   = batches,
+    .remaining = num_batches,
+  };
+
+  pthread_t *threads    = malloc(max_workers * sizeof *threads);
+  unsigned  num_workers = 0;
+  if (threads && num_batches) {
+    for (; num_workers < MIN(max_workers, num_batches); num_workers++)
+      pthread_create(threads + num_workers, NULL, async_scoring_worker, &shared);
+  }
+  for (unsigned i = 0; i < num_workers; i++)
+    pthread_join(threads[i], NULL);
+  free(threads);
+
+  /* Compact all surviving entries into a flat array for sorting */
+  size_t total = 0;
+  for (unsigned i = 0; i < num_batches; i++) total += batches[i].len;
+
+  /* Optional limit: how many candidates to return to Elisp. */
+  size_t limit = 0;
+  if (nargs > 2 && !env->eq(env, args[2], Qnil))
+    limit = (size_t)env->extract_integer(env, args[2]);
+
+  ScoredStr *flat = total ? malloc(total * sizeof *flat) : NULL;
+  size_t pos = 0;
+  if (flat) {
+    for (unsigned i = 0; i < num_batches; i++) {
+      struct AsyncScoringBatch *b = batches + i;
+      for (unsigned j = 0; j < b->len; j++)
+        flat[pos++] = b->xs[j];
+    }
+    if (pattern && pos > 1)
+      counting_sort_scored(flat, pos);
+  }
+
+  /* Record stats (full filtered count, not the capped emit count). */
+  s->last_filtered = pos;
+  s->last_total    = count;
+
+  /* Emit at most `limit' candidates; 0 means no cap. */
+  size_t emit = (limit > 0 && limit < pos) ? limit : pos;
+
+  /* Build Emacs list on the main thread */
+  emacs_value result = Qnil;
+  for (size_t i = emit; i-- > 0;) {
+    emacs_value str = env->make_string(env, flat[i].str,
+                                       (ptrdiff_t)strlen(flat[i].str));
+    result = env->funcall(env, Fcons, 2, (emacs_value[]){ str, result });
+  }
+
+  fzf_log("async_candidates DONE: filter='%s' filtered=%zu total=%zu emit=%zu\n",
+          filter, s->last_filtered, s->last_total, emit);
+
+  if (pattern) fzf_free_pattern(pattern);
+  free(flat);
+  free(snap);
+  free(batches);
+  free(filter);
+  return result;
+}
+
+/* fzf-native-async-stats HANDLE -> (filtered . total) */
+static emacs_value
+fzf_native_async_stats(emacs_env *env, ptrdiff_t UNUSED(nargs),
+                       emacs_value args[], void *UNUSED(data)) {
+  AsyncSession *s = env->get_user_ptr(env, args[0]);
+  if (!s) return Qnil;
+  return env->funcall(env, Fcons, 2, (emacs_value[]){
+    env->make_integer(env, (intmax_t)s->last_filtered),
+    env->make_integer(env, (intmax_t)s->last_total),
+  });
+}
+
+#endif /* APPLE || linux || FreeBSD */
+
 int emacs_module_init(struct emacs_runtime *rt) {
   // Verify compatability with Emacs executable loading this module
   if ((size_t) rt->size < sizeof *rt)
@@ -596,6 +987,8 @@ int emacs_module_init(struct emacs_runtime *rt) {
   emacs_env *env = rt->get_environment(rt);
   if ((size_t) env->size < sizeof *env)
     return 2;
+
+  global_rt = rt;
 
 #ifdef FZF_NATIVE_DEBUG
   /* Bootstrap the log file at ~/.emacs.d/fzf-native.log. Truncate on each
@@ -640,6 +1033,42 @@ int emacs_module_init(struct emacs_runtime *rt) {
 
   env->funcall(env, env->intern(env, "provide"), 1,
                (emacs_value[]) { env->intern(env, "fzf-native-module") });
+
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-start"),
+      env->make_function(env, 1, 2, fzf_native_async_start,
+                         "Start async shell COMMAND; return a session handle.\n"
+                         "Optional DIR sets the working directory (default: Emacs cwd).\n\n"
+                         "\\(fn COMMAND &optional DIR)", NULL),
+    });
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-stop"),
+      env->make_function(env, 1, 1, fzf_native_async_stop,
+                         "Stop async session HANDLE and free resources.\n\n"
+                         "\\(fn HANDLE)", NULL),
+    });
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-generation"),
+      env->make_function(env, 1, 1, fzf_native_async_generation,
+                         "Return candidate-count generation for HANDLE.\n\n"
+                         "\\(fn HANDLE)", NULL),
+    });
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-candidates"),
+      env->make_function(env, 2, 3, fzf_native_async_candidates,
+                         "Return fzf-scored candidates from HANDLE matching FILTER.\n"
+                         "Optional LIMIT caps the number of candidates returned to Elisp;\n"
+                         "use `fzf-native-async-stats' to get the full filtered count.\n\n"
+                         "\\(fn HANDLE FILTER &optional LIMIT)", NULL),
+    });
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-stats"),
+      env->make_function(env, 1, 1, fzf_native_async_stats,
+                         "Return (FILTERED . TOTAL) counts from the last async-candidates call.\n\n"
+                         "\\(fn HANDLE)", NULL),
+    });
+#endif
 
   // fzf-native-make-default-slab
   env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
