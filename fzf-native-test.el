@@ -271,3 +271,93 @@ below assert the absence of a signal, not any particular score.")
   (let* ((coll ["a" "b" "c"])
          (result (fzf-native-score-all coll "")))
     (should (equal result coll))))
+
+;;
+;; Async path (fzf-native-async-*)
+;;
+
+(defun fzf-native-test--wait-for-data (handle &optional timeout)
+  "Poll HANDLE until its generation advances past 0.
+Returns t when data has arrived, nil if TIMEOUT seconds elapsed (default 5)."
+  (let ((deadline (+ (float-time) (or timeout 5))))
+    (while (and (zerop (fzf-native-async-generation handle))
+                (< (float-time) deadline))
+      (sleep-for 0.05)))
+  (> (fzf-native-async-generation handle) 0))
+
+(ert-deftest fzf-native-async-lifecycle-test ()
+  "Start → wait for data → generation advances → stop."
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz")))
+    (unwind-protect
+        (should (fzf-native-test--wait-for-data handle))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-stop-invalidates-handle-test ()
+  "After stop, generation returns nil (handle is invalidated)."
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo")))
+    (fzf-native-test--wait-for-data handle)
+    (fzf-native-async-stop handle)
+    (should (null (fzf-native-async-generation handle)))))
+
+(ert-deftest fzf-native-async-candidates-empty-filter-test ()
+  "Empty filter returns all candidates."
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz")))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-data handle)
+          (let ((result (fzf-native-async-candidates handle "")))
+            (should (= (length result) 3))
+            (should (member "foo" result))
+            (should (member "bar" result))
+            (should (member "baz" result))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-candidates-filter-test ()
+  "Filter keeps matching candidates and drops non-matches."
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz foobaz")))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-data handle)
+          (let ((result (fzf-native-async-candidates handle "foo")))
+            (should (member "foo" result))
+            (should (member "foobaz" result))
+            (should-not (member "bar" result))
+            (should-not (member "baz" result))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-candidates-no-match-test ()
+  "Filter that matches nothing returns nil."
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz")))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-data handle)
+          (should (null (fzf-native-async-candidates handle "zzz"))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-candidates-limit-test ()
+  "LIMIT argument caps returned candidates."
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz foobaz")))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-data handle)
+          (let ((result (fzf-native-async-candidates handle "" 2)))
+            (should (= (length result) 2))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-stats-test ()
+  "Stats return (filtered . total) after scoring."
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz foobaz")))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-data handle)
+          (fzf-native-async-candidates handle "foo")
+          (let ((stats (fzf-native-async-stats handle)))
+            (should (consp stats))
+            (should (= (car stats) 2))    ; filtered: foo + foobaz
+            (should (= (cdr stats) 4))))  ; total: 4 candidates
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-start-wrong-type-test ()
+  "`fzf-native-async-start' signals on a non-string command."
+  (should-error (fzf-native-async-start 42)
+                :type 'wrong-type-argument))
