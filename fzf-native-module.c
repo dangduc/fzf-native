@@ -619,6 +619,8 @@ static size_t async_strip_ansi(char *s, size_t len) {
   return w;
 }
 
+typedef struct { char *str; int score; } ScoredStr;
+
 typedef struct {
   pthread_t     reader;
   pid_t         pid;
@@ -633,6 +635,19 @@ typedef struct {
 
   size_t          last_filtered;   /* candidates matching last filter */
   size_t          last_total;      /* total candidates at last call */
+
+  /* Background scoring thread */
+  pthread_t        score_thread;
+  pthread_mutex_t  score_req_mu;
+  pthread_cond_t   score_req_cond;
+  char            *score_req_filter;  /* owned; NULL = nothing pending */
+  size_t           score_req_limit;
+  bool             score_req_stop;
+  _Atomic bool     score_abort;       /* set to cancel in-flight workers */
+
+  pthread_mutex_t  score_res_mu;
+  ScoredStr       *score_results;     /* latest scored+sorted results */
+  size_t           score_count;       /* number of entries in score_results */
 } AsyncSession;
 
 static void *async_reader(void *arg) {
@@ -667,12 +682,30 @@ static void *async_reader(void *arg) {
   return NULL;
 }
 
+static void *scoring_thread_fn(void *arg);  /* defined after async_scoring_worker */
+
 static void async_session_destroy(void *ptr) {
   AsyncSession *s = ptr;
   if (!s) return;
   fzf_log("async_session_destroy: pid=%d count=%zu\n", (int)s->pid, s->count);
+
+  /* Stop scoring thread: abort in-flight workers, then send stop signal */
+  atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
+  pthread_mutex_lock(&s->score_req_mu);
+  free(s->score_req_filter);
+  s->score_req_filter = NULL;
+  s->score_req_stop   = true;
+  pthread_cond_signal(&s->score_req_cond);
+  pthread_mutex_unlock(&s->score_req_mu);
+  pthread_join(s->score_thread, NULL);
+
+  free(s->score_results);
+  pthread_mutex_destroy(&s->score_res_mu);
+  pthread_mutex_destroy(&s->score_req_mu);
+  pthread_cond_destroy(&s->score_req_cond);
+
+  /* Stop reader: SIGTERM → child exits → pipe EOF → fgets NULL → reader exits */
   atomic_store_explicit(&s->stop, true, memory_order_relaxed);
-  /* SIGTERM → child exits → pipe EOF → fgets returns NULL → reader exits */
   if (s->pid > 0) kill(s->pid, SIGTERM);
   pthread_join(s->reader, NULL);
   if (s->fp)      { fclose(s->fp); s->fp = NULL; }
@@ -755,10 +788,15 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   s->cap   = ASYNC_INIT_CAP;
   s->cands = malloc(s->cap * sizeof *s->cands);
   pthread_mutex_init(&s->mu, NULL);
+  pthread_mutex_init(&s->score_req_mu, NULL);
+  pthread_cond_init(&s->score_req_cond, NULL);
+  pthread_mutex_init(&s->score_res_mu, NULL);
   atomic_store(&s->gen, 0);
+  atomic_store(&s->score_abort, false);
 
   if (!s->fp || !s->cands ||
-      pthread_create(&s->reader, NULL, async_reader, s) != 0) {
+      pthread_create(&s->reader, NULL, async_reader, s) != 0 ||
+      pthread_create(&s->score_thread, NULL, scoring_thread_fn, s) != 0) {
     async_session_destroy(s);
     return Qnil;
   }
@@ -790,7 +828,6 @@ fzf_native_async_generation(emacs_env *env, ptrdiff_t nargs,
     atomic_load_explicit(&s->gen, memory_order_relaxed));
 }
 
-typedef struct { char *str; int score; } ScoredStr;
 static int cmp_scored_desc(const void *a, const void *b) {
   return ((const ScoredStr *)b)->score - ((const ScoredStr *)a)->score;
 }
@@ -830,6 +867,7 @@ struct AsyncScoringShared {
   fzf_pattern_t            *pattern;
   struct AsyncScoringBatch *batches;
   _Atomic ssize_t           remaining;
+  _Atomic bool             *stop;     /* points to session's score_abort */
 };
 
 static void *async_scoring_worker(void *ptr) {
@@ -840,6 +878,8 @@ static void *async_scoring_worker(void *ptr) {
   ssize_t bi;
   while ((bi = atomic_fetch_sub_explicit(&shared->remaining, 1,
                                          memory_order_seq_cst) - 1) >= 0) {
+    if (shared->stop && atomic_load_explicit(shared->stop, memory_order_relaxed))
+      break;
     struct AsyncScoringBatch *batch = shared->batches + bi;
     unsigned n = 0;
     for (unsigned i = 0; i < batch->len; i++) {
@@ -856,7 +896,127 @@ static void *async_scoring_worker(void *ptr) {
   return NULL;
 }
 
-/* fzf-native-async-candidates HANDLE FILTER &optional LIMIT -> list of strings, scored */
+static void *scoring_thread_fn(void *arg) {
+  AsyncSession *s = arg;
+  fzf_log("scoring_thread START\n");
+
+  for (;;) {
+    pthread_mutex_lock(&s->score_req_mu);
+    while (!s->score_req_stop && !s->score_req_filter)
+      pthread_cond_wait(&s->score_req_cond, &s->score_req_mu);
+    if (s->score_req_stop) {
+      pthread_mutex_unlock(&s->score_req_mu);
+      break;
+    }
+    char  *filter = s->score_req_filter;   /* steal ownership */
+    size_t limit  = s->score_req_limit;
+    s->score_req_filter = NULL;
+    pthread_mutex_unlock(&s->score_req_mu);
+
+    /* Reset abort flag AFTER stealing request so we don't race with the
+       next dispatch that may have already set it again. */
+    atomic_store_explicit(&s->score_abort, false, memory_order_seq_cst);
+
+    /* Snapshot candidate pointers (strings are stable until session destroy) */
+    pthread_mutex_lock(&s->mu);
+    size_t  count = s->count;
+    char  **snap  = count ? malloc(count * sizeof *snap) : NULL;
+    if (snap) memcpy(snap, s->cands, count * sizeof *snap);
+    pthread_mutex_unlock(&s->mu);
+
+    if (count && !snap) { free(filter); continue; }
+
+    /* Batch */
+    struct AsyncScoringBatch *batches = NULL;
+    size_t bi = 0, bcap = 0;
+    bool batch_ok = true;
+    for (size_t i = 0; i < count; i++) {
+      if (!batches || (batches[bi].len >= BATCH_SIZE && ++bi >= bcap)) {
+        bcap = bcap ? bcap * 2 : 1;
+        struct AsyncScoringBatch *nb = realloc(batches, bcap * sizeof *nb);
+        if (!nb) { batch_ok = false; break; }
+        for (size_t k = bi; k < bcap; k++) nb[k].len = 0;
+        batches = nb;
+      }
+      batches[bi].xs[batches[bi].len].str   = snap[i];
+      batches[bi].xs[batches[bi].len].score = 0;
+      batches[bi].len++;
+    }
+    if (!batch_ok) { free(snap); free(filter); free(batches); continue; }
+
+    unsigned num_batches = count ? (unsigned)(bi + 1) : 0;
+    unsigned max_workers = (unsigned)sysconf(_SC_NPROCESSORS_ONLN);
+
+    size_t flen = strlen(filter);
+    fzf_pattern_t *pattern = flen ? fzf_parse_pattern(CaseIgnore, false, filter, true) : NULL;
+    bool has_pattern = (pattern != NULL);
+
+    struct AsyncScoringShared shared = {
+      .pattern   = pattern,
+      .batches   = batches,
+      .remaining = num_batches,
+      .stop      = &s->score_abort,
+    };
+
+    pthread_t *threads    = malloc(max_workers * sizeof *threads);
+    unsigned   num_workers = 0;
+    if (threads && num_batches) {
+      for (; num_workers < MIN(max_workers, num_batches); num_workers++)
+        pthread_create(threads + num_workers, NULL, async_scoring_worker, &shared);
+    }
+    for (unsigned i = 0; i < num_workers; i++)
+      pthread_join(threads[i], NULL);
+    free(threads);
+    if (pattern) fzf_free_pattern(pattern);
+
+    /* If a newer request arrived while we were scoring, discard partial results. */
+    if (atomic_load_explicit(&s->score_abort, memory_order_relaxed)) {
+      free(snap); free(batches); free(filter);
+      continue;
+    }
+
+    /* Compact into flat array */
+    size_t total = 0;
+    for (unsigned i = 0; i < num_batches; i++) total += batches[i].len;
+
+    ScoredStr *flat = total ? malloc(total * sizeof *flat) : NULL;
+    size_t pos = 0;
+    if (flat) {
+      for (unsigned i = 0; i < num_batches; i++) {
+        struct AsyncScoringBatch *b = batches + i;
+        for (unsigned j = 0; j < b->len; j++)
+          flat[pos++] = b->xs[j];
+      }
+      if (has_pattern && pos > 1)
+        counting_sort_scored(flat, pos);
+    }
+
+    size_t emit = (limit && limit < pos) ? limit : pos;
+
+    pthread_mutex_lock(&s->score_res_mu);
+    free(s->score_results);
+    s->score_results = flat;
+    s->score_count   = emit;
+    s->last_filtered = pos;
+    s->last_total    = count;
+    pthread_mutex_unlock(&s->score_res_mu);
+
+    /* Increment gen so Elisp knows new results are available */
+    atomic_fetch_add_explicit(&s->gen, 1, memory_order_relaxed);
+
+    fzf_log("scoring_thread: filter='%s' filtered=%zu total=%zu emit=%zu\n",
+            filter, pos, count, emit);
+
+    free(snap); free(batches); free(filter);
+  }
+
+  fzf_log("scoring_thread EXIT\n");
+  return NULL;
+}
+
+/* fzf-native-async-candidates HANDLE FILTER &optional LIMIT -> list of strings, scored.
+   Returns immediately with the last completed scored results while dispatching a new
+   scoring job on the background thread.  Non-blocking on the main thread. */
 static emacs_value
 fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
                              emacs_value args[], void *UNUSED(data)) {
@@ -869,93 +1029,38 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
   if (!filter) return Qnil;
   env->copy_string_contents(env, args[1], filter, &flen);
 
-  fzf_log("async_candidates START: filter='%s' gen=%d\n",
-          filter, (int)atomic_load_explicit(&s->gen, memory_order_relaxed));
-
-  /* Snapshot candidate pointers under lock.
-     Strings are strdup'd and never freed until session destroy,
-     so pointers remain valid after we release the lock. */
-  pthread_mutex_lock(&s->mu);
-  size_t  count = s->count;
-  char  **snap  = count ? malloc(count * sizeof *snap) : NULL;
-  if (snap) memcpy(snap, s->cands, count * sizeof *snap);
-  pthread_mutex_unlock(&s->mu);
-
-  if (count && !snap) { free(filter); return Qnil; }
-
-  /* Distribute snap into BATCH_SIZE batches (same pattern as fzf_native_score_all) */
-  struct AsyncScoringBatch *batches = NULL;
-  size_t bi = 0, cap = 0;
-  for (size_t i = 0; i < count; i++) {
-    if (!batches || (batches[bi].len >= BATCH_SIZE && ++bi >= cap)) {
-      cap = cap ? cap * 2 : 1;
-      struct AsyncScoringBatch *nb = realloc(batches, cap * sizeof *nb);
-      if (!nb) { free(snap); free(filter); free(batches); return Qnil; }
-      for (size_t k = bi; k < cap; k++) nb[k].len = 0;
-      batches = nb;
-    }
-    batches[bi].xs[batches[bi].len].str   = snap[i];
-    batches[bi].xs[batches[bi].len].score = 0;
-    batches[bi].len++;
-  }
-
-  unsigned num_batches = count ? (unsigned)(bi + 1) : 0;
-  unsigned max_workers = (unsigned)sysconf(_SC_NPROCESSORS_ONLN);
-
-  fzf_pattern_t *pattern = (flen > 1) ? fzf_parse_pattern(CaseIgnore, false, filter, true) : NULL;
-  struct AsyncScoringShared shared = {
-    .pattern   = pattern,
-    .batches   = batches,
-    .remaining = num_batches,
-  };
-
-  pthread_t *threads    = malloc(max_workers * sizeof *threads);
-  unsigned  num_workers = 0;
-  if (threads && num_batches) {
-    for (; num_workers < MIN(max_workers, num_batches); num_workers++)
-      pthread_create(threads + num_workers, NULL, async_scoring_worker, &shared);
-  }
-  for (unsigned i = 0; i < num_workers; i++)
-    pthread_join(threads[i], NULL);
-  free(threads);
-
-  /* Compact all surviving entries into a flat array for sorting */
-  size_t total = 0;
-  for (unsigned i = 0; i < num_batches; i++) total += batches[i].len;
-
-  /* Optional limit: how many candidates to return to Elisp. */
   size_t limit = 0;
   if (nargs > 2 && !env->eq(env, args[2], Qnil))
     limit = (size_t)env->extract_integer(env, args[2]);
 
-  ScoredStr *flat = total ? malloc(total * sizeof *flat) : NULL;
-  size_t pos = 0;
-  if (flat) {
-    for (unsigned i = 0; i < num_batches; i++) {
-      struct AsyncScoringBatch *b = batches + i;
-      for (unsigned j = 0; j < b->len; j++)
-        flat[pos++] = b->xs[j];
-    }
-    if (pattern && pos > 1)
-      counting_sort_scored(flat, pos);
-  }
+  fzf_log("async_candidates: filter='%s' limit=%zu — dispatching to bg thread\n",
+          filter, limit);
 
-  /* Record stats (full filtered count, not the capped emit count). */
-  s->last_filtered = pos;
-  s->last_total    = count;
+  /* Cancel any in-flight scoring job, then enqueue the new request.
+     filter ownership is transferred to the scoring thread here. */
+  atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
+  pthread_mutex_lock(&s->score_req_mu);
+  free(s->score_req_filter);
+  s->score_req_filter = filter;   /* scoring thread owns this now */
+  s->score_req_limit  = limit;
+  pthread_cond_signal(&s->score_req_cond);
+  pthread_mutex_unlock(&s->score_req_mu);
 
-  /* Emit at most `limit' candidates; 0 means no cap. */
-  size_t emit = (limit > 0 && limit < pos) ? limit : pos;
+  /* Copy latest scored results under lock so we can release quickly */
+  pthread_mutex_lock(&s->score_res_mu);
+  size_t     rcount = s->score_count;
+  ScoredStr *snap   = rcount ? malloc(rcount * sizeof *snap) : NULL;
+  if (snap && s->score_results)
+    memcpy(snap, s->score_results, rcount * sizeof *snap);
+  else
+    rcount = 0;
+  pthread_mutex_unlock(&s->score_res_mu);
 
-  /* Build Emacs list on the main thread */
+  /* Build Emacs list from stale results — strings are stable until session destroy */
   emacs_value result = Qnil;
-  for (size_t i = emit; i-- > 0;) {
-    emacs_value str = env->make_string(env, flat[i].str,
-                                       (ptrdiff_t)strlen(flat[i].str));
-    /* make_string signals on non-UTF-8 bytes (e.g. Latin-1 filename):
-       clear that error and skip the candidate.  Any other exit kind
-       (quit from C-g, throw) must not be cleared — break and let it
-       propagate when the module function returns. */
+  for (size_t i = rcount; i-- > 0;) {
+    emacs_value str = env->make_string(env, snap[i].str,
+                                       (ptrdiff_t)strlen(snap[i].str));
     enum emacs_funcall_exit status = env->non_local_exit_check(env);
     if (status == emacs_funcall_exit_signal) {
       env->non_local_exit_clear(env);
@@ -964,20 +1069,11 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
       break;
     }
     result = env->funcall(env, Fcons, 2, (emacs_value[]){ str, result });
-    /* funcall can deliver a pending quit (C-g pressed during long scoring).
-       Stop building the list and let the signal propagate. */
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
       break;
   }
 
-  fzf_log("async_candidates DONE: filter='%s' filtered=%zu total=%zu emit=%zu\n",
-          filter, s->last_filtered, s->last_total, emit);
-
-  if (pattern) fzf_free_pattern(pattern);
-  free(flat);
   free(snap);
-  free(batches);
-  free(filter);
   return result;
 }
 
@@ -987,9 +1083,13 @@ fzf_native_async_stats(emacs_env *env, ptrdiff_t UNUSED(nargs),
                        emacs_value args[], void *UNUSED(data)) {
   AsyncSession *s = env->get_user_ptr(env, args[0]);
   if (!s) return Qnil;
+  pthread_mutex_lock(&s->score_res_mu);
+  size_t filtered = s->last_filtered;
+  size_t total    = s->last_total;
+  pthread_mutex_unlock(&s->score_res_mu);
   return env->funcall(env, Fcons, 2, (emacs_value[]){
-    env->make_integer(env, (intmax_t)s->last_filtered),
-    env->make_integer(env, (intmax_t)s->last_total),
+    env->make_integer(env, (intmax_t)filtered),
+    env->make_integer(env, (intmax_t)total),
   });
 }
 
