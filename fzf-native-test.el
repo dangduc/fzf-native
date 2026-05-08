@@ -285,6 +285,21 @@ Returns t when data has arrived, nil if TIMEOUT seconds elapsed (default 5)."
       (sleep-for 0.05)))
   (> (fzf-native-async-generation handle) 0))
 
+(defun fzf-native-test--wait-for-scoring (handle filter &optional limit timeout)
+  "Dispatch FILTER and poll until scoring completes; return candidates.
+Scoring is considered done when stats total > 0.  Polls for up to
+TIMEOUT seconds (default 5), calling candidates each iteration."
+  (let ((deadline (+ (float-time) (or timeout 5.0))))
+    (while (and (= (cdr (or (fzf-native-async-stats handle) '(0 . 0))) 0)
+                (< (float-time) deadline))
+      (if limit
+          (fzf-native-async-candidates handle filter limit)
+        (fzf-native-async-candidates handle filter))
+      (sleep-for 0.05)))
+  (if limit
+      (fzf-native-async-candidates handle filter limit)
+    (fzf-native-async-candidates handle filter)))
+
 (ert-deftest fzf-native-async-lifecycle-test ()
   "Start → wait for data → generation advances → stop."
   (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz")))
@@ -305,7 +320,7 @@ Returns t when data has arrived, nil if TIMEOUT seconds elapsed (default 5)."
     (unwind-protect
         (progn
           (fzf-native-test--wait-for-data handle)
-          (let ((result (fzf-native-async-candidates handle "")))
+          (let ((result (fzf-native-test--wait-for-scoring handle "")))
             (should (= (length result) 3))
             (should (member "foo" result))
             (should (member "bar" result))
@@ -318,7 +333,7 @@ Returns t when data has arrived, nil if TIMEOUT seconds elapsed (default 5)."
     (unwind-protect
         (progn
           (fzf-native-test--wait-for-data handle)
-          (let ((result (fzf-native-async-candidates handle "foo")))
+          (let ((result (fzf-native-test--wait-for-scoring handle "foo")))
             (should (member "foo" result))
             (should (member "foobaz" result))
             (should-not (member "bar" result))
@@ -340,7 +355,7 @@ Returns t when data has arrived, nil if TIMEOUT seconds elapsed (default 5)."
     (unwind-protect
         (progn
           (fzf-native-test--wait-for-data handle)
-          (let ((result (fzf-native-async-candidates handle "" 2)))
+          (let ((result (fzf-native-test--wait-for-scoring handle "" 2)))
             (should (= (length result) 2))))
       (fzf-native-async-stop handle))))
 
@@ -350,11 +365,41 @@ Returns t when data has arrived, nil if TIMEOUT seconds elapsed (default 5)."
     (unwind-protect
         (progn
           (fzf-native-test--wait-for-data handle)
-          (fzf-native-async-candidates handle "foo")
+          (fzf-native-test--wait-for-scoring handle "foo")
           (let ((stats (fzf-native-async-stats handle)))
             (should (consp stats))
             (should (= (car stats) 2))    ; filtered: foo + foobaz
             (should (= (cdr stats) 4))))  ; total: 4 candidates
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-candidates-same-filter-no-livelock ()
+  "Same-filter repeated calls must not prevent scoring from completing.
+Previously score_abort=true was set unconditionally on every call; with
+large candidate sets the pre-work exceeded the 50ms timer interval so
+workers always aborted immediately (livelock: scoring never completed).
+The fix skips setting abort when the incoming filter matches the one
+currently being scored.  Stats are only written on completion, so
+(car (fzf-native-async-stats handle)) > 0 proves scoring finished."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (let ((handle (fzf-native-async-start "seq 1 1000000")))
+    (unwind-protect
+        (progn
+          ;; Wait up to 15s for 1M candidates to arrive
+          (should (fzf-native-test--wait-for-data handle 15.0))
+          (sleep-for 3.0)
+          ;; Rapid same-filter calls simulating the 50ms UI refresh timer
+          (dotimes (_ 40)
+            (fzf-native-async-candidates handle "1" 100)
+            (sleep-for 0.02))
+          ;; Stats > 0 means scoring completed; zero throughout = livelock
+          (let ((deadline (+ (float-time) 15.0))
+                done)
+            (while (and (not done) (< (float-time) deadline))
+              (fzf-native-async-candidates handle "1" 100)
+              (when (> (car (or (fzf-native-async-stats handle) '(0 . 0))) 0)
+                (setq done t))
+              (unless done (sleep-for 0.1)))
+            (should done)))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-start-wrong-type-test ()
