@@ -274,7 +274,7 @@ static AsyncSession *make_async_session(FILE *fp, size_t cap) {
 }
 
 static void free_async_session(AsyncSession *s) {
-  for (size_t i = 0; i < s->count; i++) free(s->cands[i]);
+  arena_free(&s->arena);
   free(s->cands);
   pthread_mutex_destroy(&s->mu);
   free(s);
