@@ -604,8 +604,34 @@ emacs_value fzf_native_make_slab(emacs_env *env,
 
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 
-#define ASYNC_INIT_CAP 4096
-#define ASYNC_LINE_MAX 8192
+#define ASYNC_INIT_CAP   4096
+#define ASYNC_LINE_MAX   8192
+#define ARENA_CHUNK_SIZE (4 * 1024 * 1024)  /* 4 MB per chunk */
+
+/* Arena allocator: strings are packed into large chunks so freeing the
+   entire candidate set is O(chunks) instead of O(candidates). */
+typedef struct ArenaChunk { struct ArenaChunk *next; size_t used; char data[]; } ArenaChunk;
+typedef struct { ArenaChunk *head; } Arena;
+
+static char *arena_strdup(Arena *a, const char *s, size_t len) {
+  size_t need = len + 1;
+  if (!a->head || a->head->used + need > ARENA_CHUNK_SIZE) {
+    size_t chunk_sz = sizeof(ArenaChunk) + (need > ARENA_CHUNK_SIZE ? need : ARENA_CHUNK_SIZE);
+    ArenaChunk *c = malloc(chunk_sz);
+    if (!c) return NULL;
+    c->used = 0; c->next = a->head; a->head = c;
+  }
+  char *p = a->head->data + a->head->used;
+  memcpy(p, s, len + 1);
+  a->head->used += need;
+  return p;
+}
+
+static void arena_free(Arena *a) {
+  ArenaChunk *c = a->head;
+  while (c) { ArenaChunk *nx = c->next; free(c); c = nx; }
+  a->head = NULL;
+}
 
 /* Strip ANSI CSI escape sequences (ESC [ ... m) in-place. */
 static size_t async_strip_ansi(char *s, size_t len) {
@@ -632,6 +658,7 @@ typedef struct {
   _Atomic bool stop;
 
   pthread_mutex_t mu;
+  Arena           arena;   /* backing storage for all candidate strings */
   char          **cands;
   size_t          count;
   size_t          cap;
@@ -668,7 +695,7 @@ static void *async_reader(void *arg) {
     len = async_strip_ansi(line, len);
     if (!len) continue;
 
-    char *dup = strdup(line);
+    char *dup = arena_strdup(&s->arena, line, len);
     if (!dup) continue;
 
     pthread_mutex_lock(&s->mu);
@@ -696,8 +723,12 @@ static void async_session_destroy(void *ptr) {
   if (!s) return;
   fzf_log("async_session_destroy: pid=%d count=%zu\n", (int)s->pid, s->count);
 
-  /* Stop scoring thread: abort in-flight workers, then send stop signal */
+  /* Signal everything to stop simultaneously so scoring and reader wind down
+     in parallel rather than sequentially. */
   atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
+  atomic_store_explicit(&s->stop, true, memory_order_relaxed);
+  if (s->pid > 0) kill(s->pid, SIGTERM);   /* reader unblocks on pipe EOF */
+
   pthread_mutex_lock(&s->score_req_mu);
   free(s->score_req_filter);
   s->score_req_filter = NULL;
@@ -712,14 +743,12 @@ static void async_session_destroy(void *ptr) {
   pthread_mutex_destroy(&s->score_req_mu);
   pthread_cond_destroy(&s->score_req_cond);
 
-  /* Stop reader: SIGTERM → child exits → pipe EOF → fgets NULL → reader exits */
-  atomic_store_explicit(&s->stop, true, memory_order_relaxed);
-  if (s->pid > 0) kill(s->pid, SIGTERM);
+  /* Reader has been winding down since SIGTERM above; join it now. */
   pthread_join(s->reader, NULL);
   if (s->fp)      { fclose(s->fp); s->fp = NULL; }
   if (s->pid > 0) { waitpid(s->pid, NULL, 0); s->pid = -1; }
   pthread_mutex_lock(&s->mu);
-  for (size_t i = 0; i < s->count; i++) free(s->cands[i]);
+  arena_free(&s->arena);
   free(s->cands);
   pthread_mutex_unlock(&s->mu);
   pthread_mutex_destroy(&s->mu);
@@ -890,13 +919,19 @@ static void *async_scoring_worker(void *ptr) {
       break;
     struct AsyncScoringBatch *batch = shared->batches + bi;
     unsigned n = 0;
+    bool aborted = false;
     for (unsigned i = 0; i < batch->len; i++) {
+      if ((i & 0xFF) == 0 && shared->stop &&
+          atomic_load_explicit(shared->stop, memory_order_relaxed)) {
+        aborted = true; break;
+      }
       int sc = pattern ? fzf_get_score(batch->xs[i].str, pattern, slab) : 1;
       if (!pattern || sc > 0) {
         batch->xs[n]         = batch->xs[i];
         batch->xs[n++].score = sc;
       }
     }
+    if (aborted) break;
     batch->len = n;
   }
 
