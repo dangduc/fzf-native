@@ -952,14 +952,22 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
   for (size_t i = emit; i-- > 0;) {
     emacs_value str = env->make_string(env, flat[i].str,
                                        (ptrdiff_t)strlen(flat[i].str));
-    /* make_string signals if the shell emitted non-UTF-8 bytes (e.g. a
-       Latin-1 filename on a non-UTF-8 filesystem).  Skip the offending
-       candidate rather than truncating the rest of the list. */
-    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    /* make_string signals on non-UTF-8 bytes (e.g. Latin-1 filename):
+       clear that error and skip the candidate.  Any other exit kind
+       (quit from C-g, throw) must not be cleared — break and let it
+       propagate when the module function returns. */
+    enum emacs_funcall_exit status = env->non_local_exit_check(env);
+    if (status == emacs_funcall_exit_signal) {
       env->non_local_exit_clear(env);
       continue;
+    } else if (status != emacs_funcall_exit_return) {
+      break;
     }
     result = env->funcall(env, Fcons, 2, (emacs_value[]){ str, result });
+    /* funcall can deliver a pending quit (C-g pressed during long scoring).
+       Stop building the list and let the signal propagate. */
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+      break;
   }
 
   fzf_log("async_candidates DONE: filter='%s' filtered=%zu total=%zu emit=%zu\n",
