@@ -101,7 +101,15 @@ accurate indices for multibyte chars.
 [[https://github.com/jojojames/fussy][Fussy]]: ~fzf-native~ is used as
 one of several choose-your-own scoring backends in ~fussy~, a package
 that provides a ~completing-style~ for intelligent matching and
-sorting.
+sorting. See [[https://github.com/jojojames/fussy/blob/HEAD/architecture.org][fussy's architecture overview]]
+for how fussy dispatches to ~fzf-native~ during ~all-completions~.
+
+[[https://github.com/jojojames/fzf-async][fzf-async]]: an Emacs
+~completing-read~ wrapper that uses ~fzf-native~'s async surface to
+stream candidates from long-running shell commands (~find~, ~rg~,
+~git ls-files~, etc.) without blocking. See
+[[https://github.com/jojojames/fzf-async/blob/HEAD/architecture.org][fzf-async's architecture overview]]
+for the Elisp-side pipeline.
 
 ** Building the Native Libraries
 
@@ -180,6 +188,14 @@ $ brew install llvm
 ;; M-x dape in fzf-native-module.c
 ;; Set breakpoints with mouse.
 #+end_src
+
+** Architecture
+
+For a deep dive into how ~fzf-native~ works internally — the three
+scoring paths (sync single, sync batch, async streaming), the
+=AsyncSession= threading and lock model, the arena allocator, the
+=score_abort= same-filter rule, and the counting-sort top-K
+extraction — see [[file:architecture.org][architecture.org]].
 
 ** Credit
 All credit for fzf.c goes to the

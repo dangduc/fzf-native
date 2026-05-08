@@ -1,0 +1,497 @@
+#+TITLE: fzf-native — Architecture Reference
+#+AUTHOR: James Nguyen
+#+STARTUP: overview
+#+OPTIONS: toc:3
+
+* About this file
+
+Canonical reference for *how fzf-native works today*.
+
+This file describes /implemented/ behavior only. When the implementation
+changes, update this file in the same commit.
+
+For the broader picture across the three sibling projects, see also:
+
+- [[https://github.com/jojojames/fussy/blob/HEAD/architecture.org][fussy/architecture.org]]
+- [[https://github.com/jojojames/fzf-async/blob/HEAD/architecture.org][fzf-async/architecture.org]]
+
+* Place in the pipeline
+
+fzf-native is the *C dynamic module*. Two distinct consumer projects
+sit above it:
+
+#+begin_src
+  ┌──────────────────┐    ┌──────────────────────────────────┐
+  │ fussy            │    │ fzf-async                        │
+  │  (sync, in-mem)  │    │  (async, child-process streaming)│
+  └────────┬─────────┘    └─────────────────┬────────────────┘
+           │                                │
+           │ fzf-native-score-all           │ fzf-native-async-*
+           │ (sync batch)                   │ (async streaming)
+           ▼                                ▼
+  ╔═══════════════════════════════════════════════════════════╗
+  ║ fzf-native (this project)                                 ║
+  ║   - sync single-candidate scoring                         ║
+  ║   - sync batch scoring (parallel workers + counting sort) ║
+  ║   - async streaming pipeline (reader + scoring threads)   ║
+  ║   - fzf algorithm core (fzf.c)                            ║
+  ╚═══════════════════════════════════════════════════════════╝
+#+end_src
+
+The C module exposes both sync and async surfaces on purpose. fussy
+needs sync to slot into Emacs's =completion-styles= flow; fzf-async
+needs async because it streams candidates from a long-running child
+process and must never block the main thread.
+
+* Public Elisp API
+
+| Function                       | Args                                 | Returns                | Path        |
+|--------------------------------+--------------------------------------+------------------------+-------------|
+| =fzf-native-score=             | =(str query &optional slab)=         | =(score idx idx ...)=  | sync single |
+| =fzf-native-score-all=         | =(collection query &optional slab)=  | sorted candidate vector | sync batch  |
+| =fzf-native-make-default-slab= | =()=                                 | slab                   | (helper)    |
+| =fzf-native-make-slab=         | =(size16 size32)=                    | slab                   | (helper)    |
+| =fzf-native-async-start=       | =(command &optional dir)=            | handle                 | async       |
+| =fzf-native-async-candidates=  | =(handle filter &optional limit)=    | Emacs list             | async       |
+| =fzf-native-async-stats=       | =(handle)=                           | =(filtered . total)=   | async       |
+| =fzf-native-async-generation=  | =(handle)=                           | integer                | async       |
+| =fzf-native-async-stop=        | =(handle)=                           | nil                    | async       |
+
+The async surface is Unix-only (uses =fork=, =execl=, =pthread=).
+
+* The fzf algorithm (in =fzf.c=)
+
+All three paths share the same matching/scoring core.
+
+** Pattern parsing — =fzf_parse_pattern=
+
+The query is parsed into a =fzf_pattern_t= once per request. Term layout:
+
+#+begin_src
+  query        =  "foo 'bar !baz | qux"
+  parsed       =  [ {foo, bar(exact), !baz} OR {qux} ]
+                  └─ first term-set ────┘    └───┘
+                       (AND inside)         second term-set
+                       (OR between sets)
+#+end_src
+
+Per-term modifiers:
+
+| Modifier | Meaning                                             |
+|----------+-----------------------------------------------------|
+| (none)   | Fuzzy match (=fzf_fuzzy_match_v2=, the default)     |
+| ='term=  | Exact substring match (=fzf_exact_match_naive=)     |
+| =^term=  | Prefix anchor                                       |
+| =term$=  | Suffix anchor                                       |
+| =^term$= | Equal match                                         |
+| =!term=  | Negation: candidate must *not* match the term       |
+| =a | b=  | OR within a term-set: candidate matches either side |
+
+Spaces separate AND-terms; =|= separates OR-clauses inside a term-set.
+
+** Scoring — =fzf_get_score=
+
+Given a parsed pattern and one candidate, returns an integer score
+≥ 0. Score is bounded (typically 0–10 000), which is what makes
+counting sort viable.
+
+Match indices are computed during scoring and surfaced for highlighting.
+
+** Slabs
+
+A slab is a pair of preallocated buffers (=i16=, =i32=) used as scratch
+space for the dynamic-programming match. Reusing one slab across many
+=fzf_get_score= calls avoids per-candidate allocation.
+
+- Sync single: caller may pass a slab; if not, one is created and freed.
+- Sync batch: each worker thread owns a thread-local slab.
+- Async: each worker thread allocates and frees its own slab per run.
+
+** Counting sort
+
+fzf scores are bounded non-negative integers. Three linear passes
+(frequency count → prefix sum → placement) replace =qsort= for an
+O(n + max_score) sort. Two implementations:
+
+- =counting_sort_candidates= — sync batch path
+- =counting_sort_scored= — async path
+
+=qsort= remains as a fallback when allocation fails or =max_score= is
+unexpectedly large. =n < 64= falls through to =qsort= directly to skip
+the malloc/calloc round-trip on tiny inputs. Counting sort is *stable*;
+the qsort fallback is not.
+
+* Path 1 — sync single (=fzf_native_score=)
+
+The simplest entry. One candidate, one query, one score. Used by
+=fussy= for the per-candidate scoring loop when its dispatch lands on
+the fzf-native backend.
+
+** Flow
+
+#+begin_src
+  Elisp call: (fzf-native-score "foobar" "fb" slab)
+       │
+       ▼
+  ┌──────────────────────────────────┐
+  │ C: fzf_native_score              │
+  │  - copy_emacs_string("foobar")   │
+  │  - fzf_parse_pattern("fb")       │
+  │  - fzf_get_score(text, pat, slab)│
+  │  - free pattern                  │
+  │  - build (score idx idx ...) cons│
+  └──────────────────────────────────┘
+       │
+       ▼
+  Elisp value: (score idx0 idx1 ...)
+#+end_src
+
+** Notes
+
+- Pattern is parsed and freed inside this single call.
+- If the caller doesn't pass a slab, one is created on the spot and
+  freed before return. fussy passes a long-lived slab on every call to
+  avoid that cost.
+- Non-UTF-8 Emacs strings are coerced via =copy_emacs_string=, falling
+  back to =encode-coding-string= if =make_string= would signal.
+
+* Path 2 — sync batch (=fzf_native_score_all=)
+
+Score every candidate in a collection in one synchronous call. fussy
+uses this when it wants to score thousands of candidates in one shot
+without the per-candidate Elisp ↔ C round-trip cost.
+
+** Flow
+
+#+begin_src
+  Elisp call: (fzf-native-score-all collection "fb" slab)
+       │
+       ▼
+  ┌──────────────────────────────────────────────┐
+  │ C: fzf_native_score_all                      │
+  │  - empty-query short-circuit: return args[0] │
+  │    (eq identity, preserves list/vector)      │
+  │  - fzf_parse_pattern (once)                  │
+  │  - chunk into 2048-candidate batches         │
+  │  - spawn N worker threads                    │
+  │  - pthread_join all                          │
+  │  - flatten survivors                         │
+  │  - counting_sort_candidates (descending)     │
+  │  - return result vector                      │
+  └──────────────────────────────────────────────┘
+#+end_src
+
+** Workers
+
+#+begin_src
+  shared (read-only): pattern, BATCH_SIZE=2048, atomic remaining counter
+       │
+       │ each worker:
+       ▼
+  while (claim batch via atomic_fetch_sub on `remaining`):
+    for each candidate in batch:
+      score = fzf_get_score(text, pattern, slab)
+      if score > 0: keep; else drop
+    compact survivors in-place into batch.xs[]
+#+end_src
+
+| Mechanism                       | Why                                               |
+|---------------------------------+---------------------------------------------------|
+| Atomic batch claiming           | Lock-free work-stealing across N threads          |
+| Pattern shared (parsed once)    | =strtok= used inside =fzf_parse_pattern= is *not* thread-safe — never call from workers |
+| Per-thread slab                 | DP scratch is per-call, no contention             |
+| In-place compaction             | No extra allocation per worker                    |
+
+** Empty-query short-circuit
+
+When =query=""=, =fzf_native_score_all= returns =args[0]= via =eq=
+identity — no scoring, no copy, no allocation. The input type (list
+vs. vector) is preserved. The check is at function entry, before
+vector conversion or batch construction, so an empty query exits as
+early as possible.
+
+** Output
+
+Vector of original-string ↔ score, sorted descending by score. Stable
+order for same-score candidates (counting sort guarantees this).
+
+* Path 3 — async streaming
+
+The async pipeline is the bulk of the C module's complexity. Three
+threads run concurrently per session: a *reader* tailing a child
+process, a *scorer* that fields filter requests, and the Emacs main
+thread, which polls without ever blocking.
+
+** Flow
+
+#+begin_src
+  Elisp call: (fzf-native-async-start "find ." "/")
+       │
+       ▼
+  ┌──────────────────────────────────────────────┐
+  │ C: fork + chdir(dir) + execl                 │
+  │    spawn reader thread                       │
+  │    spawn persistent scoring thread           │
+  │    return AsyncSession handle                │
+  └──────────────────────────────────────────────┘
+
+  ─── time passes; user types "fo" ───
+
+  Elisp poll: (fzf-native-async-candidates h "fo")
+       │ non-blocking — returns previous snapshot immediately
+       ▼
+  ┌──────────────────────────────────────────────┐
+  │ C: dispatch (main thread)                    │
+  │  - if filter changed: signal scorer to abort │
+  │    and re-score with "fo"                    │
+  │  - if filter unchanged: just re-queue        │
+  │  - copy out current score_results            │
+  └──────────────────────────────────────────────┘
+       │
+       ▼
+  ┌─────────────────┐         ┌───────────────────┐
+  │ scoring thread  │ ◀────── │ reader thread     │
+  │  (background)   │ shares  │  (background)     │
+  │                 │ s->cands│  - reads child fp │
+  │ - score all     │         │  - strips ANSI    │
+  │ - counting sort │         │  - arena_strdup   │
+  │ - publish top-K │         │  - appends cand   │
+  └─────────────────┘         └───────────────────┘
+       │ writes
+       ▼
+  score_results[]   ← every poll from Elisp reads this
+#+end_src
+
+The main thread *never blocks on scoring*. New scores arrive
+asynchronously; Elisp polls a generation counter to detect "new data
+ready."
+
+** AsyncSession layout
+
+#+begin_src
+  ┌─────────────────┐
+  │ AsyncSession    │
+  ├─────────────────┤
+  │ s->cands[]      │  ← protected by s->mu
+  │ s->count        │  ← protected by s->mu
+  │ s->arena        │  ← protected by s->mu (string storage)
+  │ s->gen (atomic) │  ← published on score completion
+  │ s->stop (atomic)│  ← shutdown signal
+  ├─────────────────┤
+  │ score_req_*     │  ← protected by score_req_mu
+  │   filter, limit │
+  │   cond, abort   │
+  │   current_*     │
+  ├─────────────────┤
+  │ score_results[] │  ← protected by score_res_mu
+  │ score_count     │
+  │ last_filtered   │
+  │ last_total      │
+  └─────────────────┘
+#+end_src
+
+** Threads, locks, ownership
+
+| Thread              | Reads                          | Writes                                     |
+|---------------------+--------------------------------+--------------------------------------------|
+| Main (Elisp)        | =score_results= (under res mu) | =score_req_*= (under req mu); signals cond |
+| Reader              | child fp                       | =s->cands=, =s->count=, =s->arena= (under s->mu) |
+| Scorer              | =s->cands= snapshot (under s->mu briefly), =score_req_*= | =score_results= (under res mu); =s->gen= |
+| Scorer's sub-workers (transient) | their batch slice, =shared->pattern= (read-only) | their batch slice (compaction in-place) |
+
+Three locks, distinct purposes:
+
+- =s->mu= — guards the candidate array and the arena. Held briefly:
+  read =count=, =memcpy= a candidate-pointer snapshot out, release.
+- =score_req_mu= — guards the request queue (one slot deep) and the
+  =score_current_filter= used for the same-filter-no-abort check.
+- =score_res_mu= — guards the published top-K results.
+
+Locks are never nested. The scoring thread takes them sequentially:
+=score_req_mu= (steal request) → =s->mu= (snapshot candidates) →
+=score_res_mu= (publish results).
+
+** Reader thread — =async_reader=
+
+#+begin_src
+  while (read line from child fp) {
+    strip ANSI escapes (in place)
+    arena_strdup(line)            ← arena owns the bytes
+    grow s->cands[] if at cap     ← realloc, doubling
+    s->cands[s->count++] = ptr    ← under s->mu
+  }
+  on EOF: just return; thread exits naturally.
+#+end_src
+
+Why an arena: candidates are written once and freed all at once at
+session end. =arena_strdup= bumps a pointer into a 4 MB chunk;
+=arena_free= walks chunks and frees them — O(chunks), not
+O(candidates). For 60 M candidates this is the difference between
+"instant teardown" and "seconds of individual =free()= calls when ESC
+is pressed."
+
+** Scoring thread — =scoring_thread_fn=
+
+Persistent. Sleeps on =score_req_cond= until the main thread enqueues
+a filter or sets =score_req_stop=.
+
+#+begin_src
+  loop:
+    wait on score_req_cond
+    if score_req_stop: exit thread
+    steal score_req_filter (set score_current_filter under req mu)
+    atomic_store(score_abort, false)
+    parse pattern (once, on this thread)
+    snapshot s->cands pointers (brief s->mu, malloc outside lock)
+    spawn N worker pthreads, each scores its batch
+    pthread_join all workers   ← runs HERE, never on main thread
+    if score_abort:            ← filter changed mid-run
+      free, clear current_filter, loop
+    compact survivors, counting_sort_scored, apply limit
+    publish to score_results (under res mu), update stats
+    atomic_fetch_add(s->gen, 1)
+#+end_src
+
+Workers check =score_abort= every 256 items inside the batch loop, not
+just at batch boundaries. This bounds ESC latency at very large
+candidate counts.
+
+The batch loop also checks abort every 64 K items during the
+*snapshot construction* before workers spawn, so a filter change
+during a 25 M-item memcpy doesn't force a full pre-work pass.
+
+** The "same-filter, don't abort" rule
+
+This is subtle and the source of one historical livelock bug. The
+rule:
+
+| Incoming filter from main             | Action                                       |
+|---------------------------------------+----------------------------------------------|
+| Different from =score_current_filter= | =score_abort = true=, signal cond — rescore  |
+| Same as =score_current_filter=        | Just re-queue; do *not* abort                |
+| =score_current_filter= is NULL (idle) | Enqueue, signal cond                         |
+
+Without this rule, an external 50 ms refresh timer (e.g. fzf-async's
+poll loop) would set =abort= every tick. Workers would see =abort=
+within a batch or two and exit. The scoring thread would loop,
+restart, and the timer would fire again — livelock. With it,
+same-filter polls are a no-op against the running computation.
+
+** The generation counter
+
+=s->gen= is an atomic int. The scoring thread =atomic_fetch_add= bumps
+it after every publish to =score_results=. Callers poll
+=fzf-native-async-generation= and compare to the last value they saw.
+A change ⇒ "new data ready, time to re-display."
+
+This is the only "push" signal from C to Elisp. Stats and candidates
+are still pulled.
+
+(There is also =s->count=, the reader's "candidates seen" counter,
+which serves as the "has any data arrived yet" signal but is not the
+cross-thread publish signal.)
+
+** Memory and string ownership
+
+| Object                  | Owner                            | Lifetime                                       |
+|-------------------------+----------------------------------+------------------------------------------------|
+| Candidate strings       | =s->arena=                       | Whole session — freed once at stop             |
+| =s->cands[]= (pointers) | =s->mu=-protected                | Reallocated as it grows; freed at stop         |
+| =score_results[]=       | =score_res_mu=                   | Replaced on each publish; final free at stop   |
+| =score_req_filter=      | =score_req_mu= owns the slot     | =strdup='d when stolen by scorer; freed before next steal |
+| =score_current_filter=  | Scoring thread owns; main thread reads under req mu | Cleared on every scoring exit path |
+| =fzf_pattern_t=         | Scoring thread                   | Parsed once per request, freed after workers join |
+
+The arena is the key invariant: every char* exposed in =s->cands= or
+=score_results= points into arena memory and is valid until the
+=AsyncSession= is destroyed.
+
+** Stop / cleanup — =fzf_native_async_stop=
+
+1. =score_abort = true= and =score_req_stop = true=, signal cond.
+2. =pthread_join(score_thread)=. Workers (if any) abort within 256
+   items.
+3. =s->stop = true=. =pthread_join(reader_thread)=. Reader exits when
+   it next checks =stop= or hits EOF.
+4. =arena_free(&s->arena)= — frees all candidate strings in O(chunks).
+5. Free =s->cands=, =score_results=, mutexes, condvar, the session.
+
+ESC in the minibuffer triggers this path. The two parallelizing
+optimizations — abort-every-256 in workers, arena teardown — are what
+make ESC feel responsive at 60 M candidates.
+
+* Async behavior reference (canonical input → output)
+
+** Empty query (async)
+
+| Input                | Output                                                |
+|----------------------+-------------------------------------------------------|
+| =handle=, =query=""= | The current unfiltered =score_results= snapshot, capped at =limit= |
+
+** Same query re-dispatched
+
+| Input                                                  | Output                  | Side effect                          |
+|--------------------------------------------------------+-------------------------+--------------------------------------|
+| =query == score_current_filter= (scorer running)       | Stale =score_results=   | Filter re-queued; abort *not* set    |
+| =query == score_current_filter= (scorer idle, just published) | Latest =score_results= | New scoring run starts (re-validates against any new candidates) |
+
+** Filter changes mid-scoring
+
+| Stage scoring is in             | Effect of filter change                        |
+|---------------------------------+------------------------------------------------|
+| Building snapshot (memcpy loop) | =abort= seen every 64 K items → exit, restart  |
+| Workers running                 | =abort= seen every 256 items inside batch → workers exit, scoring thread sees =abort=, discards, restarts |
+| Just published                  | =score_results= still valid; next dispatch picks up the new filter |
+
+** Generation counter
+
+| Event                                        | =s->gen= |
+|----------------------------------------------+----------|
+| Session start                                | 0        |
+| Scoring thread publishes new =score_results= | += 1     |
+| Reader appends candidates                    | unchanged (gen tracks scoring publishes, not reads) |
+
+* Concurrency model — quick reference (async path)
+
+| Invariant                                                           | Why it holds                          |
+|---------------------------------------------------------------------+---------------------------------------|
+| Main thread never calls =pthread_join= during a candidates dispatch.| All joins happen on the scoring thread. |
+| =strtok= is never called concurrently.                              | Pattern is parsed once per scoring run on the scoring thread; workers receive a =fzf_pattern_t *= and only read it. |
+| Candidate strings outlive every reference in =score_results= and returned Emacs lists. | Strings live in the arena; arena is freed only after =async_session_destroy= and after Emacs has copied the strings into its own =make_string= results. |
+| =score_abort= is observed promptly by workers.                      | Atomic load (=memory_order_relaxed= is sufficient — abort doesn't synchronize other data) every 256 items inside the batch loop. |
+| Same-filter polls don't interrupt in-progress scoring.              | =score_current_filter= compared under =score_req_mu= before setting abort. |
+
+* Logging — =fzf_log=
+
+Compile-time gated. Release builds: =#define fzf_log(...) ((void)0)=,
+zero runtime cost, log-related globals dead-code-eliminated.
+
+Debug builds (=FZF_NATIVE_DEBUG=1 cmake -B build= or =make build-log=):
+mutex-protected file logger writing to =$HOME/.emacs.d/fzf-native.log=,
+truncated on each module load.
+
+Why a file: =fprintf(stderr)= from module worker threads is not
+surfaced anywhere by Emacs.
+
+* Build & test
+
+- Build: CMake. =cmake -B build && cmake --build build= produces
+  =bin/${PLATFORM}/fzf-native-module.so=.
+- Debug build with logging: =FZF_NATIVE_DEBUG=1 cmake -B build= or
+  =make build-log=.
+- Elisp tests: =fzf-native-test.el= via =eask test ert= or =make test=.
+- C tests: =fzf-native-ctest.c= via =make ctest=. Includes the module
+  source directly so =static= helpers (counting sort, ANSI strip,
+  reader) are testable without the Emacs runtime.
+
+* References
+
+- =fzf-native-module.c= — the C module entry points and async pipeline.
+- =fzf.c= / =fzf.h= — the upstream fzf algorithm port (parse, score, match).
+- =fzf-native.el= — Elisp loader and =declare-function= shims.
+- =fzf-native-test.el= — ERT tests for sync + async surfaces.
+- =fzf-native-ctest.c= — standalone C tests for internal helpers.
+- =CMakeLists.txt= — build config.
+- Sibling architecture docs:
+  [[https://github.com/jojojames/fussy/blob/HEAD/architecture.org][fussy/architecture.org]],
+  [[https://github.com/jojojames/fzf-async/blob/HEAD/architecture.org][fzf-async/architecture.org]].
