@@ -645,6 +645,9 @@ typedef struct {
   bool             score_req_stop;
   _Atomic bool     score_abort;       /* set to cancel in-flight workers */
 
+  char            *score_current_filter; /* filter being actively scored (under score_req_mu) */
+  size_t           score_current_limit;
+
   pthread_mutex_t  score_res_mu;
   ScoredStr       *score_results;     /* latest scored+sorted results */
   size_t           score_count;       /* number of entries in score_results */
@@ -700,6 +703,7 @@ static void async_session_destroy(void *ptr) {
   pthread_join(s->score_thread, NULL);
 
   free(s->score_results);
+  free(s->score_current_filter);
   pthread_mutex_destroy(&s->score_res_mu);
   pthread_mutex_destroy(&s->score_req_mu);
   pthread_cond_destroy(&s->score_req_cond);
@@ -911,26 +915,45 @@ static void *scoring_thread_fn(void *arg) {
     char  *filter = s->score_req_filter;   /* steal ownership */
     size_t limit  = s->score_req_limit;
     s->score_req_filter = NULL;
+    /* Record what we're about to score so main thread can skip abort for same filter */
+    free(s->score_current_filter);
+    s->score_current_filter = strdup(filter);
+    s->score_current_limit  = limit;
     pthread_mutex_unlock(&s->score_req_mu);
 
     /* Reset abort flag AFTER stealing request so we don't race with the
        next dispatch that may have already set it again. */
     atomic_store_explicit(&s->score_abort, false, memory_order_seq_cst);
 
-    /* Snapshot candidate pointers (strings are stable until session destroy) */
+    /* Snapshot candidate count first (brief lock), then malloc outside lock,
+       then memcpy under lock.  Keeps s->mu held only for the fast memcpy,
+       not for the potentially-slow malloc with tens of millions of candidates. */
     pthread_mutex_lock(&s->mu);
-    size_t  count = s->count;
-    char  **snap  = count ? malloc(count * sizeof *snap) : NULL;
+    size_t count = s->count;
+    pthread_mutex_unlock(&s->mu);
+
+    char **snap = count ? malloc(count * sizeof *snap) : NULL;
+    if (!snap && count) {
+      pthread_mutex_lock(&s->score_req_mu);
+      free(s->score_current_filter); s->score_current_filter = NULL;
+      pthread_mutex_unlock(&s->score_req_mu);
+      free(filter); continue;
+    }
+
+    pthread_mutex_lock(&s->mu);
+    if (s->count < count) count = s->count;   /* cap if reader shrank (shouldn't happen) */
     if (snap) memcpy(snap, s->cands, count * sizeof *snap);
     pthread_mutex_unlock(&s->mu);
 
-    if (count && !snap) { free(filter); continue; }
-
-    /* Batch */
+    /* Batch; check abort every 64 K items so a filter change is noticed quickly. */
     struct AsyncScoringBatch *batches = NULL;
     size_t bi = 0, bcap = 0;
     bool batch_ok = true;
     for (size_t i = 0; i < count; i++) {
+      if ((i & 0xFFFF) == 0 &&
+          atomic_load_explicit(&s->score_abort, memory_order_relaxed)) {
+        batch_ok = false; break;
+      }
       if (!batches || (batches[bi].len >= BATCH_SIZE && ++bi >= bcap)) {
         bcap = bcap ? bcap * 2 : 1;
         struct AsyncScoringBatch *nb = realloc(batches, bcap * sizeof *nb);
@@ -942,7 +965,12 @@ static void *scoring_thread_fn(void *arg) {
       batches[bi].xs[batches[bi].len].score = 0;
       batches[bi].len++;
     }
-    if (!batch_ok) { free(snap); free(filter); free(batches); continue; }
+    if (!batch_ok) {
+      pthread_mutex_lock(&s->score_req_mu);
+      free(s->score_current_filter); s->score_current_filter = NULL;
+      pthread_mutex_unlock(&s->score_req_mu);
+      free(snap); free(filter); free(batches); continue;
+    }
 
     unsigned num_batches = count ? (unsigned)(bi + 1) : 0;
     unsigned max_workers = (unsigned)sysconf(_SC_NPROCESSORS_ONLN);
@@ -969,8 +997,11 @@ static void *scoring_thread_fn(void *arg) {
     free(threads);
     if (pattern) fzf_free_pattern(pattern);
 
-    /* If a newer request arrived while we were scoring, discard partial results. */
+    /* If a different filter arrived while we were scoring, discard partial results. */
     if (atomic_load_explicit(&s->score_abort, memory_order_relaxed)) {
+      pthread_mutex_lock(&s->score_req_mu);
+      free(s->score_current_filter); s->score_current_filter = NULL;
+      pthread_mutex_unlock(&s->score_req_mu);
       free(snap); free(batches); free(filter);
       continue;
     }
@@ -992,6 +1023,11 @@ static void *scoring_thread_fn(void *arg) {
     }
 
     size_t emit = (limit && limit < pos) ? limit : pos;
+
+    /* Clear active-filter marker before publishing results */
+    pthread_mutex_lock(&s->score_req_mu);
+    free(s->score_current_filter); s->score_current_filter = NULL;
+    pthread_mutex_unlock(&s->score_req_mu);
 
     pthread_mutex_lock(&s->score_res_mu);
     free(s->score_results);
@@ -1036,10 +1072,16 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
   fzf_log("async_candidates: filter='%s' limit=%zu — dispatching to bg thread\n",
           filter, limit);
 
-  /* Cancel any in-flight scoring job, then enqueue the new request.
-     filter ownership is transferred to the scoring thread here. */
-  atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
+  /* Enqueue the new request.  Only abort in-flight scoring if the filter
+     actually changed — same-filter timer re-triggers must not interrupt a
+     scoring run that is still working on the same query, which would cause
+     a livelock where scoring never completes on large candidate sets. */
   pthread_mutex_lock(&s->score_req_mu);
+  bool filter_changed = !(s->score_current_filter &&
+                          strcmp(s->score_current_filter, filter) == 0 &&
+                          s->score_current_limit == limit);
+  if (filter_changed)
+    atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
   free(s->score_req_filter);
   s->score_req_filter = filter;   /* scoring thread owns this now */
   s->score_req_limit  = limit;
