@@ -3,7 +3,7 @@
 ;; Copyright 2021 Duc Dang
 ;; Author: Duc Dang <me@dangduc.com>
 ;; Version: 0.3
-;; Package-Requires: ((emacs "27.1"))
+;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: matching
 ;; Homepage: https://github.com/dangduc/fzf-native
 ;; SPDX-License-Identifier: GPL-3.0-or-later
