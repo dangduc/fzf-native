@@ -376,7 +376,7 @@ static ScoredStr make_top(const char *str, int score) {
 
 static void test_cache_lookup_miss_on_empty(void) {
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   ScoredStr *out_top = NULL;
   SharedIdx *out_sidx = NULL;
   size_t out_count = 0, out_gen = 0;
@@ -388,7 +388,7 @@ static void test_cache_lookup_miss_on_empty(void) {
 
 static void test_cache_insert_then_lookup_hit(void) {
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   ScoredStr top[2] = { make_top("alpha", 42), make_top("beta", 17) };
 
   cache_insert(&c, "fo", 1000, top, 2, NULL, 0);
@@ -410,7 +410,7 @@ static void test_cache_insert_then_lookup_hit(void) {
 
 static void test_cache_lookup_miss_distinct_query(void) {
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   ScoredStr top[1] = { make_top("alpha", 42) };
   cache_insert(&c, "fo", 100, top, 1, NULL, 0);
 
@@ -427,7 +427,7 @@ static void test_cache_insert_updates_in_place(void) {
      than creating a duplicate.  Verify count stays at 1 and the new
      data wins. */
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   ScoredStr v1[1] = { make_top("alpha", 10) };
   ScoredStr v2[2] = { make_top("alpha", 99), make_top("beta", 50) };
 
@@ -451,7 +451,7 @@ static void test_cache_lru_eviction_at_capacity(void) {
   /* Fill the cache, insert one more, verify the oldest entry is gone
      and all others remain. */
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   ScoredStr one[1] = { make_top("x", 1) };
 
   char qbuf[16];
@@ -493,7 +493,7 @@ static void test_cache_touch_on_hit(void) {
   /* Fill the cache; touch q0 (the oldest) so it becomes MRU; insert
      one more; verify q0 survived and q1 (now the LRU) was evicted. */
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   ScoredStr one[1] = { make_top("x", 1) };
 
   char qbuf[16];
@@ -526,7 +526,7 @@ static void test_cache_insert_zero_count(void) {
   /* Empty top[] is a legitimate "no matches" cache entry; verify it
      stores and looks up cleanly. */
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   cache_insert(&c, "nothing", 500, NULL, 0, NULL, 0);
 
   ScoredStr *out = (ScoredStr *)0xdeadbeef;
@@ -587,7 +587,7 @@ static void test_subsumes_equal_strings(void) {
 
 static void test_cache_lookup_prefix_finds_subsumer(void) {
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   ScoredStr top1[1]    = { make_top("alpha", 10) };
   uint32_t  midx[3]    = { 0, 5, 9 };
   cache_insert(&c, "fo", 100, top1, 1, midx, 3);
@@ -612,7 +612,7 @@ static void test_cache_lookup_prefix_picks_longest(void) {
   /* Two subsumers: "f" and "fo".  Looking up "foo" should return "fo"
      (the longer one, since longer prefixes are more selective). */
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   ScoredStr top1[1] = { make_top("x", 1) };
   uint32_t  midx_f[10];  for (int i = 0; i < 10; i++) midx_f[i]  = (uint32_t)i;
   uint32_t  midx_fo[5];  for (int i = 0; i < 5;  i++) midx_fo[i] = (uint32_t)i;
@@ -636,7 +636,7 @@ static void test_cache_lookup_prefix_picks_longest(void) {
 
 static void test_cache_lookup_prefix_skips_or_query(void) {
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   ScoredStr top[1] = { make_top("x", 1) };
   uint32_t  midx[1] = { 0 };
   cache_insert(&c, "fo", 100, top, 1, midx, 1);
@@ -656,7 +656,7 @@ static void test_cache_lookup_prefix_skips_exact(void) {
      cache_lookup_prefix returns false — exact matches are the
      caller's responsibility (cache_lookup_exact). */
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   ScoredStr top[1] = { make_top("x", 1) };
   uint32_t  midx[1] = { 0 };
   cache_insert(&c, "fo", 100, top, 1, midx, 1);
@@ -672,7 +672,7 @@ static void test_cache_lookup_prefix_skips_exact(void) {
 
 static void test_cache_lookup_prefix_miss_when_no_subsumer(void) {
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   ScoredStr top[1] = { make_top("x", 1) };
   uint32_t  midx[1] = { 0 };
   cache_insert(&c, "ba", 100, top, 1, midx, 1);
@@ -690,7 +690,7 @@ static void test_cache_insert_with_matched_idx(void) {
   /* Verify cache_insert + cache_lookup_exact round-trip the matched_idx
      array correctly. */
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   ScoredStr top[2] = { make_top("alpha", 30), make_top("beta", 20) };
   uint32_t  midx[4] = { 7, 13, 21, 100 };
   cache_insert(&c, "fo", 200, top, 2, midx, 4);
@@ -732,7 +732,7 @@ static void test_cache_insert_or_query_no_idx(void) {
   /* OR queries (containing '|') must never store matched_idx since they
      can never serve as prefix-refinement sources. */
   Cache c;
-  cache_init(&c);
+  cache_init(&c, 0);
   ScoredStr top[1] = { make_top("y", 5) };
   uint32_t  midx[3] = { 1, 2, 3 };
   cache_insert(&c, "foo | bar", 100, top, 1, midx, 3);
