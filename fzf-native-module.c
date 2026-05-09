@@ -297,6 +297,72 @@ static void *worker_routine(void *ptr) {
   return NULL;
 }
 
+/* Apply `completions-common-part' face to STR_VAL on positions matched by
+   PATTERN against CSTR.  Computes positions via fzf_get_positions and groups
+   them into contiguous runs to minimize put-text-property calls.
+
+   Byte offsets from fzf are used directly as character positions: accurate
+   for ASCII, may be slightly misaligned for multi-byte UTF-8 (same caveat
+   as the async highlight path). */
+static void apply_highlight_positions(emacs_env *env,
+                                      const char *cstr,
+                                      fzf_pattern_t *pattern,
+                                      fzf_slab_t *slab,
+                                      emacs_value str_val) {
+  fzf_position_t *pos = fzf_get_positions(cstr, pattern, slab);
+  if (pos && pos->size > 0) {
+    /* pos->data[] is in descending order: pos->data[0] = highest position.
+       Iterate ascending (j from size-1 to 0) to find contiguous runs. */
+    size_t plen      = pos->size;
+    size_t run_start = pos->data[plen - 1];
+    size_t run_end   = run_start;
+    for (ptrdiff_t j = (ptrdiff_t)plen - 2; j >= 0; j--) {
+      size_t p = pos->data[j];
+      if (p == run_end + 1) {
+        run_end = p;
+      } else {
+        emacs_value a[5] = {
+          env->make_integer(env, (intmax_t)run_start),
+          env->make_integer(env, (intmax_t)(run_end + 1)),
+          Qface, Qcompletions_common_part, str_val };
+        env->funcall(env, Fput_text_property, 5, a);
+        env->non_local_exit_clear(env);
+        run_start = run_end = p;
+      }
+    }
+    emacs_value a[5] = {
+      env->make_integer(env, (intmax_t)run_start),
+      env->make_integer(env, (intmax_t)(run_end + 1)),
+      Qface, Qcompletions_common_part, str_val };
+    env->funcall(env, Fput_text_property, 5, a);
+    env->non_local_exit_clear(env);
+  }
+  fzf_free_positions(pos);
+}
+
+/* Read fussy-fzf-native-highlight via symbol-value and resolve to a cap.
+   Returns:
+     0    — no highlighting (nil, negative, unreadable, or zero).
+     LEN  — highlight all (t).
+     N    — highlight top N (clamped to LEN). */
+static size_t resolve_fussy_highlight_cap(emacs_env *env, size_t len) {
+  emacs_value sym = env->intern(env, "fussy-fzf-native-highlight");
+  emacs_value v   = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    return 0;
+  }
+  if (env->eq(env, v, Qnil)) return 0;
+  if (env->eq(env, v, Qt))   return len;
+  intmax_t n = env->extract_integer(env, v);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    return 0;
+  }
+  if (n <= 0) return 0;
+  return (size_t)n > len ? len : (size_t)n;
+}
+
 // fzf-native-score-all COLLECTION QUERY &optional SLAB
 emacs_value fzf_native_score_all(emacs_env *env,
                                  ptrdiff_t nargs,
@@ -423,11 +489,23 @@ err_join_threads:
 
   counting_sort_candidates(xs, len);
 
+  /* Resolve C-side highlight cap from fussy-fzf-native-highlight.  After the
+     sort, xs[0] is the highest-scoring candidate, so the top-N candidates
+     are xs[0..hl_cap-1].  The original parsing pattern was already freed;
+     re-parse for highlighting (case-insensitive matches the async path). */
+  size_t hl_cap = resolve_fussy_highlight_cap(env, len);
+  fzf_pattern_t *hl_pattern = NULL;
+  fzf_slab_t    *hl_slab    = NULL;
+  if (hl_cap > 0) {
+    hl_pattern = fzf_parse_pattern(CaseIgnore, false, query.b, true);
+    if (hl_pattern) hl_slab = fzf_make_default_slab();
+    if (!hl_slab) {
+      if (hl_pattern) { fzf_free_pattern(hl_pattern); hl_pattern = NULL; }
+      hl_cap = 0;
+    }
+  }
+
   for (size_t i = len; i-- > 0;) {
-    /* printf("zero: %jd one: %jd score: %d", */
-    /*        env->extract_integer(env, Qzero), */
-    /*        env->extract_integer(env, Qone), */
-    /*        xs[i].score); */
     /* e.g. (put-text-property 0 1 'completion-score score x) */
     if (xs[i].s.len > 0) {
       env->funcall(env, Fput_text_property, 5,
@@ -438,8 +516,16 @@ err_join_threads:
                    });
     }
 
+    if (hl_pattern && i < hl_cap) {
+      apply_highlight_positions(env, xs[i].s.b, hl_pattern, hl_slab,
+                                xs[i].value);
+    }
+
     result = env->funcall(env, Fcons, 2, (emacs_value[]) { xs[i].value, result });
   }
+
+  if (hl_pattern) fzf_free_pattern(hl_pattern);
+  if (hl_slab)    fzf_free_slab(hl_slab);
 
   fzf_log("fzf_native_score_all DONE: query='%.*s' count=%zu\n", (int)query.len, query.b, n);
   free(xs);
@@ -535,26 +621,19 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
     slab = fzf_make_default_slab();
   }
 
-  /* You can get the score/position for as many items as you want */
   int score = fzf_get_score(str.b, pattern, slab);
-  fzf_position_t *pos = fzf_get_positions(str.b, pattern, slab);
 
-  size_t offset = 1;
-  size_t len = 0;
-  if (pos) {
-    len = pos->size;
+  /* Apply C-layer highlighting when fussy-fzf-native-highlight is non-nil
+     and the candidate matched.  The cap concept does not apply to a single
+     candidate — any non-nil value enables highlighting for this call. */
+  if (score > 0 && resolve_fussy_highlight_cap(env, 1) > 0) {
+    apply_highlight_positions(env, str.b, pattern, slab, args[0]);
   }
 
-  emacs_value *result_array = malloc(sizeof(emacs_value) * (offset + len));
-
-  result_array[0] = env->make_integer(env, score);
-
-  for (size_t i = 0; i < len; i++) {
-    result_array[offset + i] = env->make_integer(env, pos->data[len - (i + 1)]);
-  }
-
-  result = env->funcall(env, Flist, offset + len, result_array);
-  fzf_free_positions(pos);
+  /* Return (SCORE) — a single-element list.  Match indices are no longer
+     surfaced to Elisp; highlighting is handled in C. */
+  emacs_value score_val = env->make_integer(env, score);
+  result = env->funcall(env, Flist, 1, &score_val);
   fzf_free_pattern(pattern);
 
   if (nargs > 2) {
