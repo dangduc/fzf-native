@@ -6,25 +6,15 @@ on:
     branches: ["develop"]
     paths: ["**.c", "**.h"]
 
-# Make sure to build each platform binary one-at-a-time.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  REPO: "dangduc/fzf-native"
-  SOURCE_BRANCH: ${{ github.ref }}
-  TARGET_BRANCH: ${{ github.ref }}
-  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
   BUILD_TYPE: Release
 
 jobs:
   build:
-    # The CMake configure and build commands are platform agnostic and
-    # should work equally well on Windows or Mac.  You can convert
-    # this to a matrix build if you need cross-platform coverage.
-    # See:
-    # https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -32,26 +22,54 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
-    - uses: actions/checkout@v3
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
+    - uses: actions/checkout@v4
 
-    - name: Pull branch changes
-      run: |
-        git pull
+    - name: Clean stale binaries
+      shell: bash
+      run: rm -rf bin
 
     - name: Configure CMake
-      # Configure CMake in a 'build' subdirectory.
       run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
 
     - name: Build
-      # Build your program with the given configuration
       run: cmake --build ${{github.workspace}}/build --verbose --config ${{env.BUILD_TYPE}}
+
+    - name: Upload binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: bin-${{ matrix.os }}
+        path: bin/
+        if-no-files-found: error
+        retention-days: 1
+
+  commit:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Download all binaries
+      uses: actions/download-artifact@v4
+      with:
+        path: bin-artifacts
+        pattern: bin-*
+        merge-multiple: true
+
+    - name: Stage binaries
+      run: |
+        mkdir -p bin
+        cp -R bin-artifacts/. bin/
+        rm -rf bin-artifacts
 
     - name: Commit changes
       uses: EndBug/add-and-commit@v9
       with:
         author_name: github-actions
         author_email: github-actions@github.com
-        message: Update binary ${{ matrix.os }}
+        message: Update binaries for all platforms
         add: "bin/**"
