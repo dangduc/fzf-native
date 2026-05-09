@@ -92,6 +92,7 @@ emacs_value Fhashtablep, Fmessage, Fvectorp, Fconsp, Fcdr, Fcar, Fvconcat;
 emacs_value Ffunctionp, Fsymbolp, Fsymbolname, Flength, Fnth, Fprinc, Freverse;
 emacs_value Qcompletion_score, Fput_text_property, Qzero, Qone;
 emacs_value Fencode_coding_string, Qutf_8;
+emacs_value Qface, Qcompletions_common_part;
 
 
 /** An Emacs string made accessible by copying. */
@@ -1552,6 +1553,8 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
   char *filter = malloc((size_t)flen);
   if (!filter) return Qnil;
   env->copy_string_contents(env, args[1], filter, &flen);
+  /* Keep a copy for C-side highlighting; filter ownership may transfer below. */
+  char *filter_for_hilit = (flen > 1) ? strdup(filter) : NULL;
 
   size_t limit = 0;
   if (nargs > 2 && !env->eq(env, args[2], Qnil))
@@ -1634,7 +1637,40 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     pthread_mutex_unlock(&s->score_res_mu);
   }
 
-  /* Build Emacs list from stale results — strings are stable until session destroy */
+  /* Resolve C-side highlight cap from defcustoms fzf-async-highlight and
+     fzf-async-highlight-max-candidates.  Both are read via symbol-value so
+     the user can change them without reloading the module. */
+  size_t         hl_cap     = 0;
+  fzf_pattern_t *hl_pattern = NULL;
+  fzf_slab_t    *hl_slab    = NULL;
+
+  if (filter_for_hilit) {
+    emacs_value sym_hi = env->intern(env, "fzf-async-highlight");
+    emacs_value hi     = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym_hi);
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+      env->non_local_exit_clear(env);
+    else if (env->eq(env, hi, Qt))
+      hl_cap = rcount;                   /* t → highlight everything */
+    else if (!env->eq(env, hi, Qnil)) { /* integer → highlight top N */
+      intmax_t n = env->extract_integer(env, hi);
+      if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+        env->non_local_exit_clear(env);
+      else if (n > 0)
+        hl_cap = (size_t)n;
+    }
+    /* nil or negative integer → hl_cap stays 0, no highlighting */
+  }
+  if (hl_cap > 0) {
+    hl_pattern = fzf_parse_pattern(CaseIgnore, false, filter_for_hilit, true);
+    hl_slab    = fzf_make_default_slab();
+  }
+
+  /* Build Emacs list from stale results — strings are stable until session destroy.
+     snap[0] is the highest-scoring candidate (prepend loop puts it at list head).
+     Apply fzf_get_positions highlighting for snap[0..hl_cap-1] (i < hl_cap).
+     NOTE: fzf positions are byte offsets; put-text-property uses character
+     positions.  For ASCII candidates these are identical.  Multi-byte UTF-8
+     candidates may have slightly misaligned highlights — acceptable for now. */
   emacs_value result = Qnil;
   for (size_t i = rcount; i-- > 0;) {
     emacs_value str = env->make_string(env, snap[i].str,
@@ -1646,11 +1682,47 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     } else if (status != emacs_funcall_exit_return) {
       break;
     }
+
+    if (hl_pattern && i < hl_cap) {
+      fzf_position_t *pos = fzf_get_positions(snap[i].str, hl_pattern, hl_slab);
+      if (pos && pos->size > 0) {
+        /* pos->data[] is in descending order: pos->data[0] = highest position.
+           Iterate ascending (j from size-1 to 0) to find contiguous runs. */
+        size_t plen      = pos->size;
+        size_t run_start = pos->data[plen - 1];
+        size_t run_end   = run_start;
+        for (ptrdiff_t j = (ptrdiff_t)plen - 2; j >= 0; j--) {
+          size_t p = pos->data[j];
+          if (p == run_end + 1) {
+            run_end = p;
+          } else {
+            emacs_value a[5] = {
+              env->make_integer(env, (intmax_t)run_start),
+              env->make_integer(env, (intmax_t)(run_end + 1)),
+              Qface, Qcompletions_common_part, str };
+            env->funcall(env, Fput_text_property, 5, a);
+            env->non_local_exit_clear(env);
+            run_start = run_end = p;
+          }
+        }
+        emacs_value a[5] = {
+          env->make_integer(env, (intmax_t)run_start),
+          env->make_integer(env, (intmax_t)(run_end + 1)),
+          Qface, Qcompletions_common_part, str };
+        env->funcall(env, Fput_text_property, 5, a);
+        env->non_local_exit_clear(env);
+      }
+      fzf_free_positions(pos);
+    }
+
     result = env->funcall(env, Fcons, 2, (emacs_value[]){ str, result });
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
       break;
   }
 
+  if (hl_pattern) fzf_free_pattern(hl_pattern);
+  if (hl_slab)    fzf_free_slab(hl_slab);
+  free(filter_for_hilit);
   free(snap);
   return result;
 }
@@ -1811,6 +1883,8 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qcompletion_score = env->make_global_ref(env, env->intern(env, "completion-score"));
   Fput_text_property = env->make_global_ref(env, env->intern(env, "put-text-property"));
   Fencode_coding_string = env->make_global_ref(env, env->intern(env, "encode-coding-string"));
+  Qface = env->make_global_ref(env, env->intern(env, "face"));
+  Qcompletions_common_part = env->make_global_ref(env, env->intern(env, "completions-common-part"));
   Qutf_8 = env->make_global_ref(env, env->intern(env, "utf-8"));
   Qlistofzero = env->make_global_ref(
     env, env->funcall(env, Fcons, 2,
