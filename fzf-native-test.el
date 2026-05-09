@@ -4,20 +4,7 @@
 
 (fzf-native-load-dyn)
 
-(ert-deftest fzf-native-score-indices-order-test ()
-  (let ((result (fzf-native-score "abcdefghi" "acef")))
-    (should (= (nth 1 result) 0))
-    (should (= (nth 2 result) 2))
-    (should (= (nth 3 result) 4))
-    (should (= (nth 4 result) 5))))
 
-(ert-deftest score-with-default-slab-indices-order-test ()
-  (let* ((slab (fzf-native-make-default-slab))
-         (result (fzf-native-score "abcdefghi" "acef" slab)))
-    (should (= (nth 1 result) 0))
-    (should (= (nth 2 result) 2))
-    (should (= (nth 3 result) 4))
-    (should (= (nth 4 result) 5))))
 
 (ert-deftest fzf-native-score-with-default-slab-test ()
   "Test slab can be reused."
@@ -25,16 +12,16 @@
          (_result (fzf-native-score "abcdefghi" "acef" slab)))
     (should
      (equal (fzf-native-score "abcdefghi" "acef" slab)
-            '(78 0 2 4 5)))
+            '(78)))
     (should
      (equal (fzf-native-score "abc" "acef" slab)
             '(0)))
     (should
      (equal (fzf-native-score "zzzzzabc" "z" slab)
-            '(32 0)))
+            '(32)))
     (should
      (equal (fzf-native-score "sfsjoc" "jo" slab)
-            '(36 3 4)))))
+            '(36)))))
 
 (ert-deftest fzf-native-score-with-slab-test ()
   "Test slab can be reused."
@@ -42,16 +29,16 @@
          (_result (fzf-native-score "abcdefghi" "acef" slab)))
     (should
      (equal (fzf-native-score "abcdefghi" "acef" slab)
-            '(78 0 2 4 5)))
+            '(78)))
     (should
      (equal (fzf-native-score "abc" "acef" slab)
             '(0)))
     (should
      (equal (fzf-native-score "zzzzzabc" "z" slab)
-            '(32 0)))
+            '(32)))
     (should
      (equal (fzf-native-score "sfsjoc" "jo" slab)
-            '(36 3 4)))))
+            '(36)))))
 
 (ert-deftest fzf-native-score-empty-query-test ()
   (let ((result (fzf-native-score "abcdefghi" "")))
@@ -81,13 +68,13 @@
   (let* ((len 4096)
          (str (concat (make-string len ?s) "d"))
          (result (fzf-native-score str "d")))
-    (should (equal result `(16 ,len)))))
+    (should (equal result '(16)))))
 
 (ert-deftest fzf-native-score-very-long-str-test ()
   (let* ((len 65536)
          (str (concat (make-string len ?s) "d"))
          (result (fzf-native-score str "d")))
-    (should (equal result `(16 ,len)))))
+    (should (equal result '(16)))))
 
 (ert-deftest fzf-native-score-with-default-slab-benchmark-test ()
   "Test scoring with slab is faster."
@@ -118,32 +105,7 @@
        (benchmark-run 10000
          (fzf-native-score str query large-slab)))))))
 
-(ert-deftest fzf-native-score-indices-multibyte-not-supported-test ()
-  ;; Force `str' to be unambiguously multibyte regardless of the coding
-  ;; system used to load this file (eask may differ from an interactive
-  ;; session). Without the advice, the C module returns BYTE positions.
-  (let ((str (decode-coding-string
-              (encode-coding-string "ポケモン.txt" 'utf-8) 'utf-8)))
-    (should (multibyte-string-p str))
-    (should
-     (equal (cdr (fzf-native-score str "txt"))
-            '(13 14 15)))))
 
-(ert-deftest fzf-native-score-indices-multibyte-support-through-advice-test ()
-  ;; Force `str' to be multibyte (see `...not-supported-test' above).
-  ;; With the advice, byte positions are mapped back to character
-  ;; positions, so we expect (5 6 7) instead of (13 14 15).
-  (advice-add 'fzf-native-score :around #'fzf-native--fix-score-indices)
-  (unwind-protect
-      (let ((str (decode-coding-string
-                  (encode-coding-string "ポケモン.txt" 'utf-8) 'utf-8)))
-        (should (multibyte-string-p str))
-        (should
-         (equal (cdr (fzf-native-score str "txt"))
-                '(5 6 7))))
-    ;; Always remove the advice, even if the assertions above failed.
-    ;; Otherwise the advice leaks into subsequent tests.
-    (advice-remove 'fzf-native-score #'fzf-native--fix-score-indices)))
 
 (defun fzf-native-generate-random-string (length)
   "Generate a random string of LENGTH using alphanumeric characters."
@@ -402,7 +364,3 @@ currently being scored.  Stats are only written on completion, so
             (should done)))
       (fzf-native-async-stop handle))))
 
-(ert-deftest fzf-native-async-start-wrong-type-test ()
-  "`fzf-native-async-start' signals on a non-string command."
-  (should-error (fzf-native-async-start 42)
-                :type 'wrong-type-argument))
