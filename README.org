@@ -59,6 +59,16 @@ Clone / download this repository and modify your ~load-path~:
 (add-to-list 'load-path (expand-file-name "/path/to/fzf-native/" user-emacs-directory))
 #+end_src
 
+*** use-package with :vc
+
+#+begin_src emacs-lisp
+; Configuration that uses pre-built dynamic module.
+(use-package fzf-native
+  :vc (:url "https://github.com/dangduc/fzf-native" :rev :newest)
+  :config
+  (fzf-native-load-dyn))
+#+end_src
+
 *** Straight Examples
 
 #+begin_src emacs-lisp
