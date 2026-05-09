@@ -604,9 +604,26 @@ emacs_value fzf_native_make_slab(emacs_env *env,
 
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 
-#define ASYNC_INIT_CAP   4096
 #define ASYNC_LINE_MAX   8192
 #define ARENA_CHUNK_SIZE (4 * 1024 * 1024)  /* 4 MB per chunk */
+
+/* Chunked candidate-pointer storage.
+ *
+ * The candidate-pointer array is split into fixed-size blocks owned by a
+ * top-level pointer table.  Reader appends to the current block; when a
+ * block fills, it allocates the next one.  No realloc ever moves pointer
+ * data, so the worst-case allocation the reader performs is a single
+ * block — predictable cost regardless of pool size.
+ *
+ *   cands_top[]        :  CANDS_TOP_CAP slots × 8 B  (~32 KB, fixed)
+ *   cands_top[i]       :  CANDS_BLOCK_SIZE × 8 B     (2 MB, on demand)
+ *
+ * Defaults: 256 K pointers per block, 4096 blocks → 1 G candidates max.
+ */
+#define CANDS_BLOCK_SHIFT 18
+#define CANDS_BLOCK_SIZE  ((size_t)1 << CANDS_BLOCK_SHIFT)
+#define CANDS_BLOCK_MASK  (CANDS_BLOCK_SIZE - 1)
+#define CANDS_TOP_CAP     4096
 
 /* Arena allocator: strings are packed into large chunks so freeing the
    entire candidate set is O(chunks) instead of O(candidates). */
@@ -649,7 +666,282 @@ static size_t async_strip_ansi(char *s, size_t len) {
   return w;
 }
 
-typedef struct { char *str; int score; } ScoredStr;
+/* idx is the candidate's position in the scoring-time snapshot.  For
+   full-pool scoring this is the index in s->cands.  For refinement
+   scoring (Phase 2) it is the index in s->cands of the candidate that
+   was looked up via the prefix entry's matched_idx, or in the delta
+   range.  Same struct size as before on 64-bit (8 + 4 + 4 = 16). */
+typedef struct { char *str; int score; uint32_t idx; } ScoredStr;
+
+/* =====================================================================
+ * Result cache (phase 1: exact-match, stale-while-revalidate)
+ * =====================================================================
+ * Per-session LRU keyed by query string.  Each entry holds a copy of
+ * the top-K ScoredStr published when the query was last scored, plus
+ * the candidate-pool size (s->count) at that moment.  When dispatch
+ * sees an exact hit at the current pool size, it can return the
+ * cached result without scheduling new scoring.  An older pool size
+ * means new candidates have arrived since: still return the cached
+ * result, but schedule a re-score so the next dispatch picks up the
+ * fresh data.
+ *
+ * ScoredStr.str points into AsyncSession.arena, which outlives every
+ * cache entry, so the cache stores those pointers directly without
+ * copying string bytes.  Only the top[] array and the query string
+ * itself are owned by the cache.
+ *
+ * Reads happen at dispatch (Emacs main thread); writes happen at
+ * scoring-thread publish.  Both serialize through `cache->mu`.
+ */
+
+#define ASYNC_CACHE_MAX_ENTRIES 20
+/* Reference-counted immutable index array.  Allocated once, retained by each
+   consumer in O(1) (atomic refcount bump under the cache mutex — no memcpy),
+   and freed when the last consumer releases it.  Eliminates the multi-hundred-
+   millisecond dup_idx() stall that previously blocked the Emacs main thread
+   for large match sets (while-no-input cannot interrupt a blocking C call). */
+typedef struct {
+  _Atomic uint32_t refcount;
+  size_t           count;
+  uint32_t         idx[];   /* flexible array */
+} SharedIdx;
+
+static SharedIdx *shared_idx_alloc(const uint32_t *src, size_t n) {
+  if (!n || !src) return NULL;
+  SharedIdx *p = malloc(sizeof *p + n * sizeof *p->idx);
+  if (!p) return NULL;
+  atomic_init(&p->refcount, 1);
+  p->count = n;
+  memcpy(p->idx, src, n * sizeof *p->idx);
+  return p;
+}
+static SharedIdx *shared_idx_retain(SharedIdx *p) {
+  if (p) atomic_fetch_add_explicit(&p->refcount, 1, memory_order_relaxed);
+  return p;
+}
+static void shared_idx_release(SharedIdx *p) {
+  if (p && atomic_fetch_sub_explicit(&p->refcount, 1, memory_order_acq_rel) == 1)
+    free(p);
+}
+
+typedef struct CacheEntry {
+  struct CacheEntry *prev;        /* toward head (MRU); NULL at head */
+  struct CacheEntry *next;        /* toward tail (LRU); NULL at tail */
+  char              *query;       /* strdup'd, owned */
+  size_t             pool_gen;    /* s->count at score time */
+  ScoredStr         *top;         /* malloc'd copy of published top-K */
+  size_t             top_count;
+  /* Phase 2: full match set (indices into s->cands at score time).
+     Reference-counted SharedIdx — retained without copying at lookup. */
+  SharedIdx         *matched_idx;
+} CacheEntry;
+
+typedef struct {
+  pthread_mutex_t mu;
+  CacheEntry     *head;        /* most recently used */
+  CacheEntry     *tail;        /* least recently used */
+  size_t          count;
+} Cache;
+
+static void cache_init(Cache *c) {
+  pthread_mutex_init(&c->mu, NULL);
+  c->head = c->tail = NULL;
+  c->count = 0;
+}
+
+static void cache_free_entry(CacheEntry *e) {
+  if (!e) return;
+  free(e->query);
+  free(e->top);
+  shared_idx_release(e->matched_idx);
+  free(e);
+}
+
+static void cache_destroy(Cache *c) {
+  CacheEntry *e = c->head;
+  while (e) { CacheEntry *n = e->next; cache_free_entry(e); e = n; }
+  c->head = c->tail = NULL;
+  c->count = 0;
+  pthread_mutex_destroy(&c->mu);
+}
+
+/* Detach `e` from the list. Caller holds c->mu. */
+static void cache_unlink(Cache *c, CacheEntry *e) {
+  if (e->prev) e->prev->next = e->next; else c->head = e->next;
+  if (e->next) e->next->prev = e->prev; else c->tail = e->prev;
+  e->prev = e->next = NULL;
+}
+
+/* Push `e` to the head (MRU). Caller holds c->mu. */
+static void cache_push_head(Cache *c, CacheEntry *e) {
+  e->prev = NULL;
+  e->next = c->head;
+  if (c->head) c->head->prev = e;
+  c->head = e;
+  if (!c->tail) c->tail = e;
+}
+
+/* Helper: malloc a copy of a ScoredStr array.  Returns NULL when n=0
+   (caller treats as "no top-K").  On alloc failure returns NULL and
+   the caller decides whether that is fatal (it usually isn't — the
+   cache is best-effort). */
+static ScoredStr *dup_scored(const ScoredStr *src, size_t n) {
+  if (!n) return NULL;
+  ScoredStr *out = malloc(n * sizeof *out);
+  if (out && src) memcpy(out, src, n * sizeof *out);
+  return out;
+}
+
+/* Find an entry by query and bump it to head. Caller holds c->mu. */
+static CacheEntry *cache_lookup_locked(Cache *c, const char *query) {
+  for (CacheEntry *e = c->head; e; e = e->next) {
+    if (strcmp(e->query, query) == 0) {
+      if (e != c->head) {
+        cache_unlink(c, e);
+        cache_push_head(c, e);
+      }
+      return e;
+    }
+  }
+  return NULL;
+}
+
+/* Exact-match lookup.  On hit, bumps LRU, copies the cached top[] out and
+   retains (O(1) refcount bump) the SharedIdx so the caller can release the
+   cache mutex before working with the data.  Returns true on hit, false on
+   miss or top alloc failure (treated the same as a miss). */
+static bool cache_lookup_exact(Cache *c, const char *query,
+                               ScoredStr **out_top, size_t *out_top_count,
+                               SharedIdx **out_sidx,
+                               size_t *out_pool_gen) {
+  pthread_mutex_lock(&c->mu);
+  CacheEntry *e = cache_lookup_locked(c, query);
+  if (!e) { pthread_mutex_unlock(&c->mu); return false; }
+
+  ScoredStr *top_copy = dup_scored(e->top, e->top_count);
+  if (e->top_count && !top_copy) { pthread_mutex_unlock(&c->mu); return false; }
+
+  /* O(1): just bump the refcount while holding the mutex. */
+  SharedIdx *sidx = shared_idx_retain(e->matched_idx);
+
+  *out_top       = top_copy;
+  *out_top_count = e->top_count;
+  *out_sidx      = sidx;
+  *out_pool_gen  = e->pool_gen;
+  pthread_mutex_unlock(&c->mu);
+  return true;
+}
+
+/* Subsumption rule (Phase 2 v1, conservative):
+     Q' subsumes Q (matches(Q) ⊆ matches(Q')) iff
+       - neither Q nor Q' contains '|' (no OR clauses), and
+       - Q starts with Q' as a textual prefix.
+   This catches: extending a term ("fo" → "foo"), adding new AND
+   terms ("fo" → "fo bar"), adding negations ("fo" → "fo !x"), and
+   anchors.  It rejects every OR query — those fall through to
+   full-pool scoring. */
+static bool subsumes(const char *q_prime, const char *q) {
+  if (strchr(q_prime, '|') || strchr(q, '|')) return false;
+  size_t lp = strlen(q_prime);
+  if (lp == 0) return true;
+  size_t lq = strlen(q);
+  if (lq < lp) return false;
+  return memcmp(q, q_prime, lp) == 0;
+}
+
+/* Walk the cache for the longest Q' (other than Q itself) that subsumes Q.
+   On hit, bumps the chosen entry to MRU, copies its top[] out and retains
+   (O(1)) the SharedIdx.  Returns true on hit, false otherwise (miss or
+   top alloc failure). */
+static bool cache_lookup_prefix(Cache *c, const char *query,
+                                ScoredStr **out_top, size_t *out_top_count,
+                                SharedIdx **out_sidx,
+                                size_t *out_pool_gen) {
+  pthread_mutex_lock(&c->mu);
+  CacheEntry *best = NULL;
+  size_t      best_len = 0;
+  for (CacheEntry *e = c->head; e; e = e->next) {
+    if (strcmp(e->query, query) == 0) continue;       /* skip exact */
+    if (!subsumes(e->query, query)) continue;
+    size_t len = strlen(e->query);
+    if (len > best_len) { best = e; best_len = len; }
+  }
+  if (!best) { pthread_mutex_unlock(&c->mu); return false; }
+
+  ScoredStr *top_copy = dup_scored(best->top, best->top_count);
+  if (best->top_count && !top_copy) { pthread_mutex_unlock(&c->mu); return false; }
+
+  /* O(1): just bump the refcount while holding the mutex. */
+  SharedIdx *sidx = shared_idx_retain(best->matched_idx);
+
+  if (best != c->head) { cache_unlink(c, best); cache_push_head(c, best); }
+
+  *out_top       = top_copy;
+  *out_top_count = best->top_count;
+  *out_sidx      = sidx;
+  *out_pool_gen  = best->pool_gen;
+  pthread_mutex_unlock(&c->mu);
+  return true;
+}
+
+/* Insert (or update) an entry for `query`.  All allocations are done OUTSIDE
+   the mutex so the critical section is O(1) pointer swaps only — no memcpy
+   of potentially-huge index arrays while the Emacs main thread waits.
+   matched_idx is stored only for non-OR queries (OR queries can never be
+   prefix-refinement sources).  Cache is best-effort: no-op on alloc failure.
+   Evicted entries are freed after the mutex is released. */
+static void cache_insert(Cache *c, const char *query, size_t pool_gen,
+                         const ScoredStr *top, size_t top_count,
+                         const uint32_t *matched_idx, size_t match_count) {
+  bool store_idx = (matched_idx && match_count && !strchr(query, '|'));
+
+  /* Pre-allocate ALL resources OUTSIDE the mutex. */
+  ScoredStr  *new_top  = dup_scored(top, top_count);
+  SharedIdx  *new_sidx = store_idx ? shared_idx_alloc(matched_idx, match_count) : NULL;
+  CacheEntry *fresh    = calloc(1, sizeof *fresh);
+  char       *qdup     = fresh ? strdup(query) : NULL;
+  if ((top_count && !new_top) || (fresh && !qdup)) {
+    free(new_top); shared_idx_release(new_sidx); free(fresh); free(qdup); return;
+  }
+
+  pthread_mutex_lock(&c->mu);
+
+  CacheEntry *existing = cache_lookup_locked(c, query);
+  if (existing) {
+    ScoredStr *old_top  = existing->top;
+    SharedIdx *old_sidx = existing->matched_idx;
+    existing->top         = new_top;
+    existing->top_count   = new_top ? top_count : 0;
+    existing->matched_idx = new_sidx;
+    existing->pool_gen    = pool_gen;
+    pthread_mutex_unlock(&c->mu);
+    free(old_top); shared_idx_release(old_sidx);
+    free(qdup); free(fresh);
+    return;
+  }
+
+  if (!fresh) {
+    pthread_mutex_unlock(&c->mu);
+    free(new_top); shared_idx_release(new_sidx);
+    return;
+  }
+  fresh->query       = qdup;
+  fresh->top         = new_top;
+  fresh->top_count   = new_top ? top_count : 0;
+  fresh->matched_idx = new_sidx;
+  fresh->pool_gen    = pool_gen;
+
+  CacheEntry *evicted = NULL;
+  if (c->count >= ASYNC_CACHE_MAX_ENTRIES) {
+    evicted = c->tail;
+    if (evicted) { cache_unlink(c, evicted); c->count--; }
+  }
+  cache_push_head(c, fresh);
+  c->count++;
+  pthread_mutex_unlock(&c->mu);
+
+  if (evicted) cache_free_entry(evicted);
+}
 
 typedef struct {
   pthread_t     reader;
@@ -658,10 +950,9 @@ typedef struct {
   _Atomic bool stop;
 
   pthread_mutex_t mu;
-  Arena           arena;   /* backing storage for all candidate strings */
-  char          **cands;
-  size_t          count;
-  size_t          cap;
+  Arena           arena;     /* backing storage for all candidate strings */
+  char          **cands_top[CANDS_TOP_CAP]; /* chunked pointer array; entries are 2 MB blocks allocated on demand */
+  _Atomic size_t  count;     /* written by reader (under mu); read by any thread */
   _Atomic int     gen;
 
   size_t          last_filtered;   /* candidates matching last filter */
@@ -679,9 +970,19 @@ typedef struct {
   char            *score_current_filter; /* filter being actively scored (under score_req_mu) */
   size_t           score_current_limit;
 
+  /* Phase 2 refinement: when set, scoring scores against
+     score_req_refine_idx ∪ s->cands[score_req_refine_delta_from..)
+     instead of the full pool.  refine_idx is a SharedIdx retained at
+     dispatch and released when the scoring thread steals it. */
+  SharedIdx       *score_req_refine_idx;        /* may be NULL; ref-counted */
+  size_t           score_req_refine_delta_from;
+  bool             score_req_has_refine;
+
   pthread_mutex_t  score_res_mu;
   ScoredStr       *score_results;     /* latest scored+sorted results */
   size_t           score_count;       /* number of entries in score_results */
+
+  Cache            cache;             /* per-session result cache */
 } AsyncSession;
 
 static void *async_reader(void *arg) {
@@ -698,21 +999,35 @@ static void *async_reader(void *arg) {
     char *dup = arena_strdup(&s->arena, line, len);
     if (!dup) continue;
 
-    pthread_mutex_lock(&s->mu);
-    if (s->count >= s->cap) {
-      size_t  ncap = s->cap * 2;
-      fzf_log("async_reader: reallocating candidates %zu -> %zu\n", s->cap, ncap);
-      char  **nc   = realloc(s->cands, ncap * sizeof *nc);
-      if (!nc) { free(dup); pthread_mutex_unlock(&s->mu); continue; }
-      s->cands = nc;
-      s->cap   = ncap;
+    /* Chunked append: figure out which block this index lands in, allocate
+       the block on first use, write the slot, publish via the count
+       store-release.  The largest single allocation we ever do here is
+       one block (CANDS_BLOCK_SIZE * 8 B = 2 MB) — predictable cost
+       regardless of pool size, so memory-pressure stalls scale O(1). */
+    size_t cur = atomic_load_explicit(&s->count, memory_order_relaxed);
+    size_t hi  = cur >> CANDS_BLOCK_SHIFT;
+    size_t lo  = cur & CANDS_BLOCK_MASK;
+    if (hi >= CANDS_TOP_CAP) continue;             /* 1 G-candidate ceiling */
+
+    if (s->cands_top[hi] == NULL) {
+      char **blk = malloc(CANDS_BLOCK_SIZE * sizeof *blk);
+      if (!blk) continue;
+      fzf_log("async_reader: allocated cands block %zu (%zu entries, %zu MB)\n",
+              hi, (size_t)CANDS_BLOCK_SIZE,
+              (size_t)(CANDS_BLOCK_SIZE * sizeof *blk) / (1024 * 1024));
+      pthread_mutex_lock(&s->mu);
+      s->cands_top[hi] = blk;
+      pthread_mutex_unlock(&s->mu);
     }
-    s->cands[s->count++] = dup;
+    pthread_mutex_lock(&s->mu);
+    s->cands_top[hi][lo] = dup;
+    atomic_store_explicit(&s->count, cur + 1, memory_order_release);
     pthread_mutex_unlock(&s->mu);
     atomic_fetch_add_explicit(&s->gen, 1, memory_order_relaxed);
   }
   fzf_log("async_reader EXIT: total=%zu gen=%d\n",
-          s->count, (int)atomic_load_explicit(&s->gen, memory_order_relaxed));
+          (size_t)atomic_load_explicit(&s->count, memory_order_relaxed),
+          (int)atomic_load_explicit(&s->gen, memory_order_relaxed));
   return NULL;
 }
 
@@ -721,7 +1036,8 @@ static void *scoring_thread_fn(void *arg);  /* defined after async_scoring_worke
 static void async_session_destroy(void *ptr) {
   AsyncSession *s = ptr;
   if (!s) return;
-  fzf_log("async_session_destroy: pid=%d count=%zu\n", (int)s->pid, s->count);
+  fzf_log("async_session_destroy: pid=%d count=%zu\n", (int)s->pid,
+          (size_t)atomic_load_explicit(&s->count, memory_order_relaxed));
 
   /* Signal everything to stop simultaneously so scoring and reader wind down
      in parallel rather than sequentially. */
@@ -732,6 +1048,9 @@ static void async_session_destroy(void *ptr) {
   pthread_mutex_lock(&s->score_req_mu);
   free(s->score_req_filter);
   s->score_req_filter = NULL;
+  shared_idx_release(s->score_req_refine_idx);
+  s->score_req_refine_idx = NULL;
+  s->score_req_has_refine = false;
   s->score_req_stop   = true;
   pthread_cond_signal(&s->score_req_cond);
   pthread_mutex_unlock(&s->score_req_mu);
@@ -747,9 +1066,14 @@ static void async_session_destroy(void *ptr) {
   pthread_join(s->reader, NULL);
   if (s->fp)      { fclose(s->fp); s->fp = NULL; }
   if (s->pid > 0) { waitpid(s->pid, NULL, 0); s->pid = -1; }
+
+  cache_destroy(&s->cache);
+
   pthread_mutex_lock(&s->mu);
   arena_free(&s->arena);
-  free(s->cands);
+  for (size_t i = 0; i < CANDS_TOP_CAP; i++) {
+    if (s->cands_top[i]) { free(s->cands_top[i]); s->cands_top[i] = NULL; }
+  }
   pthread_mutex_unlock(&s->mu);
   pthread_mutex_destroy(&s->mu);
   free(s);
@@ -822,16 +1146,17 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
 
   s->pid   = pid;
   s->fp    = fdopen(pfd[0], "r");
-  s->cap   = ASYNC_INIT_CAP;
-  s->cands = malloc(s->cap * sizeof *s->cands);
+  /* cands_top[] was zeroed by calloc(); blocks are allocated lazily by
+     the reader.  No upfront pointer-array allocation. */
   pthread_mutex_init(&s->mu, NULL);
   pthread_mutex_init(&s->score_req_mu, NULL);
   pthread_cond_init(&s->score_req_cond, NULL);
   pthread_mutex_init(&s->score_res_mu, NULL);
+  cache_init(&s->cache);
   atomic_store(&s->gen, 0);
   atomic_store(&s->score_abort, false);
 
-  if (!s->fp || !s->cands ||
+  if (!s->fp ||
       pthread_create(&s->reader, NULL, async_reader, s) != 0 ||
       pthread_create(&s->score_thread, NULL, scoring_thread_fn, s) != 0) {
     async_session_destroy(s);
@@ -847,7 +1172,8 @@ fzf_native_async_stop(emacs_env *env, ptrdiff_t nargs,
   (void)nargs;
   AsyncSession *s = env->get_user_ptr(env, args[0]);
   if (s) {
-    fzf_log("async_stop: pid=%d total=%zu\n", (int)s->pid, s->count);
+    fzf_log("async_stop: pid=%d total=%zu\n", (int)s->pid,
+            (size_t)atomic_load_explicit(&s->count, memory_order_relaxed));
     env->set_user_ptr(env, args[0], NULL);
     async_session_destroy(s);
   }
@@ -895,44 +1221,98 @@ static void counting_sort_scored(ScoredStr *xs, size_t n) {
   free(count);
 }
 
-struct AsyncScoringBatch {
-  unsigned len;
-  ScoredStr xs[BATCH_SIZE];
+/* Lightweight work unit: a contiguous range of virtual indices to score.
+   No string data is embedded — workers resolve candidates from cands_top. */
+struct AsyncScoringRange {
+  size_t from;
+  size_t to;
 };
 
+/* Shared read-only context for all scoring workers. */
 struct AsyncScoringShared {
-  fzf_pattern_t            *pattern;
-  struct AsyncScoringBatch *batches;
+  AsyncSession  *s;
+  fzf_pattern_t *pattern;
+  _Atomic bool  *stop;
+
+  /* Refine context: scattered previously-matched entries (bounded by LIMIT).
+     NULL for full-pool runs. */
+  char     **refine_snap;
+  uint32_t  *refine_idx_snap;
+  size_t     refine_count;
+  size_t     refine_delta_from;
+  bool       has_refine;
+
+  /* Work distribution */
+  struct AsyncScoringRange *ranges;
   _Atomic ssize_t           remaining;
-  _Atomic bool             *stop;     /* points to session's score_abort */
+
+  /* Per-worker result cap (0 = unlimited).  Set to a multiple of
+     ceil(limit/num_workers) to prevent memory exhaustion on broad queries. */
+  size_t per_worker_limit;
+};
+
+/* Per-worker state: each spawned thread gets its own copy. */
+struct AsyncWorkerArgs {
+  struct AsyncScoringShared *shared;
+  ScoredStr *results;
+  size_t     result_count;
+  size_t     result_cap;
 };
 
 static void *async_scoring_worker(void *ptr) {
-  struct AsyncScoringShared *shared = ptr;
-  fzf_slab_t    *slab         = fzf_make_default_slab();
-  fzf_pattern_t *pattern      = shared->pattern;
+  struct AsyncWorkerArgs    *args   = ptr;
+  struct AsyncScoringShared *shared = args->shared;
+  AsyncSession  *s       = shared->s;
+  fzf_pattern_t *pattern = shared->pattern;
+  fzf_slab_t    *slab    = fzf_make_default_slab();
 
-  ssize_t bi;
-  while ((bi = atomic_fetch_sub_explicit(&shared->remaining, 1,
+  ssize_t ri;
+  while ((ri = atomic_fetch_sub_explicit(&shared->remaining, 1,
                                          memory_order_seq_cst) - 1) >= 0) {
     if (shared->stop && atomic_load_explicit(shared->stop, memory_order_relaxed))
       break;
-    struct AsyncScoringBatch *batch = shared->batches + bi;
-    unsigned n = 0;
+    if (shared->per_worker_limit && args->result_count >= shared->per_worker_limit)
+      break;
+
+    struct AsyncScoringRange *range = &shared->ranges[ri];
     bool aborted = false;
-    for (unsigned i = 0; i < batch->len; i++) {
+    for (size_t i = range->from; i < range->to; i++) {
       if ((i & 0xFF) == 0 && shared->stop &&
           atomic_load_explicit(shared->stop, memory_order_relaxed)) {
         aborted = true; break;
       }
-      int sc = pattern ? fzf_get_score(batch->xs[i].str, pattern, slab) : 1;
-      if (!pattern || sc > 0) {
-        batch->xs[n]         = batch->xs[i];
-        batch->xs[n++].score = sc;
+
+      /* Resolve candidate: scattered refine entries first, then cands_top. */
+      const char *str;
+      uint32_t    orig_idx;
+      if (shared->has_refine && i < shared->refine_count) {
+        str      = shared->refine_snap[i];
+        orig_idx = shared->refine_idx_snap[i];
+      } else {
+        size_t gi = shared->has_refine
+                    ? shared->refine_delta_from + (i - shared->refine_count)
+                    : i;
+        str      = s->cands_top[gi >> CANDS_BLOCK_SHIFT][gi & CANDS_BLOCK_MASK];
+        orig_idx = (uint32_t)gi;
       }
+
+      int sc = pattern ? fzf_get_score(str, pattern, slab) : 1;
+      if (pattern && sc <= 0) continue;
+
+      if (args->result_count >= args->result_cap) {
+        size_t newcap = args->result_cap ? args->result_cap * 2 : 64;
+        ScoredStr *nb = realloc(args->results, newcap * sizeof *nb);
+        if (!nb) { aborted = true; break; }
+        args->results    = nb;
+        args->result_cap = newcap;
+      }
+      args->results[args->result_count++] =
+          (ScoredStr){ .str = (char *)str, .score = sc, .idx = orig_idx };
+
+      if (shared->per_worker_limit && args->result_count >= shared->per_worker_limit)
+        break;
     }
     if (aborted) break;
-    batch->len = n;
   }
 
   fzf_free_slab(slab);
@@ -954,6 +1334,13 @@ static void *scoring_thread_fn(void *arg) {
     char  *filter = s->score_req_filter;   /* steal ownership */
     size_t limit  = s->score_req_limit;
     s->score_req_filter = NULL;
+    /* Phase 2: also steal refine params (NULL if no refine). */
+    bool       has_refine        = s->score_req_has_refine;
+    SharedIdx *refine_sidx       = s->score_req_refine_idx;
+    size_t     refine_delta_from = s->score_req_refine_delta_from;
+    s->score_req_refine_idx        = NULL;
+    s->score_req_refine_delta_from = 0;
+    s->score_req_has_refine        = false;
     /* Record what we're about to score so main thread can skip abort for same filter */
     free(s->score_current_filter);
     s->score_current_filter = strdup(filter);
@@ -964,102 +1351,155 @@ static void *scoring_thread_fn(void *arg) {
        next dispatch that may have already set it again. */
     atomic_store_explicit(&s->score_abort, false, memory_order_seq_cst);
 
-    /* Snapshot candidate count first (brief lock), then malloc outside lock,
-       then memcpy under lock.  Keeps s->mu held only for the fast memcpy,
-       not for the potentially-slow malloc with tens of millions of candidates. */
+    /* Capture current pool count (brief lock). */
     pthread_mutex_lock(&s->mu);
-    size_t count = s->count;
+    size_t pool_count = atomic_load_explicit(&s->count, memory_order_relaxed);
     pthread_mutex_unlock(&s->mu);
 
-    char **snap = count ? malloc(count * sizeof *snap) : NULL;
-    if (!snap && count) {
+    /* Cap refine inputs against the current pool (defensive). */
+    if (has_refine && refine_delta_from > pool_count)
+      refine_delta_from = pool_count;
+    size_t refine_count = has_refine ? refine_sidx->count : 0;
+    size_t delta_count  = has_refine ? (pool_count - refine_delta_from) : 0;
+    size_t scount       = has_refine ? (refine_count + delta_count) : pool_count;
+
+    /* Allocate only the small arrays for scattered refine indices (bounded by
+       LIMIT ≤ 10000).  Workers read full-pool and delta candidates directly
+       from cands_top — no O(pool_count) snapshot or batch array is needed. */
+    char     **refine_snap     = refine_count ? malloc(refine_count * sizeof *refine_snap)     : NULL;
+    uint32_t  *refine_idx_snap = refine_count ? malloc(refine_count * sizeof *refine_idx_snap) : NULL;
+    if (refine_count && (!refine_snap || !refine_idx_snap)) {
       pthread_mutex_lock(&s->score_req_mu);
       free(s->score_current_filter); s->score_current_filter = NULL;
       pthread_mutex_unlock(&s->score_req_mu);
-      free(filter); continue;
+      free(refine_snap); free(refine_idx_snap); shared_idx_release(refine_sidx); free(filter); continue;
     }
 
     pthread_mutex_lock(&s->mu);
-    if (s->count < count) count = s->count;   /* cap if reader shrank (shouldn't happen) */
-    if (snap) memcpy(snap, s->cands, count * sizeof *snap);
+    if (has_refine) {
+      for (size_t k = 0; k < refine_count; k++) {
+        uint32_t i = refine_sidx->idx[k];
+        refine_snap[k]     = (i < s->count)
+                              ? s->cands_top[i >> CANDS_BLOCK_SHIFT][i & CANDS_BLOCK_MASK]
+                              : "";
+        refine_idx_snap[k] = i;
+      }
+      if (s->count < pool_count) pool_count = s->count;
+      if (delta_count > pool_count - refine_delta_from)
+        delta_count = pool_count - refine_delta_from;
+      scount = refine_count + delta_count;
+    } else {
+      if (s->count < pool_count) pool_count = scount = s->count;
+    }
     pthread_mutex_unlock(&s->mu);
 
-    /* Batch; check abort every 64 K items so a filter change is noticed quickly. */
-    struct AsyncScoringBatch *batches = NULL;
-    size_t bi = 0, bcap = 0;
-    bool batch_ok = true;
-    for (size_t i = 0; i < count; i++) {
-      if ((i & 0xFFFF) == 0 &&
-          atomic_load_explicit(&s->score_abort, memory_order_relaxed)) {
-        batch_ok = false; break;
-      }
-      if (!batches || (batches[bi].len >= BATCH_SIZE && ++bi >= bcap)) {
-        bcap = bcap ? bcap * 2 : 1;
-        struct AsyncScoringBatch *nb = realloc(batches, bcap * sizeof *nb);
-        if (!nb) { batch_ok = false; break; }
-        for (size_t k = bi; k < bcap; k++) nb[k].len = 0;
-        batches = nb;
-      }
-      batches[bi].xs[batches[bi].len].str   = snap[i];
-      batches[bi].xs[batches[bi].len].score = 0;
-      batches[bi].len++;
-    }
-    if (!batch_ok) {
+    /* Build a range array — each entry is 16 bytes, no string pointers.
+       Workers resolve candidates from cands_top at score time. */
+    size_t num_ranges = scount ? (scount + BATCH_SIZE - 1) / BATCH_SIZE : 0;
+    struct AsyncScoringRange *ranges = num_ranges ? malloc(num_ranges * sizeof *ranges) : NULL;
+    if (num_ranges && !ranges) {
       pthread_mutex_lock(&s->score_req_mu);
       free(s->score_current_filter); s->score_current_filter = NULL;
       pthread_mutex_unlock(&s->score_req_mu);
-      free(snap); free(filter); free(batches); continue;
+      free(refine_snap); free(refine_idx_snap); shared_idx_release(refine_sidx); free(filter); continue;
+    }
+    for (size_t r = 0; r < num_ranges; r++) {
+      ranges[r].from = r * BATCH_SIZE;
+      ranges[r].to   = (r + 1) * BATCH_SIZE <= scount ? (r + 1) * BATCH_SIZE : scount;
     }
 
-    unsigned num_batches = count ? (unsigned)(bi + 1) : 0;
-    unsigned max_workers = (unsigned)sysconf(_SC_NPROCESSORS_ONLN);
+    /* Reserve one core for Emacs's event loop and idle timers. */
+    unsigned ncpu        = (unsigned)sysconf(_SC_NPROCESSORS_ONLN);
+    unsigned max_workers = ncpu > 1 ? ncpu - 1 : 1;
 
     size_t flen = strlen(filter);
     fzf_pattern_t *pattern = flen ? fzf_parse_pattern(CaseIgnore, false, filter, true) : NULL;
     bool has_pattern = (pattern != NULL);
 
-    struct AsyncScoringShared shared = {
-      .pattern   = pattern,
-      .batches   = batches,
-      .remaining = num_batches,
-      .stop      = &s->score_abort,
+    /* Cap per-worker output to prevent memory exhaustion on broad/empty queries.
+       4× slack so results don't cluster in a subset of workers. */
+    unsigned num_workers_to_spawn = (unsigned)MIN(max_workers, num_ranges);
+    size_t per_worker_limit = (limit && num_workers_to_spawn)
+        ? (limit / num_workers_to_spawn + 1) * 4 : 0;
+
+    struct AsyncScoringShared ws = {
+      .s                 = s,
+      .pattern           = pattern,
+      .stop              = &s->score_abort,
+      .refine_snap       = refine_snap,
+      .refine_idx_snap   = refine_idx_snap,
+      .refine_count      = refine_count,
+      .refine_delta_from = refine_delta_from,
+      .has_refine        = has_refine,
+      .ranges            = ranges,
+      .remaining         = (ssize_t)num_ranges,
+      .per_worker_limit  = per_worker_limit,
     };
 
-    pthread_t *threads    = malloc(max_workers * sizeof *threads);
-    unsigned   num_workers = 0;
-    if (threads && num_batches) {
-      for (; num_workers < MIN(max_workers, num_batches); num_workers++)
-        pthread_create(threads + num_workers, NULL, async_scoring_worker, &shared);
+    struct AsyncWorkerArgs *worker_args = num_workers_to_spawn
+        ? malloc(num_workers_to_spawn * sizeof *worker_args) : NULL;
+    pthread_t *threads = num_workers_to_spawn
+        ? malloc(num_workers_to_spawn * sizeof *threads) : NULL;
+    unsigned num_workers = 0;
+    if (worker_args && threads && num_ranges) {
+      for (unsigned w = 0; w < num_workers_to_spawn; w++)
+        worker_args[w] = (struct AsyncWorkerArgs){ .shared = &ws };
+      for (; num_workers < num_workers_to_spawn; num_workers++)
+        pthread_create(&threads[num_workers], NULL, async_scoring_worker,
+                       &worker_args[num_workers]);
     }
     for (unsigned i = 0; i < num_workers; i++)
       pthread_join(threads[i], NULL);
     free(threads);
     if (pattern) fzf_free_pattern(pattern);
 
-    /* If a different filter arrived while we were scoring, discard partial results. */
+    /* If a different filter arrived while we were scoring, discard results. */
     if (atomic_load_explicit(&s->score_abort, memory_order_relaxed)) {
       pthread_mutex_lock(&s->score_req_mu);
       free(s->score_current_filter); s->score_current_filter = NULL;
       pthread_mutex_unlock(&s->score_req_mu);
-      free(snap); free(batches); free(filter);
+      if (worker_args)
+        for (unsigned w = 0; w < num_workers; w++) free(worker_args[w].results);
+      free(worker_args); free(ranges);
+      free(refine_snap); free(refine_idx_snap); shared_idx_release(refine_sidx); free(filter);
       continue;
     }
 
-    /* Compact into flat array */
-    size_t total = 0;
-    for (unsigned i = 0; i < num_batches; i++) total += batches[i].len;
-
-    ScoredStr *flat = total ? malloc(total * sizeof *flat) : NULL;
+    /* Merge per-worker result buffers into a single flat array. */
     size_t pos = 0;
-    if (flat) {
-      for (unsigned i = 0; i < num_batches; i++) {
-        struct AsyncScoringBatch *b = batches + i;
-        for (unsigned j = 0; j < b->len; j++)
-          flat[pos++] = b->xs[j];
+    if (worker_args)
+      for (unsigned w = 0; w < num_workers; w++) pos += worker_args[w].result_count;
+
+    ScoredStr *flat = pos ? malloc(pos * sizeof *flat) : NULL;
+    size_t flat_pos = 0;
+    if (flat && worker_args) {
+      for (unsigned w = 0; w < num_workers; w++) {
+        memcpy(flat + flat_pos, worker_args[w].results,
+               worker_args[w].result_count * sizeof *flat);
+        flat_pos += worker_args[w].result_count;
       }
-      if (has_pattern && pos > 1)
-        counting_sort_scored(flat, pos);
     }
+    if (worker_args)
+      for (unsigned w = 0; w < num_workers; w++) free(worker_args[w].results);
+    free(worker_args);
+    free(ranges);
+
+    /* Capture the full matched-index set BEFORE counting_sort
+       reorders flat[].  The cache stores this for prefix-refinement
+       scoring of extending queries (Phase 2). */
+    uint32_t *matched_idx = NULL;
+    size_t    match_count = pos;
+    if (pos) {
+      matched_idx = malloc(pos * sizeof *matched_idx);
+      if (matched_idx) {
+        for (size_t i = 0; i < pos; i++) matched_idx[i] = flat[i].idx;
+      } else {
+        match_count = 0;  /* alloc failure: cache entry will lack the set */
+      }
+    }
+
+    if (flat && has_pattern && pos > 1)
+      counting_sort_scored(flat, pos);
 
     size_t emit = (limit && limit < pos) ? limit : pos;
 
@@ -1073,16 +1513,25 @@ static void *scoring_thread_fn(void *arg) {
     s->score_results = flat;
     s->score_count   = emit;
     s->last_filtered = pos;
-    s->last_total    = count;
+    s->last_total    = pool_count;
     pthread_mutex_unlock(&s->score_res_mu);
+
+    /* Cache what we just published, keyed by filter, tagged with the
+       candidate-pool size at score time.  Subsequent dispatches with
+       the same filter at the same pool size skip scoring entirely.
+       matched_idx carries the full match set for prefix-refinement
+       scoring of extending queries. */
+    cache_insert(&s->cache, filter, pool_count, flat, emit,
+                 matched_idx, match_count);
+    free(matched_idx);
 
     /* Increment gen so Elisp knows new results are available */
     atomic_fetch_add_explicit(&s->gen, 1, memory_order_relaxed);
 
-    fzf_log("scoring_thread: filter='%s' filtered=%zu total=%zu emit=%zu\n",
-            filter, pos, count, emit);
+    fzf_log("scoring_thread: filter='%s' filtered=%zu total=%zu emit=%zu refine=%d\n",
+            filter, pos, pool_count, emit, has_refine ? 1 : 0);
 
-    free(snap); free(batches); free(filter);
+    free(refine_snap); free(refine_idx_snap); shared_idx_release(refine_sidx); free(filter);
   }
 
   fzf_log("scoring_thread EXIT\n");
@@ -1111,31 +1560,79 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
   fzf_log("async_candidates: filter='%s' limit=%zu — dispatching to bg thread\n",
           filter, limit);
 
-  /* Enqueue the new request.  Only abort in-flight scoring if the filter
-     actually changed — same-filter timer re-triggers must not interrupt a
-     scoring run that is still working on the same query, which would cause
-     a livelock where scoring never completes on large candidate sets. */
-  pthread_mutex_lock(&s->score_req_mu);
-  bool filter_changed = !(s->score_current_filter &&
-                          strcmp(s->score_current_filter, filter) == 0 &&
-                          s->score_current_limit == limit);
-  if (filter_changed)
-    atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
-  free(s->score_req_filter);
-  s->score_req_filter = filter;   /* scoring thread owns this now */
-  s->score_req_limit  = limit;
-  pthread_cond_signal(&s->score_req_cond);
-  pthread_mutex_unlock(&s->score_req_mu);
+  /* Read the current candidate-pool size so we can decide whether a
+     cache hit is fresh (same pool size) or stale (pool grew since).
+     count is _Atomic: no lock needed, so this call never blocks on
+     s->mu even when the reader is in the middle of a large realloc. */
+  size_t current_count = atomic_load_explicit(&s->count, memory_order_acquire);
 
-  /* Copy latest scored results under lock so we can release quickly */
-  pthread_mutex_lock(&s->score_res_mu);
-  size_t     rcount = s->score_count;
-  ScoredStr *snap   = rcount ? malloc(rcount * sizeof *snap) : NULL;
-  if (snap && s->score_results)
-    memcpy(snap, s->score_results, rcount * sizeof *snap);
-  else
-    rcount = 0;
-  pthread_mutex_unlock(&s->score_res_mu);
+  /* Cache lookup.  Three outcomes:
+       - exact fresh:  return cached top, no scoring scheduled.
+       - exact stale:  return cached top, schedule refine using this
+                       entry's matched_idx + delta to current count.
+       - prefix match: return prefix entry's top (a superset of Q's
+                       results), schedule refine using prefix entry's
+                       matched_idx + delta.
+       - miss:         return current score_results (today's behavior),
+                       schedule full-pool scoring. */
+  ScoredStr *snap           = NULL;
+  size_t     rcount         = 0;
+  size_t     entry_pool_gen = 0;
+  SharedIdx *entry_sidx     = NULL;
+
+  bool exact = cache_lookup_exact(&s->cache, filter,
+                                  &snap, &rcount,
+                                  &entry_sidx,
+                                  &entry_pool_gen);
+  bool prefix = false;
+  if (!exact) {
+    prefix = cache_lookup_prefix(&s->cache, filter,
+                                 &snap, &rcount,
+                                 &entry_sidx,
+                                 &entry_pool_gen);
+  }
+  bool exact_fresh = exact && entry_pool_gen == current_count;
+  bool can_refine  = (exact || prefix) && entry_sidx != NULL;
+
+  if (exact_fresh) {
+    /* Cache fully satisfied: nothing to score. */
+    free(filter);
+    shared_idx_release(entry_sidx);
+  } else {
+    /* Schedule scoring.  If we have a prefix or stale-exact hit, pass
+       the entry's matched_idx + pool_gen as refinement params so the
+       scoring thread restricts its work to {entry's matches ∪ delta
+       since entry was scored}. */
+    pthread_mutex_lock(&s->score_req_mu);
+    bool filter_changed = !(s->score_current_filter &&
+                            strcmp(s->score_current_filter, filter) == 0 &&
+                            s->score_current_limit == limit);
+    if (filter_changed)
+      atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
+    free(s->score_req_filter);
+    s->score_req_filter = filter;
+    s->score_req_limit  = limit;
+    shared_idx_release(s->score_req_refine_idx);
+    s->score_req_refine_idx        = can_refine ? entry_sidx    : NULL;
+    s->score_req_refine_delta_from = can_refine ? entry_pool_gen : 0;
+    s->score_req_has_refine        = can_refine;
+    pthread_cond_signal(&s->score_req_cond);
+    pthread_mutex_unlock(&s->score_req_mu);
+    /* If we didn't pass entry_sidx into the refine slot, release it. */
+    if (!can_refine) shared_idx_release(entry_sidx);
+  }
+
+  /* Cache miss (no exact, no prefix): fall back to score_results. */
+  if (!exact && !prefix) {
+    pthread_mutex_lock(&s->score_res_mu);
+    rcount = s->score_count;
+    snap   = rcount ? malloc(rcount * sizeof *snap) : NULL;
+    if (snap && s->score_results)
+      memcpy(snap, s->score_results, rcount * sizeof *snap);
+    else
+      rcount = 0;
+    pthread_mutex_unlock(&s->score_res_mu);
+  }
 
   /* Build Emacs list from stale results — strings are stable until session destroy */
   emacs_value result = Qnil;

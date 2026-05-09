@@ -158,7 +158,7 @@ static void test_matches_qsort(void) {
 /* Abuse the str pointer as an order tag; counting_sort_scored never
    dereferences str, only copies it, so this is safe for tests. */
 static ScoredStr make_scored(int score, size_t tag) {
-  ScoredStr s;
+  ScoredStr s = {0};
   s.str   = (char *)(uintptr_t)tag;
   s.score = score;
   return s;
@@ -262,22 +262,29 @@ static void test_strip_ansi_bare_esc(void) {
  * async_reader (pipe-based; no Emacs runtime needed)
  * ===================================================================== */
 
+/* `cap` is no longer meaningful — chunked storage allocates blocks on
+   demand.  Argument retained so existing callers don't change. */
 static AsyncSession *make_async_session(FILE *fp, size_t cap) {
+  (void)cap;
   AsyncSession *s = calloc(1, sizeof *s);
   if (!s) return NULL;
-  s->fp    = fp;
-  s->cap   = cap;
-  s->cands = calloc(cap, sizeof *s->cands);
-  if (!s->cands) { free(s); return NULL; }
+  s->fp = fp;
   pthread_mutex_init(&s->mu, NULL);
   return s;
 }
 
 static void free_async_session(AsyncSession *s) {
   arena_free(&s->arena);
-  free(s->cands);
+  for (size_t i = 0; i < CANDS_TOP_CAP; i++) {
+    if (s->cands_top[i]) free(s->cands_top[i]);
+  }
   pthread_mutex_destroy(&s->mu);
   free(s);
+}
+
+/* Test helper: read candidate i via the chunked accessor. */
+static char *cands_at(AsyncSession *s, size_t i) {
+  return s->cands_top[i >> CANDS_BLOCK_SHIFT][i & CANDS_BLOCK_MASK];
 }
 
 static void test_async_reader_basic(void) {
@@ -296,9 +303,9 @@ static void test_async_reader_basic(void) {
   async_reader((void *)s);
 
   CHECK(s->count == 3);
-  CHECK(strcmp(s->cands[0], "alpha") == 0);
-  CHECK(strcmp(s->cands[1], "beta")  == 0);
-  CHECK(strcmp(s->cands[2], "gamma") == 0);
+  CHECK(strcmp(cands_at(s, 0), "alpha") == 0);
+  CHECK(strcmp(cands_at(s, 1), "beta")  == 0);
+  CHECK(strcmp(cands_at(s, 2), "gamma") == 0);
   free_async_session(s);
 }
 
@@ -319,13 +326,14 @@ static void test_async_reader_ansi_stripping(void) {
   async_reader((void *)s);
 
   CHECK(s->count == 2);
-  CHECK(strcmp(s->cands[0], "file.txt") == 0);
-  CHECK(strcmp(s->cands[1], "plain.c")  == 0);
+  CHECK(strcmp(cands_at(s, 0), "file.txt") == 0);
+  CHECK(strcmp(cands_at(s, 1), "plain.c")  == 0);
   free_async_session(s);
 }
 
 static void test_async_reader_buffer_growth(void) {
-  /* Initial cap=4, write 32 lines — exercises the realloc doubling path. */
+  /* Write a small batch of lines and verify they round-trip through the
+     chunked cands_top storage in order.  All 32 fit within block 0. */
   enum { NLINES = 32 };
   int pfd[2];
   CHECK(pipe(pfd) == 0);
@@ -345,9 +353,400 @@ static void test_async_reader_buffer_growth(void) {
   char expected[32];
   for (int i = 0; i < NLINES; i++) {
     snprintf(expected, sizeof expected, "line%d", i);
-    CHECK(strcmp(s->cands[i], expected) == 0);
+    CHECK(strcmp(cands_at(s, i), expected) == 0);
   }
   free_async_session(s);
+}
+
+/* =====================================================================
+ * Cache (per-session result cache, phase 1: exact-match)
+ * =====================================================================
+ * The cache stores ScoredStr arrays whose .str pointers normally point
+ * into AsyncSession.arena. In these tests we use string literals as
+ * the .str values; the cache only memcpys the pointers, so this is
+ * safe — we never dereference them after teardown.
+ */
+
+static ScoredStr make_top(const char *str, int score) {
+  ScoredStr s = {0};
+  s.str   = (char *)str;   /* not freed by the cache */
+  s.score = score;
+  return s;
+}
+
+static void test_cache_lookup_miss_on_empty(void) {
+  Cache c;
+  cache_init(&c);
+  ScoredStr *out_top = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "foo", &out_top, &out_count,
+                           &out_sidx, &out_gen) == false);
+  CHECK(out_top == NULL);
+  cache_destroy(&c);
+}
+
+static void test_cache_insert_then_lookup_hit(void) {
+  Cache c;
+  cache_init(&c);
+  ScoredStr top[2] = { make_top("alpha", 42), make_top("beta", 17) };
+
+  cache_insert(&c, "fo", 1000, top, 2, NULL, 0);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "fo", &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(out_count == 2);
+  CHECK(out_gen == 1000);
+  CHECK(out != NULL);
+  CHECK(out[0].score == 42);
+  CHECK(strcmp(out[0].str, "alpha") == 0);
+  CHECK(out[1].score == 17);
+  CHECK(strcmp(out[1].str, "beta") == 0);
+  free(out);
+  cache_destroy(&c);
+}
+
+static void test_cache_lookup_miss_distinct_query(void) {
+  Cache c;
+  cache_init(&c);
+  ScoredStr top[1] = { make_top("alpha", 42) };
+  cache_insert(&c, "fo", 100, top, 1, NULL, 0);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "bar", &out, &out_count, &out_sidx, &out_gen) == false);
+  CHECK(out == NULL);
+  cache_destroy(&c);
+}
+
+static void test_cache_insert_updates_in_place(void) {
+  /* Re-inserting the same query overwrites the existing entry rather
+     than creating a duplicate.  Verify count stays at 1 and the new
+     data wins. */
+  Cache c;
+  cache_init(&c);
+  ScoredStr v1[1] = { make_top("alpha", 10) };
+  ScoredStr v2[2] = { make_top("alpha", 99), make_top("beta", 50) };
+
+  cache_insert(&c, "fo", 100, v1, 1, NULL, 0);
+  cache_insert(&c, "fo", 200, v2, 2, NULL, 0);
+  CHECK(c.count == 1);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "fo", &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(out_count == 2);
+  CHECK(out_gen == 200);
+  CHECK(out[0].score == 99);
+  CHECK(out[1].score == 50);
+  free(out);
+  cache_destroy(&c);
+}
+
+static void test_cache_lru_eviction_at_capacity(void) {
+  /* Fill the cache, insert one more, verify the oldest entry is gone
+     and all others remain. */
+  Cache c;
+  cache_init(&c);
+  ScoredStr one[1] = { make_top("x", 1) };
+
+  char qbuf[16];
+  for (size_t i = 0; i < ASYNC_CACHE_MAX_ENTRIES; i++) {
+    snprintf(qbuf, sizeof qbuf, "q%zu", i);
+    cache_insert(&c, qbuf, (size_t)i, one, 1, NULL, 0);
+  }
+  CHECK(c.count == ASYNC_CACHE_MAX_ENTRIES);
+
+  /* Insert one more — should evict q0 (the LRU tail). */
+  cache_insert(&c, "extra", 999, one, 1, NULL, 0);
+  CHECK(c.count == ASYNC_CACHE_MAX_ENTRIES);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+
+  /* q0 is gone. */
+  CHECK(cache_lookup_exact(&c, "q0", &out, &out_count, &out_sidx, &out_gen) == false);
+
+  /* q1 .. q(N-1) are still present. */
+  for (size_t i = 1; i < ASYNC_CACHE_MAX_ENTRIES; i++) {
+    snprintf(qbuf, sizeof qbuf, "q%zu", i);
+    out = NULL; out_sidx = NULL; out_count = 0; out_gen = 0;
+    CHECK(cache_lookup_exact(&c, qbuf, &out, &out_count, &out_sidx, &out_gen) == true);
+    free(out);
+  }
+
+  /* And the freshly inserted "extra" is present. */
+  out = NULL; out_sidx = NULL; out_count = 0; out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "extra", &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(out_gen == 999);
+  free(out);
+
+  cache_destroy(&c);
+}
+
+static void test_cache_touch_on_hit(void) {
+  /* Fill the cache; touch q0 (the oldest) so it becomes MRU; insert
+     one more; verify q0 survived and q1 (now the LRU) was evicted. */
+  Cache c;
+  cache_init(&c);
+  ScoredStr one[1] = { make_top("x", 1) };
+
+  char qbuf[16];
+  for (size_t i = 0; i < ASYNC_CACHE_MAX_ENTRIES; i++) {
+    snprintf(qbuf, sizeof qbuf, "q%zu", i);
+    cache_insert(&c, qbuf, (size_t)i, one, 1, NULL, 0);
+  }
+
+  /* Touch q0 — moves it to head (MRU). */
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "q0", &out, &out_count, &out_sidx, &out_gen) == true);
+  free(out);
+
+  /* Now the LRU tail is q1.  Insert one more; q1 should be evicted. */
+  cache_insert(&c, "extra", 999, one, 1, NULL, 0);
+
+  out = NULL; out_sidx = NULL; out_count = 0; out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "q0", &out, &out_count, &out_sidx, &out_gen) == true);
+  free(out);
+
+  out = NULL; out_sidx = NULL; out_count = 0; out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "q1", &out, &out_count, &out_sidx, &out_gen) == false);
+
+  cache_destroy(&c);
+}
+
+static void test_cache_insert_zero_count(void) {
+  /* Empty top[] is a legitimate "no matches" cache entry; verify it
+     stores and looks up cleanly. */
+  Cache c;
+  cache_init(&c);
+  cache_insert(&c, "nothing", 500, NULL, 0, NULL, 0);
+
+  ScoredStr *out = (ScoredStr *)0xdeadbeef;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 99, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "nothing", &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(out == NULL);
+  CHECK(out_count == 0);
+  CHECK(out_gen == 500);
+  cache_destroy(&c);
+}
+
+/* =====================================================================
+ * Phase 2: subsumes() + cache_lookup_prefix()
+ * ===================================================================== */
+
+static void test_subsumes_extending_term(void) {
+  /* "fo" → "foo" — extending a single term. */
+  CHECK(subsumes("fo", "foo") == true);
+  CHECK(subsumes("foo", "fo") == false);   /* shorter doesn't subsume longer's superset */
+}
+
+static void test_subsumes_adding_and_term(void) {
+  /* "fo" → "fo bar" — adding an AND term. Q starts with Q' textually. */
+  CHECK(subsumes("fo", "fo bar") == true);
+}
+
+static void test_subsumes_adding_negation(void) {
+  /* "fo" → "fo !bad" — adding a negation narrows. */
+  CHECK(subsumes("fo", "fo !bad") == true);
+}
+
+static void test_subsumes_or_in_prefix_rejected(void) {
+  /* Q' contains '|' → not safe to refine from. */
+  CHECK(subsumes("fo|bar", "fo|bar baz") == false);
+}
+
+static void test_subsumes_or_in_query_rejected(void) {
+  /* Q contains '|' → introduces OR; not safe to assume narrowing. */
+  CHECK(subsumes("fo", "fo|bar") == false);
+}
+
+static void test_subsumes_empty_prefix(void) {
+  /* Empty Q' subsumes anything (in practice we never cache empty). */
+  CHECK(subsumes("", "anything") == true);
+}
+
+static void test_subsumes_non_textual_prefix(void) {
+  /* "ba" is not a textual prefix of "foo". */
+  CHECK(subsumes("ba", "foo") == false);
+}
+
+static void test_subsumes_equal_strings(void) {
+  /* Q' == Q is trivially a prefix; subsumes() returns true.  Callers
+     who want to skip exact matches do so explicitly. */
+  CHECK(subsumes("fo", "fo") == true);
+}
+
+static void test_cache_lookup_prefix_finds_subsumer(void) {
+  Cache c;
+  cache_init(&c);
+  ScoredStr top1[1]    = { make_top("alpha", 10) };
+  uint32_t  midx[3]    = { 0, 5, 9 };
+  cache_insert(&c, "fo", 100, top1, 1, midx, 3);
+
+  ScoredStr *out_top = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_prefix(&c, "foo",
+                            &out_top, &out_count,
+                            &out_sidx, &out_gen) == true);
+  CHECK(out_count == 1);
+  CHECK(out_sidx != NULL);
+  CHECK(out_sidx->count == 3);
+  CHECK(out_gen   == 100);
+  CHECK(out_sidx->idx[0] == 0 && out_sidx->idx[1] == 5 && out_sidx->idx[2] == 9);
+  free(out_top);
+  shared_idx_release(out_sidx);
+  cache_destroy(&c);
+}
+
+static void test_cache_lookup_prefix_picks_longest(void) {
+  /* Two subsumers: "f" and "fo".  Looking up "foo" should return "fo"
+     (the longer one, since longer prefixes are more selective). */
+  Cache c;
+  cache_init(&c);
+  ScoredStr top1[1] = { make_top("x", 1) };
+  uint32_t  midx_f[10];  for (int i = 0; i < 10; i++) midx_f[i]  = (uint32_t)i;
+  uint32_t  midx_fo[5];  for (int i = 0; i < 5;  i++) midx_fo[i] = (uint32_t)i;
+
+  cache_insert(&c, "f",  50,  top1, 1, midx_f,  10);
+  cache_insert(&c, "fo", 100, top1, 1, midx_fo, 5);
+
+  ScoredStr *out_top = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_prefix(&c, "foo",
+                            &out_top, &out_count,
+                            &out_sidx, &out_gen) == true);
+  CHECK(out_sidx != NULL);
+  CHECK(out_sidx->count == 5);    /* came from "fo" entry, not "f" */
+  CHECK(out_gen   == 100);
+  free(out_top);
+  shared_idx_release(out_sidx);
+  cache_destroy(&c);
+}
+
+static void test_cache_lookup_prefix_skips_or_query(void) {
+  Cache c;
+  cache_init(&c);
+  ScoredStr top[1] = { make_top("x", 1) };
+  uint32_t  midx[1] = { 0 };
+  cache_insert(&c, "fo", 100, top, 1, midx, 1);
+
+  ScoredStr *out_top = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  /* Q has '|' — refinement isn't safe. */
+  CHECK(cache_lookup_prefix(&c, "fo|bar",
+                            &out_top, &out_count,
+                            &out_sidx, &out_gen) == false);
+  cache_destroy(&c);
+}
+
+static void test_cache_lookup_prefix_skips_exact(void) {
+  /* If only an exact-match entry exists (no actual subsuming prefix),
+     cache_lookup_prefix returns false — exact matches are the
+     caller's responsibility (cache_lookup_exact). */
+  Cache c;
+  cache_init(&c);
+  ScoredStr top[1] = { make_top("x", 1) };
+  uint32_t  midx[1] = { 0 };
+  cache_insert(&c, "fo", 100, top, 1, midx, 1);
+
+  ScoredStr *out_top = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_prefix(&c, "fo",
+                            &out_top, &out_count,
+                            &out_sidx, &out_gen) == false);
+  cache_destroy(&c);
+}
+
+static void test_cache_lookup_prefix_miss_when_no_subsumer(void) {
+  Cache c;
+  cache_init(&c);
+  ScoredStr top[1] = { make_top("x", 1) };
+  uint32_t  midx[1] = { 0 };
+  cache_insert(&c, "ba", 100, top, 1, midx, 1);
+
+  ScoredStr *out_top = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_prefix(&c, "foo",
+                            &out_top, &out_count,
+                            &out_sidx, &out_gen) == false);
+  cache_destroy(&c);
+}
+
+static void test_cache_insert_with_matched_idx(void) {
+  /* Verify cache_insert + cache_lookup_exact round-trip the matched_idx
+     array correctly. */
+  Cache c;
+  cache_init(&c);
+  ScoredStr top[2] = { make_top("alpha", 30), make_top("beta", 20) };
+  uint32_t  midx[4] = { 7, 13, 21, 100 };
+  cache_insert(&c, "fo", 200, top, 2, midx, 4);
+
+  ScoredStr *out_top = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "fo",
+                           &out_top, &out_count,
+                           &out_sidx, &out_gen) == true);
+  CHECK(out_sidx != NULL);
+  CHECK(out_sidx->count == 4);
+  CHECK(out_sidx->idx[0] == 7);
+  CHECK(out_sidx->idx[1] == 13);
+  CHECK(out_sidx->idx[2] == 21);
+  CHECK(out_sidx->idx[3] == 100);
+  free(out_top);
+  shared_idx_release(out_sidx);
+  cache_destroy(&c);
+}
+
+static void test_shared_idx_refcount_roundtrip(void) {
+  /* alloc → retain → release (first) → release (last) → freed. */
+  uint32_t src[3] = { 10, 20, 30 };
+  SharedIdx *p = shared_idx_alloc(src, 3);
+  CHECK(p != NULL);
+  CHECK(p->count == 3);
+  CHECK(p->idx[0] == 10 && p->idx[1] == 20 && p->idx[2] == 30);
+
+  SharedIdx *q = shared_idx_retain(p);
+  CHECK(q == p);
+
+  shared_idx_release(p);  /* refcount 2 → 1; still live */
+  CHECK(q->count == 3);   /* accessible via q */
+  shared_idx_release(q);  /* refcount 1 → 0; freed */
+}
+
+static void test_cache_insert_or_query_no_idx(void) {
+  /* OR queries (containing '|') must never store matched_idx since they
+     can never serve as prefix-refinement sources. */
+  Cache c;
+  cache_init(&c);
+  ScoredStr top[1] = { make_top("y", 5) };
+  uint32_t  midx[3] = { 1, 2, 3 };
+  cache_insert(&c, "foo | bar", 100, top, 1, midx, 3);
+
+  ScoredStr *out_top = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "foo | bar",
+                           &out_top, &out_count,
+                           &out_sidx, &out_gen) == true);
+  CHECK(out_count == 1);
+  CHECK(out_sidx == NULL);   /* OR query: no matched_idx stored */
+  free(out_top);
+  cache_destroy(&c);
 }
 
 /* ================================================================= */
@@ -380,6 +779,37 @@ int main(void) {
   RUN(test_async_reader_basic);
   RUN(test_async_reader_ansi_stripping);
   RUN(test_async_reader_buffer_growth);
+
+  printf("--- cache ---\n");
+  RUN(test_cache_lookup_miss_on_empty);
+  RUN(test_cache_insert_then_lookup_hit);
+  RUN(test_cache_lookup_miss_distinct_query);
+  RUN(test_cache_insert_updates_in_place);
+  RUN(test_cache_lru_eviction_at_capacity);
+  RUN(test_cache_touch_on_hit);
+  RUN(test_cache_insert_zero_count);
+
+  printf("--- subsumes ---\n");
+  RUN(test_subsumes_extending_term);
+  RUN(test_subsumes_adding_and_term);
+  RUN(test_subsumes_adding_negation);
+  RUN(test_subsumes_or_in_prefix_rejected);
+  RUN(test_subsumes_or_in_query_rejected);
+  RUN(test_subsumes_empty_prefix);
+  RUN(test_subsumes_non_textual_prefix);
+  RUN(test_subsumes_equal_strings);
+
+  printf("--- shared_idx ---\n");
+  RUN(test_shared_idx_refcount_roundtrip);
+
+  printf("--- cache_lookup_prefix ---\n");
+  RUN(test_cache_lookup_prefix_finds_subsumer);
+  RUN(test_cache_lookup_prefix_picks_longest);
+  RUN(test_cache_lookup_prefix_skips_or_query);
+  RUN(test_cache_lookup_prefix_skips_exact);
+  RUN(test_cache_lookup_prefix_miss_when_no_subsumer);
+  RUN(test_cache_insert_with_matched_idx);
+  RUN(test_cache_insert_or_query_no_idx);
 
   if (failed == 0) {
     printf("\nAll tests passed.\n");
