@@ -269,25 +269,29 @@ ready."
 ** AsyncSession layout
 
 #+begin_src
-  ┌─────────────────┐
-  │ AsyncSession    │
-  ├─────────────────┤
-  │ s->cands[]      │  ← protected by s->mu
-  │ s->count        │  ← protected by s->mu
-  │ s->arena        │  ← protected by s->mu (string storage)
-  │ s->gen (atomic) │  ← published on score completion
-  │ s->stop (atomic)│  ← shutdown signal
-  ├─────────────────┤
-  │ score_req_*     │  ← protected by score_req_mu
-  │   filter, limit │
-  │   cond, abort   │
-  │   current_*     │
-  ├─────────────────┤
-  │ score_results[] │  ← protected by score_res_mu
-  │ score_count     │
-  │ last_filtered   │
-  │ last_total      │
-  └─────────────────┘
+  ┌──────────────────────────┐
+  │ AsyncSession             │
+  ├──────────────────────────┤
+  │ s->cands_top[][]         │  ← two-level pointer table, under s->mu
+  │ s->count (atomic)        │  ← candidate count; reader stores-release
+  │ s->arena                 │  ← bump allocator for candidate strings
+  │ s->gen (atomic)          │  ← bumped on each score publish
+  │ s->stop (atomic)         │  ← shutdown signal
+  │ s->max_line_length       │  ← read-only after start; set from defcustom
+  ├──────────────────────────┤
+  │ score_req_*              │  ← protected by score_req_mu
+  │   filter, limit          │
+  │   cond, abort            │
+  │   current_filter/limit   │
+  │   refine_idx, delta_from │  ← LRU cache refinement params
+  ├──────────────────────────┤
+  │ score_results[]          │  ← protected by score_res_mu
+  │ score_count              │
+  │ last_filtered            │
+  │ last_total               │
+  ├──────────────────────────┤
+  │ cache (LRU, 20 entries)  │  ← per-session result cache
+  └──────────────────────────┘
 #+end_src
 
 ** Threads, locks, ownership
@@ -295,9 +299,9 @@ ready."
 | Thread              | Reads                          | Writes                                     |
 |---------------------+--------------------------------+--------------------------------------------|
 | Main (Elisp)        | =score_results= (under res mu) | =score_req_*= (under req mu); signals cond |
-| Reader              | child fp                       | =s->cands=, =s->count=, =s->arena= (under s->mu) |
-| Scorer              | =s->cands= snapshot (under s->mu briefly), =score_req_*= | =score_results= (under res mu); =s->gen= |
-| Scorer's sub-workers (transient) | their batch slice, =shared->pattern= (read-only) | their batch slice (compaction in-place) |
+| Reader              | child fp                       | =cands_top=, =s->count=, =s->arena= (under s->mu) |
+| Scorer              | =cands_top= directly (no lock; see safety note below), =score_req_*= | =score_results= (under res mu); =s->gen= |
+| Scorer's sub-workers (transient) | their range slice of =cands_top= (read-only), =shared->pattern= (read-only) | per-worker result buffer |
 
 Three locks, distinct purposes:
 
@@ -316,19 +320,36 @@ Locks are never nested. The scoring thread takes them sequentially:
 #+begin_src
   while (read line from child fp) {
     strip ANSI escapes (in place)
-    arena_strdup(line)            ← arena owns the bytes
-    grow s->cands[] if at cap     ← realloc, doubling
-    s->cands[s->count++] = ptr    ← under s->mu
+    apply max_line_length gate (exclude or truncate)
+    arena_strdup(line)                    ← arena owns the bytes
+    resolve block: hi = count >> SHIFT    ← two-level pointer table
+                   lo = count &  MASK
+    alloc block on first use (2 MB, lazy) ← under s->mu
+    s->cands_top[hi][lo] = ptr            ← under s->mu
+    atomic_store(count, count+1)
   }
   on EOF: just return; thread exits naturally.
 #+end_src
 
-Why an arena: candidates are written once and freed all at once at
-session end. =arena_strdup= bumps a pointer into a 4 MB chunk;
-=arena_free= walks chunks and frees them — O(chunks), not
-O(candidates). For 60 M candidates this is the difference between
-"instant teardown" and "seconds of individual =free()= calls when ESC
-is pressed."
+*Chunked candidate table:* rather than a single flat =char **= that must
+be =realloc='d as it grows (causing VM-pressure stalls at tens of millions
+of candidates), =cands_top= is a two-level pointer table.
+=cands_top[CANDS_TOP_CAP]= holds up to 4096 block pointers; each block
+holds =CANDS_BLOCK_SIZE= (256 K) candidate pointers (2 MB per block, allocated
+lazily). The largest single allocation the reader ever makes is one 2 MB block,
+regardless of pool size.
+
+*Max-line-length gate:* if =AsyncSession.max_line_length != 0=, lines
+exceeding the cap are dropped (positive value) or truncated (negative value)
+before =arena_strdup=. The value is read from the =fzf-async-max-line-length=
+defcustom in =fzf_native_async_start= on the main thread before
+=pthread_create=, so no locking is needed in the reader.
+
+*Arena:* candidates are written once and freed all at once at session end.
+=arena_strdup= bumps a pointer into a 4 MB chunk; =arena_free= walks chunks
+and frees them — O(chunks), not O(candidates). For 60 M candidates this is
+the difference between instant teardown and seconds of individual =free()=
+calls when ESC is pressed.
 
 ** Scoring thread — =scoring_thread_fn=
 
@@ -341,24 +362,42 @@ a filter or sets =score_req_stop=.
     if score_req_stop: exit thread
     steal score_req_filter (set score_current_filter under req mu)
     atomic_store(score_abort, false)
-    parse pattern (once, on this thread)
-    snapshot s->cands pointers (brief s->mu, malloc outside lock)
-    spawn N worker pthreads, each scores its batch
+    parse pattern once (on this thread — strtok is not thread-safe)
+    read pool_count under s->mu
+    build range array: N ranges of BATCH_SIZE candidates each (16 B/range)
+    spawn M worker pthreads, each claims ranges atomically
     pthread_join all workers   ← runs HERE, never on main thread
     if score_abort:            ← filter changed mid-run
       free, clear current_filter, loop
-    compact survivors, counting_sort_scored, apply limit
+    merge per-worker result buffers, counting_sort_scored, apply limit
     publish to score_results (under res mu), update stats
     atomic_fetch_add(s->gen, 1)
 #+end_src
 
-Workers check =score_abort= every 256 items inside the batch loop, not
-just at batch boundaries. This bounds ESC latency at very large
-candidate counts.
+*Range-based workers:* each worker receives an array of =AsyncScoringRange
+{from, to}= structs (16 B each) and claims ranges atomically via
+=atomic_fetch_sub= on a shared =remaining= counter. Workers resolve
+candidate pointers directly from =cands_top= at score time — no pre-copied
+snapshot array needed. This eliminates the O(N) snapshot malloc (447 MB for
+55 M candidates) and replaces the old O(N) batch array (~1 GB) with an
+O(N/BATCH_SIZE) range array (~430 KB).
 
-The batch loop also checks abort every 64 K items during the
-*snapshot construction* before workers spawn, so a filter change
-during a 25 M-item memcpy doesn't force a full pre-work pass.
+*Worker result buffers:* each worker grows its own =ScoredStr *results=
+buffer only as matches are found, bounded by
+=ceil(limit / num_workers + 1) × 4= entries. For limit=10000 and 9 workers
+this is ≤ 71 KB per worker, capping total scoring memory at ≤ 640 KB
+regardless of pool size.
+
+*cands_top read safety:* workers read entries at indices =i < pool_count=
+without holding =s->mu=. This is safe because: (a) entries below pool_count
+are written by the reader exactly once and never modified thereafter;
+(b) the scoring thread captures =pool_count= under =s->mu= before spawning
+workers, establishing a happens-before edge; (c) the store-release on
+=s->count= by the reader and the load-acquire by the scoring thread provide
+the necessary memory ordering.
+
+Workers check =score_abort= every 256 items inside their scoring loop. This
+bounds ESC latency even at very large candidate counts.
 
 ** The "same-filter, don't abort" rule
 
@@ -393,18 +432,68 @@ cross-thread publish signal.)
 
 ** Memory and string ownership
 
-| Object                  | Owner                            | Lifetime                                       |
-|-------------------------+----------------------------------+------------------------------------------------|
-| Candidate strings       | =s->arena=                       | Whole session — freed once at stop             |
-| =s->cands[]= (pointers) | =s->mu=-protected                | Reallocated as it grows; freed at stop         |
-| =score_results[]=       | =score_res_mu=                   | Replaced on each publish; final free at stop   |
-| =score_req_filter=      | =score_req_mu= owns the slot     | =strdup='d when stolen by scorer; freed before next steal |
-| =score_current_filter=  | Scoring thread owns; main thread reads under req mu | Cleared on every scoring exit path |
-| =fzf_pattern_t=         | Scoring thread                   | Parsed once per request, freed after workers join |
+| Object                         | Owner                            | Lifetime                                       |
+|--------------------------------+----------------------------------+------------------------------------------------|
+| Candidate strings              | =s->arena=                       | Whole session — freed once at stop             |
+| =cands_top[i][j]= (pointers)  | =s->mu=-protected writes; lock-free reads by workers | Blocks allocated on demand (2 MB each); freed at stop |
+| =score_results[]=              | =score_res_mu=                   | Replaced on each publish; final free at stop   |
+| =score_req_filter=             | =score_req_mu= owns the slot     | =strdup='d when stolen by scorer; freed before next steal |
+| =score_current_filter=         | Scoring thread owns; main thread reads under req mu | Cleared on every scoring exit path |
+| =fzf_pattern_t= (scoring)      | Scoring thread                   | Parsed once per request, freed after workers join |
+| =fzf_pattern_t= (highlighting) | Main thread (in =fzf_native_async_candidates=) | Parsed per call for top-N highlight pass; freed before return |
+| Per-worker =ScoredStr *= buffers | Each worker thread              | Allocated when first match found; freed after merge |
+| Cache =SharedIdx= (matched indices) | Reference-counted; shared between cache and score_req | Released when evicted or when refine slot is consumed |
 
 The arena is the key invariant: every char* exposed in =s->cands= or
 =score_results= points into arena memory and is valid until the
 =AsyncSession= is destroyed.
+
+** Result cache (=fzf_native_async_candidates=)
+
+Each session maintains a 20-entry LRU cache mapping =(filter, pool_gen)=
+to the scored snapshot from that run, retaining the matched candidate indices
+as a =SharedIdx= (ref-counted shared array).
+
+On each =fzf_native_async_candidates= call, three outcomes are possible:
+
+| Outcome       | Condition                                         | Action                                  |
+|---------------+---------------------------------------------------+-----------------------------------------|
+| Exact fresh   | Filter matches and pool hasn't grown              | Return cached snapshot; no scoring queued |
+| Exact stale or prefix hit | Filter matches (or is an extension of a cached filter) but pool grew | Return cached snapshot; queue scoring restricted to =matched_idx ∪ [pool_gen..now)= |
+| Miss          | No matching cache entry                           | Return current =score_results=; queue full scoring |
+
+The refinement path ("exact stale" and "prefix") avoids re-scoring the
+entire pool on each keystroke during incremental narrowing. When typing
+"foo" after "fo", the cache hit for "fo" constrains the next scoring run to
+the ~fo~ matches plus any candidates that arrived after that run completed.
+
+** C-side match highlighting (=fzf_native_async_candidates=)
+
+After building the result list from the scored snapshot, =fzf_native_async_candidates=
+applies =completions-common-part= face to matched character runs directly on
+the Emacs string objects, before they are consed into the return value.
+
+Flow:
+
+1. Read =fzf-async-highlight= via =symbol-value=:
+   - =nil= → skip; no pattern parsed.
+   - =t= → =hl_cap = rcount= (highlight everything).
+   - Integer N → =hl_cap = N= (highlight top N only).
+2. If =hl_cap > 0=: parse =filter_for_hilit= (a =strdup= of the filter taken
+   before its ownership transfers to the scoring thread) into an
+   =fzf_pattern_t=; allocate one shared =fzf_slab_t=.
+3. For =snap[0..hl_cap-1]= (the highest-scoring candidates, which end up at
+   the front of the Emacs list):
+   - =fzf_get_positions(str, pattern, slab)= → =pos->data[]= descending.
+   - Iterate ascending; merge adjacent byte offsets into contiguous runs.
+   - =put-text-property(run_start, run_end+1, face, completions-common-part, str)=
+     once per run. =Qface= and =Qcompletions_common_part= are global refs
+     interned once at module init.
+4. Free pattern, slab, and =filter_for_hilit=.
+
+Candidates for index > =hl_cap= enter the result list unhighlighted; the
+user would need to scroll to reach them, and most interactive sessions stay
+within the top 20–50 results.
 
 ** Stop / cleanup — =fzf_native_async_stop=
 
