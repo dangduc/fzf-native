@@ -984,6 +984,10 @@ typedef struct {
   size_t           score_count;       /* number of entries in score_results */
 
   Cache            cache;             /* per-session result cache */
+
+  /* Read-only after session start; set from fzf-async-max-line-length defcustom.
+     0 = no limit.  >0 = exclude lines longer than N chars.  <0 = truncate to |N|. */
+  ptrdiff_t        max_line_length;
 } AsyncSession;
 
 static void *async_reader(void *arg) {
@@ -996,6 +1000,16 @@ static void *async_reader(void *arg) {
       line[--len] = '\0';
     len = async_strip_ansi(line, len);
     if (!len) continue;
+
+    ptrdiff_t mll = s->max_line_length;
+    if (mll != 0) {
+      ptrdiff_t cap = mll > 0 ? mll : -mll;
+      if ((ptrdiff_t)len > cap) {
+        if (mll > 0) continue;   /* exclude */
+        len = (size_t)cap;       /* truncate */
+        line[len] = '\0';
+      }
+    }
 
     char *dup = arena_strdup(&s->arena, line, len);
     if (!dup) continue;
@@ -1156,6 +1170,22 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   cache_init(&s->cache);
   atomic_store(&s->gen, 0);
   atomic_store(&s->score_abort, false);
+
+  {
+    emacs_value sym = env->intern(env, "fzf-async-max-line-length");
+    emacs_value val = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+      env->non_local_exit_clear(env);
+    else if (env->eq(env, val, Qt))
+      s->max_line_length = 512;
+    else if (!env->eq(env, val, Qnil)) {
+      s->max_line_length = (ptrdiff_t)env->extract_integer(env, val);
+      if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+        env->non_local_exit_clear(env);
+        s->max_line_length = 0;
+      }
+    }
+  }
 
   if (!s->fp ||
       pthread_create(&s->reader, NULL, async_reader, s) != 0 ||
