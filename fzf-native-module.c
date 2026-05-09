@@ -821,12 +821,14 @@ typedef struct {
   CacheEntry     *head;        /* most recently used */
   CacheEntry     *tail;        /* least recently used */
   size_t          count;
+  size_t          max_entries; /* set from fzf-async-cache-size at session start */
 } Cache;
 
-static void cache_init(Cache *c) {
+static void cache_init(Cache *c, size_t max_entries) {
   pthread_mutex_init(&c->mu, NULL);
   c->head = c->tail = NULL;
   c->count = 0;
+  c->max_entries = max_entries ? max_entries : ASYNC_CACHE_MAX_ENTRIES;
 }
 
 static void cache_free_entry(CacheEntry *e) {
@@ -1012,7 +1014,7 @@ static void cache_insert(Cache *c, const char *query, size_t pool_gen,
   fresh->pool_gen    = pool_gen;
 
   CacheEntry *evicted = NULL;
-  if (c->count >= ASYNC_CACHE_MAX_ENTRIES) {
+  if (c->count >= c->max_entries) {
     evicted = c->tail;
     if (evicted) { cache_unlink(c, evicted); c->count--; }
   }
@@ -1246,7 +1248,21 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   pthread_mutex_init(&s->score_req_mu, NULL);
   pthread_cond_init(&s->score_req_cond, NULL);
   pthread_mutex_init(&s->score_res_mu, NULL);
-  cache_init(&s->cache);
+  {
+    size_t cache_size = ASYNC_CACHE_MAX_ENTRIES;
+    emacs_value sym = env->intern(env, "fzf-async-cache-size");
+    emacs_value val = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+      env->non_local_exit_clear(env);
+    else if (!env->eq(env, val, Qnil)) {
+      intmax_t n = env->extract_integer(env, val);
+      if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+        env->non_local_exit_clear(env);
+      else if (n > 0)
+        cache_size = (size_t)n;
+    }
+    cache_init(&s->cache, cache_size);
+  }
   atomic_store(&s->gen, 0);
   atomic_store(&s->score_abort, false);
 
