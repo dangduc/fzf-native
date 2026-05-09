@@ -85,17 +85,6 @@ Clone / download this repository and modify your ~load-path~:
   (fzf-native-load-dyn))
 #+end_src
 
-*** Multibyte character support
-
-Work around the lib's lack of support for multibyte chars. Add this
-advice if you want accurate indices for multibyte chars.  Don't add
-this advice if you want better run time performance or you don't need
-accurate indices for multibyte chars.
-
-#+begin_src emacs-lisp
-(advice-add 'fzf-native-score :around #'fzf-native--fix-score-indices)
-#+end_src
-
 ** Use Cases
 
 [[https://github.com/jojojames/fussy][Fussy]]: ~fzf-native~ is used as
