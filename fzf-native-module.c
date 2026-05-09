@@ -1193,11 +1193,80 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     if (dir) env->copy_string_contents(env, args[1], dir, &dlen);
   }
 
+  /* Use shell-file-name / shell-command-switch so behaviour matches
+     shell-command (M-!) rather than hardcoding /bin/sh -c. */
+  char *shell_prog = NULL, *shell_switch = NULL;
+  {
+    emacs_value sym = env->intern(env, "shell-file-name");
+    emacs_value v   = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
+    if (env->non_local_exit_check(env) == emacs_funcall_exit_return &&
+        !env->eq(env, v, Qnil)) {
+      ptrdiff_t slen = 0;
+      env->copy_string_contents(env, v, NULL, &slen);
+      if (slen > 1) {
+        shell_prog = malloc((size_t)slen);
+        if (shell_prog) env->copy_string_contents(env, v, shell_prog, &slen);
+      }
+    } else {
+      env->non_local_exit_clear(env);
+    }
+    if (!shell_prog) shell_prog = strdup("/bin/sh");
+  }
+  {
+    emacs_value sym = env->intern(env, "shell-command-switch");
+    emacs_value v   = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
+    if (env->non_local_exit_check(env) == emacs_funcall_exit_return &&
+        !env->eq(env, v, Qnil)) {
+      ptrdiff_t slen = 0;
+      env->copy_string_contents(env, v, NULL, &slen);
+      if (slen > 1) {
+        shell_switch = malloc((size_t)slen);
+        if (shell_switch) env->copy_string_contents(env, v, shell_switch, &slen);
+      }
+    } else {
+      env->non_local_exit_clear(env);
+    }
+    if (!shell_switch) shell_switch = strdup("-c");
+  }
+
+  /* Build PATH from exec-path so the child shell can find binaries that
+     Emacs can find, even on macOS GUI launches with a minimal inherited PATH. */
+  char *exec_path_str = NULL;
+  {
+    emacs_value sym    = env->intern(env, "exec-path");
+    emacs_value v      = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
+    emacs_value sep    = env->make_string(env, ":", 1);
+    emacs_value id     = env->intern(env, "identity");
+    emacs_value mc_fn  = env->intern(env, "mapconcat");
+    emacs_value mc_args[3] = {id, v, sep};
+    if (env->non_local_exit_check(env) == emacs_funcall_exit_return) {
+      emacs_value joined = env->funcall(env, mc_fn, 3, mc_args);
+      if (env->non_local_exit_check(env) == emacs_funcall_exit_return) {
+        ptrdiff_t plen = 0;
+        env->copy_string_contents(env, joined, NULL, &plen);
+        if (plen > 1) {
+          exec_path_str = malloc((size_t)plen);
+          if (exec_path_str)
+            env->copy_string_contents(env, joined, exec_path_str, &plen);
+        }
+      }
+    }
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+      env->non_local_exit_clear(env);
+  }
+
+  fzf_log("async_start: shell='%s' switch='%s' cmd='%s' dir='%s' PATH='%s'\n",
+          shell_prog, shell_switch, cmd, dir ? dir : "(nil)",
+          exec_path_str ? exec_path_str : "(inherited)");
+
   int pfd[2];
   if (pipe(pfd) != 0) {
     fzf_log("async_start: pipe failed\n");
     free(cmd);
     free(dir);
+    free(shell_prog);
+    free(shell_switch);
+    free(exec_path_str);
     return Qnil;
   }
 
@@ -1208,6 +1277,9 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     close(pfd[1]);
     free(cmd);
     free(dir);
+    free(shell_prog);
+    free(shell_switch);
+    free(exec_path_str);
     return Qnil;
   }
 
@@ -1217,11 +1289,28 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     close(pfd[1]);
     int dn = open("/dev/null", O_WRONLY);
     if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+    if (exec_path_str) {
+      const char *old = getenv("PATH");
+      if (old && *old) {
+        size_t nlen = strlen(exec_path_str) + 1 + strlen(old) + 1;
+        char *new_path = malloc(nlen);
+        if (new_path) {
+          snprintf(new_path, nlen, "%s:%s", exec_path_str, old);
+          setenv("PATH", new_path, 1);
+          free(new_path);
+        }
+      } else {
+        setenv("PATH", exec_path_str, 1);
+      }
+    }
     if (dir) chdir(dir);
-    execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+    execl(shell_prog, shell_prog, shell_switch, cmd, (char *)NULL);
     _exit(127);
   }
   close(pfd[1]);
+  free(shell_prog);
+  free(shell_switch);
+  free(exec_path_str);
 
   AsyncSession *s = calloc(1, sizeof *s);
   if (!s) {
