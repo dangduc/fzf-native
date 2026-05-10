@@ -78,7 +78,7 @@ emacs-asan:
 .PHONY: ctest
 ctest:
 	mkdir -p $(BUILD_DIR)
-	$(CC) -std=c11 -Wall -Wextra -O2 -I. -pthread \
+	$(CC) -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -O2 -I. -pthread \
 		-o $(BUILD_DIR)/fzf-native-ctest fzf-native-ctest.c fzf.c
 	$(BUILD_DIR)/fzf-native-ctest
 
