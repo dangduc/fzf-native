@@ -97,10 +97,9 @@ Bridged by fzf-async from `fzf-async-highlight' via `:around' advice."
                  (integer :tag "Top N candidates"))
   :group 'fzf-native)
 
-(defcustom fzf-native-max-line-length t
+(defcustom fzf-native-max-line-length 256
   "Per-line character cap applied by the async reader thread.
-nil       — no limit.
-t         — apply a built-in default of 512 characters.
+nil        — no limit.
 positive N — exclude lines longer than N characters.
 negative -N — include but truncate lines to N characters.
 
@@ -110,7 +109,6 @@ Bridged by fzf-async from `fzf-async-max-line-length' via `:around'
 advice; the read happens inside `fzf-native-async-start' so the
 advice is in scope for the symbol-value lookup."
   :type '(choice (const   :tag "No limit" nil)
-                 (const   :tag "Default (512)" t)
                  (integer :tag "N (positive = exclude, negative = truncate)"))
   :group 'fzf-native)
 

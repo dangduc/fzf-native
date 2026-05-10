@@ -1587,13 +1587,14 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
 
   {
     /* Canonical name; fzf-async bridges `fzf-async-max-line-length'
-       onto this via :around advice on `fzf-native-async-start'. */
+       onto this via :around advice on `fzf-native-async-start'.
+       Type is integer (positive = exclude, negative = truncate) or nil
+       (no limit).  The defcustom default lives in fzf-native.el — no
+       hardcoded fallback here. */
     emacs_value sym = env->intern(env, "fzf-native-max-line-length");
     emacs_value val = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
       env->non_local_exit_clear(env);
-    else if (env->eq(env, val, Qt))
-      s->max_line_length = 512;
     else if (!env->eq(env, val, Qnil)) {
       s->max_line_length = (ptrdiff_t)env->extract_integer(env, val);
       if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
