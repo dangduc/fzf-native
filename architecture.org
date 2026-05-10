@@ -287,6 +287,10 @@ ready."
   │ score_count     │
   │ last_filtered   │
   │ last_total      │
+  ├─────────────────┤
+  │ cache           │  ← LRU result cache, own mutex
+  │   head, tail    │
+  │   count, max    │
   └─────────────────┘
 #+end_src
 
@@ -390,6 +394,84 @@ are still pulled.
 (There is also =s->count=, the reader's "candidates seen" counter,
 which serves as the "has any data arrived yet" signal but is not the
 cross-thread publish signal.)
+
+** Result cache
+
+A per-session LRU cache sits between the dispatch path and the scoring
+thread. Configured via the =fzf-async-cache-size= defcustom (read
+once at session start; default 40 entries).
+
+*Data model*:
+
+#+begin_src
+  CacheEntry {
+    query     : strdup'd filter string             ← owned
+    pool_gen  : s->count at time of scoring
+    top[K]    : copy of top-K results published    ← owned
+    m_idx     : SharedIdx*, refcounted             ← shared
+    parsed    : fzf_pattern_t* (parsed query)      ← owned
+  }
+
+  Cache {
+    head, tail : doubly-linked list (MRU at head)
+    count, max
+    mu         : mutex
+  }
+#+end_src
+
+=SharedIdx= is a refcounted flexible-array struct of =uint32_t=
+holding the *full set* of matched candidate indices for one scoring
+run (not just the top-K). Lookup consumers retain in O(1) under the
+cache mutex (atomic refcount bump — no memcpy); the last consumer
+frees it.
+
+*Dispatch flow* (=fzf_native_async_candidates=, main thread):
+
+| Lookup result        | Display              | Scoring scheduled                 |
+|----------------------+----------------------+-----------------------------------|
+| Exact, pool_gen==now | Cached top-K         | None (no work)                    |
+| Exact, pool_gen<now  | Cached top-K         | Refine on m_idx + delta           |
+| Prefix hit           | Prefix's top-K       | Refine on prefix m_idx + delta    |
+| Miss                 | Current score_results | Full pool scoring                 |
+
+*Subsumption rule* (cache_lookup_prefix). Q' subsumes Q if either
+holds:
+
+- *Byte-prefix* — Q' is a literal byte-prefix of Q and neither
+  contains =|=. Captures: extending a term, adding AND terms at the
+  end, adding negations/anchors at the end.
+- *Term-set* — both queries parse to non-OR patterns (no term-set
+  with >1 term) and every term-set in Q' has an equivalent term-set
+  in Q. Captures: adding an AND term in non-prefix position
+  (=fo= → =x fo=), term reordering (=foo bar= → =bar foo=),
+  non-prefix negation (=fo= → =!x fo=).
+
+OR queries (containing =|=) are excluded from prefix lookups in both
+directions — adding an OR alternate widens results unpredictably, so
+prefix refinement is unsound.
+
+When multiple cached entries subsume Q, the one with the most
+term-sets wins (= most constraints = smallest match set = fastest
+refinement scan), with byte-length as a tiebreaker.
+
+*Refinement scoring*: When the scoring thread receives a refine
+request, it builds the snap from =m_idx= ∪ =s->cands[delta_from..count]=
+instead of the full =s->cands[]=. Typical match sets after 2-3 chars
+are <1% of pool size, so refine scans drop by 100-1000× vs full
+scans on large pools.
+
+*Critical-section discipline*: =cache_insert= pre-allocates everything
+(strdup, malloc, parse_query) *before* taking the cache mutex. The
+critical section is just pointer swaps + LRU list manipulation.
+Evicted entries are freed after unlock. Lookups bump the SharedIdx
+refcount under the mutex, then release it; the consumer holds the
+=SharedIdx*= with no further locking.
+
+*fzf semantics gotcha*: within a term-set = OR (terms are
+alternatives); across term-sets = AND. So =foo bar= parses as 2 sets
+× 1 term (AND-of-two), and =foo | bar= parses as 1 set × 2 terms
+(OR-of-two). The cache rejects any term-set with >1 term as an OR
+query.
 
 ** Memory and string ownership
 

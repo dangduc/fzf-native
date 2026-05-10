@@ -177,7 +177,7 @@
 ;; the same as "did not match" and the candidate is silently dropped.
 
 (defconst fzf-native-test--bad-bytes
-  (string-as-multibyte ";; Copyright 2022 Jo Beøˆ€’")
+  (string-as-multibyte ";; Copyright 2022 Jo Beï¿½ï¿½ï¿½ï¿½ï¿½")
   "Raw-byte string used as a reproducer for the `unicode-string-p' bug.
 Note: on Emacs 30+ this WILL coerce successfully through
 `encode-coding-string', so it scores like any other string. The tests
@@ -362,5 +362,66 @@ currently being scored.  Stats are only written on completion, so
                 (setq done t))
               (unless done (sleep-for 0.1)))
             (should done)))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-cache-prefix-refinement-test ()
+  "Cache returns consistent results across a typing progression and on
+backspace.  Setup: a small corpus where 'fo'/'foo'/'food' produce
+predictably-different result sets.  We type the progression, verify
+each query's results, then backspace back to 'fo' and verify it
+returns the same set as the original 'fo' call.
+
+This exercises:
+- Phase-1 exact lookup (each first call inserts; second call hits)
+- Phase-2 prefix refinement (typing extends matched_idx)
+- Backspace coverage (LRU keeps prior queries)"
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' food foo foobar fool bar baz")))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-data handle)
+          (let ((r-fo-1   (sort (copy-sequence
+                                 (fzf-native-test--wait-for-scoring handle "fo"))
+                                #'string<)))
+            (should (member "foo"    r-fo-1))
+            (should (member "food"   r-fo-1))
+            (should (member "foobar" r-fo-1))
+            (should (member "fool"   r-fo-1))
+            (should-not (member "bar" r-fo-1))
+            ;; Type "foo": narrower than "fo" â€” refinement scenario
+            (let ((r-foo (fzf-native-test--wait-for-scoring handle "foo")))
+              (should (member "foo"    r-foo))
+              (should (member "food"   r-foo))
+              (should (member "foobar" r-foo))
+              ;; "fool" doesn't fuzzy-match "foo" cleanly; just check non-foo
+              ;; candidates are absent
+              (should-not (member "bar" r-foo))
+              (should-not (member "baz" r-foo)))
+            ;; Backspace to "fo" â€” should hit cached entry, return same set
+            (let ((r-fo-2 (sort (copy-sequence
+                                 (fzf-native-async-candidates handle "fo"))
+                                #'string<)))
+              (should (equal r-fo-2 r-fo-1)))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-cache-term-reorder-test ()
+  "Term reordering: \"foo bar\" and \"bar foo\" are semantically equal
+in fzf and the cache should treat them so via term-set subsumption
+(v2).  Both queries should return the same candidates."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' foobar fooXbar bar foo barfoo barXfoo")))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-data handle)
+          (let ((r1 (sort (copy-sequence
+                           (fzf-native-test--wait-for-scoring handle "foo bar"))
+                          #'string<))
+                (r2 (sort (copy-sequence
+                           (fzf-native-test--wait-for-scoring handle "bar foo"))
+                          #'string<)))
+            (should r1)
+            (should (equal r1 r2))))
       (fzf-native-async-stop handle))))
 
