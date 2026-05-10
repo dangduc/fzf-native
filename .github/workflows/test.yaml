@@ -40,4 +40,13 @@ jobs:
       - run: make lint
       - run: make ctest
         if: runner.os != 'Windows'
+
+      - name: Clean stale binaries
+        shell: bash
+        run: rm -rf bin
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build native module
+        run: cmake --build build --config Release
+
       - run: make test
