@@ -350,6 +350,210 @@ static void test_async_reader_buffer_growth(void) {
   free_async_session(s);
 }
 
+/* =====================================================================
+ * Result cache — phase 1: exact-match lookup, LRU eviction, MRU touch
+ * ===================================================================== */
+
+static ScoredStr make_top(const char *str, int score) {
+  ScoredStr s = {0};
+  s.str   = (char *)str;   /* not freed by the cache (cache strdups internally) */
+  s.score = score;
+  return s;
+}
+
+static void test_cache_lookup_miss_on_empty(void) {
+  Cache c;
+  cache_init(&c, 20);
+  ScoredStr *out_top = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "foo", &out_top, &out_count,
+                           &out_sidx, &out_gen) == false);
+  CHECK(out_top == NULL);
+  cache_free(&c);
+}
+
+static void test_cache_insert_then_lookup_hit(void) {
+  Cache c;
+  cache_init(&c, 20);
+  ScoredStr top[2] = { make_top("alpha", 42), make_top("beta", 17) };
+
+  cache_insert(&c, "fo", 1000, top, 2, NULL, 0);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "fo", &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(out_count == 2);
+  CHECK(out_gen == 1000);
+  CHECK(out != NULL);
+  CHECK(out[0].score == 42);
+  CHECK(strcmp(out[0].str, "alpha") == 0);
+  CHECK(out[1].score == 17);
+  CHECK(strcmp(out[1].str, "beta") == 0);
+  CHECK(out_sidx == NULL);   /* no matched_idx supplied */
+  free(out);
+  cache_free(&c);
+}
+
+static void test_cache_lookup_miss_distinct_query(void) {
+  Cache c;
+  cache_init(&c, 20);
+  ScoredStr top[1] = { make_top("alpha", 42) };
+  cache_insert(&c, "fo", 100, top, 1, NULL, 0);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "bar", &out, &out_count, &out_sidx, &out_gen) == false);
+  CHECK(out == NULL);
+  cache_free(&c);
+}
+
+static void test_cache_insert_updates_in_place(void) {
+  /* Re-inserting the same query overwrites the existing entry rather
+     than creating a duplicate.  Verify count stays at 1 and the new
+     data wins. */
+  Cache c;
+  cache_init(&c, 20);
+  ScoredStr v1[1] = { make_top("alpha", 10) };
+  ScoredStr v2[2] = { make_top("alpha", 99), make_top("beta", 50) };
+
+  cache_insert(&c, "fo", 100, v1, 1, NULL, 0);
+  cache_insert(&c, "fo", 200, v2, 2, NULL, 0);
+  CHECK(c.count == 1);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "fo", &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(out_count == 2);
+  CHECK(out_gen == 200);
+  CHECK(out[0].score == 99);
+  CHECK(out[1].score == 50);
+  free(out);
+  cache_free(&c);
+}
+
+static void test_cache_lru_eviction_at_capacity(void) {
+  /* Fill the cache, insert one more, verify the oldest entry is gone
+     and all others remain. */
+  const size_t MAX = 8;
+  Cache c;
+  cache_init(&c, MAX);
+  ScoredStr one[1] = { make_top("x", 1) };
+
+  char qbuf[16];
+  for (size_t i = 0; i < MAX; i++) {
+    snprintf(qbuf, sizeof qbuf, "q%zu", i);
+    cache_insert(&c, qbuf, (size_t)i, one, 1, NULL, 0);
+  }
+  CHECK(c.count == MAX);
+
+  /* Insert one more — should evict q0 (the LRU tail). */
+  cache_insert(&c, "extra", 999, one, 1, NULL, 0);
+  CHECK(c.count == MAX);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+
+  /* q0 is gone. */
+  CHECK(cache_lookup_exact(&c, "q0", &out, &out_count, &out_sidx, &out_gen) == false);
+
+  /* q1 .. q(MAX-1) are still present. */
+  for (size_t i = 1; i < MAX; i++) {
+    snprintf(qbuf, sizeof qbuf, "q%zu", i);
+    out = NULL; out_sidx = NULL; out_count = 0; out_gen = 0;
+    CHECK(cache_lookup_exact(&c, qbuf, &out, &out_count, &out_sidx, &out_gen) == true);
+    free(out);
+  }
+
+  /* And the freshly inserted "extra" is present. */
+  out = NULL; out_sidx = NULL; out_count = 0; out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "extra", &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(out_gen == 999);
+  free(out);
+
+  cache_free(&c);
+}
+
+static void test_cache_touch_on_hit(void) {
+  /* Fill the cache; touch q0 (the oldest) so it becomes MRU; insert
+     one more; verify q0 survived and q1 (now the LRU) was evicted. */
+  const size_t MAX = 4;
+  Cache c;
+  cache_init(&c, MAX);
+  ScoredStr one[1] = { make_top("x", 1) };
+
+  char qbuf[16];
+  for (size_t i = 0; i < MAX; i++) {
+    snprintf(qbuf, sizeof qbuf, "q%zu", i);
+    cache_insert(&c, qbuf, (size_t)i, one, 1, NULL, 0);
+  }
+
+  /* Touch q0 — moves it to head (MRU). */
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "q0", &out, &out_count, &out_sidx, &out_gen) == true);
+  free(out);
+
+  /* Now the LRU tail is q1.  Insert one more; q1 should be evicted. */
+  cache_insert(&c, "extra", 999, one, 1, NULL, 0);
+
+  out = NULL; out_sidx = NULL; out_count = 0; out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "q0", &out, &out_count, &out_sidx, &out_gen) == true);
+  free(out);
+
+  out = NULL; out_sidx = NULL; out_count = 0; out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "q1", &out, &out_count, &out_sidx, &out_gen) == false);
+
+  cache_free(&c);
+}
+
+static void test_cache_insert_zero_count(void) {
+  /* Empty top[] is a legitimate "no matches" cache entry; verify it
+     stores and looks up cleanly. */
+  Cache c;
+  cache_init(&c, 20);
+  cache_insert(&c, "nothing", 500, NULL, 0, NULL, 0);
+
+  ScoredStr *out = (ScoredStr *)0xdeadbeef;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 99, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "nothing", &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(out == NULL);
+  CHECK(out_count == 0);
+  CHECK(out_gen == 500);
+  cache_free(&c);
+}
+
+static void test_cache_pool_gen_distinguishes_stale(void) {
+  /* The cache itself doesn't decide fresh-vs-stale — that's the dispatch
+     layer's job — but it must faithfully report pool_gen so the dispatch
+     can compare it against the current pool size. */
+  Cache c;
+  cache_init(&c, 20);
+  ScoredStr top[1] = { make_top("alpha", 1) };
+  cache_insert(&c, "fo", 100, top, 1, NULL, 0);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "fo", &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(out_gen == 100);
+  free(out);
+
+  /* Re-insert at a new pool_gen; lookup should reflect the latest. */
+  cache_insert(&c, "fo", 5000, top, 1, NULL, 0);
+  out = NULL; out_count = 0; out_gen = 0;
+  CHECK(cache_lookup_exact(&c, "fo", &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(out_gen == 5000);
+  free(out);
+  cache_free(&c);
+}
+
 /* ================================================================= */
 
 int main(void) {
@@ -380,6 +584,16 @@ int main(void) {
   RUN(test_async_reader_basic);
   RUN(test_async_reader_ansi_stripping);
   RUN(test_async_reader_buffer_growth);
+
+  printf("--- cache (phase 1: exact-match) ---\n");
+  RUN(test_cache_lookup_miss_on_empty);
+  RUN(test_cache_insert_then_lookup_hit);
+  RUN(test_cache_lookup_miss_distinct_query);
+  RUN(test_cache_insert_updates_in_place);
+  RUN(test_cache_lru_eviction_at_capacity);
+  RUN(test_cache_touch_on_hit);
+  RUN(test_cache_insert_zero_count);
+  RUN(test_cache_pool_gen_distinguishes_stale);
 
   if (failed == 0) {
     printf("\nAll tests passed.\n");
