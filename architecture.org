@@ -47,7 +47,7 @@ process and must never block the main thread.
 
 | Function                       | Args                                 | Returns                | Path        |
 |--------------------------------+--------------------------------------+------------------------+-------------|
-| =fzf-native-score=             | =(str query &optional slab)=         | =(score idx idx ...)=  | sync single |
+| =fzf-native-score=             | =(str query &optional slab)=         | =(score)=              | sync single |
 | =fzf-native-score-all=         | =(collection query &optional slab)=  | sorted candidate vector | sync batch  |
 | =fzf-native-make-default-slab= | =()=                                 | slab                   | (helper)    |
 | =fzf-native-make-slab=         | =(size16 size32)=                    | slab                   | (helper)    |
@@ -133,17 +133,22 @@ the fzf-native backend.
   Elisp call: (fzf-native-score "foobar" "fb" slab)
        │
        ▼
-  ┌──────────────────────────────────┐
-  │ C: fzf_native_score              │
-  │  - copy_emacs_string("foobar")   │
-  │  - fzf_parse_pattern("fb")       │
-  │  - fzf_get_score(text, pat, slab)│
-  │  - free pattern                  │
-  │  - build (score idx idx ...) cons│
-  └──────────────────────────────────┘
+  ┌──────────────────────────────────────────┐
+  │ C: fzf_native_score                      │
+  │  - copy_emacs_string("foobar")           │
+  │  - fzf_parse_pattern("fb")               │
+  │  - fzf_get_score(text, pat, slab)        │
+  │  - if fussy-fzf-native-highlight non-nil │
+  │      and score > 0:                      │
+  │    - fzf_get_positions                   │
+  │    - put-text-property on args[0] with   │
+  │      face=completions-common-part        │
+  │  - free pattern                          │
+  │  - return (score)                        │
+  └──────────────────────────────────────────┘
        │
        ▼
-  Elisp value: (score idx0 idx1 ...)
+  Elisp value: (score)   ; match indices not surfaced
 #+end_src
 
 ** Notes
@@ -154,6 +159,12 @@ the fzf-native backend.
   avoid that cost.
 - Non-UTF-8 Emacs strings are coerced via =copy_emacs_string=, falling
   back to =encode-coding-string= if =make_string= would signal.
+- Highlighting is applied in C, not Elisp. The C module reads
+  =fussy-fzf-native-highlight= via =symbol-value= on every call; any
+  non-nil value enables highlighting (the cap concept used by
+  =fzf_native_score_all= does not apply to a single candidate). The
+  return value is =(score)= — match indices are no longer surfaced
+  to Elisp callers.
 
 * Path 2 — sync batch (=fzf_native_score_all=)
 

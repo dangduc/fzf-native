@@ -110,6 +110,31 @@ stream candidates from long-running shell commands (~find~, ~rg~,
 [[https://github.com/jojojames/fzf-async/blob/HEAD/architecture.org][fzf-async's architecture overview]]
 for the Elisp-side pipeline.
 
+** Customization
+
+The C module reads the following defcustoms via ~symbol-value~ at call
+time.  Higher-level packages (~fussy~, ~fzf-async~) keep their own
+user-facing defcustoms and bridge their values onto these canonical
+names — ~fussy~ via ~setq-local~ (synchronous, same-buffer call
+pattern), ~fzf-async~ via ~:around~ advice on the C entry points
+(timer-driven, cross-buffer).  Set these directly only if you call
+~fzf-native-score~ / ~fzf-native-score-all~ / ~fzf-native-async-*~
+yourself; otherwise prefer the package-level knob.
+
+| Variable                        | Default | Read by                            | Behavior                                    |
+|---------------------------------+---------+------------------------------------+---------------------------------------------|
+| ~fzf-native-case-mode~          | ~smart~ | every scoring call (sync + async)  | ~smart~ (lowercase = ignore, mixed = respect) / ~ignore~ / ~respect~ |
+| ~fzf-native-batch-highlight~    | 25      | ~fzf-native-score~ / ~fzf-native-score-all~ | nil = off; positive N = apply ~completions-common-part~ face to top N candidates via ~fzf_get_positions~ in C. |
+| ~fzf-native-async-highlight~    | 200     | ~fzf-native-async-candidates~      | nil = off; t = all returned candidates; positive N = top N. |
+| ~fzf-native-max-line-length~    | 256     | ~fzf-native-async-start~ (once at session start) | nil = no limit; +N = drop lines longer than N; -N = truncate lines to N characters. |
+| ~fzf-native-async-cache-size~   | 40      | ~fzf-native-async-start~ (once at session start) | LRU result-cache entries.  Each entry stores top-K results plus the full matched-candidate index for one query, enabling exact-fresh hits and prefix-refinement hits. |
+
+Highlighting runs entirely inside the C module: after scoring,
+~fzf_get_positions~ produces matched byte offsets, which are merged
+into runs and applied to the candidate string with ~put-text-property~
+before strings are handed back to Emacs.  No Elisp regex pass is
+involved.
+
 ** Building the Native Libraries
 
 #+begin_src bash
