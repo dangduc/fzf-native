@@ -54,6 +54,19 @@ confirmation before compiling."
   :type  'boolean
   :group 'fzf-native)
 
+(defcustom fzf-native-case-mode 'smart
+  "How fzf-native treats letter case when matching queries.
+smart    Case-insensitive when the query is all lowercase; case-sensitive
+         once it contains any uppercase character (fzf's default).
+ignore   Always case-insensitive.
+respect  Always case-sensitive.
+
+Read on every scoring call; changes take effect immediately."
+  :type '(choice (const :tag "Smart case (default)" smart)
+                 (const :tag "Ignore case"          ignore)
+                 (const :tag "Respect case"         respect))
+  :group 'fzf-native)
+
 (defun fzf-native-module--cmake-is-available ()
   "Return t if cmake is available.
 CMake is needed to build fzf-native, here we check that we can find
