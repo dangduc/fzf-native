@@ -55,6 +55,12 @@ confirmation before compiling."
   :type  'boolean
   :group 'fzf-native)
 
+;; Canonical knobs the C module reads via `symbol-value' at call time.
+;; Higher-level packages (fzf-async, fussy) keep their own user-facing
+;; defcustoms and bridge their values onto these names — fussy via
+;; `setq-local' (synchronous, same-buffer call pattern), fzf-async via
+;; `:around' advice on the C entry points (timer-driven, cross-buffer).
+
 (defcustom fzf-native-case-mode 'smart
   "How fzf-native treats letter case when matching queries.
 smart    Case-insensitive when the query is all lowercase; case-sensitive
@@ -66,6 +72,59 @@ Read on every scoring call; changes take effect immediately."
   :type '(choice (const :tag "Smart case (default)" smart)
                  (const :tag "Ignore case"          ignore)
                  (const :tag "Respect case"         respect))
+  :group 'fzf-native)
+
+(defcustom fzf-native-batch-highlight 25
+  "Highlight cap for the synchronous (batch) scoring path.
+Read by `fzf-native-score' / `fzf-native-score-all' on every call.
+nil disables highlighting; a positive integer caps the number of
+top-scoring candidates that get `completions-common-part' face
+applied via `fzf_get_positions' inside the C module.
+
+Bridged by fussy from `fussy-fzf-native-highlight' via `setq-local'."
+  :type '(choice (const   :tag "Disabled" nil)
+                 (integer :tag "Top N candidates"))
+  :group 'fzf-native)
+
+(defcustom fzf-native-async-highlight 200
+  "Highlight cap for the streaming (async) candidate path.
+Read by `fzf-native-async-candidates' on every call.  Same semantics
+as `fzf-native-batch-highlight' (nil / positive integer).
+
+Bridged by fzf-async from `fzf-async-highlight' via `:around' advice."
+  :type '(choice (const   :tag "Disabled" nil)
+                 (const   :tag "All candidates" t)
+                 (integer :tag "Top N candidates"))
+  :group 'fzf-native)
+
+(defcustom fzf-native-max-line-length t
+  "Per-line character cap applied by the async reader thread.
+nil       — no limit.
+t         — apply a built-in default of 512 characters.
+positive N — exclude lines longer than N characters.
+negative -N — include but truncate lines to N characters.
+
+Read once at session start by `fzf-native-async-start'.
+
+Bridged by fzf-async from `fzf-async-max-line-length' via `:around'
+advice; the read happens inside `fzf-native-async-start' so the
+advice is in scope for the symbol-value lookup."
+  :type '(choice (const   :tag "No limit" nil)
+                 (const   :tag "Default (512)" t)
+                 (integer :tag "N (positive = exclude, negative = truncate)"))
+  :group 'fzf-native)
+
+(defcustom fzf-native-async-cache-size 40
+  "Per-session LRU result cache capacity for the async path.
+Each entry stores top-K results and the full matched-candidate index
+for one query — enables exact-fresh hits (skip scoring) and prefix-
+refinement hits (rescore only previously-matched candidates plus
+deltas) without re-scanning the full pool.
+
+Read once at session start by `fzf-native-async-start'.
+
+Bridged by fzf-async from `fzf-async-cache-size' via `:around' advice."
+  :type 'integer
   :group 'fzf-native)
 
 (defun fzf-native-module--cmake-is-available ()

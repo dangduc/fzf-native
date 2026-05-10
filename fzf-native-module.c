@@ -379,7 +379,9 @@ static fzf_case_types resolve_fzf_native_case_mode(emacs_env *env) {
      LEN  — highlight all (t).
      N    — highlight top N (clamped to LEN). */
 static size_t resolve_fussy_highlight_cap(emacs_env *env, size_t len) {
-  emacs_value sym = env->intern(env, "fussy-fzf-native-highlight");
+  /* Canonical name; fussy bridges its `fussy-fzf-native-highlight'
+     onto this via `setq-local' inside its all-completions entry. */
+  emacs_value sym = env->intern(env, "fzf-native-batch-highlight");
   emacs_value v   = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
   if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
     env->non_local_exit_clear(env);
@@ -1584,7 +1586,9 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   atomic_store(&s->score_abort, false);
 
   {
-    emacs_value sym = env->intern(env, "fzf-async-max-line-length");
+    /* Canonical name; fzf-async bridges `fzf-async-max-line-length'
+       onto this via :around advice on `fzf-native-async-start'. */
+    emacs_value sym = env->intern(env, "fzf-native-max-line-length");
     emacs_value val = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
       env->non_local_exit_clear(env);
@@ -1601,7 +1605,9 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
 
   {
     size_t cache_max = 40;
-    emacs_value sym = env->intern(env, "fzf-async-cache-size");
+    /* Canonical name; fzf-async bridges `fzf-async-cache-size'
+       onto this via :around advice on `fzf-native-async-start'. */
+    emacs_value sym = env->intern(env, "fzf-native-async-cache-size");
     emacs_value val = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
       env->non_local_exit_clear(env);
@@ -2055,15 +2061,16 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     pthread_mutex_unlock(&s->score_res_mu);
   }
 
-  /* Resolve C-side highlight cap from defcustoms fzf-async-highlight and
-     fzf-async-highlight-max-candidates.  Both are read via symbol-value so
-     the user can change them without reloading the module. */
+  /* Resolve C-side highlight cap from the canonical defcustom.  Read
+     via symbol-value so the user can change it without reloading the
+     module.  fzf-async bridges `fzf-async-highlight' onto this via
+     :around advice on `fzf-native-async-candidates'. */
   size_t         hl_cap     = 0;
   fzf_pattern_t *hl_pattern = NULL;
   fzf_slab_t    *hl_slab    = NULL;
 
   if (filter_for_hilit) {
-    emacs_value sym_hi = env->intern(env, "fzf-async-highlight");
+    emacs_value sym_hi = env->intern(env, "fzf-native-async-highlight");
     emacs_value hi     = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym_hi);
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
       env->non_local_exit_clear(env);
