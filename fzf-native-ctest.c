@@ -262,22 +262,31 @@ static void test_strip_ansi_bare_esc(void) {
  * async_reader (pipe-based; no Emacs runtime needed)
  * ===================================================================== */
 
+/* The `cap` parameter is ignored under the chunked-storage design — the
+   reader allocates blocks lazily.  Kept in the signature so existing test
+   sites remain readable without rewrites. */
 static AsyncSession *make_async_session(FILE *fp, size_t cap) {
+  (void)cap;
   AsyncSession *s = calloc(1, sizeof *s);
   if (!s) return NULL;
-  s->fp    = fp;
-  s->cap   = cap;
-  s->cands = calloc(cap, sizeof *s->cands);
-  if (!s->cands) { free(s); return NULL; }
+  s->fp = fp;
   pthread_mutex_init(&s->mu, NULL);
   return s;
 }
 
 static void free_async_session(AsyncSession *s) {
   arena_free(&s->arena);
-  free(s->cands);
+  for (size_t k = 0; k < CANDS_TOP_CAP; k++)
+    if (s->cands_top[k]) free(s->cands_top[k]);
   pthread_mutex_destroy(&s->mu);
   free(s);
+}
+
+/* Convenience accessor: read s->cands_top[i >> SHIFT][i & MASK].
+   Returns NULL if the block isn't allocated (which would be a bug). */
+static const char *cands_at(AsyncSession *s, size_t i) {
+  char **block = s->cands_top[i >> CANDS_BLOCK_SHIFT];
+  return block ? block[i & CANDS_BLOCK_MASK] : NULL;
 }
 
 static void test_async_reader_basic(void) {
@@ -296,9 +305,9 @@ static void test_async_reader_basic(void) {
   async_reader((void *)s);
 
   CHECK(s->count == 3);
-  CHECK(strcmp(s->cands[0], "alpha") == 0);
-  CHECK(strcmp(s->cands[1], "beta")  == 0);
-  CHECK(strcmp(s->cands[2], "gamma") == 0);
+  CHECK(strcmp(cands_at(s, 0), "alpha") == 0);
+  CHECK(strcmp(cands_at(s, 1), "beta")  == 0);
+  CHECK(strcmp(cands_at(s, 2), "gamma") == 0);
   free_async_session(s);
 }
 
@@ -319,13 +328,15 @@ static void test_async_reader_ansi_stripping(void) {
   async_reader((void *)s);
 
   CHECK(s->count == 2);
-  CHECK(strcmp(s->cands[0], "file.txt") == 0);
-  CHECK(strcmp(s->cands[1], "plain.c")  == 0);
+  CHECK(strcmp(cands_at(s, 0), "file.txt") == 0);
+  CHECK(strcmp(cands_at(s, 1), "plain.c")  == 0);
   free_async_session(s);
 }
 
-static void test_async_reader_buffer_growth(void) {
-  /* Initial cap=4, write 32 lines — exercises the realloc doubling path. */
+static void test_async_reader_many_lines(void) {
+  /* Write 32 lines.  Under the chunked-storage design no realloc is
+     involved; this just verifies sequential round-trip through the
+     accessor. */
   enum { NLINES = 32 };
   int pfd[2];
   CHECK(pipe(pfd) == 0);
@@ -345,9 +356,62 @@ static void test_async_reader_buffer_growth(void) {
   char expected[32];
   for (int i = 0; i < NLINES; i++) {
     snprintf(expected, sizeof expected, "line%d", i);
-    CHECK(strcmp(s->cands[i], expected) == 0);
+    CHECK(strcmp(cands_at(s, i), expected) == 0);
   }
+  /* All 32 fit in block 0; later blocks must be untouched. */
+  CHECK(s->cands_top[0] != NULL);
+  CHECK(s->cands_top[1] == NULL);
   free_async_session(s);
+}
+
+/* =====================================================================
+ * Chunked candidate storage — index split formula and accessor
+ * ===================================================================== */
+
+static void test_cands_top_index_split(void) {
+  /* Verify hi = i >> SHIFT and lo = i & MASK match the documented
+     "i = hi * BLOCK_SIZE + lo" decomposition. */
+  size_t cases[][3] = {
+    /* { i, expected_hi, expected_lo } */
+    {                           0, 0,                          0 },
+    {                           1, 0,                          1 },
+    { CANDS_BLOCK_SIZE       - 1, 0, CANDS_BLOCK_SIZE       - 1 },
+    { CANDS_BLOCK_SIZE          , 1,                          0 },
+    { CANDS_BLOCK_SIZE       + 5, 1,                          5 },
+    { CANDS_BLOCK_SIZE * 2      , 2,                          0 },
+    { CANDS_BLOCK_SIZE * 2   + 7, 2,                          7 },
+    { CANDS_BLOCK_SIZE * 100    , 100,                        0 },
+  };
+  for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+    size_t i = cases[k][0];
+    CHECK((i >> CANDS_BLOCK_SHIFT) == cases[k][1]);
+    CHECK((i & CANDS_BLOCK_MASK)   == cases[k][2]);
+    /* Inverse: reconstruct i from (hi, lo). */
+    CHECK((cases[k][1] << CANDS_BLOCK_SHIFT) + cases[k][2] == i);
+  }
+}
+
+static void test_cands_top_accessor_reads_block_pointer(void) {
+  /* Manually populate a single slot via the accessor formula and
+     verify the read path returns the same pointer. */
+  AsyncSession *s = calloc(1, sizeof *s);
+  CHECK(s != NULL);
+  pthread_mutex_init(&s->mu, NULL);
+
+  /* Allocate block 3 and write a sentinel pointer at slot 42. */
+  size_t hi = 3, lo = 42;
+  s->cands_top[hi] = calloc(CANDS_BLOCK_SIZE, sizeof *s->cands_top[hi]);
+  CHECK(s->cands_top[hi] != NULL);
+  char *sentinel = "sentinel";
+  s->cands_top[hi][lo] = sentinel;
+
+  /* Read it back via the accessor formula at the equivalent global index. */
+  size_t i = (hi << CANDS_BLOCK_SHIFT) + lo;
+  CHECK(s->cands_top[i >> CANDS_BLOCK_SHIFT][i & CANDS_BLOCK_MASK] == sentinel);
+
+  free(s->cands_top[hi]);
+  pthread_mutex_destroy(&s->mu);
+  free(s);
 }
 
 /* =====================================================================
@@ -762,7 +826,11 @@ int main(void) {
   printf("--- async_reader ---\n");
   RUN(test_async_reader_basic);
   RUN(test_async_reader_ansi_stripping);
-  RUN(test_async_reader_buffer_growth);
+  RUN(test_async_reader_many_lines);
+
+  printf("--- chunked cands_top ---\n");
+  RUN(test_cands_top_index_split);
+  RUN(test_cands_top_accessor_reads_block_pointer);
 
   printf("--- cache (phase 1: exact-match) ---\n");
   RUN(test_cache_lookup_miss_on_empty);

@@ -827,9 +827,30 @@ emacs_value fzf_native_make_slab(emacs_env *env,
 
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 
-#define ASYNC_INIT_CAP   4096
 #define ASYNC_LINE_MAX   8192
 #define ARENA_CHUNK_SIZE (4 * 1024 * 1024)  /* 4 MB per chunk */
+
+/* Chunked candidate-pointer storage.
+ *
+ * The candidate-pointer table is split into fixed-size blocks owned by a
+ * top-level pointer table.  The reader appends to the current block; when a
+ * block fills, it allocates the next one.  No realloc ever moves pointer
+ * data, so the worst-case allocation the reader performs is a single
+ * block — predictable cost regardless of pool size.
+ *
+ *   cands_top[]        :  CANDS_TOP_CAP slots × 8 B  (~32 KB, fixed inline)
+ *   cands_top[i]       :  CANDS_BLOCK_SIZE × 8 B     (2 MB, on demand)
+ *
+ * Defaults: 256K pointers per block, 4096 blocks → 1 G candidates max.
+ *
+ * Index split:  hi = i >> SHIFT  (which block)
+ *               lo = i & MASK    (which slot in that block)
+ * Both ops are single CPU instructions because BLOCK_SIZE is a power of 2.
+ */
+#define CANDS_BLOCK_SHIFT 18
+#define CANDS_BLOCK_SIZE  ((size_t)1 << CANDS_BLOCK_SHIFT)
+#define CANDS_BLOCK_MASK  (CANDS_BLOCK_SIZE - 1)
+#define CANDS_TOP_CAP     4096
 
 /* Arena allocator: strings are packed into large chunks so freeing the
    entire candidate set is O(chunks) instead of O(candidates). */
@@ -1241,9 +1262,12 @@ typedef struct {
 
   pthread_mutex_t mu;
   Arena           arena;   /* backing storage for all candidate strings */
-  char          **cands;
+  /* Two-level pointer table; see CANDS_BLOCK_SHIFT comments above.
+     Top level is fixed-size and zero-initialized at session start;
+     blocks are allocated on demand by the reader.  Access pattern:
+     cands_top[i >> CANDS_BLOCK_SHIFT][i & CANDS_BLOCK_MASK]. */
+  char          **cands_top[CANDS_TOP_CAP];
   size_t          count;
-  size_t          cap;
   _Atomic int     gen;
 
   size_t          last_filtered;   /* candidates matching last filter */
@@ -1302,19 +1326,47 @@ static void *async_reader(void *arg) {
       }
     }
 
+    /* Compute chunked-table coordinates BEFORE allocating in the arena.
+       The reader is the sole writer to s->count, so reading without the
+       lock is safe.  Cap check first so a hit doesn't leak arena bytes
+       on every dropped line — at 1G candidates we keep draining the pipe
+       (so the child doesn't block on write) but allocate nothing. */
+    size_t i  = s->count;
+    size_t hi = i >> CANDS_BLOCK_SHIFT;
+    size_t lo = i & CANDS_BLOCK_MASK;
+    if (hi >= CANDS_TOP_CAP) {
+      /* Verbose by design: a single fzf-async session producing >1G
+         candidates is so far outside expected behavior that hitting this
+         almost certainly means a broken upstream command (infinite loop,
+         runaway find on a cyclic FS, etc.).  Log every dropped line so
+         the cause is obvious in the log. */
+      size_t preview = len > 80 ? 80 : len;
+      fzf_log("async_reader: TOP TABLE FULL count=%zu cap=%zu line='%.*s%s'\n",
+              s->count, (size_t)CANDS_TOP_CAP * CANDS_BLOCK_SIZE,
+              (int)preview, line, len > preview ? "..." : "");
+      continue;
+    }
+
     char *dup = arena_strdup(&s->arena, line, len);
     if (!dup) continue;
 
-    pthread_mutex_lock(&s->mu);
-    if (s->count >= s->cap) {
-      size_t  ncap = s->cap * 2;
-      fzf_log("async_reader: reallocating candidates %zu -> %zu\n", s->cap, ncap);
-      char  **nc   = realloc(s->cands, ncap * sizeof *nc);
-      if (!nc) { free(dup); pthread_mutex_unlock(&s->mu); continue; }
-      s->cands = nc;
-      s->cap   = ncap;
+    /* Pre-allocate the new block (if needed) OUTSIDE s->mu — that's the
+       largest allocation the reader ever does (2 MB).  Doing it under the
+       lock would let a slow malloc (e.g. macOS compressor pressure) stall
+       the scoring thread's snapshot path. */
+    char **block = s->cands_top[hi];   /* sole writer ⇒ safe to read unlocked */
+    bool   need_publish = (block == NULL);
+    if (need_publish) {
+      block = malloc(CANDS_BLOCK_SIZE * sizeof *block);
+      if (!block) continue;            /* dup stays in arena, freed at session stop */
+      fzf_log("async_reader: allocated block %zu (count=%zu, %zu MB)\n",
+              hi, s->count, (CANDS_BLOCK_SIZE * sizeof *block) >> 20);
     }
-    s->cands[s->count++] = dup;
+
+    pthread_mutex_lock(&s->mu);
+    if (need_publish) s->cands_top[hi] = block;   /* publish under lock */
+    s->cands_top[hi][lo] = dup;
+    s->count++;
     pthread_mutex_unlock(&s->mu);
     atomic_fetch_add_explicit(&s->gen, 1, memory_order_relaxed);
   }
@@ -1359,7 +1411,8 @@ static void async_session_destroy(void *ptr) {
   if (s->pid > 0) { waitpid(s->pid, NULL, 0); s->pid = -1; }
   pthread_mutex_lock(&s->mu);
   arena_free(&s->arena);
-  free(s->cands);
+  for (size_t k = 0; k < CANDS_TOP_CAP; k++)
+    if (s->cands_top[k]) { free(s->cands_top[k]); s->cands_top[k] = NULL; }
   pthread_mutex_unlock(&s->mu);
   pthread_mutex_destroy(&s->mu);
   free(s);
@@ -1521,8 +1574,8 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
 
   s->pid   = pid;
   s->fp    = fdopen(pfd[0], "r");
-  s->cap   = ASYNC_INIT_CAP;
-  s->cands = malloc(s->cap * sizeof *s->cands);
+  /* cands_top is zero-initialized by the calloc above; blocks are
+     allocated lazily by the reader on first write into each block. */
   pthread_mutex_init(&s->mu, NULL);
   pthread_mutex_init(&s->score_req_mu, NULL);
   pthread_cond_init(&s->score_req_cond, NULL);
@@ -1562,7 +1615,7 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     cache_init(&s->cache, cache_max);
   }
 
-  if (!s->fp || !s->cands ||
+  if (!s->fp ||
       pthread_create(&s->reader, NULL, async_reader, s) != 0 ||
       pthread_create(&s->score_thread, NULL, scoring_thread_fn, s) != 0) {
     async_session_destroy(s);
@@ -1730,20 +1783,38 @@ static void *scoring_thread_fn(void *arg) {
       /* Cap delta range too in case reader shrank. */
       if (refine_delta_from > count) refine_delta_from = count;
       delta_len = count - refine_delta_from;
-      /* Refine entries first: validate each refine_idx[i] < count. */
+      /* Refine entries first: validate each refine_idx[i] < count.
+         Random-access path — pay shift+mask per entry. */
       size_t w = 0;
       for (size_t i = 0; i < refine_idx->count; i++) {
         uint32_t gi = refine_idx->idx[i];
-        if (gi < count) { snap[w] = s->cands[gi]; snap_idx[w] = gi; w++; }
+        if (gi < count) {
+          snap[w] = s->cands_top[gi >> CANDS_BLOCK_SHIFT][gi & CANDS_BLOCK_MASK];
+          snap_idx[w] = gi;
+          w++;
+        }
       }
-      /* Delta entries. */
+      /* Delta entries — sequential range, but a small one (delta size).
+         Walk via accessor too; the cost is negligible at delta-scale. */
       for (size_t k = 0; k < delta_len; k++) {
         size_t gi = refine_delta_from + k;
-        snap[w] = s->cands[gi]; snap_idx[w] = (uint32_t)gi; w++;
+        snap[w] = s->cands_top[gi >> CANDS_BLOCK_SHIFT][gi & CANDS_BLOCK_MASK];
+        snap_idx[w] = (uint32_t)gi;
+        w++;
       }
       snap_count = w;
     } else if (snap) {
-      memcpy(snap, s->cands, count * sizeof *snap);
+      /* Full-pool snapshot — walk block-by-block.  Inside a block this is
+         a flat memcpy over contiguous memory, same speed as the old flat
+         array.  Boundary-crossing cost is paid once per block (every
+         CANDS_BLOCK_SIZE entries — ~250 crossings for a 60M pool). */
+      size_t copied = 0;
+      for (size_t hi = 0; copied < count; hi++) {
+        size_t in_block = CANDS_BLOCK_SIZE;
+        if (count - copied < in_block) in_block = count - copied;
+        memcpy(snap + copied, s->cands_top[hi], in_block * sizeof *snap);
+        copied += in_block;
+      }
       for (size_t i = 0; i < count; i++) snap_idx[i] = (uint32_t)i;
       snap_count = count;
     }
