@@ -76,6 +76,27 @@
          (result (fzf-native-score str "d")))
     (should (equal result '(16)))))
 
+(ert-deftest fzf-native-score-case-mode-smart-test ()
+  "Default `fzf-native-case-mode' is smart: lowercase query is
+case-insensitive, query with any uppercase becomes case-sensitive."
+  (should (eq fzf-native-case-mode 'smart))
+  ;; Lowercase query → insensitive: matches uppercase target.
+  (should (equal (fzf-native-score "Foo" "foo") '(80)))
+  ;; Uppercase query → sensitive: lowercase target no longer matches.
+  (should (equal (fzf-native-score "foo" "Foo") '(0))))
+
+(ert-deftest fzf-native-score-case-mode-ignore-test ()
+  "`fzf-native-case-mode' = ignore matches regardless of case."
+  (let ((fzf-native-case-mode 'ignore))
+    (should (equal (fzf-native-score "foo" "Foo") '(80)))
+    (should (equal (fzf-native-score "Foo" "foo") '(80)))))
+
+(ert-deftest fzf-native-score-case-mode-respect-test ()
+  "`fzf-native-case-mode' = respect requires exact case."
+  (let ((fzf-native-case-mode 'respect))
+    (should (equal (fzf-native-score "Foo" "foo") '(0)))
+    (should (equal (fzf-native-score "foo" "foo") '(80)))))
+
 (ert-deftest fzf-native-score-with-default-slab-benchmark-test ()
   "Test scoring with slab is faster."
   (let* ((slab (fzf-native-make-default-slab))

@@ -340,6 +340,21 @@ static void apply_highlight_positions(emacs_env *env,
   fzf_free_positions(pos);
 }
 
+/* Read `fzf-native-case-mode' via symbol-value and resolve to fzf_case_types.
+   Recognized symbol values: smart (default), ignore, respect.
+   Falls back to CaseSmart on any read or comparison failure. */
+static fzf_case_types resolve_fzf_native_case_mode(emacs_env *env) {
+  emacs_value sym = env->intern(env, "fzf-native-case-mode");
+  emacs_value v   = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    return CaseSmart;
+  }
+  if (env->eq(env, v, env->intern(env, "ignore")))  return CaseIgnore;
+  if (env->eq(env, v, env->intern(env, "respect"))) return CaseRespect;
+  return CaseSmart;
+}
+
 /* Read fussy-fzf-native-highlight via symbol-value and resolve to a cap.
    Returns:
      0    — no highlighting (nil, negative, unreadable, or zero).
@@ -430,7 +445,8 @@ emacs_value fzf_native_score_all(emacs_env *env,
     return Qnil;
   }
 
-  fzf_pattern_t *pattern = fzf_parse_pattern(CaseIgnore, false, query.b, true);
+  fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
+  fzf_pattern_t *pattern = fzf_parse_pattern(case_mode, false, query.b, true);
   struct Shared shared = {
     .pattern = pattern,
     .batches = batches,
@@ -492,12 +508,12 @@ err_join_threads:
   /* Resolve C-side highlight cap from fussy-fzf-native-highlight.  After the
      sort, xs[0] is the highest-scoring candidate, so the top-N candidates
      are xs[0..hl_cap-1].  The original parsing pattern was already freed;
-     re-parse for highlighting (case-insensitive matches the async path). */
+     re-parse for highlighting using the same case mode the scoring used. */
   size_t hl_cap = resolve_fussy_highlight_cap(env, len);
   fzf_pattern_t *hl_pattern = NULL;
   fzf_slab_t    *hl_slab    = NULL;
   if (hl_cap > 0) {
-    hl_pattern = fzf_parse_pattern(CaseIgnore, false, query.b, true);
+    hl_pattern = fzf_parse_pattern(case_mode, false, query.b, true);
     if (hl_pattern) hl_slab = fzf_make_default_slab();
     if (!hl_slab) {
       if (hl_pattern) { fzf_free_pattern(hl_pattern); hl_pattern = NULL; }
@@ -609,7 +625,8 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
    * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
    * fuzzy bool         : Enable or disable fuzzy matching
    */
-  fzf_pattern_t *pattern = fzf_parse_pattern(CaseSmart, false, query.b, true);
+  fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
+  fzf_pattern_t *pattern = fzf_parse_pattern(case_mode, false, query.b, true);
   if (!pattern) { goto err; }
 
   fzf_slab_t *slab;
@@ -898,11 +915,12 @@ static bool subsumes_pattern(const fzf_pattern_t *p_prime,
 /* Parse a query string into an fzf_pattern_t.  Returns NULL if the query
    is empty or parsing fails.  fzf_parse_pattern mutates its input, so we
    strdup first and free after — the returned pattern is self-contained. */
-static fzf_pattern_t *parse_query_for_cache(const char *query) {
+static fzf_pattern_t *parse_query_for_cache(const char *query,
+                                            fzf_case_types case_mode) {
   if (!query || !*query) return NULL;
   char *dup = strdup(query);
   if (!dup) return NULL;
-  fzf_pattern_t *p = fzf_parse_pattern(CaseIgnore, false, dup, true);
+  fzf_pattern_t *p = fzf_parse_pattern(case_mode, false, dup, true);
   free(dup);
   return p;
 }
@@ -951,11 +969,12 @@ static bool cache_lookup_exact(Cache *c, const char *query,
    back to byte-prefix-length tiebreak when both have equal term counts
    (or for entries whose parsed pattern is unavailable). */
 static bool cache_lookup_prefix(Cache *c, const char *query,
+                                fzf_case_types case_mode,
                                 ScoredStr **out_top, size_t *out_top_count,
                                 SharedIdx **out_m_idx, size_t *out_pool_gen) {
   if (strchr(query, '|')) return false;   /* fast reject */
 
-  fzf_pattern_t *p_query = parse_query_for_cache(query);
+  fzf_pattern_t *p_query = parse_query_for_cache(query, case_mode);
   /* If parse failed and query isn't empty, fall back to byte-prefix only.
      Empty query has p_query == NULL but byte-prefix subsumes("", anything)
      also returns true so the loop still works. */
@@ -1012,6 +1031,7 @@ static bool cache_lookup_prefix(Cache *c, const char *query,
    or empty match sets); the entry is still inserted, but is then ineligible
    as a prefix-refinement source. */
 static void cache_insert(Cache *c, const char *query, size_t pool_gen,
+                         fzf_case_types case_mode,
                          const ScoredStr *top, size_t top_count,
                          const uint32_t *m_idx_src, size_t m_idx_count) {
   /* Pre-allocate everything outside the mutex. */
@@ -1027,7 +1047,7 @@ static void cache_insert(Cache *c, const char *query, size_t pool_gen,
   /* Parse once on insert so cache_lookup_prefix doesn't pay parse cost on
      every iteration of its scan loop.  NULL is fine — entries with NULL
      parsed only participate via the byte-prefix subsumption fallback. */
-  fzf_pattern_t *parsed = parse_query_for_cache(query);
+  fzf_pattern_t *parsed = parse_query_for_cache(query, case_mode);
 
   if (!q_dup) {
     free(top_dup);
@@ -1109,6 +1129,7 @@ typedef struct {
   pthread_cond_t   score_req_cond;
   char            *score_req_filter;  /* owned; NULL = nothing pending */
   size_t           score_req_limit;
+  fzf_case_types   score_req_case_mode;
   /* Refinement request: when score_req_refine_idx is non-NULL the next scoring
      run scores only those candidate indices plus s->cands[refine_delta_from..count].
      Ownership transfers to the scoring thread along with score_req_filter. */
@@ -1535,10 +1556,11 @@ static void *scoring_thread_fn(void *arg) {
       pthread_mutex_unlock(&s->score_req_mu);
       break;
     }
-    char      *filter           = s->score_req_filter;       /* steal ownership */
-    size_t     limit            = s->score_req_limit;
-    SharedIdx *refine_idx       = s->score_req_refine_idx;   /* steal */
-    size_t     refine_delta_from = s->score_req_refine_delta_from;
+    char           *filter           = s->score_req_filter;       /* steal ownership */
+    size_t          limit            = s->score_req_limit;
+    fzf_case_types  case_mode        = s->score_req_case_mode;
+    SharedIdx      *refine_idx       = s->score_req_refine_idx;   /* steal */
+    size_t          refine_delta_from = s->score_req_refine_delta_from;
     s->score_req_filter      = NULL;
     s->score_req_refine_idx  = NULL;
     /* Record what we're about to score so main thread can skip abort for same filter */
@@ -1634,7 +1656,7 @@ static void *scoring_thread_fn(void *arg) {
     unsigned max_workers = (unsigned)sysconf(_SC_NPROCESSORS_ONLN);
 
     size_t flen = strlen(filter);
-    fzf_pattern_t *pattern = flen ? fzf_parse_pattern(CaseIgnore, false, filter, true) : NULL;
+    fzf_pattern_t *pattern = flen ? fzf_parse_pattern(case_mode, false, filter, true) : NULL;
     bool has_pattern = (pattern != NULL);
 
     struct AsyncScoringShared shared = {
@@ -1690,7 +1712,7 @@ static void *scoring_thread_fn(void *arg) {
     /* Cache the result.  pool_gen = count (the pool size we actually scored).
        For refine runs, count may be > refine_delta_from, so the new entry
        supersedes the old one as a refinement source for the same query. */
-    cache_insert(&s->cache, filter, count, flat, emit, m_idx_buf, pos);
+    cache_insert(&s->cache, filter, count, case_mode, flat, emit, m_idx_buf, pos);
     free(m_idx_buf);
 
     /* Clear active-filter marker before publishing results */
@@ -1741,6 +1763,8 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
   if (nargs > 2 && !env->eq(env, args[2], Qnil))
     limit = (size_t)env->extract_integer(env, args[2]);
 
+  fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
+
   /* Cache lookup.  Exact-fresh hits skip scoring entirely; exact-stale
      and prefix hits dispatch a refinement scoring run that scans only
      the prior match set + candidates that arrived since.  Misses fall
@@ -1755,7 +1779,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
                                       &cached_m_idx, &cached_pool_gen);
   bool prefix_hit = false;
   if (!exact_hit)
-    prefix_hit = cache_lookup_prefix(&s->cache, filter,
+    prefix_hit = cache_lookup_prefix(&s->cache, filter, case_mode,
                                      &cached_top, &cached_count,
                                      &cached_m_idx, &cached_pool_gen);
 
@@ -1793,6 +1817,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     shared_idx_release(s->score_req_refine_idx);
     s->score_req_filter            = filter;          /* transfer */
     s->score_req_limit             = limit;
+    s->score_req_case_mode         = case_mode;
     s->score_req_refine_idx        = cached_m_idx;    /* transfer (NULL on miss) */
     s->score_req_refine_delta_from = cached_pool_gen;
     pthread_cond_signal(&s->score_req_cond);
@@ -1842,7 +1867,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     /* nil or negative integer → hl_cap stays 0, no highlighting */
   }
   if (hl_cap > 0) {
-    hl_pattern = fzf_parse_pattern(CaseIgnore, false, filter_for_hilit, true);
+    hl_pattern = fzf_parse_pattern(case_mode, false, filter_for_hilit, true);
     hl_slab    = fzf_make_default_slab();
   }
 
