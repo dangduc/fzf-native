@@ -2021,14 +2021,28 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
   }
   pthread_mutex_unlock(&s->score_req_mu);
 
-  /* Determine display set.  Cache hits return their (stale-but-useful)
-     top-K immediately; misses fall back to whatever the scorer last
-     published. */
+  /* Update displayed stats so the [FILTERED](TOTAL) overlay matches what
+     we're about to return:
+       - TOTAL always reflects the *current* pool, not the pool at the
+         last scoring time.  Without this, the total in the prompt lags
+         behind the streaming counter visible elsewhere — and on cache
+         hits (which skip scoring) it can stay stale for many seconds.
+       - FILTERED on a cache hit is the cached entry's full match-set
+         count (m_idx->count), which describes the candidate set the
+         user is currently looking at.  On a miss we leave it alone:
+         scoring will publish a fresh value shortly, and meanwhile the
+         existing value (from the previous query) is at least
+         consistent with the candidates we're about to fall back to. */
   ScoredStr *snap   = NULL;
   size_t     rcount = 0;
   if (exact_hit || prefix_hit) {
     snap   = cached_top;     /* ownership transferred from cache_lookup_*. */
     rcount = cached_count;
+    size_t cached_filtered = cached_m_idx ? cached_m_idx->count : rcount;
+    pthread_mutex_lock(&s->score_res_mu);
+    s->last_filtered = cached_filtered;
+    s->last_total    = current_pool;
+    pthread_mutex_unlock(&s->score_res_mu);
   } else {
     pthread_mutex_lock(&s->score_res_mu);
     rcount = s->score_count;
@@ -2037,6 +2051,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
       memcpy(snap, s->score_results, rcount * sizeof *snap);
     else
       rcount = 0;
+    s->last_total = current_pool;   /* keep TOTAL live even on miss */
     pthread_mutex_unlock(&s->score_res_mu);
   }
 
