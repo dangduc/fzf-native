@@ -554,6 +554,185 @@ static void test_cache_pool_gen_distinguishes_stale(void) {
   cache_free(&c);
 }
 
+/* =====================================================================
+ * Result cache — phase 2: term-set subsumption + prefix lookup
+ * ===================================================================== */
+
+static void test_subsumes_pattern_extending_term_via_byte_prefix(void) {
+  /* "fo" → "foo": same single-term query getting longer.  Term-set rule
+     alone says NO (terms "fo" and "foo" aren't equivalent), but
+     cache_lookup_prefix uses byte-prefix OR term-set, so this still
+     captures via the byte-prefix path.  Verify the byte-prefix subsumes()
+     directly. */
+  CHECK(subsumes("fo", "foo") == true);
+}
+
+static void test_subsumes_pattern_adding_term_at_end(void) {
+  /* "fo" → "fo bar": both rules agree.  Verify term-set path. */
+  fzf_pattern_t *p1 = parse_query_for_cache("fo");
+  fzf_pattern_t *p2 = parse_query_for_cache("fo bar");
+  CHECK(p1 && p2);
+  CHECK(subsumes_pattern(p1, p2) == true);
+  CHECK(subsumes_pattern(p2, p1) == false);
+  fzf_free_pattern(p1);
+  fzf_free_pattern(p2);
+}
+
+static void test_subsumes_pattern_adding_term_at_start(void) {
+  /* "fo" → "x fo": v2-only case.  Byte-prefix says NO (fo not prefix of
+     x fo), term-set says YES (fo's terms ⊆ x fo's terms). */
+  fzf_pattern_t *p1 = parse_query_for_cache("fo");
+  fzf_pattern_t *p2 = parse_query_for_cache("x fo");
+  CHECK(p1 && p2);
+  CHECK(subsumes("fo", "x fo") == false);            /* v1 misses */
+  CHECK(subsumes_pattern(p1, p2) == true);           /* v2 catches */
+  CHECK(subsumes_pattern(p2, p1) == false);
+  fzf_free_pattern(p1);
+  fzf_free_pattern(p2);
+}
+
+static void test_subsumes_pattern_term_reorder(void) {
+  /* "foo bar" and "bar foo" are semantically equivalent in fzf — same
+     term set, different textual order.  Term-set rule sees mutual
+     subsumption; byte-prefix rule sees neither. */
+  fzf_pattern_t *p1 = parse_query_for_cache("foo bar");
+  fzf_pattern_t *p2 = parse_query_for_cache("bar foo");
+  CHECK(p1 && p2);
+  CHECK(subsumes("foo bar", "bar foo") == false);
+  CHECK(subsumes("bar foo", "foo bar") == false);
+  CHECK(subsumes_pattern(p1, p2) == true);
+  CHECK(subsumes_pattern(p2, p1) == true);
+  fzf_free_pattern(p1);
+  fzf_free_pattern(p2);
+}
+
+static void test_subsumes_pattern_negation_at_start(void) {
+  /* "fo" → "!x fo": adding a negation term in non-prefix position.
+     Term-set rule catches it; byte-prefix doesn't. */
+  fzf_pattern_t *p1 = parse_query_for_cache("fo");
+  fzf_pattern_t *p2 = parse_query_for_cache("!x fo");
+  CHECK(p1 && p2);
+  CHECK(subsumes_pattern(p1, p2) == true);
+  fzf_free_pattern(p1);
+  fzf_free_pattern(p2);
+}
+
+static void test_subsumes_pattern_or_query_rejected(void) {
+  /* "fo | bar" parses as ONE term-set with TWO terms (within a set =
+     OR; across sets = AND).  subsumes_pattern rejects any term-set with
+     >1 term — it can never serve as a refinement source. */
+  fzf_pattern_t *p1 = parse_query_for_cache("fo");
+  fzf_pattern_t *p2 = parse_query_for_cache("fo | bar");
+  CHECK(p1 && p2);
+  CHECK(p1->size == 1 && p1->ptr[0]->size == 1);  /* "fo": 1 set, 1 term */
+  CHECK(p2->size == 1 && p2->ptr[0]->size == 2);  /* "fo|bar": 1 set, 2 terms */
+  CHECK(subsumes_pattern(p1, p2) == false);
+  CHECK(subsumes_pattern(p2, p1) == false);
+  fzf_free_pattern(p1);
+  fzf_free_pattern(p2);
+}
+
+static void test_subsumes_pattern_distinct_terms(void) {
+  /* "foo" and "bar" share no terms; neither subsumes the other. */
+  fzf_pattern_t *p1 = parse_query_for_cache("foo");
+  fzf_pattern_t *p2 = parse_query_for_cache("bar");
+  CHECK(p1 && p2);
+  CHECK(subsumes_pattern(p1, p2) == false);
+  CHECK(subsumes_pattern(p2, p1) == false);
+  fzf_free_pattern(p1);
+  fzf_free_pattern(p2);
+}
+
+/* Helper: insert a cache entry that has a non-NULL m_idx (so it's eligible
+   as a prefix-refinement source) using a single dummy match index.  Tests
+   the lookup logic without caring about the actual indices. */
+static void cache_insert_eligible(Cache *c, const char *query, size_t pool_gen) {
+  uint32_t idx[1] = { 0 };
+  cache_insert(c, query, pool_gen, NULL, 0, idx, 1);
+}
+
+static void test_cache_lookup_prefix_v2_finds_term_subset(void) {
+  /* Cache has "fo".  New query "x fo" should hit via term-set rule. */
+  Cache c;
+  cache_init(&c, 20);
+  cache_insert_eligible(&c, "fo", 100);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_prefix(&c, "x fo", &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(out_gen == 100);
+  shared_idx_release(out_sidx);
+  free(out);
+  cache_free(&c);
+}
+
+static void test_cache_lookup_prefix_v2_finds_reordered(void) {
+  /* Cache has "foo bar".  New query "bar foo" should hit via term-set
+     mutual subsumption.  We exclude exact-match entries from prefix
+     lookup, but "bar foo" != "foo bar" textually so it counts as
+     non-exact and the term-set rule picks it up. */
+  Cache c;
+  cache_init(&c, 20);
+  cache_insert_eligible(&c, "foo bar", 100);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_prefix(&c, "bar foo", &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(out_gen == 100);
+  shared_idx_release(out_sidx);
+  free(out);
+  cache_free(&c);
+}
+
+static void test_cache_lookup_prefix_picks_most_terms(void) {
+  /* Cache has "fo" (1 term) and "fo bar" (2 terms).  New query
+     "fo bar baz" subsumes both.  cache_lookup_prefix should prefer the
+     most-restricted entry — "fo bar" with 2 terms — over "fo". */
+  Cache c;
+  cache_init(&c, 20);
+  cache_insert_eligible(&c, "fo",     100);
+  cache_insert_eligible(&c, "fo bar", 200);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_prefix(&c, "fo bar baz", &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(out_gen == 200);   /* "fo bar" entry wins */
+  shared_idx_release(out_sidx);
+  free(out);
+  cache_free(&c);
+}
+
+static void test_cache_lookup_prefix_skips_or_in_query(void) {
+  /* If the new query contains '|', prefix lookup short-circuits to false
+     (we never refine into an OR query). */
+  Cache c;
+  cache_init(&c, 20);
+  cache_insert_eligible(&c, "fo", 100);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_prefix(&c, "fo | bar", &out, &out_count, &out_sidx, &out_gen) == false);
+  cache_free(&c);
+}
+
+static void test_cache_lookup_prefix_skips_exact_match(void) {
+  /* Even if an entry's parsed pattern equals the new query's, we exclude
+     it from prefix lookup (that's what cache_lookup_exact is for). */
+  Cache c;
+  cache_init(&c, 20);
+  cache_insert_eligible(&c, "fo bar", 100);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_prefix(&c, "fo bar", &out, &out_count, &out_sidx, &out_gen) == false);
+  cache_free(&c);
+}
+
 /* ================================================================= */
 
 int main(void) {
@@ -594,6 +773,20 @@ int main(void) {
   RUN(test_cache_touch_on_hit);
   RUN(test_cache_insert_zero_count);
   RUN(test_cache_pool_gen_distinguishes_stale);
+
+  printf("--- cache (phase 2: term-set subsumption) ---\n");
+  RUN(test_subsumes_pattern_extending_term_via_byte_prefix);
+  RUN(test_subsumes_pattern_adding_term_at_end);
+  RUN(test_subsumes_pattern_adding_term_at_start);
+  RUN(test_subsumes_pattern_term_reorder);
+  RUN(test_subsumes_pattern_negation_at_start);
+  RUN(test_subsumes_pattern_or_query_rejected);
+  RUN(test_subsumes_pattern_distinct_terms);
+  RUN(test_cache_lookup_prefix_v2_finds_term_subset);
+  RUN(test_cache_lookup_prefix_v2_finds_reordered);
+  RUN(test_cache_lookup_prefix_picks_most_terms);
+  RUN(test_cache_lookup_prefix_skips_or_in_query);
+  RUN(test_cache_lookup_prefix_skips_exact_match);
 
   if (failed == 0) {
     printf("\nAll tests passed.\n");

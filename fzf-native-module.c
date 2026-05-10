@@ -780,6 +780,10 @@ typedef struct CacheEntry {
   ScoredStr      *top;
   size_t          top_count;
   SharedIdx      *m_idx;
+  /* Parsed form of `query`, populated on insert.  NULL when parsing failed
+     or for OR queries (which are excluded from prefix-refinement anyway).
+     Owned by the entry; freed in cache_entry_free. */
+  fzf_pattern_t  *parsed;
 } CacheEntry;
 
 typedef struct {
@@ -794,7 +798,7 @@ static void cache_init(Cache *c, size_t max_entries) {
   pthread_mutex_init(&c->mu, NULL);
   c->head = c->tail = NULL;
   c->count = 0;
-  c->max_entries = max_entries ? max_entries : 20;
+  c->max_entries = max_entries ? max_entries : 40;
 }
 
 static void cache_entry_free(CacheEntry *e) {
@@ -802,6 +806,7 @@ static void cache_entry_free(CacheEntry *e) {
   free(e->query);
   free(e->top);
   shared_idx_release(e->m_idx);
+  if (e->parsed) fzf_free_pattern(e->parsed);
   free(e);
 }
 
@@ -832,9 +837,10 @@ static void cache_free(Cache *c) {
 }
 
 /* Q' subsumes Q iff neither contains '|' AND Q' is a byte-prefix of Q.
-   Captures: extending a term, adding AND terms, adding negations, adding
-   anchors.  Conservatively rejects every query containing '|' — adding an
-   OR alternate widens results unpredictably. */
+   Captures: extending a term (fo → foo), adding AND terms at end (fo → fo
+   bar), adding negations/anchors at end (fo → fo !x).  Conservatively
+   rejects every query containing '|' — adding an OR alternate widens
+   results unpredictably.  This is the v1 rule, kept as a fast-path. */
 static bool subsumes(const char *q_prime, const char *q) {
   if (strchr(q_prime, '|') || strchr(q, '|')) return false;
   size_t lp = strlen(q_prime);
@@ -842,6 +848,63 @@ static bool subsumes(const char *q_prime, const char *q) {
   size_t lq = strlen(q);
   if (lq < lp) return false;
   return memcmp(q, q_prime, lp) == 0;
+}
+
+/* Two parsed terms are equivalent iff they would match exactly the same
+   strings: same algorithm, same negation flag, same case sensitivity, same
+   text after fzf's prefix stripping.  Both terms must have been parsed with
+   the same case mode (CaseIgnore in our usage), so `ptr` (the lowercased
+   token) is directly comparable. */
+static bool term_equiv(const fzf_term_t *a, const fzf_term_t *b) {
+  if (a->fn != b->fn) return false;
+  if (a->inv != b->inv) return false;
+  if (a->case_sensitive != b->case_sensitive) return false;
+  return strcmp(a->ptr, b->ptr) == 0;
+}
+
+/* P' subsumes P (term-set rule) iff every term-set in P' has an equivalent
+   term-set in P.  In fzf's model, term-sets are AND'd together; adding
+   more term-sets monotonically narrows the match set, so P (with all of
+   P''s term-sets plus possibly more) matches a subset of P''s candidates.
+
+   Restricted to non-OR queries: any term-set with >1 term is an OR (e.g.
+   "fo | bar" parses as one set with two terms), and OR queries can never
+   serve as refinement sources because adding an OR alternate widens the
+   match set unpredictably.
+
+   Catches v2-only cases: adding an AND term in non-prefix position (fo →
+   x fo), term reordering (fo bar → bar fo), non-prefix negation (fo →
+   !x fo).  Empty P' (zero term-sets) trivially subsumes anything. */
+static bool subsumes_pattern(const fzf_pattern_t *p_prime,
+                             const fzf_pattern_t *p) {
+  if (!p_prime || !p) return false;
+  /* Reject if either side has any OR-containing term-set. */
+  for (size_t i = 0; i < p_prime->size; i++)
+    if (p_prime->ptr[i]->size != 1) return false;
+  for (size_t i = 0; i < p->size; i++)
+    if (p->ptr[i]->size != 1) return false;
+  /* Every single-term set in p_prime must equal some single-term set in p. */
+  for (size_t i = 0; i < p_prime->size; i++) {
+    fzf_term_t *t_prime = &p_prime->ptr[i]->ptr[0];
+    bool found = false;
+    for (size_t j = 0; j < p->size; j++) {
+      if (term_equiv(t_prime, &p->ptr[j]->ptr[0])) { found = true; break; }
+    }
+    if (!found) return false;
+  }
+  return true;
+}
+
+/* Parse a query string into an fzf_pattern_t.  Returns NULL if the query
+   is empty or parsing fails.  fzf_parse_pattern mutates its input, so we
+   strdup first and free after — the returned pattern is self-contained. */
+static fzf_pattern_t *parse_query_for_cache(const char *query) {
+  if (!query || !*query) return NULL;
+  char *dup = strdup(query);
+  if (!dup) return NULL;
+  fzf_pattern_t *p = fzf_parse_pattern(CaseIgnore, false, dup, true);
+  free(dup);
+  return p;
 }
 
 /* Find an entry by exact query match.  Caller holds c->mu. */
@@ -879,24 +942,53 @@ static bool cache_lookup_exact(Cache *c, const char *query,
   return true;
 }
 
-/* Prefix lookup: longest Q' that subsumes Q (and is not Q itself).  Skips
-   entries with NULL m_idx — they can't serve as refinement sources. */
+/* Prefix lookup: most-constrained Q' that subsumes Q (and is not Q itself).
+   Uses byte-prefix OR term-set subsumption.  Skips entries with NULL m_idx
+   (OR queries / empty match sets — can't serve as refinement sources).
+
+   Best = the entry whose parsed pattern has the most terms.  More terms =
+   more constraints = smaller match set = faster refinement scan.  Falls
+   back to byte-prefix-length tiebreak when both have equal term counts
+   (or for entries whose parsed pattern is unavailable). */
 static bool cache_lookup_prefix(Cache *c, const char *query,
                                 ScoredStr **out_top, size_t *out_top_count,
                                 SharedIdx **out_m_idx, size_t *out_pool_gen) {
   if (strchr(query, '|')) return false;   /* fast reject */
 
+  fzf_pattern_t *p_query = parse_query_for_cache(query);
+  /* If parse failed and query isn't empty, fall back to byte-prefix only.
+     Empty query has p_query == NULL but byte-prefix subsumes("", anything)
+     also returns true so the loop still works. */
+
   pthread_mutex_lock(&c->mu);
   CacheEntry *best = NULL;
-  size_t best_len = 0;
+  size_t best_terms = 0;
+  size_t best_len   = 0;
   for (CacheEntry *e = c->head; e; e = e->next) {
     if (!e->m_idx) continue;
     if (strcmp(e->query, query) == 0) continue;
-    if (!subsumes(e->query, query)) continue;
-    size_t l = strlen(e->query);
-    if (l > best_len) { best = e; best_len = l; }
+
+    bool match = subsumes(e->query, query)
+              || (p_query && subsumes_pattern(e->parsed, p_query));
+    if (!match) continue;
+
+    /* Term count = number of AND term-sets in the parsed pattern.  More
+       sets = more constraints = smaller match set = better refinement
+       source.  OR-containing entries have m_idx==NULL and were skipped. */
+    size_t terms = e->parsed ? e->parsed->size : 0;
+    size_t len   = strlen(e->query);
+    if (terms > best_terms ||
+        (terms == best_terms && len > best_len)) {
+      best = e;
+      best_terms = terms;
+      best_len   = len;
+    }
   }
-  if (!best) { pthread_mutex_unlock(&c->mu); return false; }
+  if (!best) {
+    pthread_mutex_unlock(&c->mu);
+    if (p_query) fzf_free_pattern(p_query);
+    return false;
+  }
 
   ScoredStr *top_copy = NULL;
   if (best->top_count) {
@@ -910,6 +1002,7 @@ static bool cache_lookup_prefix(Cache *c, const char *query,
 
   if (best != c->head) { cache_unlink_locked(c, best); cache_push_head_locked(c, best); }
   pthread_mutex_unlock(&c->mu);
+  if (p_query) fzf_free_pattern(p_query);
   return true;
 }
 
@@ -931,10 +1024,15 @@ static void cache_insert(Cache *c, const char *query, size_t pool_gen,
   }
   SharedIdx *sidx = (m_idx_src && m_idx_count && !strchr(query, '|'))
                     ? shared_idx_alloc(m_idx_src, m_idx_count) : NULL;
+  /* Parse once on insert so cache_lookup_prefix doesn't pay parse cost on
+     every iteration of its scan loop.  NULL is fine — entries with NULL
+     parsed only participate via the byte-prefix subsumption fallback. */
+  fzf_pattern_t *parsed = parse_query_for_cache(query);
 
   if (!q_dup) {
     free(top_dup);
     shared_idx_release(sidx);
+    if (parsed) fzf_free_pattern(parsed);
     return;
   }
 
@@ -945,16 +1043,19 @@ static void cache_insert(Cache *c, const char *query, size_t pool_gen,
     char *old_q = e->query;
     ScoredStr *old_top = e->top;
     SharedIdx *old_idx = e->m_idx;
+    fzf_pattern_t *old_parsed = e->parsed;
     e->query     = q_dup;
     e->top       = top_dup;
     e->top_count = top_dup ? top_count : 0;
     e->m_idx     = sidx;
+    e->parsed    = parsed;
     e->pool_gen  = pool_gen;
     if (e != c->head) { cache_unlink_locked(c, e); cache_push_head_locked(c, e); }
     pthread_mutex_unlock(&c->mu);
     free(old_q);
     free(old_top);
     shared_idx_release(old_idx);
+    if (old_parsed) fzf_free_pattern(old_parsed);
     return;
   }
 
@@ -965,12 +1066,14 @@ static void cache_insert(Cache *c, const char *query, size_t pool_gen,
     free(q_dup);
     free(top_dup);
     shared_idx_release(sidx);
+    if (parsed) fzf_free_pattern(parsed);
     return;
   }
   ne->query     = q_dup;
   ne->top       = top_dup;
   ne->top_count = top_dup ? top_count : 0;
   ne->m_idx     = sidx;
+  ne->parsed    = parsed;
   ne->pool_gen  = pool_gen;
   cache_push_head_locked(c, ne);
 
@@ -1297,7 +1400,7 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   }
 
   {
-    size_t cache_max = 20;
+    size_t cache_max = 40;
     emacs_value sym = env->intern(env, "fzf-async-cache-size");
     emacs_value val = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
