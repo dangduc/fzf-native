@@ -1593,10 +1593,5 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qzero = env->make_global_ref(env, env->make_integer(env, 0));
   Qone = env->make_global_ref(env, env->make_integer(env, 1));
 
-  /* Unconditional load marker — visible in *Messages* after rebuild + reload. */
-  emacs_value load_msg = env->make_string(env, "fzf-native: module loaded",
-                                          (ptrdiff_t)sizeof("fzf-native: module loaded") - 1);
-  env->funcall(env, Fmessage, 1, &load_msg);
-
   return 0;
 }
