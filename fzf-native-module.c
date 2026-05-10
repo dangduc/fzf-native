@@ -93,6 +93,7 @@ emacs_value Ffunctionp, Fsymbolp, Fsymbolname, Flength, Fnth, Fprinc, Freverse;
 emacs_value Qcompletion_score, Fput_text_property, Qzero, Qone;
 emacs_value Fencode_coding_string, Qutf_8;
 emacs_value Qface, Qcompletions_common_part;
+emacs_value Fremove_text_properties, Qface_nil_plist;
 
 
 /** An Emacs string made accessible by copying. */
@@ -309,6 +310,23 @@ static void apply_highlight_positions(emacs_env *env,
                                       fzf_pattern_t *pattern,
                                       fzf_slab_t *slab,
                                       emacs_value str_val) {
+  /* Empty candidates can't carry text properties or matched positions; skip
+     the funcalls and the get_positions slab work entirely. */
+  if (cstr[0] == '\0') return;
+  /* Strip any `completions-common-part' face left over from a prior highlight
+     pass on the same Emacs string (fussy reuses caller-owned candidate strings
+     across keystrokes; without this, e.g. "ab" highlight [0,2] persists when
+     the user backspaces to "a" because put-text-property only writes the new
+     [0,1] range and leaves byte [1,2] highlighted).  One funcall per
+     highlighted candidate; the (face nil) plist is interned at init. */
+  emacs_value len_v = env->funcall(env, Flength, 1, &str_val);
+  if (env->non_local_exit_check(env) == emacs_funcall_exit_return) {
+    emacs_value rargs[4] = { Qzero, len_v, Qface_nil_plist, str_val };
+    env->funcall(env, Fremove_text_properties, 4, rargs);
+    env->non_local_exit_clear(env);
+  } else {
+    env->non_local_exit_clear(env);
+  }
   fzf_position_t *pos = fzf_get_positions(cstr, pattern, slab);
   if (pos && pos->size > 0) {
     /* pos->data[] is in descending order: pos->data[0] = highest position.
@@ -378,6 +396,12 @@ static size_t resolve_fussy_highlight_cap(emacs_env *env, size_t len) {
   return (size_t)n > len ? len : (size_t)n;
 }
 
+// Forward declare.
+emacs_value fzf_native_highlight_all(emacs_env *env,
+                                     ptrdiff_t nargs,
+                                     emacs_value args[],
+                                     void *data_ptr);
+
 // fzf-native-score-all COLLECTION QUERY &optional SLAB
 emacs_value fzf_native_score_all(emacs_env *env,
                                  ptrdiff_t nargs,
@@ -394,9 +418,13 @@ emacs_value fzf_native_score_all(emacs_env *env,
 
   fzf_log("fzf_native_score_all START: query='%.*s'\n", (int)query.len, query.b);
 
-  // Return all candidates if query is empty with doing anything else.
+  /* Empty query: don't score, but still strip stale `completions-common-part'
+     face from the top-N candidates so backspacing to "" clears highlights left
+     behind by a prior query.  Delegate to highlight-all, which respects
+     `fussy-fzf-native-highlight' for the cap. */
   if (query.len == 0) {
-    result = args[0];
+    emacs_value hargs[2] = { args[0], args[1] };
+    result = fzf_native_highlight_all(env, 2, hargs, NULL);
     success = true;
     goto err;
   }
@@ -559,6 +587,104 @@ err:
     env->non_local_exit_signal(env, env->intern(env, "error"), Qnil);
   }
   return result;
+}
+
+/* Strip `completions-common-part' face from STR_VAL without applying any new
+   positions.  Used by the empty-query path of `fzf-native-highlight-all', and
+   shares the (face nil) plist with `apply_highlight_positions'. */
+static void clear_highlight_face(emacs_env *env, emacs_value str_val) {
+  emacs_value len_v = env->funcall(env, Flength, 1, &str_val);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    return;
+  }
+  emacs_value rargs[4] = { Qzero, len_v, Qface_nil_plist, str_val };
+  env->funcall(env, Fremove_text_properties, 4, rargs);
+  env->non_local_exit_clear(env);
+}
+
+// fzf-native-highlight-all COLLECTION QUERY
+//
+// Apply `completions-common-part' face to each candidate in COLLECTION
+// against QUERY without scoring or sorting.  Intended for callers that
+// already have a sorted result set but need to refresh stale highlights
+// (e.g. fussy cache hits or the empty-query branch, where the C scoring
+// path is skipped entirely and previously-applied face properties from
+// a different query persist on the same Emacs string objects).
+//
+// When QUERY is empty, performs a clear-only pass: removes the face
+// from the top-N candidates without computing new positions.  This is
+// the path that fixes the "type m, backspace, highlight stays" case.
+//
+// Honors `fussy-fzf-native-highlight' the same way `fzf-native-score-all'
+// does: nil → no-op, t → process all, N → process top N.  COLLECTION
+// is assumed to be in display order (highest-scoring first).
+//
+// Returns COLLECTION unchanged.  Mutates the candidate strings in-place.
+emacs_value fzf_native_highlight_all(emacs_env *env,
+                                     ptrdiff_t UNUSED(nargs),
+                                     emacs_value args[],
+                                     void UNUSED(*data_ptr)) {
+  struct Bump *bump = NULL;
+  fzf_pattern_t *pattern = NULL;
+  fzf_slab_t    *slab    = NULL;
+
+  /* Treat an empty *or* undecodable query as clear-only.  The stale face
+     properties live on the COLLECTION strings, not on the query, so we still
+     need to walk the collection and strip face even if the query couldn't be
+     coerced through `encode-coding-string'. */
+  struct Str query = copy_emacs_string(env, &bump, args[1]);
+  bool clear_only = (!query.b || query.len == 0);
+
+  /* Accept both lists and vectors; mirror score-all's normalization so
+     callers don't have to care which one they have on hand. */
+  emacs_value collection = args[0];
+  if (!env->eq(env, env->type_of(env, collection), env->intern(env, "vector"))) {
+    collection = env->funcall(env, Fvconcat, 1, (emacs_value[]) { args[0] });
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+      env->non_local_exit_clear(env);
+      goto done;
+    }
+  }
+
+  ptrdiff_t n = env->vec_size(env, collection);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    goto done;
+  }
+
+  /* Cap the highlight/clear pass to the user's `fussy-fzf-native-highlight'
+     setting.  Returns 0 when highlighting is disabled — at that point the
+     candidates can't have stale face from this module either, so skip. */
+  size_t hl_cap = resolve_fussy_highlight_cap(env, (size_t)n);
+  if (hl_cap == 0) goto done;
+
+  if (!clear_only) {
+    fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
+    pattern = fzf_parse_pattern(case_mode, false, query.b, true);
+    if (!pattern) goto done;
+    slab = fzf_make_default_slab();
+    if (!slab) goto done;
+  }
+
+  for (ptrdiff_t i = 0; i < (ptrdiff_t)hl_cap; i++) {
+    emacs_value value = env->vec_get(env, collection, i);
+    if (clear_only) {
+      clear_highlight_face(env, value);
+    } else {
+      struct Str s = copy_emacs_string(env, &bump, value);
+      if (!s.b) continue;
+      apply_highlight_positions(env, s.b, pattern, slab, value);
+    }
+  }
+
+done:
+  if (slab)    fzf_free_slab(slab);
+  if (pattern) fzf_free_pattern(pattern);
+  bump_free(bump);
+  /* Always return the original COLLECTION (not the vector-coerced copy)
+     so list callers see their list back. */
+  return args[0];
 }
 
 /* Signal `(wrong-type-argument stringp VALUE)' if VALUE is not a string.
@@ -1992,6 +2118,20 @@ int emacs_module_init(struct emacs_runtime *rt) {
                          &data),
     });
 
+  // fzf-native-highlight-all COLLECTION QUERY
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-highlight-all"),
+      env->make_function(env, 2, 2, fzf_native_highlight_all,
+                         "Apply fzf match highlights to COLLECTION against QUERY.\n"
+                         "Mutates each candidate string's text properties in place;\n"
+                         "stale `completions-common-part' face from a prior query is\n"
+                         "stripped before new positions are applied.  No scoring or\n"
+                         "sorting is performed.\n"
+                         "\n"
+                         "\\(fn COLLECTION QUERY)",
+                         &data),
+    });
+
   // fzf-native-score STR QUERY &optional SLAB
   env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
       env->intern(env, "fzf-native-score"),
@@ -2091,6 +2231,12 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Fencode_coding_string = env->make_global_ref(env, env->intern(env, "encode-coding-string"));
   Qface = env->make_global_ref(env, env->intern(env, "face"));
   Qcompletions_common_part = env->make_global_ref(env, env->intern(env, "completions-common-part"));
+  Fremove_text_properties = env->make_global_ref(env, env->intern(env, "remove-text-properties"));
+  /* Pre-built (face nil) plist passed to remove-text-properties to strip the
+     `face' property regardless of value.  Built once to avoid allocating a
+     fresh cons cell on every highlight call. */
+  Qface_nil_plist = env->make_global_ref(
+    env, env->funcall(env, Flist, 2, (emacs_value[]){Qface, Qnil}));
   Qutf_8 = env->make_global_ref(env, env->intern(env, "utf-8"));
   Qlistofzero = env->make_global_ref(
     env, env->funcall(env, Fcons, 2,
