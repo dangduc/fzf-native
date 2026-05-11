@@ -128,6 +128,57 @@ Bridged by fzf-async from `fzf-async-cache-size' via `:around' advice."
   :type 'integer
   :group 'fzf-native)
 
+(defcustom fzf-native-async-result-cache-ttl 120
+  "Time-to-live in seconds for the cross-session result cache.
+
+When non-nil and positive, the candidate arena from a session whose
+child finished writing is kept alive after `fzf-native-async-stop'.
+A subsequent `fzf-native-async-start' with the same \(COMMAND,
+DIRECTORY\) within TTL seconds skips fork+exec entirely and adopts
+the cached arena.
+
+A session is eligible to cache when, at stop time, any of:
+  - the reader hit EOF on the pipe (child closed stdout),
+  - the reader caught up and saw no new data over a ~20ms sample
+    (child still alive but idle — common in post-write cleanup),
+  - waitpid reports the child exited on its own (WIFEXITED).
+Sessions where the child was actively writing at stop time are
+skipped — the arena would be partial.
+
+nil or <= 0 disables the cache (no lookup, no insert).  Default
+120 (2 minutes).
+
+Read on every call to `fzf-native-async-start'.
+
+Eviction emits a `message' so the Emacs side has visibility.
+
+Bridged by fzf-async from `fzf-async-result-cache-ttl' via `:around'
+advice."
+  :type '(choice (const :tag "Disabled" nil)
+                 (number :tag "Seconds"))
+  :group 'fzf-native)
+
+(defcustom fzf-native-async-result-cache-entries 10
+  "Maximum number of entries in the cross-session result cache.
+Each entry is one completed `(COMMAND, DIRECTORY)' candidate pool.
+LRU eviction once the count would exceed this bound.
+
+Note: each entry retains its full candidate arena plus a chunked
+pointer table (~32 KB fixed overhead per entry, plus arena chunks
+proportional to candidate count).  Keep this small — the cache is
+meant for the few command shapes a user runs repeatedly, not as a
+durable archive.
+
+Active only when `fzf-native-async-result-cache-ttl' is set; <= 0
+disables the cache regardless of TTL.
+
+Read on every call to `fzf-native-async-start'.
+
+Bridged by fzf-async from `fzf-async-result-cache-entries' via
+`:around' advice."
+  :type 'integer
+  :group 'fzf-native)
+
 (defun fzf-native-module--cmake-is-available ()
   "Return t if cmake is available.
 CMake is needed to build fzf-native, here we check that we can find

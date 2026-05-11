@@ -12,6 +12,7 @@
 #include "fzf.h"
 #include <stdio.h>
 #include <stdarg.h>
+#include <time.h>
 
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <stdatomic.h>
@@ -1256,6 +1257,184 @@ static void cache_insert(Cache *c, const char *query, size_t pool_gen,
   cache_entry_free(evicted);
 }
 
+/* ---------------------------------------------------------------------------
+   Result cache (cross-session, command-keyed).
+   ---------------------------------------------------------------------------
+
+   Skips re-running the subprocess when the same (command, directory) is
+   queried again within a TTL window.  Saves the cost of re-enumerating
+   large pools (e.g. `find ~' with millions of candidates).
+
+   Lookup happens at the top of `fzf_native_async_start' (main thread,
+   env available).  On hit + not-expired: a new AsyncSession adopts the
+   cached arena + chunked candidate table; no fork+exec; only the
+   scoring thread is spawned.  Insert happens in `fzf_native_async_stop'
+   after the reader has joined: if the reader hit EOF cleanly
+   (s->reader_completed), the arena is moved out of the session into a
+   fresh cache entry; otherwise the session is freed as before.
+
+   Concurrency: Emacs runs only one fzf-async session at a time, so the
+   arena's owner is unambiguous at every moment (cache between sessions,
+   session during).  No refcounting needed.  The cache mutex serializes
+   access to the LRU list itself.
+
+   Eviction policy: TTL + LRU bound, both configured via Elisp
+   defcustoms `fzf-native-async-result-cache-ttl' (float seconds;
+   nil/<=0 disables the cache entirely) and
+   `fzf-native-async-result-cache-entries' (integer; <=0 also disables).
+   Eviction emits a `message' so the user has visibility from Emacs.
+
+   The finalizer path (user-ptr GC) does NOT cache — the finalizer has
+   no `emacs_env' to read defcustoms or emit messages.  Only the
+   explicit stop path (`fzf_native_async_stop') populates the cache.
+*/
+
+typedef struct ResultCacheEntry {
+  struct ResultCacheEntry *prev, *next;
+  char            *command;       /* owned */
+  char            *dir;           /* owned; NULL allowed */
+  struct timespec  ts;             /* CLOCK_MONOTONIC at insert time */
+  /* Moved out of an AsyncSession on insert; moved back into a new
+     AsyncSession on lookup.  Layout matches AsyncSession's so the
+     transfer is a straight copy + zero-out on both ends. */
+  Arena            arena;
+  char           **cands_top[CANDS_TOP_CAP];
+  size_t           count;
+} ResultCacheEntry;
+
+typedef struct {
+  pthread_mutex_t   mu;
+  ResultCacheEntry *head;     /* MRU */
+  ResultCacheEntry *tail;     /* LRU */
+  size_t            count;
+} ResultCache;
+
+static ResultCache g_result_cache;
+
+static void result_cache_global_init(void) {
+  pthread_mutex_init(&g_result_cache.mu, NULL);
+  g_result_cache.head = g_result_cache.tail = NULL;
+  g_result_cache.count = 0;
+}
+
+static void result_cache_entry_free(ResultCacheEntry *e) {
+  if (!e) return;
+  free(e->command);
+  free(e->dir);
+  arena_free(&e->arena);
+  for (size_t k = 0; k < CANDS_TOP_CAP; k++)
+    if (e->cands_top[k]) free(e->cands_top[k]);
+  free(e);
+}
+
+static void result_cache_unlink_locked(ResultCacheEntry *e) {
+  if (e->prev) e->prev->next = e->next; else g_result_cache.head = e->next;
+  if (e->next) e->next->prev = e->prev; else g_result_cache.tail = e->prev;
+  e->prev = e->next = NULL;
+  g_result_cache.count--;
+}
+
+static void result_cache_push_head_locked(ResultCacheEntry *e) {
+  e->prev = NULL;
+  e->next = g_result_cache.head;
+  if (g_result_cache.head) g_result_cache.head->prev = e;
+  g_result_cache.head = e;
+  if (!g_result_cache.tail) g_result_cache.tail = e;
+  g_result_cache.count++;
+}
+
+/* NULL-safe key equality. */
+static bool result_cache_key_eq(const char *a, const char *b) {
+  if (a == b) return true;
+  if (!a || !b) return false;
+  return strcmp(a, b) == 0;
+}
+
+static ResultCacheEntry *
+result_cache_find_locked(const char *command, const char *dir) {
+  for (ResultCacheEntry *e = g_result_cache.head; e; e = e->next)
+    if (result_cache_key_eq(e->command, command) &&
+        result_cache_key_eq(e->dir, dir))
+      return e;
+  return NULL;
+}
+
+/* Lookup.  Removes the matching entry from the cache and returns
+   ownership to the caller; caller must `result_cache_entry_free' if it
+   chooses not to adopt the contents.  Returns NULL on miss or expiry.
+
+   On TTL expiry: removes and frees the entry; writes
+   *out_expired_command = strdup of the evicted command (caller frees +
+   messages).  Otherwise *out_expired_command is set to NULL.
+
+   ttl_seconds <= 0 disables expiry (treated as "no time check"). */
+static ResultCacheEntry *
+result_cache_take(const char *command, const char *dir, double ttl_seconds,
+                  char **out_expired_command) {
+  *out_expired_command = NULL;
+
+  pthread_mutex_lock(&g_result_cache.mu);
+  ResultCacheEntry *e = result_cache_find_locked(command, dir);
+  if (!e) {
+    pthread_mutex_unlock(&g_result_cache.mu);
+    return NULL;
+  }
+
+  if (ttl_seconds > 0) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double age = (double)(now.tv_sec - e->ts.tv_sec) +
+                 (double)(now.tv_nsec - e->ts.tv_nsec) / 1e9;
+    if (age > ttl_seconds) {
+      result_cache_unlink_locked(e);
+      pthread_mutex_unlock(&g_result_cache.mu);
+      *out_expired_command = e->command ? strdup(e->command) : NULL;
+      result_cache_entry_free(e);
+      return NULL;
+    }
+  }
+
+  result_cache_unlink_locked(e);
+  pthread_mutex_unlock(&g_result_cache.mu);
+  return e;
+}
+
+/* Insert.  Takes ownership of NEW_ENTRY.  If count exceeds MAX_ENTRIES,
+   evicts LRU tail and returns it via *out_evicted for the caller to
+   free + message.  max_entries == 0 disables the cache: NEW_ENTRY is
+   freed and *out_evicted is left NULL. */
+static void
+result_cache_put(ResultCacheEntry *new_entry, size_t max_entries,
+                 ResultCacheEntry **out_evicted) {
+  *out_evicted = NULL;
+  if (!new_entry) return;
+  if (max_entries == 0) {
+    result_cache_entry_free(new_entry);
+    return;
+  }
+
+  pthread_mutex_lock(&g_result_cache.mu);
+  /* If a prior entry exists for the same key (rare: same command+dir
+     re-run while the cached entry still lives), replace it.  Freeing
+     the dup happens outside the lock to avoid re-entry. */
+  ResultCacheEntry *dup = result_cache_find_locked(new_entry->command,
+                                                   new_entry->dir);
+  if (dup) result_cache_unlink_locked(dup);
+
+  clock_gettime(CLOCK_MONOTONIC, &new_entry->ts);
+  result_cache_push_head_locked(new_entry);
+
+  ResultCacheEntry *evicted = NULL;
+  if (g_result_cache.count > max_entries && g_result_cache.tail) {
+    evicted = g_result_cache.tail;
+    result_cache_unlink_locked(evicted);
+  }
+  pthread_mutex_unlock(&g_result_cache.mu);
+
+  if (dup) result_cache_entry_free(dup);
+  *out_evicted = evicted;
+}
+
 typedef struct {
   pthread_t     reader;
   pid_t         pid;
@@ -1305,13 +1484,33 @@ typedef struct {
   /* Read-only after session start; set from fzf-async-max-line-length defcustom.
      0 = no limit.  >0 = exclude lines longer than N chars.  <0 = truncate to |N|. */
   ptrdiff_t        max_line_length;
+
+  /* Cross-session result cache support.  command/dir retained here so
+     `fzf_native_async_stop' can key the cache insert without re-reading
+     anything from Elisp.
+
+     reader_drained: set by the reader when fgets returns NULL.  This is
+       the strongest "arena is complete" signal — the child closed its
+       end of the pipe (either via exit or explicit close), which means
+       everything the child intended to write has made it into the
+       arena.  Snapshot at freeze entry to decide cache eligibility.
+     reader_completed: set in three places —
+       1. `async_session_freeze' if reader_drained was true at entry
+          OR the child exited cleanly (WIFEXITED).
+       2. `fzf_native_async_start' on a result-cache hit (adopted
+          arena is already complete).
+     Consulted by `result_cache_capture_from_session'. */
+  char            *command;        /* owned, kept for cache key */
+  char            *dir;            /* owned, kept for cache key; NULL allowed */
+  _Atomic bool     reader_drained;
+  _Atomic bool     reader_completed;
 } AsyncSession;
 
 static void *async_reader(void *arg) {
   AsyncSession *s = arg;
   fzf_log("async_reader START: pid=%d\n", (int)s->pid);
   char line[ASYNC_LINE_MAX];
-  while (!atomic_load_explicit(&s->stop, memory_order_relaxed) && s->fp && fgets(line, sizeof line, s->fp)) {
+  while (s->fp && fgets(line, sizeof line, s->fp)) {
     size_t len = strlen(line);
     while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
       line[--len] = '\0';
@@ -1372,6 +1571,12 @@ static void *async_reader(void *arg) {
     pthread_mutex_unlock(&s->mu);
     atomic_fetch_add_explicit(&s->gen, 1, memory_order_relaxed);
   }
+  /* Pipe writer side closed.  Record this as the primary signal that
+     the arena is complete — see `reader_drained' field comment.  If
+     freeze samples this flag *before* deciding to SIGTERM the child,
+     it can tell "child already closed its pipe" (cache-eligible) from
+     "child still writing" (likely not). */
+  atomic_store_explicit(&s->reader_drained, true, memory_order_release);
   fzf_log("async_reader EXIT: total=%zu gen=%d\n",
           s->count, (int)atomic_load_explicit(&s->gen, memory_order_relaxed));
   return NULL;
@@ -1379,16 +1584,69 @@ static void *async_reader(void *arg) {
 
 static void *scoring_thread_fn(void *arg);  /* defined after async_scoring_worker */
 
-static void async_session_destroy(void *ptr) {
-  AsyncSession *s = ptr;
-  if (!s) return;
-  fzf_log("async_session_destroy: pid=%d count=%zu\n", (int)s->pid, s->count);
+/* Stops threads + child process, joins them, releases per-session
+   sync primitives and small buffers.  Does NOT free the candidate
+   arena, the chunked candidate table, command, dir, or `s` itself —
+   those remain valid for the caller to consume (e.g. move into a
+   ResultCacheEntry).  Call once per session. */
+static void async_session_freeze(AsyncSession *s) {
+  /* Determine arena completeness BEFORE doing anything that could race
+     with the reader or perturb the child.  Three states to distinguish:
 
-  /* Signal everything to stop simultaneously so scoring and reader wind down
-     in parallel rather than sequentially. */
+       a. Reader has already exited via fgets-NULL (pipe writer closed).
+          Definitively complete.
+       b. Reader is blocked in fgets but the child has caught up — child
+          wrote everything and is now idle (e.g. post-write cleanup with
+          stdout still open).  count is stable across a brief sample.
+          Arena reflects everything the child has emitted; safe to cache.
+       c. Reader is actively consuming.  count grows over a brief sample.
+          SIGTERM would cut off in-flight writes; do not cache.
+
+     The user's reported case is (b): a tool like ripgrep finishes its
+     output loop but stays alive for cleanup, leaving stdout open.  Our
+     reader sits in fgets and `reader_drained` stays false until the
+     child finally calls exit().  Sampling count over a brief window
+     catches this. */
+  bool reader_drained_at_entry =
+    atomic_load_explicit(&s->reader_drained, memory_order_acquire);
+
+  bool reader_idle = false;
+  if (!reader_drained_at_entry) {
+    /* Sole reader-thread writer guarantee makes s->count safe to read
+       unlocked (same as the reader's own access pattern). */
+    size_t before = s->count;
+    /* 20ms: long enough to confidently distinguish "blocked in fgets"
+       from "actively consuming" for any sane streaming tool, short
+       enough that the user won't notice the latency at minibuffer exit. */
+    struct timespec ts = {0, 20 * 1000 * 1000};
+    nanosleep(&ts, NULL);
+    if (atomic_load_explicit(&s->reader_drained, memory_order_acquire)) {
+      reader_drained_at_entry = true;
+    } else {
+      size_t after = s->count;
+      reader_idle = (before == after);
+    }
+  }
+  bool arena_complete = reader_drained_at_entry || reader_idle;
+
+  /* Signal the scoring thread to abort any in-flight work; it pays
+     attention to score_abort + score_req_stop. */
   atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
-  atomic_store_explicit(&s->stop, true, memory_order_relaxed);
-  if (s->pid > 0) kill(s->pid, SIGTERM);   /* reader unblocks on pipe EOF */
+
+  /* Child-process wrangling.  SIGTERM regardless of arena_complete —
+     arena_complete already locked in the cache decision; SIGTERM is
+     just cleanup. */
+  int  child_status     = 0;
+  bool child_status_set = false;
+  if (s->pid > 0) {
+    pid_t r = waitpid(s->pid, &child_status, WNOHANG);
+    if (r == s->pid) {
+      child_status_set = true;        /* reaped: child had already exited */
+    } else if (r == 0) {
+      kill(s->pid, SIGTERM);          /* still running */
+    }
+    /* r < 0: ECHILD or similar — treat as "unknown". */
+  }
 
   pthread_mutex_lock(&s->score_req_mu);
   free(s->score_req_filter);
@@ -1400,24 +1658,174 @@ static void async_session_destroy(void *ptr) {
   pthread_mutex_unlock(&s->score_req_mu);
   pthread_join(s->score_thread, NULL);
 
-  free(s->score_results);
-  free(s->score_current_filter);
+  free(s->score_results);          s->score_results = NULL;
+  free(s->score_current_filter);   s->score_current_filter = NULL;
   cache_free(&s->cache);
   pthread_mutex_destroy(&s->score_res_mu);
   pthread_mutex_destroy(&s->score_req_mu);
   pthread_cond_destroy(&s->score_req_cond);
 
-  /* Reader has been winding down since SIGTERM above; join it now. */
-  pthread_join(s->reader, NULL);
+  /* Reader is winding down (pipe EOF from child exit or SIGTERM).
+     For cache-hit sessions the reader was never spawned — pthread_join
+     on a zero-initialized pthread_t is undefined, so guard with pid. */
+  if (s->pid >= 0) pthread_join(s->reader, NULL);
   if (s->fp)      { fclose(s->fp); s->fp = NULL; }
-  if (s->pid > 0) { waitpid(s->pid, NULL, 0); s->pid = -1; }
+  if (s->pid > 0) {
+    if (!child_status_set) waitpid(s->pid, &child_status, 0);
+    child_status_set = true;
+    s->pid = -1;
+  }
+
+  /* Cache eligibility: arena_complete was determined at the top from
+     reader_drained OR reader-idle observation.  Also accept WIFEXITED
+     as a third signal — covers the case where the child exited cleanly
+     between our drain-state snapshot and now, which would have made
+     reader_drained true had we sampled a fraction of a second later. */
+  if (arena_complete ||
+      (child_status_set && WIFEXITED(child_status)))
+    atomic_store_explicit(&s->reader_completed, true, memory_order_release);
+
+  fzf_log("async_session_freeze: total=%zu drained=%d idle=%d exited=%d signaled=%d status=%d completed=%d\n",
+          s->count,
+          (int)reader_drained_at_entry,
+          (int)reader_idle,
+          child_status_set ? WIFEXITED(child_status)   : -1,
+          child_status_set ? WIFSIGNALED(child_status) : -1,
+          child_status_set ? (WIFEXITED(child_status) ? WEXITSTATUS(child_status) : -1) : -1,
+          (int)atomic_load_explicit(&s->reader_completed, memory_order_relaxed));
+}
+
+/* Free the arena, chunked candidate table, command, dir, and `s` itself.
+   Assumes `async_session_freeze' has already been called (or `s` came
+   from a never-started init path).  Fields that have been moved out
+   (arena.head == NULL, cands_top[k] == NULL, command == NULL,
+   dir == NULL) are skipped harmlessly. */
+static void async_session_free(AsyncSession *s) {
   pthread_mutex_lock(&s->mu);
   arena_free(&s->arena);
   for (size_t k = 0; k < CANDS_TOP_CAP; k++)
     if (s->cands_top[k]) { free(s->cands_top[k]); s->cands_top[k] = NULL; }
   pthread_mutex_unlock(&s->mu);
   pthread_mutex_destroy(&s->mu);
+  free(s->command);
+  free(s->dir);
   free(s);
+}
+
+/* User-ptr finalizer.  GC has no emacs_env, so the result cache is
+   NOT consulted on this path — only `fzf_native_async_stop' caches. */
+static void async_session_destroy(void *ptr) {
+  AsyncSession *s = ptr;
+  if (!s) return;
+  fzf_log("async_session_destroy: pid=%d count=%zu\n", (int)s->pid, s->count);
+  async_session_freeze(s);
+  async_session_free(s);
+}
+
+/* Read the two result-cache defcustoms.  Returns true if the cache is
+   enabled (both knobs non-nil and positive).  On disable, *out_ttl
+   and *out_max_entries are left at 0. */
+static bool
+result_cache_read_settings(emacs_env *env, double *out_ttl,
+                           size_t *out_max_entries) {
+  *out_ttl = 0.0;
+  *out_max_entries = 0;
+
+  emacs_value sym_ttl = env->intern(env, "fzf-native-async-result-cache-ttl");
+  emacs_value val_ttl = env->funcall(env, env->intern(env, "symbol-value"),
+                                     1, &sym_ttl);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    return false;
+  }
+  if (env->eq(env, val_ttl, Qnil)) return false;
+
+  double ttl = env->extract_float(env, val_ttl);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    intmax_t ttl_i = env->extract_integer(env, val_ttl);
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+      env->non_local_exit_clear(env);
+      return false;
+    }
+    ttl = (double)ttl_i;
+  }
+  if (!(ttl > 0.0)) return false;
+
+  emacs_value sym_max = env->intern(env, "fzf-native-async-result-cache-entries");
+  emacs_value val_max = env->funcall(env, env->intern(env, "symbol-value"),
+                                     1, &sym_max);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    return false;
+  }
+  if (env->eq(env, val_max, Qnil)) return false;
+
+  intmax_t maxe = env->extract_integer(env, val_max);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    return false;
+  }
+  if (maxe <= 0) return false;
+
+  *out_ttl = ttl;
+  *out_max_entries = (size_t)maxe;
+  return true;
+}
+
+/* Emit a message via Fmessage; tolerate any non-local exit from the
+   call (the cache path must not propagate Emacs errors). */
+static void
+result_cache_emit_message(emacs_env *env, const char *fmt,
+                          const char *command, const char *dir) {
+  if (!command) command = "";
+  if (!dir) dir = "";
+  emacs_value args[3] = {
+    env->make_string(env, fmt, (ptrdiff_t)strlen(fmt)),
+    env->make_string(env, command, (ptrdiff_t)strlen(command)),
+    env->make_string(env, dir, (ptrdiff_t)strlen(dir))
+  };
+  env->funcall(env, Fmessage, 3, args);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+    env->non_local_exit_clear(env);
+}
+
+/* On clean reader EOF and cache enabled: move the session's arena +
+   chunked candidate table + command + dir into a new ResultCacheEntry
+   and insert.  Emit a `message' for any LRU eviction.  Safe to call
+   regardless of state — bails out early when ineligible. */
+static void
+result_cache_capture_from_session(emacs_env *env, AsyncSession *s) {
+  if (!atomic_load_explicit(&s->reader_completed, memory_order_acquire)) return;
+  if (!s->command) return;
+
+  double ttl = 0.0;
+  size_t max_entries = 0;
+  if (!result_cache_read_settings(env, &ttl, &max_entries)) return;
+  (void)ttl;  /* TTL is consulted on lookup, not insert. */
+
+  ResultCacheEntry *ne = calloc(1, sizeof *ne);
+  if (!ne) return;
+
+  /* Move ownership out of `s` so async_session_free skips these fields. */
+  ne->command = s->command; s->command = NULL;
+  ne->dir     = s->dir;     s->dir     = NULL;
+  ne->arena   = s->arena;   s->arena   = (Arena){0};
+  memcpy(ne->cands_top, s->cands_top, sizeof ne->cands_top);
+  memset(s->cands_top, 0, sizeof s->cands_top);
+  ne->count   = s->count;
+
+  ResultCacheEntry *evicted = NULL;
+  result_cache_put(ne, max_entries, &evicted);
+
+  if (evicted) {
+    fzf_log("result_cache: LRU evicted command='%s' count=%zu\n",
+            evicted->command ? evicted->command : "", evicted->count);
+    result_cache_emit_message(env,
+                              "fzf-async: result cache LRU evicted: %s @ %s",
+                              evicted->command, evicted->dir);
+    result_cache_entry_free(evicted);
+  }
 }
 
 /* fzf-native-async-start COMMAND &optional DIR -> session handle */
@@ -1438,151 +1846,214 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     if (dir) env->copy_string_contents(env, args[1], dir, &dlen);
   }
 
-  /* Use shell-file-name / shell-command-switch so behaviour matches
-     shell-command (M-!) rather than hardcoding /bin/sh -c. */
-  char *shell_prog = NULL, *shell_switch = NULL;
-  {
-    emacs_value sym = env->intern(env, "shell-file-name");
-    emacs_value v   = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
-    if (env->non_local_exit_check(env) == emacs_funcall_exit_return &&
-        !env->eq(env, v, Qnil)) {
-      ptrdiff_t slen = 0;
-      env->copy_string_contents(env, v, NULL, &slen);
-      if (slen > 1) {
-        shell_prog = malloc((size_t)slen);
-        if (shell_prog) env->copy_string_contents(env, v, shell_prog, &slen);
-      }
-    } else {
-      env->non_local_exit_clear(env);
+  /* Cross-session result-cache lookup.  When enabled and not expired,
+     a hit skips the fork+exec entirely and the new session adopts the
+     cached arena.  Read settings once up front; the captured value of
+     `cache_enabled' also gates the eventual insert path inside
+     async_session_freeze → result_cache_capture_from_session. */
+  double cache_ttl = 0.0;
+  size_t cache_max_entries = 0;
+  bool   cache_enabled = result_cache_read_settings(env, &cache_ttl,
+                                                    &cache_max_entries);
+  ResultCacheEntry *cache_hit = NULL;
+  if (cache_enabled) {
+    char *expired_cmd = NULL;
+    cache_hit = result_cache_take(cmd, dir, cache_ttl, &expired_cmd);
+    if (expired_cmd) {
+      fzf_log("result_cache: TTL evicted command='%s'\n", expired_cmd);
+      result_cache_emit_message(env,
+                                "fzf-async: result cache TTL evicted: %s @ %s",
+                                expired_cmd, dir);
+      free(expired_cmd);
     }
-    if (!shell_prog) shell_prog = strdup("/bin/sh");
-  }
-  {
-    emacs_value sym = env->intern(env, "shell-command-switch");
-    emacs_value v   = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
-    if (env->non_local_exit_check(env) == emacs_funcall_exit_return &&
-        !env->eq(env, v, Qnil)) {
-      ptrdiff_t slen = 0;
-      env->copy_string_contents(env, v, NULL, &slen);
-      if (slen > 1) {
-        shell_switch = malloc((size_t)slen);
-        if (shell_switch) env->copy_string_contents(env, v, shell_switch, &slen);
-      }
-    } else {
-      env->non_local_exit_clear(env);
+    if (cache_hit) {
+      fzf_log("result_cache: HIT command='%s' count=%zu\n",
+              cache_hit->command ? cache_hit->command : "",
+              cache_hit->count);
     }
-    if (!shell_switch) shell_switch = strdup("-c");
   }
 
-  /* Build PATH from exec-path so the child shell can find binaries that
-     Emacs can find, even on macOS GUI launches with a minimal inherited PATH. */
-  char *exec_path_str = NULL;
-  {
-    emacs_value sym    = env->intern(env, "exec-path");
-    emacs_value v      = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
-    emacs_value sep    = env->make_string(env, ":", 1);
-    emacs_value id     = env->intern(env, "identity");
-    emacs_value mc_fn  = env->intern(env, "mapconcat");
-    emacs_value mc_args[3] = {id, v, sep};
-    if (env->non_local_exit_check(env) == emacs_funcall_exit_return) {
-      emacs_value joined = env->funcall(env, mc_fn, 3, mc_args);
-      if (env->non_local_exit_check(env) == emacs_funcall_exit_return) {
-        ptrdiff_t plen = 0;
-        env->copy_string_contents(env, joined, NULL, &plen);
-        if (plen > 1) {
-          exec_path_str = malloc((size_t)plen);
-          if (exec_path_str)
-            env->copy_string_contents(env, joined, exec_path_str, &plen);
-        }
-      }
-    }
-    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
-      env->non_local_exit_clear(env);
-  }
-
-  fzf_log("async_start: shell='%s' switch='%s' cmd='%s' dir='%s' PATH='%s'\n",
-          shell_prog, shell_switch, cmd, dir ? dir : "(nil)",
-          exec_path_str ? exec_path_str : "(inherited)");
-
-  int pfd[2];
-  if (pipe(pfd) != 0) {
-    fzf_log("async_start: pipe failed\n");
-    free(cmd);
-    free(dir);
-    free(shell_prog);
-    free(shell_switch);
-    free(exec_path_str);
-    return Qnil;
-  }
-
-  pid_t pid = fork();
-  if (pid < 0) {
-    fzf_log("async_start: fork failed\n");
-    close(pfd[0]);
-    close(pfd[1]);
-    free(cmd);
-    free(dir);
-    free(shell_prog);
-    free(shell_switch);
-    free(exec_path_str);
-    return Qnil;
-  }
-
-  if (pid == 0) {
-    close(pfd[0]);
-    dup2(pfd[1], STDOUT_FILENO);
-    close(pfd[1]);
-    int dn = open("/dev/null", O_WRONLY);
-    if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
-    if (exec_path_str) {
-      const char *old = getenv("PATH");
-      if (old && *old) {
-        size_t nlen = strlen(exec_path_str) + 1 + strlen(old) + 1;
-        char *new_path = malloc(nlen);
-        if (new_path) {
-          snprintf(new_path, nlen, "%s:%s", exec_path_str, old);
-          setenv("PATH", new_path, 1);
-          free(new_path);
+  /* Shell / fork / exec / pipe setup is skipped on cache hit — the
+     cached arena already contains a complete enumeration of the same
+     (command, dir), so respawning the subprocess would be pure waste. */
+  int   pfd[2] = { -1, -1 };
+  pid_t pid    = -1;
+  if (!cache_hit) {
+    /* Use shell-file-name / shell-command-switch so behaviour matches
+       shell-command (M-!) rather than hardcoding /bin/sh -c. */
+    char *shell_prog = NULL, *shell_switch = NULL;
+    {
+      emacs_value sym = env->intern(env, "shell-file-name");
+      emacs_value v   = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
+      if (env->non_local_exit_check(env) == emacs_funcall_exit_return &&
+          !env->eq(env, v, Qnil)) {
+        ptrdiff_t slen = 0;
+        env->copy_string_contents(env, v, NULL, &slen);
+        if (slen > 1) {
+          shell_prog = malloc((size_t)slen);
+          if (shell_prog) env->copy_string_contents(env, v, shell_prog, &slen);
         }
       } else {
-        setenv("PATH", exec_path_str, 1);
+        env->non_local_exit_clear(env);
       }
+      if (!shell_prog) shell_prog = strdup("/bin/sh");
     }
-    if (dir) chdir(dir);
-    execl(shell_prog, shell_prog, shell_switch, cmd, (char *)NULL);
-    _exit(127);
+    {
+      emacs_value sym = env->intern(env, "shell-command-switch");
+      emacs_value v   = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
+      if (env->non_local_exit_check(env) == emacs_funcall_exit_return &&
+          !env->eq(env, v, Qnil)) {
+        ptrdiff_t slen = 0;
+        env->copy_string_contents(env, v, NULL, &slen);
+        if (slen > 1) {
+          shell_switch = malloc((size_t)slen);
+          if (shell_switch) env->copy_string_contents(env, v, shell_switch, &slen);
+        }
+      } else {
+        env->non_local_exit_clear(env);
+      }
+      if (!shell_switch) shell_switch = strdup("-c");
+    }
+
+    /* Build PATH from exec-path so the child shell can find binaries
+       that Emacs can find, even on macOS GUI launches with a minimal
+       inherited PATH. */
+    char *exec_path_str = NULL;
+    {
+      emacs_value sym    = env->intern(env, "exec-path");
+      emacs_value v      = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
+      emacs_value sep    = env->make_string(env, ":", 1);
+      emacs_value id     = env->intern(env, "identity");
+      emacs_value mc_fn  = env->intern(env, "mapconcat");
+      emacs_value mc_args[3] = {id, v, sep};
+      if (env->non_local_exit_check(env) == emacs_funcall_exit_return) {
+        emacs_value joined = env->funcall(env, mc_fn, 3, mc_args);
+        if (env->non_local_exit_check(env) == emacs_funcall_exit_return) {
+          ptrdiff_t plen = 0;
+          env->copy_string_contents(env, joined, NULL, &plen);
+          if (plen > 1) {
+            exec_path_str = malloc((size_t)plen);
+            if (exec_path_str)
+              env->copy_string_contents(env, joined, exec_path_str, &plen);
+          }
+        }
+      }
+      if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+        env->non_local_exit_clear(env);
+    }
+
+    fzf_log("async_start: shell='%s' switch='%s' cmd='%s' dir='%s' PATH='%s'\n",
+            shell_prog, shell_switch, cmd, dir ? dir : "(nil)",
+            exec_path_str ? exec_path_str : "(inherited)");
+
+    if (pipe(pfd) != 0) {
+      fzf_log("async_start: pipe failed\n");
+      free(cmd);
+      free(dir);
+      free(shell_prog);
+      free(shell_switch);
+      free(exec_path_str);
+      return Qnil;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+      fzf_log("async_start: fork failed\n");
+      close(pfd[0]);
+      close(pfd[1]);
+      free(cmd);
+      free(dir);
+      free(shell_prog);
+      free(shell_switch);
+      free(exec_path_str);
+      return Qnil;
+    }
+
+    if (pid == 0) {
+      close(pfd[0]);
+      dup2(pfd[1], STDOUT_FILENO);
+      close(pfd[1]);
+      int dn = open("/dev/null", O_WRONLY);
+      if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+      if (exec_path_str) {
+        const char *old = getenv("PATH");
+        if (old && *old) {
+          size_t nlen = strlen(exec_path_str) + 1 + strlen(old) + 1;
+          char *new_path = malloc(nlen);
+          if (new_path) {
+            snprintf(new_path, nlen, "%s:%s", exec_path_str, old);
+            setenv("PATH", new_path, 1);
+            free(new_path);
+          }
+        } else {
+          setenv("PATH", exec_path_str, 1);
+        }
+      }
+      if (dir) chdir(dir);
+      execl(shell_prog, shell_prog, shell_switch, cmd, (char *)NULL);
+      _exit(127);
+    }
+    close(pfd[1]);
+    free(shell_prog);
+    free(shell_switch);
+    free(exec_path_str);
   }
-  close(pfd[1]);
-  free(shell_prog);
-  free(shell_switch);
-  free(exec_path_str);
 
   AsyncSession *s = calloc(1, sizeof *s);
   if (!s) {
     fzf_log("async_start: calloc failed\n");
-    close(pfd[0]);
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
+    if (!cache_hit) {
+      close(pfd[0]);
+      kill(pid, SIGTERM);
+      waitpid(pid, NULL, 0);
+    }
+    if (cache_hit) result_cache_entry_free(cache_hit);
     free(cmd);
     free(dir);
     return Qnil;
   }
 
-  fzf_log("async_start: cmd='%s' dir='%s' pid=%d\n",
-          cmd, dir ? dir : ".", (int)pid);
+  fzf_log("async_start: cmd='%s' dir='%s' pid=%d %s\n",
+          cmd, dir ? dir : ".", (int)pid,
+          cache_hit ? "(CACHE HIT)" : "");
 
-  free(cmd);
-  free(dir);
-
-  s->pid   = pid;
-  s->fp    = fdopen(pfd[0], "r");
-  /* cands_top is zero-initialized by the calloc above; blocks are
-     allocated lazily by the reader on first write into each block. */
+  if (cache_hit) {
+    /* Move the cached arena, chunked candidate table, command, and dir
+       into the new session.  cmd/dir locals are redundant — the cache
+       entry already owned matching copies. */
+    s->pid     = -1;
+    s->fp      = NULL;
+    s->command = cache_hit->command; cache_hit->command = NULL;
+    s->dir     = cache_hit->dir;     cache_hit->dir     = NULL;
+    s->arena   = cache_hit->arena;   cache_hit->arena   = (Arena){0};
+    memcpy(s->cands_top, cache_hit->cands_top, sizeof s->cands_top);
+    memset(cache_hit->cands_top, 0, sizeof cache_hit->cands_top);
+    s->count   = cache_hit->count;
+    atomic_store_explicit(&s->reader_completed, true, memory_order_release);
+    result_cache_entry_free(cache_hit);
+    cache_hit = NULL;
+    free(cmd);
+    free(dir);
+  } else {
+    s->pid     = pid;
+    s->fp      = fdopen(pfd[0], "r");
+    /* Move ownership of cmd/dir into the session — async_session_free
+       releases them, and result_cache_capture_from_session may move
+       them into a fresh cache entry on clean stop. */
+    s->command = cmd;
+    s->dir     = dir;
+  }
+  /* cands_top is zero-initialized by the calloc above for the miss
+     path; for the hit path it was just populated from the cache. */
   pthread_mutex_init(&s->mu, NULL);
   pthread_mutex_init(&s->score_req_mu, NULL);
   pthread_cond_init(&s->score_req_cond, NULL);
   pthread_mutex_init(&s->score_res_mu, NULL);
-  atomic_store(&s->gen, 0);
+  /* For cache-hit sessions the scoring thread has full data immediately
+     — pre-publish gen=1 so the first poll picks up results without
+     waiting for a reader increment that will never come.  Miss path
+     starts at gen=0; the reader thread bumps it on each candidate. */
+  atomic_store(&s->gen, s->fp ? 0 : 1);
   atomic_store(&s->score_abort, false);
 
   {
@@ -1622,11 +2093,19 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     cache_init(&s->cache, cache_max);
   }
 
-  if (!s->fp ||
-      pthread_create(&s->reader, NULL, async_reader, s) != 0 ||
-      pthread_create(&s->score_thread, NULL, scoring_thread_fn, s) != 0) {
-    async_session_destroy(s);
-    return Qnil;
+  /* Cache-hit sessions skip the reader (no subprocess); only the
+     scoring thread is spawned.  Miss path spawns both as before. */
+  if (s->fp) {
+    if (pthread_create(&s->reader, NULL, async_reader, s) != 0 ||
+        pthread_create(&s->score_thread, NULL, scoring_thread_fn, s) != 0) {
+      async_session_destroy(s);
+      return Qnil;
+    }
+  } else {
+    if (pthread_create(&s->score_thread, NULL, scoring_thread_fn, s) != 0) {
+      async_session_destroy(s);
+      return Qnil;
+    }
   }
   return env->make_user_ptr(env, async_session_destroy, s);
 }
@@ -1640,7 +2119,12 @@ fzf_native_async_stop(emacs_env *env, ptrdiff_t nargs,
   if (s) {
     fzf_log("async_stop: pid=%d total=%zu\n", (int)s->pid, s->count);
     env->set_user_ptr(env, args[0], NULL);
-    async_session_destroy(s);
+    async_session_freeze(s);
+    /* env is available here (unlike in the GC finalizer), so the
+       result cache can be consulted.  Moves arena + cands_top + cmd +
+       dir out of `s` on cache hit; remaining fields are freed below. */
+    result_cache_capture_from_session(env, s);
+    async_session_free(s);
   }
   return Qnil;
 }
@@ -2180,6 +2664,12 @@ int emacs_module_init(struct emacs_runtime *rt) {
     return 2;
 
   global_rt = rt;
+
+  /* One-time init of the cross-session result cache (mutex + empty
+     LRU).  Survives across Emacs sessions only in the sense that the
+     pthread_mutex is statically initialized — the cache contents are
+     populated/evicted at runtime. */
+  result_cache_global_init();
 
 #ifdef FZF_NATIVE_DEBUG
   /* Bootstrap the log file at ~/.emacs.d/fzf-native.log. Truncate on each
