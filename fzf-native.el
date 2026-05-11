@@ -15,6 +15,8 @@
 
 (require 'cl-lib)
 
+;;; Code:
+
 (defgroup fzf-native nil
   "Fuzzy completion style."
   :group 'minibuffer
@@ -107,7 +109,7 @@ Read once at session start by `fzf-native-async-start'.
 
 Bridged by fzf-async from `fzf-async-max-line-length' via `:around'
 advice; the read happens inside `fzf-native-async-start' so the
-advice is in scope for the symbol-value lookup."
+advice is in scope for the `symbol-value' lookup."
   :type '(choice (const   :tag "No limit" nil)
                  (integer :tag "N (positive = exclude, negative = truncate)"))
   :group 'fzf-native)
@@ -163,8 +165,8 @@ the executable."
 (defun fzf-native-module-compile-with-logging ()
   "Compile fzf-native-module with file logging enabled.
 Sets FZF_NATIVE_DEBUG=1 so CMake compiles in the log-to-file path.
-Logs are written to ~/.emacs.d/fzf-native.log and truncated on each
-module load."
+Logs are written to user-emacs-directory/fzf-native.log and truncated
+on each module load."
   (interactive)
   (when (fzf-native-module--cmake-is-available)
     (let* ((fzf-native-directory
@@ -189,12 +191,12 @@ module load."
   (interactive)
   (let* ((dyn-name (cl-case system-type
                      ((windows-nt ms-dos cygwin) (concat "Windows/Release/" fzf-native--dyn-name ".dll"))
-                     ('darwin (if (string-prefix-p "x86_64" system-configuration)
-                                  ; Intel
-                                  (concat "Darwin/" fzf-native--dyn-name ".so")
-                                ; Apple Silicon
-                                (concat "Darwin/arm64/" fzf-native--dyn-name ".so")))
-                     ('berkeley-unix (concat  "FreeBSD/" fzf-native--dyn-name ".so"))
+                     (darwin (if (string-prefix-p "x86_64" system-configuration)
+                                 ;; Intel
+                                 (concat "Darwin/" fzf-native--dyn-name ".so")
+                               ;; Apple Silicon
+                               (concat "Darwin/arm64/" fzf-native--dyn-name ".so")))
+                     (berkeley-unix (concat  "FreeBSD/" fzf-native--dyn-name ".so"))
                      (t (concat "Linux/" fzf-native--dyn-name ".so"))))
          (dyn-path (concat fzf-native--bin-dir dyn-name)))
     (module-load dyn-path)
@@ -202,7 +204,7 @@ module load."
 
 ;;;###autoload
 (defun fzf-native-load-own-build-dyn ()
-  "Loads user-compiled version of module, building it if necessary"
+  "Loads user-compiled version of module, building it if necessary."
   (unless (require 'fzf-native-module nil t)
     (if (or fzf-native-always-compile-module
             (y-or-n-p "Fzf-Native needs `fzf-native-module' to work.  Compile it now? "))
