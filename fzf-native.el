@@ -2,6 +2,7 @@
 
 ;; Copyright 2021 Duc Dang
 ;; Author: Duc Dang <me@dangduc.com>
+;; Assisted-by: Claude:claude-opus-4-7
 ;; Version: 0.3
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: matching
