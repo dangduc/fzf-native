@@ -13,6 +13,7 @@
 #include "fzf-additions.h"
 #include <stdio.h>
 #include <stdarg.h>
+#include <time.h>
 
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <stdatomic.h>
@@ -1274,6 +1275,173 @@ static void cache_insert(Cache *c, const char *query, size_t pool_gen,
   cache_entry_free(evicted);
 }
 
+/* ---------------------------------------------------------------------------
+   Result cache (cross-session, command-keyed).
+   ---------------------------------------------------------------------------
+
+   Skips re-running the subprocess when the same (command, directory) is
+   queried again within a TTL window.  Saves the cost of re-enumerating
+   large pools (e.g. `find ~').
+
+   Lookup happens at the top of `fzf_native_async_start' (env available);
+   insert happens in `fzf_native_async_stop' (env available).  The GC
+   finalizer path does NOT cache — no env, can't read defcustoms or emit
+   eviction messages.
+
+   Concurrency: Emacs runs only one fzf-async session at a time, so the
+   arena's owner is unambiguous at every moment (cache between sessions,
+   session during).  No refcounting.  The cache mutex serializes access
+   to the LRU list itself.
+
+   Eviction: TTL (lookup) + LRU bound (insert).  Both emit a `message'
+   via the caller (cache primitives stay env-free). */
+
+typedef struct ResultCacheEntry {
+  struct ResultCacheEntry *prev, *next;
+  char            *command;       /* owned */
+  char            *dir;           /* owned; NULL allowed */
+  struct timespec  ts;            /* CLOCK_MONOTONIC at insert time */
+  /* Moved out of an AsyncSession on insert; moved back into a new
+     AsyncSession on lookup.  Layout matches AsyncSession's so the
+     transfer is a straight copy + zero-out on both ends. */
+  Arena            arena;
+  char           **cands_top[CANDS_TOP_CAP];
+  size_t           count;
+} ResultCacheEntry;
+
+typedef struct {
+  pthread_mutex_t   mu;
+  ResultCacheEntry *head;     /* MRU */
+  ResultCacheEntry *tail;     /* LRU */
+  size_t            count;
+} ResultCache;
+
+static ResultCache g_result_cache;
+
+static void result_cache_global_init(void) {
+  pthread_mutex_init(&g_result_cache.mu, NULL);
+  g_result_cache.head = g_result_cache.tail = NULL;
+  g_result_cache.count = 0;
+}
+
+static void result_cache_entry_free(ResultCacheEntry *e) {
+  if (!e) return;
+  free(e->command);
+  free(e->dir);
+  arena_free(&e->arena);
+  for (size_t k = 0; k < CANDS_TOP_CAP; k++)
+    if (e->cands_top[k]) free(e->cands_top[k]);
+  free(e);
+}
+
+static void result_cache_unlink_locked(ResultCacheEntry *e) {
+  if (e->prev) e->prev->next = e->next; else g_result_cache.head = e->next;
+  if (e->next) e->next->prev = e->prev; else g_result_cache.tail = e->prev;
+  e->prev = e->next = NULL;
+  g_result_cache.count--;
+}
+
+static void result_cache_push_head_locked(ResultCacheEntry *e) {
+  e->prev = NULL;
+  e->next = g_result_cache.head;
+  if (g_result_cache.head) g_result_cache.head->prev = e;
+  g_result_cache.head = e;
+  if (!g_result_cache.tail) g_result_cache.tail = e;
+  g_result_cache.count++;
+}
+
+/* NULL-safe key equality. */
+static bool result_cache_key_eq(const char *a, const char *b) {
+  if (a == b) return true;
+  if (!a || !b) return false;
+  return strcmp(a, b) == 0;
+}
+
+static ResultCacheEntry *
+result_cache_find_locked(const char *command, const char *dir) {
+  for (ResultCacheEntry *e = g_result_cache.head; e; e = e->next)
+    if (result_cache_key_eq(e->command, command) &&
+        result_cache_key_eq(e->dir, dir))
+      return e;
+  return NULL;
+}
+
+/* Lookup.  Removes the matching entry from the cache and returns
+   ownership to the caller.  Returns NULL on miss or TTL expiry.
+
+   On TTL expiry: removes and frees the entry; writes
+   *out_expired_command = strdup of the evicted command (caller frees +
+   messages — cache primitives stay env-free).  Otherwise
+   *out_expired_command stays NULL.
+
+   ttl_seconds <= 0 disables expiry (treated as no time check). */
+static ResultCacheEntry *
+result_cache_take(const char *command, const char *dir, double ttl_seconds,
+                  char **out_expired_command) {
+  *out_expired_command = NULL;
+
+  pthread_mutex_lock(&g_result_cache.mu);
+  ResultCacheEntry *e = result_cache_find_locked(command, dir);
+  if (!e) {
+    pthread_mutex_unlock(&g_result_cache.mu);
+    return NULL;
+  }
+
+  if (ttl_seconds > 0) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double age = (double)(now.tv_sec - e->ts.tv_sec) +
+                 (double)(now.tv_nsec - e->ts.tv_nsec) / 1e9;
+    if (age > ttl_seconds) {
+      result_cache_unlink_locked(e);
+      pthread_mutex_unlock(&g_result_cache.mu);
+      *out_expired_command = e->command ? strdup(e->command) : NULL;
+      result_cache_entry_free(e);
+      return NULL;
+    }
+  }
+
+  result_cache_unlink_locked(e);
+  pthread_mutex_unlock(&g_result_cache.mu);
+  return e;
+}
+
+/* Insert.  Takes ownership of NEW_ENTRY.  If count exceeds MAX_ENTRIES,
+   evicts the LRU tail and returns it via *out_evicted for the caller to
+   free + message.  max_entries == 0 disables the cache: NEW_ENTRY is
+   freed and *out_evicted is left NULL. */
+static void
+result_cache_put(ResultCacheEntry *new_entry, size_t max_entries,
+                 ResultCacheEntry **out_evicted) {
+  *out_evicted = NULL;
+  if (!new_entry) return;
+  if (max_entries == 0) {
+    result_cache_entry_free(new_entry);
+    return;
+  }
+
+  pthread_mutex_lock(&g_result_cache.mu);
+  /* If a prior entry exists for the same key (rare: same command+dir
+     re-run while the cached entry still lives), replace it.  Freeing
+     the dup happens outside the lock to avoid re-entry. */
+  ResultCacheEntry *dup = result_cache_find_locked(new_entry->command,
+                                                   new_entry->dir);
+  if (dup) result_cache_unlink_locked(dup);
+
+  clock_gettime(CLOCK_MONOTONIC, &new_entry->ts);
+  result_cache_push_head_locked(new_entry);
+
+  ResultCacheEntry *evicted = NULL;
+  if (g_result_cache.count > max_entries && g_result_cache.tail) {
+    evicted = g_result_cache.tail;
+    result_cache_unlink_locked(evicted);
+  }
+  pthread_mutex_unlock(&g_result_cache.mu);
+
+  if (dup) result_cache_entry_free(dup);
+  *out_evicted = evicted;
+}
+
 typedef struct {
   pthread_t     reader;
   pid_t         pid;
@@ -2273,6 +2441,9 @@ int emacs_module_init(struct emacs_runtime *rt) {
     return 2;
 
   global_rt = rt;
+
+  /* One-time init of the cross-session result cache (mutex + empty LRU). */
+  result_cache_global_init();
 
 #ifdef FZF_NATIVE_DEBUG
   /* Bootstrap the log file at ~/.emacs.d/fzf-native.log. Truncate on each
