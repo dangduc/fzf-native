@@ -1990,6 +1990,48 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   return env->make_user_ptr(env, async_session_destroy, s);
 }
 
+/* If the just-frozen session is eligible (arena complete, non-empty,
+   not itself a cache adoption) and the cache is enabled, move the
+   arena + cands_top + command + dir into a new ResultCacheEntry and
+   insert.  Emit a `message' for any LRU eviction.  Safe to call
+   regardless of state — bails out early when ineligible. */
+static void
+result_cache_capture_from_session(emacs_env *env, AsyncSession *s) {
+  if (s->is_cache_hit) return;                  /* dedup: already cached */
+  if (s->count == 0) return;                    /* empty pool */
+  if (!atomic_load_explicit(&s->reader_drained, /* arena incomplete */
+                            memory_order_acquire)) return;
+  if (!s->command) return;                      /* defensive */
+
+  double ttl = 0.0;
+  size_t max_entries = 0;
+  if (!result_cache_read_settings(env, &ttl, &max_entries)) return;
+  (void)ttl;  /* consulted on lookup, not insert */
+
+  ResultCacheEntry *ne = calloc(1, sizeof *ne);
+  if (!ne) return;
+
+  /* Move ownership out of `s` so async_session_free skips these fields. */
+  ne->command = s->command; s->command = NULL;
+  ne->dir     = s->dir;     s->dir     = NULL;
+  ne->arena   = s->arena;   s->arena   = (Arena){0};
+  memcpy(ne->cands_top, s->cands_top, sizeof ne->cands_top);
+  memset(s->cands_top, 0, sizeof s->cands_top);
+  ne->count   = s->count;
+
+  ResultCacheEntry *evicted = NULL;
+  result_cache_put(ne, max_entries, &evicted);
+
+  if (evicted) {
+    fzf_log("result_cache: LRU evicted command='%s' count=%zu\n",
+            evicted->command ? evicted->command : "", evicted->count);
+    result_cache_emit_message(
+      env, "fzf-async: result cache LRU evicted: %s @ %s",
+      evicted->command, evicted->dir);
+    result_cache_entry_free(evicted);
+  }
+}
+
 /* fzf-native-async-stop HANDLE */
 static emacs_value
 fzf_native_async_stop(emacs_env *env, ptrdiff_t nargs,
@@ -1999,7 +2041,12 @@ fzf_native_async_stop(emacs_env *env, ptrdiff_t nargs,
   if (s) {
     fzf_log("async_stop: pid=%d total=%zu\n", (int)s->pid, s->count);
     env->set_user_ptr(env, args[0], NULL);
-    async_session_destroy(s);
+    async_session_freeze(s);
+    /* env is available here (unlike in the GC finalizer), so the result
+       cache can be consulted.  Moves arena + cands_top + cmd + dir out
+       of `s` on insert; remaining fields are freed below. */
+    result_cache_capture_from_session(env, s);
+    async_session_free(s);
   }
   return Qnil;
 }
