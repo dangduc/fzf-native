@@ -128,6 +128,42 @@ Bridged by fzf-async from `fzf-async-cache-size' via `:around' advice."
   :type 'integer
   :group 'fzf-native)
 
+(defcustom fzf-native-filter-only-min-pool 10000000
+  "Pool size at which scoring switches to filter-only mode.
+When the candidate pool reaches at least this size, scoring replaces
+full fzf evaluation with `fzf_has_match' (boolean match-only check
+from fzf-additions) and skips top-K sorting.  The match-set is
+still built exhaustively so the per-session query cache (m_idx) can
+be used to refine subsequent keystrokes — and so the rest of the
+pipeline (cache hits, refinement, downstream Elisp processing)
+behaves identically across the threshold.
+
+Pool size is sampled per scoring run, so a streaming session that
+crosses the threshold mid-typing switches modes for the keystrokes
+after the crossing.  Below the threshold the full scorer ranks
+results; above it the result order is the pool's natural order
+(typically directory traversal / find order), capped at the
+candidate limit.
+
+Threshold is checked as `pool-size >= N', so values shape behaviour
+as follows:
+  0 (or nil) — feature disabled; full scoring always.
+  1          — filter-only as soon as the pool is non-empty
+               (effectively \"always filter\"; handy for testing).
+  10000000   — filter-only only once the pool reaches 10M (default).
+
+Default 10000000 is empirical: below it the full scorer is fast
+enough; above it the per-keystroke latency benefits noticeably from
+the cheap path.
+
+Read once at session start by `fzf-native-async-start'.
+
+Bridged by fzf-async from `fzf-async-filter-only-min-pool' via
+`:around' advice."
+  :type '(choice (const :tag "Disabled" nil)
+                 (integer :tag "Minimum pool size"))
+  :group 'fzf-native)
+
 (defun fzf-native-module--cmake-is-available ()
   "Return t if cmake is available.
 CMake is needed to build fzf-native, here we check that we can find

@@ -375,6 +375,71 @@ The batch loop also checks abort every 64 K items during the
 *snapshot construction* before workers spawn, so a filter change
 during a 25 M-item memcpy doesn't force a full pre-work pass.
 
+** Filter-only mode
+
+Driven by =fzf-native-filter-only-min-pool=.  When the snapshot pool
+reaches at least that size, the scoring thread swaps its per-candidate
+work from =fzf_get_score= (full fuzzy-DP, ~500 ns per candidate) to
+=fzf_has_match= (boolean match-only check from =fzf-additions.c=,
+~100 ns per candidate).  The candidate cap at the display layer
+(=fzf-async-max-candidates=, default 10 000) is then re-scored with
+=fzf_get_score= and counting-sorted so the user still sees results
+ordered by score — but only that 10 K window pays the DP cost, not
+the whole pool.
+
+In one pass through the same worker pipeline:
+
+#+begin_src
+  pool snapshot           ──► 1,000,000 candidates
+  workers (parallel)
+    fzf_has_match each    ──► 500,000 matches kept (score = 1)
+                              compacted into batches, pool order
+                              preserved within each batch
+  scoring thread
+    flatten + skip sort   ──► flat[0..499 999], pool order
+    emit = min(limit, n)  ──► first 10,000 in pool order
+    re-score those 10 K
+      fzf_get_score each  ──► flat[0..9 999] now has real scores
+    counting_sort_scored  ──► flat[0..9 999] descending by score
+  publish + cache
+    score_results = flat[0..9 999]  (top-K, score-ranked)
+    m_idx_buf      = all 500 K matched indices (exhaustive)
+#+end_src
+
+What the user sees:
+- Top 10 K *of the first 10 K matches in pool order*, ranked by score
+  inside that window.  Best match overall may be outside the window
+  if it sits at pool position 50 000.
+- Highlights (=fzf-async-highlight=, default 200) computed via
+  =fzf_get_positions= on the score-sorted window, so highlights land
+  on the visually-top entries.
+
+What refinement gets:
+- =m_idx_buf= contains *all 500 K* matched candidate indices —
+  identical to what full-scoring mode would have cached.  The next
+  keystroke's prefix-refinement scans only those 500 K, not the full
+  pool.  Set membership is unchanged across the threshold; only
+  display ordering differs.
+
+Cost comparison for a 1 M pool with ~50 % hit rate (parallel, 8 cores):
+
+| Stage              | Full scoring          | Filter-only           |
+|--------------------+-----------------------+-----------------------|
+| Per-candidate scan | ~500 ns × 1 M  ≈ 60 ms| ~100 ns × 1 M  ≈ 12 ms|
+| Re-score emit win  | (sort only) ~1 ms     | 500 ns × 10 K  ≈ 5 ms |
+| Total              | ~60 ms                | ~17 ms                |
+
+At 60 M pool the gap widens: full scoring ~4 s parallel, filter-only
+~700 ms parallel + 5 ms re-score.  The big-pool win is the per-pass
+cost, not the (constant-bound) re-score step.
+
+Tunable knobs:
+- =fzf-native-filter-only-min-pool= (nil/0 disables; 1 always-on for
+  testing; default 10 000 000).
+- Threshold checked per scoring run against the snapshot pool size.  A
+  streaming session crosses modes naturally as the reader grows the
+  pool past the threshold.
+
 ** The "same-filter, don't abort" rule
 
 This is subtle and the source of one historical livelock bug. The

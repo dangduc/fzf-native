@@ -10,6 +10,7 @@
 #include <string.h>
 #include "emacs-module.h"
 #include "fzf.h"
+#include "fzf-additions.h"
 #include <stdio.h>
 #include <stdarg.h>
 
@@ -99,7 +100,7 @@ emacs_value Fsymbol_value;
    `defcustom_value' on each read.  The values themselves stay dynamic
    so user `setq' / `customize-set-variable' is respected. */
 emacs_value Qsym_case_mode, Qsym_batch_highlight, Qsym_async_highlight;
-emacs_value Qsym_max_line_length, Qsym_async_cache_size;
+emacs_value Qsym_max_line_length, Qsym_async_cache_size, Qsym_filter_only_min_pool;
 emacs_value Qsym_shell_file_name, Qsym_shell_command_switch, Qsym_exec_path;
 /* Cached value symbols for `type-of' comparisons and signal/error names. */
 emacs_value Qvector, Qstring, Qignore, Qrespect;
@@ -1322,6 +1323,14 @@ typedef struct {
   /* Read-only after session start; set from fzf-async-max-line-length defcustom.
      0 = no limit.  >0 = exclude lines longer than N chars.  <0 = truncate to |N|. */
   ptrdiff_t        max_line_length;
+
+  /* Filter-only mode threshold.  When > 0 and the pool reaches this
+     size, the scoring thread skips full fzf evaluation in favor of
+     `fzf_has_match' (see fzf-additions.c) and emits results in pool
+     order, capped at the limit.  Match-set is still exhaustive so
+     prefix-refinement remains correct across the threshold crossing.
+     See `fzf-native-filter-only-min-pool'. */
+  size_t           filter_only_min_pool;
 } AsyncSession;
 
 static void *async_reader(void *arg) {
@@ -1624,6 +1633,18 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     cache_init(&s->cache, cache_max);
   }
 
+  /* Filter-only threshold; nil or <= 0 disables. */
+  {
+    emacs_value val = defcustom_value(env, Qsym_filter_only_min_pool, Qnil);
+    if (!env->eq(env, val, Qnil)) {
+      intmax_t n = env->extract_integer(env, val);
+      if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+        env->non_local_exit_clear(env);
+      else if (n > 0)
+        s->filter_only_min_pool = (size_t)n;
+    }
+  }
+
   if (!s->fp ||
       pthread_create(&s->reader, NULL, async_reader, s) != 0 ||
       pthread_create(&s->score_thread, NULL, scoring_thread_fn, s) != 0) {
@@ -1698,12 +1719,21 @@ struct AsyncScoringShared {
   struct AsyncScoringBatch *batches;
   _Atomic ssize_t           remaining;
   _Atomic bool             *stop;     /* points to session's score_abort */
+  /* When true, workers replace fzf_get_score with fzf_has_match (boolean
+     match-only check from fzf-additions).  The compaction logic is
+     identical; the score field is just set to 0 (unscored) and the
+     calling thread skips counting_sort_scored. */
+  bool                      filter_only;
 };
 
 static void *async_scoring_worker(void *ptr) {
   struct AsyncScoringShared *shared = ptr;
+  /* fzf_has_match doesn't need the slab; only the score path does.
+     Allocating either way keeps the worker code uniform — slab create
+     is ~1 µs, dwarfed by the per-batch scoring work. */
   fzf_slab_t    *slab         = fzf_make_default_slab();
   fzf_pattern_t *pattern      = shared->pattern;
+  bool           filter_only  = shared->filter_only;
 
   ssize_t bi;
   while ((bi = atomic_fetch_sub_explicit(&shared->remaining, 1,
@@ -1718,7 +1748,14 @@ static void *async_scoring_worker(void *ptr) {
           atomic_load_explicit(shared->stop, memory_order_relaxed)) {
         aborted = true; break;
       }
-      int sc = pattern ? fzf_get_score(batch->xs[i].str, pattern, slab) : 1;
+      int sc;
+      if (!pattern) {
+        sc = 1;                  /* empty filter: keep everything */
+      } else if (filter_only) {
+        sc = fzf_has_match(batch->xs[i].str, pattern) ? 1 : 0;
+      } else {
+        sc = fzf_get_score(batch->xs[i].str, pattern, slab);
+      }
       if (!pattern || sc > 0) {
         batch->xs[n]         = batch->xs[i];
         batch->xs[n++].score = sc;
@@ -1829,6 +1866,17 @@ static void *scoring_thread_fn(void *arg) {
     }
     pthread_mutex_unlock(&s->mu);
 
+    /* Decide filter-only vs full-scoring mode for this run.  In
+       filter-only the workers use fzf_has_match (cheap boolean check
+       from fzf-additions) and we skip top-K sorting at the end.
+       Match-set is still built exhaustively (m_idx) so prefix
+       refinement on the next keystroke is correct.  Pool order is
+       preserved in the emit list since no sort runs. */
+    bool filter_only_mode =
+        s->filter_only_min_pool > 0 && count >= s->filter_only_min_pool;
+    fzf_log("scoring_thread: filter_only=%d (min_pool=%zu count=%zu)\n",
+            (int)filter_only_mode, s->filter_only_min_pool, count);
+
     /* Batch; check abort every 64 K items so a filter change is noticed quickly. */
     struct AsyncScoringBatch *batches = NULL;
     size_t bi = 0, bcap = 0;
@@ -1866,10 +1914,11 @@ static void *scoring_thread_fn(void *arg) {
     bool has_pattern = (pattern != NULL);
 
     struct AsyncScoringShared shared = {
-      .pattern   = pattern,
-      .batches   = batches,
-      .remaining = num_batches,
-      .stop      = &s->score_abort,
+      .pattern     = pattern,
+      .batches     = batches,
+      .remaining   = num_batches,
+      .stop        = &s->score_abort,
+      .filter_only = filter_only_mode,
     };
 
     pthread_t *threads    = malloc(max_workers * sizeof *threads);
@@ -1881,13 +1930,16 @@ static void *scoring_thread_fn(void *arg) {
     for (unsigned i = 0; i < num_workers; i++)
       pthread_join(threads[i], NULL);
     free(threads);
-    if (pattern) fzf_free_pattern(pattern);
+    /* `pattern' lifetime extended past the worker join: in filter-only
+       mode we re-score the emit window below to recover ranked order
+       within the displayed top-K.  Freed once we're done with both. */
 
     /* If a different filter arrived while we were scoring, discard partial results. */
     if (atomic_load_explicit(&s->score_abort, memory_order_relaxed)) {
       pthread_mutex_lock(&s->score_req_mu);
       free(s->score_current_filter); s->score_current_filter = NULL;
       pthread_mutex_unlock(&s->score_req_mu);
+      if (pattern) fzf_free_pattern(pattern);
       free(snap); free(snap_idx); free(batches); free(filter);
       shared_idx_release(refine_idx); continue;
     }
@@ -1904,11 +1956,32 @@ static void *scoring_thread_fn(void *arg) {
         for (unsigned j = 0; j < b->len; j++)
           flat[pos++] = b->xs[j];
       }
-      if (has_pattern && pos > 1)
+      /* Full-mode sorts the entire match-set by score.  Filter-only mode
+         skips this — every match got score=1 from fzf_has_match so the
+         sort would be a no-op.  Ranking inside the emit window is
+         restored below by re-scoring just those entries with
+         fzf_get_score and sorting them. */
+      if (has_pattern && !filter_only_mode && pos > 1)
         counting_sort_scored(flat, pos);
     }
 
     size_t emit = (limit && limit < pos) ? limit : pos;
+
+    /* Filter-only display ordering: re-score and sort the emit window so
+       the user sees best-of-emit first (not pool order).  Cost is
+       bounded by `emit' (== `limit', typically 10K) — about 5ms total —
+       not pool size, so the big-pool savings from fzf_has_match are
+       preserved.  Match-set m_idx (built below from all `pos' matches)
+       stays exhaustive: order within the set doesn't affect set
+       membership, which is all refinement needs. */
+    if (filter_only_mode && has_pattern && flat && emit > 1) {
+      fzf_slab_t *rank_slab = fzf_make_default_slab();
+      for (size_t i = 0; i < emit; i++)
+        flat[i].score = fzf_get_score(flat[i].str, pattern, rank_slab);
+      if (rank_slab) fzf_free_slab(rank_slab);
+      counting_sort_scored(flat, emit);
+    }
+    if (pattern) fzf_free_pattern(pattern);
 
     /* Build matched_idx array (all pos matches, not just top-K) for the
        cache so a future subsuming query can refine-score only this set. */
@@ -2301,6 +2374,7 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qsym_async_highlight      = env->make_global_ref(env, env->intern(env, "fzf-native-async-highlight"));
   Qsym_max_line_length      = env->make_global_ref(env, env->intern(env, "fzf-native-max-line-length"));
   Qsym_async_cache_size     = env->make_global_ref(env, env->intern(env, "fzf-native-async-cache-size"));
+  Qsym_filter_only_min_pool = env->make_global_ref(env, env->intern(env, "fzf-native-filter-only-min-pool"));
   Qsym_shell_file_name      = env->make_global_ref(env, env->intern(env, "shell-file-name"));
   Qsym_shell_command_switch = env->make_global_ref(env, env->intern(env, "shell-command-switch"));
   Qsym_exec_path            = env->make_global_ref(env, env->intern(env, "exec-path"));
