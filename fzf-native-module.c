@@ -101,6 +101,9 @@ emacs_value Fsymbol_value;
 emacs_value Qsym_case_mode, Qsym_batch_highlight, Qsym_async_highlight;
 emacs_value Qsym_max_line_length, Qsym_async_cache_size;
 emacs_value Qsym_shell_file_name, Qsym_shell_command_switch, Qsym_exec_path;
+/* Cached value symbols for `type-of' comparisons and signal/error names. */
+emacs_value Qvector, Qstring, Qignore, Qrespect;
+emacs_value Qstringp, Qwrong_type_argument, Qerror;
 
 
 /** An Emacs string made accessible by copying. */
@@ -384,8 +387,8 @@ static emacs_value defcustom_value(emacs_env *env, emacs_value sym,
    Falls back to CaseSmart on any read or comparison failure. */
 static fzf_case_types resolve_fzf_native_case_mode(emacs_env *env) {
   emacs_value v = defcustom_value(env, Qsym_case_mode, Qnil);
-  if (env->eq(env, v, env->intern(env, "ignore")))  return CaseIgnore;
-  if (env->eq(env, v, env->intern(env, "respect"))) return CaseRespect;
+  if (env->eq(env, v, Qignore))  return CaseIgnore;
+  if (env->eq(env, v, Qrespect)) return CaseRespect;
   return CaseSmart;
 }
 
@@ -445,7 +448,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
   // Collect all candidates.
   // Convert list to vector to minimize calls back to Emacs.
   emacs_value collection = args[0];
-  if (!env->eq(env, env->type_of(env, collection), env->intern(env, "vector"))) {
+  if (!env->eq(env, env->type_of(env, collection), Qvector)) {
     collection = env->funcall(env, Fvconcat, 1, (emacs_value[]) { args[0] });
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
       goto err;
@@ -597,7 +600,7 @@ err:
     /* Only signal a generic error if no more specific signal (such as
        a `wrong-type-argument' from candidate validation) is already
        pending. Otherwise we'd clobber the better diagnostic. */
-    env->non_local_exit_signal(env, env->intern(env, "error"), Qnil);
+    env->non_local_exit_signal(env, Qerror, Qnil);
   }
   return result;
 }
@@ -652,7 +655,7 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
   /* Accept both lists and vectors; mirror score-all's normalization so
      callers don't have to care which one they have on hand. */
   emacs_value collection = args[0];
-  if (!env->eq(env, env->type_of(env, collection), env->intern(env, "vector"))) {
+  if (!env->eq(env, env->type_of(env, collection), Qvector)) {
     collection = env->funcall(env, Fvconcat, 1, (emacs_value[]) { args[0] });
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
       env->non_local_exit_clear(env);
@@ -703,11 +706,11 @@ done:
 /* Signal `(wrong-type-argument stringp VALUE)' if VALUE is not a string.
    Returns true on failure (caller should return immediately). */
 static bool signal_if_not_string(emacs_env *env, emacs_value value) {
-  if (env->eq(env, env->type_of(env, value), env->intern(env, "string"))) {
+  if (env->eq(env, env->type_of(env, value), Qstring)) {
     return false;
   }
-  emacs_value data_args[] = { env->intern(env, "stringp"), value };
-  env->non_local_exit_signal(env, env->intern(env, "wrong-type-argument"),
+  emacs_value data_args[] = { Qstringp, value };
+  env->non_local_exit_signal(env, Qwrong_type_argument,
                               env->funcall(env, Flist, 2, data_args));
   return true;
 }
@@ -2324,6 +2327,13 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qsym_shell_file_name      = env->make_global_ref(env, env->intern(env, "shell-file-name"));
   Qsym_shell_command_switch = env->make_global_ref(env, env->intern(env, "shell-command-switch"));
   Qsym_exec_path            = env->make_global_ref(env, env->intern(env, "exec-path"));
+  Qvector  = env->make_global_ref(env, env->intern(env, "vector"));
+  Qstring  = env->make_global_ref(env, env->intern(env, "string"));
+  Qignore  = env->make_global_ref(env, env->intern(env, "ignore"));
+  Qrespect = env->make_global_ref(env, env->intern(env, "respect"));
+  Qstringp = env->make_global_ref(env, env->intern(env, "stringp"));
+  Qwrong_type_argument = env->make_global_ref(env, env->intern(env, "wrong-type-argument"));
+  Qerror   = env->make_global_ref(env, env->intern(env, "error"));
   Fencode_coding_string = env->make_global_ref(env, env->intern(env, "encode-coding-string"));
   Qface = env->make_global_ref(env, env->intern(env, "face"));
   Qcompletions_common_part = env->make_global_ref(env, env->intern(env, "completions-common-part"));
