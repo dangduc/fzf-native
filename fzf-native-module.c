@@ -1405,11 +1405,11 @@ static void *async_reader(void *arg) {
 
 static void *scoring_thread_fn(void *arg);  /* defined after async_scoring_worker */
 
-static void async_session_destroy(void *ptr) {
-  AsyncSession *s = ptr;
-  if (!s) return;
-  fzf_log("async_session_destroy: pid=%d count=%zu\n", (int)s->pid, s->count);
-
+/* Stops threads + child process, joins them, releases per-session sync
+   primitives and small buffers.  Does NOT free the candidate arena,
+   the chunked candidate table, or `s` itself — those remain valid for
+   the caller to inspect or transfer (later: into a result cache entry). */
+static void async_session_freeze(AsyncSession *s) {
   /* Signal everything to stop simultaneously so scoring and reader wind down
      in parallel rather than sequentially. */
   atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
@@ -1426,8 +1426,8 @@ static void async_session_destroy(void *ptr) {
   pthread_mutex_unlock(&s->score_req_mu);
   pthread_join(s->score_thread, NULL);
 
-  free(s->score_results);
-  free(s->score_current_filter);
+  free(s->score_results);        s->score_results = NULL;
+  free(s->score_current_filter); s->score_current_filter = NULL;
   cache_free(&s->cache);
   pthread_mutex_destroy(&s->score_res_mu);
   pthread_mutex_destroy(&s->score_req_mu);
@@ -1437,6 +1437,12 @@ static void async_session_destroy(void *ptr) {
   pthread_join(s->reader, NULL);
   if (s->fp)      { fclose(s->fp); s->fp = NULL; }
   if (s->pid > 0) { waitpid(s->pid, NULL, 0); s->pid = -1; }
+}
+
+/* Frees the candidate arena, chunked candidate table, and `s` itself.
+   Assumes `async_session_freeze' has run.  Fields that have been moved
+   out (arena.head == NULL, cands_top[k] == NULL) are skipped harmlessly. */
+static void async_session_free(AsyncSession *s) {
   pthread_mutex_lock(&s->mu);
   arena_free(&s->arena);
   for (size_t k = 0; k < CANDS_TOP_CAP; k++)
@@ -1444,6 +1450,16 @@ static void async_session_destroy(void *ptr) {
   pthread_mutex_unlock(&s->mu);
   pthread_mutex_destroy(&s->mu);
   free(s);
+}
+
+/* User-ptr finalizer.  GC has no emacs_env, so any future result-cache
+   capture path can't run here. */
+static void async_session_destroy(void *ptr) {
+  AsyncSession *s = ptr;
+  if (!s) return;
+  fzf_log("async_session_destroy: pid=%d count=%zu\n", (int)s->pid, s->count);
+  async_session_freeze(s);
+  async_session_free(s);
 }
 
 /* fzf-native-async-start COMMAND &optional DIR -> session handle */
