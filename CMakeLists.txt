@@ -54,9 +54,11 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
   # Assume compiler MSVC.
-  add_library(fzf-native-module SHARED fzf-native-module.c fzf.c fzf.h)
+  add_library(fzf-native-module SHARED fzf-native-module.c fzf.c fzf.h
+                                       fzf-additions.c fzf-additions.h)
 else()
-  add_library(fzf-native-module MODULE fzf-native-module.c fzf.c fzf.h)
+  add_library(fzf-native-module MODULE fzf-native-module.c fzf.c fzf.h
+                                       fzf-additions.c fzf-additions.h)
 endif()
 
 set(OUTPUT_DIR ${CMAKE_SOURCE_DIR}/${FZF_NATIVE_MODULE_OUTPUT_DIR})

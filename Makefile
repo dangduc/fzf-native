@@ -76,11 +76,26 @@ emacs-asan:
 # Includes fzf-native-module.c directly so static functions are visible.
 # No Emacs runtime needed; runs as a plain executable.
 .PHONY: ctest
-ctest:
+ctest: ctest-module ctest-additions
+
+# Module-internal tests (counting sort, cache, async_reader, etc.).
+# Links fzf-additions.c because fzf-native-module.c now references
+# fzf_has_match in the scoring thread's filter-only path.
+.PHONY: ctest-module
+ctest-module:
 	mkdir -p $(BUILD_DIR)
 	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. -pthread \
-		-o $(BUILD_DIR)/fzf-native-ctest fzf-native-ctest.c fzf.c
+		-o $(BUILD_DIR)/fzf-native-ctest fzf-native-ctest.c fzf.c fzf-additions.c
 	$(BUILD_DIR)/fzf-native-ctest
+
+# fzf-additions tests (fzf_has_match agreement with fzf_get_score).
+# Linked against fzf.c + fzf-additions.c — pure-C, no module deps.
+.PHONY: ctest-additions
+ctest-additions:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. \
+		-o $(BUILD_DIR)/fzf-additions-test fzf-additions-test.c fzf.c fzf-additions.c
+	$(BUILD_DIR)/fzf-additions-test
 
 .PHONY: clean
 clean:
