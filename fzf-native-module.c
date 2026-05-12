@@ -1729,6 +1729,37 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     if (dir) env->copy_string_contents(env, args[1], dir, &dlen);
   }
 
+  /* Cross-session result-cache lookup.  When enabled and not expired,
+     a hit skips fork+exec entirely and the new session adopts the
+     cached arena. */
+  double cache_ttl_seconds = 0.0;
+  size_t cache_max_entries = 0;
+  bool   cache_enabled =
+    result_cache_read_settings(env, &cache_ttl_seconds, &cache_max_entries);
+  ResultCacheEntry *cache_hit = NULL;
+  if (cache_enabled) {
+    char *expired_cmd = NULL;
+    cache_hit = result_cache_take(cmd, dir, cache_ttl_seconds, &expired_cmd);
+    if (expired_cmd) {
+      fzf_log("result_cache: TTL evicted command='%s'\n", expired_cmd);
+      result_cache_emit_message(
+        env, "fzf-async: result cache TTL evicted: %s @ %s",
+        expired_cmd, dir);
+      free(expired_cmd);
+    }
+    if (cache_hit) {
+      fzf_log("result_cache: HIT command='%s' count=%zu\n",
+              cache_hit->command ? cache_hit->command : "",
+              cache_hit->count);
+    }
+  }
+
+  /* Shell / fork / exec / pipe setup is skipped on cache hit — the
+     cached arena already contains a complete enumeration of the same
+     (command, dir). */
+  int   pfd[2] = { -1, -1 };
+  pid_t pid    = -1;
+  if (!cache_hit) {
   /* Use shell-file-name / shell-command-switch so behaviour matches
      shell-command (M-!) rather than hardcoding /bin/sh -c. */
   char *shell_prog = NULL, *shell_switch = NULL;
@@ -1786,7 +1817,6 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
           shell_prog, shell_switch, cmd, dir ? dir : "(nil)",
           exec_path_str ? exec_path_str : "(inherited)");
 
-  int pfd[2];
   if (pipe(pfd) != 0) {
     fzf_log("async_start: pipe failed\n");
     free(cmd);
@@ -1797,7 +1827,7 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     return Qnil;
   }
 
-  pid_t pid = fork();
+  pid = fork();
   if (pid < 0) {
     fzf_log("async_start: fork failed\n");
     close(pfd[0]);
@@ -1838,35 +1868,65 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   free(shell_prog);
   free(shell_switch);
   free(exec_path_str);
+  } /* end if (!cache_hit) — shell/fork/exec/pipe block */
 
   AsyncSession *s = calloc(1, sizeof *s);
   if (!s) {
     fzf_log("async_start: calloc failed\n");
-    close(pfd[0]);
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
+    if (!cache_hit) {
+      close(pfd[0]);
+      kill(pid, SIGTERM);
+      waitpid(pid, NULL, 0);
+    } else {
+      result_cache_entry_free(cache_hit);
+    }
     free(cmd);
     free(dir);
     return Qnil;
   }
 
-  fzf_log("async_start: cmd='%s' dir='%s' pid=%d\n",
-          cmd, dir ? dir : ".", (int)pid);
+  fzf_log("async_start: cmd='%s' dir='%s' pid=%d %s\n",
+          cmd, dir ? dir : ".", (int)pid,
+          cache_hit ? "(CACHE HIT)" : "");
 
-  s->pid   = pid;
-  s->fp    = fdopen(pfd[0], "r");
-  /* Move ownership of cmd/dir into the session.  `async_session_free`
-     releases them; a future result-cache capture may instead move them
-     into a fresh cache entry. */
-  s->command = cmd;
-  s->dir     = dir;
-  /* cands_top is zero-initialized by the calloc above; blocks are
-     allocated lazily by the reader on first write into each block. */
+  if (cache_hit) {
+    /* Adopt the cached arena, chunked candidate table, command, and dir
+       into the new session.  cmd/dir locals are redundant — the cache
+       entry already owned matching copies. */
+    s->pid          = -1;
+    s->fp           = NULL;
+    s->is_cache_hit = true;
+    s->command      = cache_hit->command; cache_hit->command = NULL;
+    s->dir          = cache_hit->dir;     cache_hit->dir     = NULL;
+    s->arena        = cache_hit->arena;   cache_hit->arena   = (Arena){0};
+    memcpy(s->cands_top, cache_hit->cands_top, sizeof s->cands_top);
+    memset(cache_hit->cands_top, 0, sizeof cache_hit->cands_top);
+    s->count        = cache_hit->count;
+    atomic_store_explicit(&s->reader_drained, true, memory_order_release);
+    result_cache_entry_free(cache_hit);
+    cache_hit = NULL;
+    free(cmd);
+    free(dir);
+  } else {
+    s->pid   = pid;
+    s->fp    = fdopen(pfd[0], "r");
+    /* Move ownership of cmd/dir into the session.  `async_session_free`
+       releases them; a future result-cache capture may instead move them
+       into a fresh cache entry. */
+    s->command = cmd;
+    s->dir     = dir;
+  }
+  /* cands_top is zero-initialized by the calloc above for the miss
+     path; for the hit path it was just populated from the cache. */
   pthread_mutex_init(&s->mu, NULL);
   pthread_mutex_init(&s->score_req_mu, NULL);
   pthread_cond_init(&s->score_req_cond, NULL);
   pthread_mutex_init(&s->score_res_mu, NULL);
-  atomic_store(&s->gen, 0);
+  /* For cache-hit sessions the scoring thread has full data immediately
+     — pre-publish gen=1 so the first poll picks up results without
+     waiting for a reader increment that will never come.  Miss path
+     starts at gen=0; the reader thread bumps it on each candidate. */
+  atomic_store(&s->gen, s->fp ? 0 : 1);
   atomic_store(&s->score_abort, false);
 
   {
@@ -1912,11 +1972,20 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     }
   }
 
-  if (!s->fp ||
-      pthread_create(&s->reader, NULL, async_reader, s) != 0 ||
-      pthread_create(&s->score_thread, NULL, scoring_thread_fn, s) != 0) {
-    async_session_destroy(s);
-    return Qnil;
+  /* Cache-hit sessions skip the reader (no subprocess); only the
+     scoring thread is spawned.  Miss path spawns both as before. */
+  if (s->is_cache_hit) {
+    if (pthread_create(&s->score_thread, NULL, scoring_thread_fn, s) != 0) {
+      async_session_destroy(s);
+      return Qnil;
+    }
+  } else {
+    if (!s->fp ||
+        pthread_create(&s->reader, NULL, async_reader, s) != 0 ||
+        pthread_create(&s->score_thread, NULL, scoring_thread_fn, s) != 0) {
+      async_session_destroy(s);
+      return Qnil;
+    }
   }
   return env->make_user_ptr(env, async_session_destroy, s);
 }
