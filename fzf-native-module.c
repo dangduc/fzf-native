@@ -103,6 +103,7 @@ emacs_value Fsymbol_value;
 emacs_value Qsym_case_mode, Qsym_batch_highlight, Qsym_async_highlight;
 emacs_value Qsym_max_line_length, Qsym_async_cache_size, Qsym_filter_only_min_pool;
 emacs_value Qsym_shell_file_name, Qsym_shell_command_switch, Qsym_exec_path;
+emacs_value Qsym_async_result_cache_ttl, Qsym_async_result_cache_entries;
 /* Cached value symbols for `type-of' comparisons and signal/error names. */
 emacs_value Qvector, Qstring, Qignore, Qrespect;
 emacs_value Qstringp, Qwrong_type_argument, Qerror;
@@ -1442,6 +1443,57 @@ result_cache_put(ResultCacheEntry *new_entry, size_t max_entries,
   *out_evicted = evicted;
 }
 
+/* Read the two result-cache defcustoms.  Returns true if the cache is
+   enabled (both knobs non-nil and positive).  On disable, *out_ttl
+   and *out_max_entries are left at 0.  TTL is integer-only — passing
+   a float disables the cache. */
+static bool
+result_cache_read_settings(emacs_env *env, double *out_ttl,
+                           size_t *out_max_entries) {
+  *out_ttl = 0.0;
+  *out_max_entries = 0;
+
+  emacs_value v_ttl = defcustom_value(env, Qsym_async_result_cache_ttl, Qnil);
+  if (env->eq(env, v_ttl, Qnil)) return false;
+  intmax_t ttl_i = env->extract_integer(env, v_ttl);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    return false;
+  }
+  if (ttl_i <= 0) return false;
+
+  emacs_value v_max =
+    defcustom_value(env, Qsym_async_result_cache_entries, Qnil);
+  if (env->eq(env, v_max, Qnil)) return false;
+  intmax_t maxe = env->extract_integer(env, v_max);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    return false;
+  }
+  if (maxe <= 0) return false;
+
+  *out_ttl = (double)ttl_i;
+  *out_max_entries = (size_t)maxe;
+  return true;
+}
+
+/* Emit a message via Fmessage; tolerate any non-local exit from the
+   call (the cache path must not propagate Emacs errors). */
+static void
+result_cache_emit_message(emacs_env *env, const char *fmt,
+                          const char *command, const char *dir) {
+  if (!command) command = "";
+  if (!dir) dir = "";
+  emacs_value args[3] = {
+    env->make_string(env, fmt, (ptrdiff_t)strlen(fmt)),
+    env->make_string(env, command, (ptrdiff_t)strlen(command)),
+    env->make_string(env, dir, (ptrdiff_t)strlen(dir))
+  };
+  env->funcall(env, Fmessage, 3, args);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+    env->non_local_exit_clear(env);
+}
+
 typedef struct {
   pthread_t     reader;
   pid_t         pid;
@@ -2596,6 +2648,8 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qsym_shell_file_name      = env->make_global_ref(env, env->intern(env, "shell-file-name"));
   Qsym_shell_command_switch = env->make_global_ref(env, env->intern(env, "shell-command-switch"));
   Qsym_exec_path            = env->make_global_ref(env, env->intern(env, "exec-path"));
+  Qsym_async_result_cache_ttl     = env->make_global_ref(env, env->intern(env, "fzf-native-async-result-cache-ttl"));
+  Qsym_async_result_cache_entries = env->make_global_ref(env, env->intern(env, "fzf-native-async-result-cache-entries"));
   Qvector  = env->make_global_ref(env, env->intern(env, "vector"));
   Qstring  = env->make_global_ref(env, env->intern(env, "string"));
   Qignore  = env->make_global_ref(env, env->intern(env, "ignore"));
