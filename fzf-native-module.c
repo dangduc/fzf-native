@@ -308,6 +308,37 @@ static void *worker_routine(void *ptr) {
   return NULL;
 }
 
+/* Apply `completions-common-part' face to STR on contiguous runs derived
+   from POS->data[] (which fzf returns in descending order).  No-op if POS
+   is NULL or empty; caller still owns the fzf_free_positions call. */
+static void maybe_put_position_runs(emacs_env *env, fzf_position_t *pos,
+                              emacs_value str) {
+  if (!pos || pos->size == 0) return;
+  size_t plen      = pos->size;
+  size_t run_start = pos->data[plen - 1];
+  size_t run_end   = run_start;
+  for (ptrdiff_t j = (ptrdiff_t)plen - 2; j >= 0; j--) {
+    size_t p = pos->data[j];
+    if (p == run_end + 1) {
+      run_end = p;
+      continue;
+    }
+    emacs_value a[5] = {
+      env->make_integer(env, (intmax_t)run_start),
+      env->make_integer(env, (intmax_t)(run_end + 1)),
+      Qface, Qcompletions_common_part, str };
+    env->funcall(env, Fput_text_property, 5, a);
+    env->non_local_exit_clear(env);
+    run_start = run_end = p;
+  }
+  emacs_value a[5] = {
+    env->make_integer(env, (intmax_t)run_start),
+    env->make_integer(env, (intmax_t)(run_end + 1)),
+    Qface, Qcompletions_common_part, str };
+  env->funcall(env, Fput_text_property, 5, a);
+  env->non_local_exit_clear(env);
+}
+
 /* Apply `completions-common-part' face to STR_VAL on positions matched by
    PATTERN against CSTR.  Computes positions via fzf_get_positions and groups
    them into contiguous runs to minimize put-text-property calls.
@@ -333,38 +364,10 @@ static void apply_highlight_positions(emacs_env *env,
   if (env->non_local_exit_check(env) == emacs_funcall_exit_return) {
     emacs_value rargs[4] = { Qzero, len_v, Qface_nil_plist, str_val };
     env->funcall(env, Fremove_text_properties, 4, rargs);
-    env->non_local_exit_clear(env);
-  } else {
-    env->non_local_exit_clear(env);
   }
+  env->non_local_exit_clear(env);
   fzf_position_t *pos = fzf_get_positions(cstr, pattern, slab);
-  if (pos && pos->size > 0) {
-    /* pos->data[] is in descending order: pos->data[0] = highest position.
-       Iterate ascending (j from size-1 to 0) to find contiguous runs. */
-    size_t plen      = pos->size;
-    size_t run_start = pos->data[plen - 1];
-    size_t run_end   = run_start;
-    for (ptrdiff_t j = (ptrdiff_t)plen - 2; j >= 0; j--) {
-      size_t p = pos->data[j];
-      if (p == run_end + 1) {
-        run_end = p;
-      } else {
-        emacs_value a[5] = {
-          env->make_integer(env, (intmax_t)run_start),
-          env->make_integer(env, (intmax_t)(run_end + 1)),
-          Qface, Qcompletions_common_part, str_val };
-        env->funcall(env, Fput_text_property, 5, a);
-        env->non_local_exit_clear(env);
-        run_start = run_end = p;
-      }
-    }
-    emacs_value a[5] = {
-      env->make_integer(env, (intmax_t)run_start),
-      env->make_integer(env, (intmax_t)(run_end + 1)),
-      Qface, Qcompletions_common_part, str_val };
-    env->funcall(env, Fput_text_property, 5, a);
-    env->non_local_exit_clear(env);
-  }
+  maybe_put_position_runs(env, pos, str_val);
   fzf_free_positions(pos);
 }
 
@@ -2107,33 +2110,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
 
     if (hl_pattern && i < hl_cap) {
       fzf_position_t *pos = fzf_get_positions(snap[i].str, hl_pattern, hl_slab);
-      if (pos && pos->size > 0) {
-        /* pos->data[] is in descending order: pos->data[0] = highest position.
-           Iterate ascending (j from size-1 to 0) to find contiguous runs. */
-        size_t plen      = pos->size;
-        size_t run_start = pos->data[plen - 1];
-        size_t run_end   = run_start;
-        for (ptrdiff_t j = (ptrdiff_t)plen - 2; j >= 0; j--) {
-          size_t p = pos->data[j];
-          if (p == run_end + 1) {
-            run_end = p;
-          } else {
-            emacs_value a[5] = {
-              env->make_integer(env, (intmax_t)run_start),
-              env->make_integer(env, (intmax_t)(run_end + 1)),
-              Qface, Qcompletions_common_part, str };
-            env->funcall(env, Fput_text_property, 5, a);
-            env->non_local_exit_clear(env);
-            run_start = run_end = p;
-          }
-        }
-        emacs_value a[5] = {
-          env->make_integer(env, (intmax_t)run_start),
-          env->make_integer(env, (intmax_t)(run_end + 1)),
-          Qface, Qcompletions_common_part, str };
-        env->funcall(env, Fput_text_property, 5, a);
-        env->non_local_exit_clear(env);
-      }
+      maybe_put_position_runs(env, pos, str);
       fzf_free_positions(pos);
     }
 
