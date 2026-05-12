@@ -94,6 +94,13 @@ emacs_value Qcompletion_score, Fput_text_property, Qzero, Qone;
 emacs_value Fencode_coding_string, Qutf_8;
 emacs_value Qface, Qcompletions_common_part;
 emacs_value Fremove_text_properties, Qface_nil_plist;
+emacs_value Fsymbol_value;
+/* Cached defcustom name symbols — interned once at init, looked up via
+   `defcustom_value' on each read.  The values themselves stay dynamic
+   so user `setq' / `customize-set-variable' is respected. */
+emacs_value Qsym_case_mode, Qsym_batch_highlight, Qsym_async_highlight;
+emacs_value Qsym_max_line_length, Qsym_async_cache_size;
+emacs_value Qsym_shell_file_name, Qsym_shell_command_switch, Qsym_exec_path;
 
 
 /** An Emacs string made accessible by copying. */
@@ -358,16 +365,25 @@ static void apply_highlight_positions(emacs_env *env,
   fzf_free_positions(pos);
 }
 
+/* Read SYM via `symbol-value' and return its value, or FALLBACK on any
+   read failure (unbound, non-local exit, etc.).  Clears the pending
+   non-local exit on failure so the caller can continue.  Centralizes
+   the read-defcustom-with-fallback pattern used across this file. */
+static emacs_value defcustom_value(emacs_env *env, emacs_value sym,
+                                   emacs_value fallback) {
+  emacs_value v = env->funcall(env, Fsymbol_value, 1, &sym);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    return fallback;
+  }
+  return v;
+}
+
 /* Read `fzf-native-case-mode' via symbol-value and resolve to fzf_case_types.
    Recognized symbol values: smart (default), ignore, respect.
    Falls back to CaseSmart on any read or comparison failure. */
 static fzf_case_types resolve_fzf_native_case_mode(emacs_env *env) {
-  emacs_value sym = env->intern(env, "fzf-native-case-mode");
-  emacs_value v   = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
-  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
-    env->non_local_exit_clear(env);
-    return CaseSmart;
-  }
+  emacs_value v = defcustom_value(env, Qsym_case_mode, Qnil);
   if (env->eq(env, v, env->intern(env, "ignore")))  return CaseIgnore;
   if (env->eq(env, v, env->intern(env, "respect"))) return CaseRespect;
   return CaseSmart;
@@ -381,12 +397,7 @@ static fzf_case_types resolve_fzf_native_case_mode(emacs_env *env) {
 static size_t resolve_fussy_highlight_cap(emacs_env *env, size_t len) {
   /* Canonical name; fussy bridges its `fussy-fzf-native-highlight'
      onto this via `setq-local' inside its all-completions entry. */
-  emacs_value sym = env->intern(env, "fzf-native-batch-highlight");
-  emacs_value v   = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
-  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
-    env->non_local_exit_clear(env);
-    return 0;
-  }
+  emacs_value v = defcustom_value(env, Qsym_batch_highlight, Qnil);
   if (env->eq(env, v, Qnil)) return 0;
   if (env->eq(env, v, Qt))   return len;
   intmax_t n = env->extract_integer(env, v);
@@ -1442,34 +1453,26 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
      shell-command (M-!) rather than hardcoding /bin/sh -c. */
   char *shell_prog = NULL, *shell_switch = NULL;
   {
-    emacs_value sym = env->intern(env, "shell-file-name");
-    emacs_value v   = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
-    if (env->non_local_exit_check(env) == emacs_funcall_exit_return &&
-        !env->eq(env, v, Qnil)) {
+    emacs_value v = defcustom_value(env, Qsym_shell_file_name, Qnil);
+    if (!env->eq(env, v, Qnil)) {
       ptrdiff_t slen = 0;
       env->copy_string_contents(env, v, NULL, &slen);
       if (slen > 1) {
         shell_prog = malloc((size_t)slen);
         if (shell_prog) env->copy_string_contents(env, v, shell_prog, &slen);
       }
-    } else {
-      env->non_local_exit_clear(env);
     }
     if (!shell_prog) shell_prog = strdup("/bin/sh");
   }
   {
-    emacs_value sym = env->intern(env, "shell-command-switch");
-    emacs_value v   = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
-    if (env->non_local_exit_check(env) == emacs_funcall_exit_return &&
-        !env->eq(env, v, Qnil)) {
+    emacs_value v = defcustom_value(env, Qsym_shell_command_switch, Qnil);
+    if (!env->eq(env, v, Qnil)) {
       ptrdiff_t slen = 0;
       env->copy_string_contents(env, v, NULL, &slen);
       if (slen > 1) {
         shell_switch = malloc((size_t)slen);
         if (shell_switch) env->copy_string_contents(env, v, shell_switch, &slen);
       }
-    } else {
-      env->non_local_exit_clear(env);
     }
     if (!shell_switch) shell_switch = strdup("-c");
   }
@@ -1478,13 +1481,12 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
      Emacs can find, even on macOS GUI launches with a minimal inherited PATH. */
   char *exec_path_str = NULL;
   {
-    emacs_value sym    = env->intern(env, "exec-path");
-    emacs_value v      = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
-    emacs_value sep    = env->make_string(env, ":", 1);
-    emacs_value id     = env->intern(env, "identity");
-    emacs_value mc_fn  = env->intern(env, "mapconcat");
-    emacs_value mc_args[3] = {id, v, sep};
-    if (env->non_local_exit_check(env) == emacs_funcall_exit_return) {
+    emacs_value v = defcustom_value(env, Qsym_exec_path, Qnil);
+    if (!env->eq(env, v, Qnil)) {
+      emacs_value sep    = env->make_string(env, ":", 1);
+      emacs_value id     = env->intern(env, "identity");
+      emacs_value mc_fn  = env->intern(env, "mapconcat");
+      emacs_value mc_args[3] = {id, v, sep};
       emacs_value joined = env->funcall(env, mc_fn, 3, mc_args);
       if (env->non_local_exit_check(env) == emacs_funcall_exit_return) {
         ptrdiff_t plen = 0;
@@ -1495,9 +1497,9 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
             env->copy_string_contents(env, joined, exec_path_str, &plen);
         }
       }
+      if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+        env->non_local_exit_clear(env);
     }
-    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
-      env->non_local_exit_clear(env);
   }
 
   fzf_log("async_start: shell='%s' switch='%s' cmd='%s' dir='%s' PATH='%s'\n",
@@ -1591,11 +1593,8 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
        Type is integer (positive = exclude, negative = truncate) or nil
        (no limit).  The defcustom default lives in fzf-native.el — no
        hardcoded fallback here. */
-    emacs_value sym = env->intern(env, "fzf-native-max-line-length");
-    emacs_value val = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
-    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
-      env->non_local_exit_clear(env);
-    else if (!env->eq(env, val, Qnil)) {
+    emacs_value val = defcustom_value(env, Qsym_max_line_length, Qnil);
+    if (!env->eq(env, val, Qnil)) {
       s->max_line_length = (ptrdiff_t)env->extract_integer(env, val);
       if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
         env->non_local_exit_clear(env);
@@ -1608,11 +1607,8 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     size_t cache_max = 40;
     /* Canonical name; fzf-async bridges `fzf-async-cache-size'
        onto this via :around advice on `fzf-native-async-start'. */
-    emacs_value sym = env->intern(env, "fzf-native-async-cache-size");
-    emacs_value val = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym);
-    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
-      env->non_local_exit_clear(env);
-    else if (!env->eq(env, val, Qnil)) {
+    emacs_value val = defcustom_value(env, Qsym_async_cache_size, Qnil);
+    if (!env->eq(env, val, Qnil)) {
       intmax_t n = env->extract_integer(env, val);
       if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
         env->non_local_exit_clear(env);
@@ -2071,11 +2067,8 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
   fzf_slab_t    *hl_slab    = NULL;
 
   if (filter_for_hilit) {
-    emacs_value sym_hi = env->intern(env, "fzf-native-async-highlight");
-    emacs_value hi     = env->funcall(env, env->intern(env, "symbol-value"), 1, &sym_hi);
-    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
-      env->non_local_exit_clear(env);
-    else if (env->eq(env, hi, Qt))
+    emacs_value hi = defcustom_value(env, Qsym_async_highlight, Qnil);
+    if (env->eq(env, hi, Qt))
       hl_cap = rcount;                   /* t → highlight everything */
     else if (!env->eq(env, hi, Qnil)) { /* integer → highlight top N */
       intmax_t n = env->extract_integer(env, hi);
@@ -2322,6 +2315,15 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Fcar = env->make_global_ref(env, env->intern(env, "car"));
   Qcompletion_score = env->make_global_ref(env, env->intern(env, "completion-score"));
   Fput_text_property = env->make_global_ref(env, env->intern(env, "put-text-property"));
+  Fsymbol_value = env->make_global_ref(env, env->intern(env, "symbol-value"));
+  Qsym_case_mode            = env->make_global_ref(env, env->intern(env, "fzf-native-case-mode"));
+  Qsym_batch_highlight      = env->make_global_ref(env, env->intern(env, "fzf-native-batch-highlight"));
+  Qsym_async_highlight      = env->make_global_ref(env, env->intern(env, "fzf-native-async-highlight"));
+  Qsym_max_line_length      = env->make_global_ref(env, env->intern(env, "fzf-native-max-line-length"));
+  Qsym_async_cache_size     = env->make_global_ref(env, env->intern(env, "fzf-native-async-cache-size"));
+  Qsym_shell_file_name      = env->make_global_ref(env, env->intern(env, "shell-file-name"));
+  Qsym_shell_command_switch = env->make_global_ref(env, env->intern(env, "shell-command-switch"));
+  Qsym_exec_path            = env->make_global_ref(env, env->intern(env, "exec-path"));
   Fencode_coding_string = env->make_global_ref(env, env->intern(env, "encode-coding-string"));
   Qface = env->make_global_ref(env, env->intern(env, "face"));
   Qcompletions_common_part = env->make_global_ref(env, env->intern(env, "completions-common-part"));
