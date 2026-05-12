@@ -1990,14 +1990,21 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   return env->make_user_ptr(env, async_session_destroy, s);
 }
 
-/* If the just-frozen session is eligible (arena complete, non-empty,
-   not itself a cache adoption) and the cache is enabled, move the
-   arena + cands_top + command + dir into a new ResultCacheEntry and
-   insert.  Emit a `message' for any LRU eviction.  Safe to call
-   regardless of state — bails out early when ineligible. */
+/* If the just-frozen session is eligible (arena complete, non-empty)
+   and the cache is enabled, move the arena + cands_top + command +
+   dir into a new ResultCacheEntry and insert.  Emit a `message' for
+   any LRU eviction.  Safe to call regardless of state — bails out
+   early when ineligible.
+
+   Cache-hit sessions DO re-capture.  When `result_cache_take` adopted
+   the entry at start, the cache lost it; if we skipped re-capture
+   here, the cache would be empty after every hit and the user would
+   pay a fresh enumeration between every reuse.  `result_cache_put`
+   dedupes by key (the previously-adopted entry has been gone since
+   start anyway, so there's nothing to replace — net effect is the
+   same entry pushed back to MRU position with refreshed timestamp). */
 static void
 result_cache_capture_from_session(emacs_env *env, AsyncSession *s) {
-  if (s->is_cache_hit) return;                  /* dedup: already cached */
   if (s->count == 0) return;                    /* empty pool */
   if (!atomic_load_explicit(&s->reader_drained, /* arena incomplete */
                             memory_order_acquire)) return;
