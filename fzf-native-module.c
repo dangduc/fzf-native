@@ -1331,13 +1331,35 @@ typedef struct {
      prefix-refinement remains correct across the threshold crossing.
      See `fzf-native-filter-only-min-pool'. */
   size_t           filter_only_min_pool;
+
+  /* Cross-session result cache support.  command/dir are retained on
+     the session so the eventual capture can key the cache insert
+     without re-reading anything from Elisp.  Ownership moves into the
+     session at start (from the caller's malloc) and may move again
+     into a cache entry on stop.
+
+     reader_drained: set by the reader thread when fgets returns NULL.
+       Pipe writer closed → child closed stdout → arena is complete.
+       The capture-time eligibility check reads this.
+     is_cache_hit: set at start() if the new session adopted a cached
+       arena (skipping fork+exec).  Stays true for the session's
+       lifetime.  Used to (a) guard the reader pthread_join in freeze
+       (reader was never spawned), and (b) suppress redundant re-caching
+       at stop. */
+  char            *command;        /* owned */
+  char            *dir;            /* owned; NULL allowed */
+  _Atomic bool     reader_drained;
+  bool             is_cache_hit;
 } AsyncSession;
 
 static void *async_reader(void *arg) {
   AsyncSession *s = arg;
   fzf_log("async_reader START: pid=%d\n", (int)s->pid);
   char line[ASYNC_LINE_MAX];
-  while (!atomic_load_explicit(&s->stop, memory_order_relaxed) && s->fp && fgets(line, sizeof line, s->fp)) {
+  /* Sole exit path is fgets-NULL (pipe EOF).  Dropping the stop-flag
+     check here makes `reader_drained` (set immediately below the loop)
+     a reliable "arena complete" signal for the result cache. */
+  while (s->fp && fgets(line, sizeof line, s->fp)) {
     size_t len = strlen(line);
     while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
       line[--len] = '\0';
@@ -1398,6 +1420,9 @@ static void *async_reader(void *arg) {
     pthread_mutex_unlock(&s->mu);
     atomic_fetch_add_explicit(&s->gen, 1, memory_order_relaxed);
   }
+  /* Pipe writer side closed (fgets returned NULL).  Mark the arena as
+     complete so the cross-session capture path can see this. */
+  atomic_store_explicit(&s->reader_drained, true, memory_order_release);
   fzf_log("async_reader EXIT: total=%zu gen=%d\n",
           s->count, (int)atomic_load_explicit(&s->gen, memory_order_relaxed));
   return NULL;
@@ -1433,8 +1458,10 @@ static void async_session_freeze(AsyncSession *s) {
   pthread_mutex_destroy(&s->score_req_mu);
   pthread_cond_destroy(&s->score_req_cond);
 
-  /* Reader has been winding down since SIGTERM above; join it now. */
-  pthread_join(s->reader, NULL);
+  /* Reader has been winding down since SIGTERM above; join it now.
+     Cache-hit sessions never spawned a reader — pthread_join on a
+     zero-initialized pthread_t is undefined, so guard with the flag. */
+  if (!s->is_cache_hit) pthread_join(s->reader, NULL);
   if (s->fp)      { fclose(s->fp); s->fp = NULL; }
   if (s->pid > 0) { waitpid(s->pid, NULL, 0); s->pid = -1; }
 }
@@ -1449,6 +1476,8 @@ static void async_session_free(AsyncSession *s) {
     if (s->cands_top[k]) { free(s->cands_top[k]); s->cands_top[k] = NULL; }
   pthread_mutex_unlock(&s->mu);
   pthread_mutex_destroy(&s->mu);
+  free(s->command);
+  free(s->dir);
   free(s);
 }
 
@@ -1604,11 +1633,13 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   fzf_log("async_start: cmd='%s' dir='%s' pid=%d\n",
           cmd, dir ? dir : ".", (int)pid);
 
-  free(cmd);
-  free(dir);
-
   s->pid   = pid;
   s->fp    = fdopen(pfd[0], "r");
+  /* Move ownership of cmd/dir into the session.  `async_session_free`
+     releases them; a future result-cache capture may instead move them
+     into a fresh cache entry. */
+  s->command = cmd;
+  s->dir     = dir;
   /* cands_top is zero-initialized by the calloc above; blocks are
      allocated lazily by the reader on first write into each block. */
   pthread_mutex_init(&s->mu, NULL);
