@@ -128,6 +128,51 @@ Bridged by fzf-async from `fzf-async-cache-size' via `:around' advice."
   :type 'integer
   :group 'fzf-native)
 
+(defcustom fzf-native-async-result-cache-ttl 300
+  "Time-to-live in seconds for the cross-session result cache.
+
+When non-nil and positive, the candidate arena from a session whose
+child closed its stdout (reader hit EOF) is kept alive after
+`fzf-native-async-stop'.  A subsequent `fzf-native-async-start' with
+the same \(COMMAND, DIRECTORY\) within TTL seconds skips fork+exec
+entirely and adopts the cached arena.
+
+Sessions where the child was still alive at stop time are skipped —
+the arena could be partial.  Empty arenas are also skipped.
+
+nil or <= 0 disables the cache (no lookup, no insert).
+
+Read on every call to `fzf-native-async-start' (gates lookup) and on
+every call to `fzf-native-async-stop' (gates insert).
+
+Eviction emits a `message' so the Emacs side has visibility.
+
+Bridged by fzf-async from `fzf-async-result-cache-ttl' via `:around'
+advice on start, candidates, and stop."
+  :type '(choice (const   :tag "Disabled" nil)
+                 (integer :tag "Seconds"))
+  :group 'fzf-native)
+
+(defcustom fzf-native-async-result-cache-entries 3
+  "Maximum number of entries in the cross-session result cache.
+Each entry is one completed `(COMMAND, DIRECTORY)' candidate pool.
+LRU eviction once the count would exceed this bound.
+
+Each entry retains its full candidate arena plus a chunked pointer
+table.  Keep this small — the cache is meant for the few command
+shapes a user runs repeatedly, not as a durable archive.
+
+Active only when `fzf-native-async-result-cache-ttl' is set; <= 0
+disables the cache regardless of TTL.
+
+Read on every call to `fzf-native-async-start' and
+`fzf-native-async-stop'.
+
+Bridged by fzf-async from `fzf-async-result-cache-entries' via
+`:around' advice."
+  :type 'integer
+  :group 'fzf-native)
+
 (defcustom fzf-native-filter-only-min-pool 10000000
   "Pool size at which scoring switches to filter-only mode.
 When the candidate pool reaches at least this size, scoring replaces
