@@ -1289,10 +1289,15 @@ static void cache_insert(Cache *c, const char *query, size_t pool_gen,
    finalizer path does NOT cache — no env, can't read defcustoms or emit
    eviction messages.
 
-   Concurrency: Emacs runs only one fzf-async session at a time, so the
-   arena's owner is unambiguous at every moment (cache between sessions,
-   session during).  No refcounting.  The cache mutex serializes access
-   to the LRU list itself.
+   Concurrency: arenas are session-private (each AsyncSession owns its
+   own; nothing shared across sessions); the cache LRU list is protected
+   by `g_result_cache.mu'; and all module entry points run on the Emacs
+   main thread, which serializes adopt/capture so a given cache entry's
+   ownership transitions atomically from cache → session at lookup and
+   session → cache at capture.  Multiple sessions may be live at once
+   (e.g. `fzf-async--multi-read' starts N), each with its own arena —
+   that is fine because nothing cross-references between them.  No
+   refcounting needed.
 
    Eviction: TTL (lookup) + LRU bound (insert).  Both emit a `message'
    via the caller (cache primitives stay env-free). */
@@ -1996,6 +2001,14 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
    any LRU eviction.  Safe to call regardless of state — bails out
    early when ineligible.
 
+   Eligibility is decided by the caller and passed in as ELIGIBLE.  The
+   stop path snapshots `reader_drained' BEFORE freeze sends SIGTERM,
+   which is the only way to distinguish "child closed stdout naturally"
+   from "freeze killed the child."  Both paths produce fgets-NULL and
+   set `reader_drained' in the reader epilogue, so reading it here
+   (after freeze) would always be true and partial pools would leak
+   into the cache.
+
    Cache-hit sessions DO re-capture.  When `result_cache_take` adopted
    the entry at start, the cache lost it; if we skipped re-capture
    here, the cache would be empty after every hit and the user would
@@ -2004,10 +2017,10 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
    start anyway, so there's nothing to replace — net effect is the
    same entry pushed back to MRU position with refreshed timestamp). */
 static void
-result_cache_capture_from_session(emacs_env *env, AsyncSession *s) {
+result_cache_capture_from_session(emacs_env *env, AsyncSession *s,
+                                  bool eligible) {
+  if (!eligible) return;                        /* arena incomplete */
   if (s->count == 0) return;                    /* empty pool */
-  if (!atomic_load_explicit(&s->reader_drained, /* arena incomplete */
-                            memory_order_acquire)) return;
   if (!s->command) return;                      /* defensive */
 
   double ttl = 0.0;
@@ -2047,12 +2060,19 @@ fzf_native_async_stop(emacs_env *env, ptrdiff_t nargs,
   AsyncSession *s = env->get_user_ptr(env, args[0]);
   if (s) {
     fzf_log("async_stop: pid=%d total=%zu\n", (int)s->pid, s->count);
+    /* Snapshot `reader_drained' BEFORE freeze.  If the reader had
+       already exited (child closed stdout on its own) we observe true;
+       if the reader is still in fgets we observe false.  Freeze about
+       to issue SIGTERM would otherwise force the flag to true via
+       reader-EOF in the kill path, hiding the distinction. */
+    bool eligible =
+      atomic_load_explicit(&s->reader_drained, memory_order_acquire);
     env->set_user_ptr(env, args[0], NULL);
     async_session_freeze(s);
     /* env is available here (unlike in the GC finalizer), so the result
        cache can be consulted.  Moves arena + cands_top + cmd + dir out
        of `s` on insert; remaining fields are freed below. */
-    result_cache_capture_from_session(env, s);
+    result_cache_capture_from_session(env, s, eligible);
     async_session_free(s);
   }
   return Qnil;
