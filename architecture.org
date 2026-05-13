@@ -56,8 +56,14 @@ process and must never block the main thread.
 | =fzf-native-async-stats=       | =(handle)=                           | =(filtered . total)=   | async       |
 | =fzf-native-async-generation=  | =(handle)=                           | integer                | async       |
 | =fzf-native-async-stop=        | =(handle)=                           | nil                    | async       |
+| =fzf-native-filter-only-p=     | =(query-length pool-size)=           | t / nil                | predicate   |
 
 The async surface is Unix-only (uses =fork=, =execl=, =pthread=).
+
+=fzf-native-filter-only-p= is the Elisp-exposed wrapper around the
+internal =decide_filter_only= and exists so external packages (fussy,
+fzf-async) take consistent branches without re-implementing the
+OR/AND composition.
 
 * The fzf algorithm (in =fzf.c=)
 
@@ -377,15 +383,29 @@ during a 25 M-item memcpy doesn't force a full pre-work pass.
 
 ** Filter-only mode
 
-Driven by =fzf-native-filter-only-min-pool=.  When the snapshot pool
-reaches at least that size, the scoring thread swaps its per-candidate
-work from =fzf_get_score= (full fuzzy-DP, ~500 ns per candidate) to
-=fzf_has_match= (boolean match-only check from =fzf-additions.c=,
-~100 ns per candidate).  The candidate cap at the display layer
-(=fzf-async-max-candidates=, default 10 000) is then re-scored with
-=fzf_get_score= and counting-sorted so the user still sees results
-ordered by score — but only that 10 K window pays the DP cost, not
-the whole pool.
+Driven by two independent triggers, composed via a logic knob:
+
+| Defcustom                          | Trigger                                    |
+|------------------------------------+--------------------------------------------|
+| =fzf-native-filter-only-min-pool=  | =pool_size >= N=  (snapshot count arm)     |
+| =fzf-native-filter-only-length=    | =query_length <= N= (short-query arm)      |
+| =fzf-native-filter-only-logic=     | =or= (default) — either arm fires;         |
+|                                    | =and= — every enabled arm fires (disabled  |
+|                                    | arms are trivially satisfied; nil/0 means  |
+|                                    | disabled).                                 |
+
+The composition lives in =decide_filter_only= in =fzf-native-module.c=.
+The same helper backs both the sync and async paths plus the
+Elisp-exposed =fzf-native-filter-only-p= predicate, so callers never
+re-derive the rule.
+
+In filter-only the per-candidate work swaps =fzf_get_score= (full
+fuzzy-DP, ~500 ns per candidate) for =fzf_has_match= (boolean
+match-only check from =fzf-additions.c=, ~100 ns per candidate).  The
+candidate cap at the display layer (=fzf-async-max-candidates=,
+default 10 000) is then re-scored with =fzf_get_score= and
+counting-sorted so the user still sees results ordered by score — but
+only that 10 K window pays the DP cost, not the whole pool.
 
 In one pass through the same worker pipeline:
 
@@ -435,10 +455,40 @@ cost, not the (constant-bound) re-score step.
 
 Tunable knobs:
 - =fzf-native-filter-only-min-pool= (nil/0 disables; 1 always-on for
-  testing; default 10 000 000).
-- Threshold checked per scoring run against the snapshot pool size.  A
-  streaming session crosses modes naturally as the reader grows the
-  pool past the threshold.
+  testing; default 10 000 000).  Read once at session start in the
+  async path; per call in =fzf-native-score-all=.
+- =fzf-native-filter-only-length= (nil/0 disables; integer = max
+  query length).  Read per scoring run (async) and per call (sync) so
+  the threshold tracks the user's typing live.
+- =fzf-native-filter-only-logic= (=or= / =and=, default =or=).  Read
+  alongside =-length=.  =or= captures the most natural "either reason
+  to skip full scoring is sufficient"; =and= is available for users
+  who want filter-only only at the intersection.
+
+The session caches =filter_only_min_pool= at start (it would never
+change mid-session in practice).  The =-length= and =-logic= knobs are
+snapshot per-dispatch on the main thread (where =emacs_env= is live)
+and stashed onto the request slot for the scoring thread to read —
+mirrors how =fzf-native-async-highlight= is plumbed.
+
+*** Sync path (=fzf-native-score-all=)
+
+The same composition applies — only the work shape differs:
+
+- Workers branch on =shared->filter_only= just like async, calling
+  =fzf_has_match= when the flag is set.
+- Counting sort over the full match-set is skipped; candidates come
+  back in *input order*.  No =completion-score= text property is
+  attached (the score would be a constant 1 from =fzf_has_match=).
+- Highlight cap still applies — =fzf_get_positions= runs on
+  =xs[0..hl_cap-1]=, which in filter-only mode is the first N
+  *input-order* candidates rather than the top-N-by-score.
+
+Callers that drive their own sort downstream (e.g. fussy) need to know
+which mode was active so they can skip score-based sorting when no
+=completion-score= is attached.  =fzf-native-filter-only-p= is the
+single source of truth — it reads the same defcustoms and applies the
+same composition.
 
 ** The "same-filter, don't abort" rule
 

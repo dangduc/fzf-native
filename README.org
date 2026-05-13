@@ -121,13 +121,47 @@ pattern), ~fzf-async~ via ~:around~ advice on the C entry points
 ~fzf-native-score~ / ~fzf-native-score-all~ / ~fzf-native-async-*~
 yourself; otherwise prefer the package-level knob.
 
-| Variable                        | Default | Read by                            | Behavior                                    |
-|---------------------------------+---------+------------------------------------+---------------------------------------------|
-| ~fzf-native-case-mode~          | ~smart~ | every scoring call (sync + async)  | ~smart~ (lowercase = ignore, mixed = respect) / ~ignore~ / ~respect~ |
-| ~fzf-native-batch-highlight~    | 25      | ~fzf-native-score~ / ~fzf-native-score-all~ | nil = off; positive N = apply ~completions-common-part~ face to top N candidates via ~fzf_get_positions~ in C. |
-| ~fzf-native-async-highlight~    | 200     | ~fzf-native-async-candidates~      | nil = off; t = all returned candidates; positive N = top N. |
-| ~fzf-native-max-line-length~    | 256     | ~fzf-native-async-start~ (once at session start) | nil = no limit; +N = drop lines longer than N; -N = truncate lines to N characters. |
-| ~fzf-native-async-cache-size~   | 40      | ~fzf-native-async-start~ (once at session start) | LRU result-cache entries.  Each entry stores top-K results plus the full matched-candidate index for one query, enabling exact-fresh hits and prefix-refinement hits. |
+| Variable                            | Default    | Read by                            | Behavior                                    |
+|-------------------------------------+------------+------------------------------------+---------------------------------------------|
+| ~fzf-native-case-mode~              | ~smart~    | every scoring call (sync + async)  | ~smart~ (lowercase = ignore, mixed = respect) / ~ignore~ / ~respect~ |
+| ~fzf-native-batch-highlight~        | 25         | ~fzf-native-score~ / ~fzf-native-score-all~ | nil = off; positive N = apply ~completions-common-part~ face to top N candidates via ~fzf_get_positions~ in C. |
+| ~fzf-native-async-highlight~        | 200        | ~fzf-native-async-candidates~      | nil = off; t = all returned candidates; positive N = top N. |
+| ~fzf-native-max-line-length~        | 256        | ~fzf-native-async-start~ (once at session start) | nil = no limit; +N = drop lines longer than N; -N = truncate lines to N characters. |
+| ~fzf-native-async-cache-size~       | 40         | ~fzf-native-async-start~ (once at session start) | LRU result-cache entries.  Each entry stores top-K results plus the full matched-candidate index for one query, enabling exact-fresh hits and prefix-refinement hits. |
+| ~fzf-native-filter-only-min-pool~   | 10 000 000 | ~fzf-native-async-start~ (once at session start), ~fzf-native-score-all~ (per call) | Pool-size threshold for filter-only mode.  When the candidate pool reaches ≥ N, scoring swaps ~fzf_get_score~ for ~fzf_has_match~ (cheap boolean) and skips top-K sorting.  ~nil~/~0~ disables this arm. |
+| ~fzf-native-filter-only-length~     | nil        | every scoring call (sync + async)  | Query-length threshold for filter-only mode.  When set to a positive integer N and the query is at most N characters, take the cheap match path.  ~nil~/~0~ disables this arm. |
+| ~fzf-native-filter-only-logic~      | ~or~       | every scoring call (sync + async)  | How the two filter-only arms compose: ~or~ = either trigger is sufficient; ~and~ = every enabled arm must fire (a disabled arm is trivially satisfied). |
+
+*** Filter-only mode
+
+Filter-only mode replaces the per-candidate fuzzy-DP score (~fzf_get_score~)
+with a cheap boolean match (~fzf_has_match~, ~5× faster) and skips the
+top-K counting sort.  Useful when full scoring is wasted work: very
+large pools (pool-size arm) or very short queries (length arm) where
+score ranking carries little signal anyway.
+
+Two independent triggers — pool size and query length — compose via
+~fzf-native-filter-only-logic~.  Set either or both; ~nil~/~0~ on a
+defcustom disables that arm.
+
+Sync (~fzf-native-score-all~): when filter-only fires, candidates are
+returned in input order, no ~completion-score~ text property is
+attached.  Highlights still apply to the top-N entries (top by input
+order in this mode).
+
+Async (~fzf-native-async-candidates~): when filter-only fires, the
+match-set is still built exhaustively so the per-session result cache
+can refine on the next keystroke; only the cap-bound emit window
+(~fzf-native-async-highlight~) gets re-scored + sorted so the visible
+top stays ranked.
+
+**** ~(fzf-native-filter-only-p QUERY-LENGTH POOL-SIZE)~
+
+C-defined predicate that returns non-nil when filter-only mode would
+fire at the given query length and pool size.  Reads the same three
+defcustoms.  Single source of truth for callers that want to take
+consistent code paths — e.g. fussy's metadata adjustment skips its
+score-based sort when this returns non-nil for the current call.
 
 Highlighting runs entirely inside the C module: after scoring,
 ~fzf_get_positions~ produces matched byte offsets, which are merged

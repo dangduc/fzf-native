@@ -33,6 +33,7 @@
 (declare-function fzf-native-async-generation "fzf-native-module" (handle))
 (declare-function fzf-native-async-candidates "fzf-native-module" (handle filter &optional limit))
 (declare-function fzf-native-async-stats "fzf-native-module" (handle))
+(declare-function fzf-native-filter-only-p "fzf-native-module" (query-length pool-size))
 
 (defconst fzf-native--dyn-name "fzf-native-module"
   "Dynamic module name.")
@@ -156,12 +157,70 @@ Default 10000000 is empirical: below it the full scorer is fast
 enough; above it the per-keystroke latency benefits noticeably from
 the cheap path.
 
-Read once at session start by `fzf-native-async-start'.
+Composes with `fzf-native-filter-only-length' under the rule
+selected by `fzf-native-filter-only-logic' (OR by default).  Async
+reads this once at session start; sync (`fzf-native-score-all')
+reads it on every call.
 
 Bridged by fzf-async from `fzf-async-filter-only-min-pool' via
 `:around' advice."
   :type '(choice (const :tag "Disabled" nil)
                  (integer :tag "Minimum pool size"))
+  :group 'fzf-native)
+
+(defcustom fzf-native-filter-only-length nil
+  "Query length below which scoring switches to filter-only mode.
+When non-nil and the current query is at most this many characters
+long, scoring replaces full fzf evaluation with `fzf_has_match'
+(boolean match-only check from fzf-additions) and skips counting-
+sort over the matched candidates.
+
+For short queries the score signal is dominated by length / position
+heuristics that don't carry much ranking information; the user is
+typically still narrowing, not picking.  Filter-only here makes the
+per-keystroke cost cheap and lets the caller (e.g. fussy) keep its
+own subsuming candidate pool for the eventual full-score pass once
+the query is long enough to rank.
+
+Threshold is checked as `query-length <= N', so values shape behaviour
+as follows:
+  nil (or 0) — feature disabled; full scoring always (for this arm).
+  1          — only single-character queries filter-only.
+  3          — queries of length 1, 2, or 3 filter-only (matches
+               fussy's default `fussy-company-prefix-length').
+
+Read on every scoring call (sync) or every scoring run (async).
+
+Composes with `fzf-native-filter-only-min-pool' under the rule
+selected by `fzf-native-filter-only-logic' (OR by default — either
+trigger is sufficient).
+
+Bridged by higher-level packages (fzf-async, fussy) via the usual
+`:around' advice / `setq-local' patterns."
+  :type '(choice (const :tag "Disabled" nil)
+                 (integer :tag "Maximum query length"))
+  :group 'fzf-native)
+
+(defcustom fzf-native-filter-only-logic 'or
+  "`fzf-native-filter-only-min-pool' or/and `fzf-native-filter-only-length'.
+Both defcustoms gate the switch from full fzf scoring to the cheap
+`fzf_has_match' path.  Each is an independent trigger; this knob
+controls how the two triggers are combined when both are enabled.
+
+`or' (default)
+  Filter-only fires when *either* trigger fires.  Natural reading:
+  each defcustom names an independent sufficient reason to skip full
+  scoring (pool too large / query too short).
+
+`and'
+  Filter-only fires only when *every enabled* trigger fires.  A
+  trigger that is disabled (its defcustom is nil/0) is treated as
+  trivially satisfied and ignored.  If both are disabled the feature
+  is off regardless of logic.
+
+Read on every scoring call (sync) or every scoring run (async)."
+  :type '(choice (const :tag "OR (either trigger fires)" or)
+                 (const :tag "AND (all enabled triggers fire)" and))
   :group 'fzf-native)
 
 (defun fzf-native-module--cmake-is-available ()

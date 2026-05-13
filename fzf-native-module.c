@@ -101,9 +101,11 @@ emacs_value Fsymbol_value;
    so user `setq' / `customize-set-variable' is respected. */
 emacs_value Qsym_case_mode, Qsym_batch_highlight, Qsym_async_highlight;
 emacs_value Qsym_max_line_length, Qsym_async_cache_size, Qsym_filter_only_min_pool;
+emacs_value Qsym_filter_only_length, Qsym_filter_only_logic;
 emacs_value Qsym_shell_file_name, Qsym_shell_command_switch, Qsym_exec_path;
 /* Cached value symbols for `type-of' comparisons and signal/error names. */
 emacs_value Qvector, Qstring, Qignore, Qrespect;
+emacs_value Qor, Qand;
 emacs_value Qstringp, Qwrong_type_argument, Qerror;
 
 
@@ -260,6 +262,10 @@ struct Shared {
 #else
   ssize_t remaining;
 #endif
+  /* When true, workers call `fzf_has_match' (cheap boolean) instead of
+     `fzf_get_score' and assign score=1 to survivors.  Caller is expected
+     to skip the counting sort so input order is preserved. */
+  bool filter_only;
 };
 
 // Most of the threading lifted from https://github.com/axelf4/hotfuzz
@@ -270,6 +276,7 @@ static void *worker_routine(void *ptr) {
 
   struct Shared *shared = ptr;
   fzf_pattern_t *pattern = shared->pattern;
+  bool filter_only = shared->filter_only;
   ssize_t batch_idx;
 
 #ifdef _WIN32
@@ -291,7 +298,9 @@ static void *worker_routine(void *ptr) {
       for (unsigned i = 0; i < batch->len; ++i) {
         struct Candidate x = batch->xs[i];
         /* You can get the score/position for as many items as you want */
-        int score = fzf_get_score(x.s.b, pattern, slab);
+        int score = filter_only
+          ? (fzf_has_match(x.s.b, pattern) ? 1 : 0)
+          : fzf_get_score(x.s.b, pattern, slab);
         if (score > 0) {
           /* printf("Str: %s # = %d | i = %d, batch->len = %d, batch_idx = %zd\n", */
           /*        x.s.b, score, i, batch->len, batch_idx); */
@@ -416,6 +425,63 @@ static size_t resolve_fussy_highlight_cap(emacs_env *env, size_t len) {
   return (size_t)n > len ? len : (size_t)n;
 }
 
+/* Resolve filter-only thresholds and logic from defcustoms.
+   Writes the integer values back via out-params; returns true if `logic'
+   is 'and (false = OR, the default).  A nil/0 threshold means the arm
+   is disabled — callers should treat it as "this trigger never fires."
+
+   Reads are independent and tolerant: bad reads default to disabled / OR. */
+static bool resolve_filter_only_settings(emacs_env *env,
+                                         size_t *out_min_pool,
+                                         size_t *out_max_len) {
+  *out_min_pool = 0;
+  *out_max_len  = 0;
+
+  emacs_value vp = defcustom_value(env, Qsym_filter_only_min_pool, Qnil);
+  if (!env->eq(env, vp, Qnil)) {
+    intmax_t n = env->extract_integer(env, vp);
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+      env->non_local_exit_clear(env);
+    else if (n > 0)
+      *out_min_pool = (size_t)n;
+  }
+
+  emacs_value vl = defcustom_value(env, Qsym_filter_only_length, Qnil);
+  if (!env->eq(env, vl, Qnil)) {
+    intmax_t n = env->extract_integer(env, vl);
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+      env->non_local_exit_clear(env);
+    else if (n > 0)
+      *out_max_len = (size_t)n;
+  }
+
+  emacs_value vlogic = defcustom_value(env, Qsym_filter_only_logic, Qor);
+  return env->eq(env, vlogic, Qand);
+}
+
+/* Decide filter-only mode from already-resolved settings + the call's
+   query_len and pool_size.  Encapsulates the OR/AND composition so both
+   the sync and async paths agree on semantics:
+
+     OR  — either enabled trigger firing is sufficient.
+     AND — every enabled trigger must fire; disabled arms are ignored.
+
+   If both thresholds are disabled (0) the result is always false. */
+static bool decide_filter_only(size_t min_pool, size_t max_len,
+                               bool logic_and,
+                               size_t query_len, size_t pool_size) {
+  if (min_pool == 0 && max_len == 0) return false;
+  bool by_pool = (min_pool > 0) && (pool_size >= min_pool);
+  bool by_len  = (max_len  > 0) && (query_len <= max_len);
+  if (logic_and) {
+    /* Disabled arm => trivially satisfied. */
+    if (min_pool == 0) by_pool = true;
+    if (max_len  == 0) by_len  = true;
+    return by_pool && by_len;
+  }
+  return by_pool || by_len;
+}
+
 // Forward declare.
 emacs_value fzf_native_highlight_all(emacs_env *env,
                                      ptrdiff_t nargs,
@@ -494,11 +560,25 @@ emacs_value fzf_native_score_all(emacs_env *env,
   }
 
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
+
+  /* Decide filter-only mode from the two thresholds and the logic knob.
+     Evaluated once before the workers spawn; the result rides on `shared'.
+     Pool size for the decision is the candidate count we just batched. */
+  size_t fo_min_pool = 0, fo_max_len = 0;
+  bool   fo_logic_and = resolve_filter_only_settings(env, &fo_min_pool, &fo_max_len);
+  bool   filter_only_mode = decide_filter_only(fo_min_pool, fo_max_len,
+                                               fo_logic_and,
+                                               query.len, (size_t)n);
+  fzf_log("fzf_native_score_all: filter_only=%d (min_pool=%zu max_len=%zu logic=%s qlen=%zu pool=%td)\n",
+          (int)filter_only_mode, fo_min_pool, fo_max_len,
+          fo_logic_and ? "and" : "or", query.len, n);
+
   fzf_pattern_t *pattern = fzf_parse_pattern(case_mode, false, query.b, true);
   struct Shared shared = {
     .pattern = pattern,
     .batches = batches,
     .remaining = batch_idx + 1,
+    .filter_only = filter_only_mode,
   };
 
 #ifdef _WIN32
@@ -551,12 +631,19 @@ err_join_threads:
     pos += n;
   }
 
-  counting_sort_candidates(xs, len);
+  /* In full mode `xs[0]` becomes the highest-scoring candidate after the
+     sort.  In filter-only mode we skip sorting — every survivor has
+     score=1 from `fzf_has_match' so the sort would be a no-op — and
+     preserve input order so callers (e.g. fussy) can run their own
+     ranking against a stable, subsumable candidate set. */
+  if (!filter_only_mode)
+    counting_sort_candidates(xs, len);
 
-  /* Resolve C-side highlight cap from fussy-fzf-native-highlight.  After the
-     sort, xs[0] is the highest-scoring candidate, so the top-N candidates
-     are xs[0..hl_cap-1].  The original parsing pattern was already freed;
-     re-parse for highlighting using the same case mode the scoring used. */
+  /* Resolve C-side highlight cap from fussy-fzf-native-highlight.  After
+     the (possibly skipped) sort, xs[0..hl_cap-1] is the top-N to highlight
+     — top-by-score in full mode, top-by-input-order in filter-only mode.
+     The original parsing pattern was already freed; re-parse for
+     highlighting using the same case mode the scoring used. */
   size_t hl_cap = resolve_fussy_highlight_cap(env, len);
   fzf_pattern_t *hl_pattern = NULL;
   fzf_slab_t    *hl_slab    = NULL;
@@ -570,8 +657,11 @@ err_join_threads:
   }
 
   for (size_t i = len; i-- > 0;) {
-    /* e.g. (put-text-property 0 1 'completion-score score x) */
-    if (xs[i].s.len > 0) {
+    /* `completion-score' is a meaningful ranking signal in full mode but
+       not in filter-only (every survivor scored 1 from fzf_has_match).
+       Skip attaching it so downstream sort routines don't pick up a
+       constant and treat it as a real ranking. */
+    if (!filter_only_mode && xs[i].s.len > 0) {
       env->funcall(env, Fput_text_property, 5,
                    (emacs_value[]) {
                      Qzero, Qone, Qcompletion_score,
@@ -1305,6 +1395,13 @@ typedef struct {
      Ownership transfers to the scoring thread along with score_req_filter. */
   SharedIdx       *score_req_refine_idx;
   size_t           score_req_refine_delta_from;
+  /* Filter-only request settings, snapshot of the user-facing defcustoms
+     at dispatch time (main thread has the emacs_env *; scoring thread
+     does not).  `score_req_filter_only_length` 0 == disabled arm;
+     `score_req_filter_only_logic_and` selects AND vs OR composition with
+     `s->filter_only_min_pool`. */
+  size_t           score_req_filter_only_length;
+  bool             score_req_filter_only_logic_and;
   bool             score_req_stop;
   _Atomic bool     score_abort;       /* set to cancel in-flight workers */
 
@@ -1786,6 +1883,8 @@ static void *scoring_thread_fn(void *arg) {
     fzf_case_types  case_mode        = s->score_req_case_mode;
     SharedIdx      *refine_idx       = s->score_req_refine_idx;   /* steal */
     size_t          refine_delta_from = s->score_req_refine_delta_from;
+    size_t          fo_max_len       = s->score_req_filter_only_length;
+    bool            fo_logic_and     = s->score_req_filter_only_logic_and;
     s->score_req_filter      = NULL;
     s->score_req_refine_idx  = NULL;
     /* Record what we're about to score so main thread can skip abort for same filter */
@@ -1871,11 +1970,18 @@ static void *scoring_thread_fn(void *arg) {
        from fzf-additions) and we skip top-K sorting at the end.
        Match-set is still built exhaustively (m_idx) so prefix
        refinement on the next keystroke is correct.  Pool order is
-       preserved in the emit list since no sort runs. */
-    bool filter_only_mode =
-        s->filter_only_min_pool > 0 && count >= s->filter_only_min_pool;
-    fzf_log("scoring_thread: filter_only=%d (min_pool=%zu count=%zu)\n",
-            (int)filter_only_mode, s->filter_only_min_pool, count);
+       preserved in the emit list since no sort runs.
+
+       The min-pool arm is cached at session start; the length arm and
+       the logic knob were snapshot per dispatch on the main thread and
+       carried here via the request slot. */
+    size_t flen_for_decision = filter ? strlen(filter) : 0;
+    bool   filter_only_mode  = decide_filter_only(
+        s->filter_only_min_pool, fo_max_len, fo_logic_and,
+        flen_for_decision, count);
+    fzf_log("scoring_thread: filter_only=%d (min_pool=%zu max_len=%zu logic=%s qlen=%zu count=%zu)\n",
+            (int)filter_only_mode, s->filter_only_min_pool, fo_max_len,
+            fo_logic_and ? "and" : "or", flen_for_decision, count);
 
     /* Batch; check abort every 64 K items so a filter change is noticed quickly. */
     struct AsyncScoringBatch *batches = NULL;
@@ -2092,6 +2198,15 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     free(filter);
     shared_idx_release(cached_m_idx);
   } else {
+    /* Snapshot filter-only settings here, on the main thread, so the
+       scoring thread (no emacs_env) can compose its mode decision.
+       `min_pool' is read at session start; only the length arm and the
+       logic knob need this per-dispatch read.  Ignore the returned
+       `min_pool' from the helper — the session-cached value wins. */
+    size_t fo_unused_min = 0, fo_max_len = 0;
+    bool   fo_logic_and  = resolve_filter_only_settings(env, &fo_unused_min, &fo_max_len);
+    (void)fo_unused_min;
+
     free(s->score_req_filter);
     shared_idx_release(s->score_req_refine_idx);
     s->score_req_filter            = filter;          /* transfer */
@@ -2099,6 +2214,8 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     s->score_req_case_mode         = case_mode;
     s->score_req_refine_idx        = cached_m_idx;    /* transfer (NULL on miss) */
     s->score_req_refine_delta_from = cached_pool_gen;
+    s->score_req_filter_only_length     = fo_max_len;
+    s->score_req_filter_only_logic_and  = fo_logic_and;
     pthread_cond_signal(&s->score_req_cond);
   }
   pthread_mutex_unlock(&s->score_req_mu);
@@ -2217,6 +2334,34 @@ fzf_native_async_stats(emacs_env *env, ptrdiff_t UNUSED(nargs),
 
 #endif /* APPLE || linux || FreeBSD */
 
+/* fzf-native-filter-only-p QUERY-LENGTH POOL-SIZE -> t / nil
+   Single source of truth for the filter-only decision.  Exposes the
+   internal `decide_filter_only' so Elisp callers (fussy, etc.) can
+   take consistent code paths without re-implementing the OR/AND
+   composition and disabled-arm rules. */
+static emacs_value
+fzf_native_filter_only_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
+                         emacs_value args[], void *UNUSED(data)) {
+  intmax_t qlen = env->extract_integer(env, args[0]);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env); qlen = 0;
+  }
+  intmax_t psize = env->extract_integer(env, args[1]);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env); psize = 0;
+  }
+
+  size_t min_pool = 0, max_len = 0;
+  bool   logic_and = resolve_filter_only_settings(env, &min_pool, &max_len);
+
+  /* Negative inputs are treated as 0 — callers shouldn't pass them but
+     we don't want to underflow size_t on the cast. */
+  size_t qlen_u  = qlen  > 0 ? (size_t)qlen  : 0;
+  size_t psize_u = psize > 0 ? (size_t)psize : 0;
+  return decide_filter_only(min_pool, max_len, logic_and, qlen_u, psize_u)
+         ? Qt : Qnil;
+}
+
 int emacs_module_init(struct emacs_runtime *rt) {
   // Verify compatability with Emacs executable loading this module
   if ((size_t) rt->size < sizeof *rt)
@@ -2321,6 +2466,21 @@ int emacs_module_init(struct emacs_runtime *rt) {
     });
 #endif
 
+  /* fzf-native-filter-only-p — single source of truth for the filter-only
+     decision.  Reads the filter-only defcustoms and applies the OR/AND
+     composition; Elisp callers (fussy etc.) use this to take consistent
+     paths without re-implementing the rule. */
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-filter-only-p"),
+      env->make_function(env, 2, 2, fzf_native_filter_only_p,
+                         "Return non-nil when filter-only mode would fire at QUERY-LENGTH and POOL-SIZE.\n"
+                         "\n"
+                         "Honors `fzf-native-filter-only-min-pool',\n"
+                         "`fzf-native-filter-only-length', and `fzf-native-filter-only-logic'.\n"
+                         "An arm whose defcustom is nil/0 is disabled.\n\n"
+                         "\\(fn QUERY-LENGTH POOL-SIZE)", NULL),
+    });
+
   // fzf-native-make-default-slab
   env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
       env->intern(env, "fzf-native-make-default-slab"),
@@ -2375,6 +2535,10 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qsym_max_line_length      = env->make_global_ref(env, env->intern(env, "fzf-native-max-line-length"));
   Qsym_async_cache_size     = env->make_global_ref(env, env->intern(env, "fzf-native-async-cache-size"));
   Qsym_filter_only_min_pool = env->make_global_ref(env, env->intern(env, "fzf-native-filter-only-min-pool"));
+  Qsym_filter_only_length   = env->make_global_ref(env, env->intern(env, "fzf-native-filter-only-length"));
+  Qsym_filter_only_logic    = env->make_global_ref(env, env->intern(env, "fzf-native-filter-only-logic"));
+  Qor      = env->make_global_ref(env, env->intern(env, "or"));
+  Qand     = env->make_global_ref(env, env->intern(env, "and"));
   Qsym_shell_file_name      = env->make_global_ref(env, env->intern(env, "shell-file-name"));
   Qsym_shell_command_switch = env->make_global_ref(env, env->intern(env, "shell-command-switch"));
   Qsym_exec_path            = env->make_global_ref(env, env->intern(env, "exec-path"));
