@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #ifndef FZF_ADDITIONS_H_
 #define FZF_ADDITIONS_H_
 

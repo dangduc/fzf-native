@@ -1,4 +1,5 @@
-/* fzf-additions.c — extensions to the upstream fzf scorer that aren't in
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * fzf-additions.c — extensions to the upstream fzf scorer that aren't in
  * fzf.h, kept here so future syncs with upstream don't conflict.
  *
  *   fzf_has_match(text, pattern) -> bool

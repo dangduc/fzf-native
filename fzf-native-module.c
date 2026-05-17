@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* strdup is POSIX (not C11); Linux glibc hides it under c11 without this */
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L
