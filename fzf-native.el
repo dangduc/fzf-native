@@ -143,8 +143,7 @@ Pool size is sampled per scoring run, so a streaming session that
 crosses the threshold mid-typing switches modes for the keystrokes
 after the crossing.  Below the threshold the full scorer ranks
 results; above it the result order is the pool's natural order
-(typically directory traversal / find order), capped at the
-candidate limit.
+capped at the candidate limit.
 
 Threshold is checked as `pool-size >= N', so values shape behaviour
 as follows:
@@ -172,8 +171,7 @@ Bridged by fzf-async from `fzf-async-filter-only-min-pool' via
   "Query length below which scoring switches to filter-only mode.
 When non-nil and the current query is at most this many characters
 long, scoring replaces full fzf evaluation with `fzf_has_match'
-(boolean match-only check from fzf-additions) and skips counting-
-sort over the matched candidates.
+and skips counting-sort over the matched candidates.
 
 For short queries the score signal is dominated by length / position
 heuristics that don't carry much ranking information; the user is
