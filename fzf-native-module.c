@@ -161,7 +161,16 @@ static struct Str copy_valid_emacs_string(emacs_env *env, struct Bump **bump, em
   *new = (struct Bump) { .next = *bump, .cursor = new->b, .limit = new->b + capacity };
   *bump = new;
 
-  env->copy_string_contents(env, value, buf = new->cursor, &len);
+  if (!env->copy_string_contents(env, value, buf = new->cursor, &len)) {
+    /* Re-signal on the retry (e.g. unicode-string-p, or len shrunk between
+       calls): clear the pending exit so the caller can try the
+       encode-coding-string fallback, and drop this candidate. Without this
+       the signal would ride out on a "successful" Str and surface later from
+       deep inside Fapply / the byte-code interpreter. */
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+      env->non_local_exit_clear(env);
+    return (struct Str) { 0 };
+  }
 success:
   (*bump)->cursor = (char *) (((uintptr_t) (*bump)->cursor + len
                                + alignof(uint64_t) - 1) & ~(alignof(uint64_t) - 1));
