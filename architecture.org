@@ -13,7 +13,7 @@ changes, update this file in the same commit.
 For the broader picture across the three sibling projects, see also:
 
 - [[https://github.com/jojojames/fussy/blob/HEAD/architecture.org][fussy/architecture.org]]
-- [[https://github.com/jojojames/fzf-async/blob/HEAD/architecture.org][fzf-async/architecture.org]]
+- [[https://github.com/jojojames/fzfa/blob/HEAD/architecture.org][fzfa/architecture.org]]
 
 * Place in the pipeline
 
@@ -22,7 +22,7 @@ sit above it:
 
 #+begin_src
   ┌──────────────────┐    ┌──────────────────────────────────┐
-  │ fussy            │    │ fzf-async                        │
+  │ fussy            │    │ fzfa                        │
   │  (sync, in-mem)  │    │  (async, child-process streaming)│
   └────────┬─────────┘    └─────────────────┬────────────────┘
            │                                │
@@ -39,7 +39,7 @@ sit above it:
 #+end_src
 
 The C module exposes both sync and async surfaces on purpose. fussy
-needs sync to slot into Emacs's =completion-styles= flow; fzf-async
+needs sync to slot into Emacs's =completion-styles= flow; fzfa
 needs async because it streams candidates from a long-running child
 process and must never block the main thread.
 
@@ -62,7 +62,7 @@ The async surface is Unix-only (uses =fork=, =execl=, =pthread=).
 
 =fzf-native-filter-only-p= is the Elisp-exposed wrapper around the
 internal =decide_filter_only= and exists so external packages (fussy,
-fzf-async) take consistent branches without re-implementing the
+fzfa) take consistent branches without re-implementing the
 OR/AND composition.
 
 * The fzf algorithm (in =fzf.c=)
@@ -402,7 +402,7 @@ re-derive the rule.
 In filter-only the per-candidate work swaps =fzf_get_score= (full
 fuzzy-DP, ~500 ns per candidate) for =fzf_has_match= (boolean
 match-only check from =fzf-additions.c=, ~100 ns per candidate).  The
-candidate cap at the display layer (=fzf-async-max-candidates=,
+candidate cap at the display layer (=fzfa-max-candidates=,
 default 10 000) is then re-scored with =fzf_get_score= and
 counting-sorted so the user still sees results ordered by score — but
 only that 10 K window pays the DP cost, not the whole pool.
@@ -430,7 +430,7 @@ What the user sees:
 - Top 10 K *of the first 10 K matches in pool order*, ranked by score
   inside that window.  Best match overall may be outside the window
   if it sits at pool position 50 000.
-- Highlights (=fzf-async-highlight=, default 200) computed via
+- Highlights (=fzfa-highlight=, default 200) computed via
   =fzf_get_positions= on the score-sorted window, so highlights land
   on the visually-top entries.
 
@@ -501,7 +501,7 @@ rule:
 | Same as =score_current_filter=        | Just re-queue; do *not* abort                |
 | =score_current_filter= is NULL (idle) | Enqueue, signal cond                         |
 
-Without this rule, an external 50 ms refresh timer (e.g. fzf-async's
+Without this rule, an external 50 ms refresh timer (e.g. fzfa's
 poll loop) would set =abort= every tick. Workers would see =abort=
 within a batch or two and exit. The scoring thread would loop,
 restart, and the timer would fire again — livelock. With it,
@@ -524,7 +524,7 @@ cross-thread publish signal.)
 ** Result cache
 
 A per-session LRU cache sits between the dispatch path and the scoring
-thread. Configured via the =fzf-async-cache-size= defcustom (read
+thread. Configured via the =fzfa-cache-size= defcustom (read
 once at session start; default 40 entries).
 
 *Data model*:
@@ -702,4 +702,4 @@ surfaced anywhere by Emacs.
 - =CMakeLists.txt= — build config.
 - Sibling architecture docs:
   [[https://github.com/jojojames/fussy/blob/HEAD/architecture.org][fussy/architecture.org]],
-  [[https://github.com/jojojames/fzf-async/blob/HEAD/architecture.org][fzf-async/architecture.org]].
+  [[https://github.com/jojojames/fzfa/blob/HEAD/architecture.org][fzfa/architecture.org]].

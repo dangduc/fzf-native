@@ -60,9 +60,9 @@ confirmation before compiling."
   :group 'fzf-native)
 
 ;; Canonical knobs the C module reads via `symbol-value' at call time.
-;; Higher-level packages (fzf-async, fussy) keep their own user-facing
+;; Higher-level packages (fzfa, fussy) keep their own user-facing
 ;; defcustoms and bridge their values onto these names — fussy via
-;; `setq-local' (synchronous, same-buffer call pattern), fzf-async via
+;; `setq-local' (synchronous, same-buffer call pattern), fzfa via
 ;; `:around' advice on the C entry points (timer-driven, cross-buffer).
 
 (defcustom fzf-native-case-mode 'smart
@@ -95,7 +95,7 @@ Bridged by fussy from `fussy-fzf-native-highlight' via `setq-local'."
 Read by `fzf-native-async-candidates' on every call.  Same semantics
 as `fzf-native-batch-highlight' (nil / positive integer).
 
-Bridged by fzf-async from `fzf-async-highlight' via `:around' advice."
+Bridged by fzfa from `fzfa-highlight' via `:around' advice."
   :type '(choice (const   :tag "Disabled" nil)
                  (const   :tag "All candidates" t)
                  (integer :tag "Top N candidates"))
@@ -109,7 +109,7 @@ negative -N — include but truncate lines to N characters.
 
 Read once at session start by `fzf-native-async-start'.
 
-Bridged by fzf-async from `fzf-async-max-line-length' via `:around'
+Bridged by fzfa from `fzfa-max-line-length' via `:around'
 advice; the read happens inside `fzf-native-async-start' so the
 advice is in scope for the `symbol-value' lookup."
   :type '(choice (const   :tag "No limit" nil)
@@ -125,7 +125,7 @@ deltas) without re-scanning the full pool.
 
 Read once at session start by `fzf-native-async-start'.
 
-Bridged by fzf-async from `fzf-async-cache-size' via `:around' advice."
+Bridged by fzfa from `fzfa-cache-size' via `:around' advice."
   :type 'integer
   :group 'fzf-native)
 
@@ -161,7 +161,7 @@ selected by `fzf-native-filter-only-logic' (OR by default).  Async
 reads this once at session start; sync (`fzf-native-score-all')
 reads it on every call.
 
-Bridged by fzf-async from `fzf-async-filter-only-min-pool' via
+Bridged by fzfa from `fzfa-filter-only-min-pool' via
 `:around' advice."
   :type '(choice (const :tag "Disabled" nil)
                  (integer :tag "Minimum pool size"))
@@ -193,7 +193,7 @@ Composes with `fzf-native-filter-only-min-pool' under the rule
 selected by `fzf-native-filter-only-logic' (OR by default — either
 trigger is sufficient).
 
-Bridged by higher-level packages (fzf-async, fussy) via the usual
+Bridged by higher-level packages (fzfa, fussy) via the usual
 `:around' advice / `setq-local' patterns."
   :type '(choice (const :tag "Disabled" nil)
                  (integer :tag "Maximum query length"))

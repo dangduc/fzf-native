@@ -103,20 +103,20 @@ that provides a ~completing-style~ for intelligent matching and
 sorting. See [[https://github.com/jojojames/fussy/blob/HEAD/architecture.org][fussy's architecture overview]]
 for how fussy dispatches to ~fzf-native~ during ~all-completions~.
 
-[[https://github.com/jojojames/fzf-async][fzf-async]]: an Emacs
+[[https://github.com/jojojames/fzfa][fzfa]]: an Emacs
 ~completing-read~ wrapper that uses ~fzf-native~'s async surface to
 stream candidates from long-running shell commands (~find~, ~rg~,
 ~git ls-files~, etc.) without blocking. See
-[[https://github.com/jojojames/fzf-async/blob/HEAD/architecture.org][fzf-async's architecture overview]]
+[[https://github.com/jojojames/fzfa/blob/HEAD/architecture.org][fzfa's architecture overview]]
 for the Elisp-side pipeline.
 
 ** Customization
 
 The C module reads the following defcustoms via ~symbol-value~ at call
-time.  Higher-level packages (~fussy~, ~fzf-async~) keep their own
+time.  Higher-level packages (~fussy~, ~fzfa~) keep their own
 user-facing defcustoms and bridge their values onto these canonical
 names — ~fussy~ via ~setq-local~ (synchronous, same-buffer call
-pattern), ~fzf-async~ via ~:around~ advice on the C entry points
+pattern), ~fzfa~ via ~:around~ advice on the C entry points
 (timer-driven, cross-buffer).  Set these directly only if you call
 ~fzf-native-score~ / ~fzf-native-score-all~ / ~fzf-native-async-*~
 yourself; otherwise prefer the package-level knob.
