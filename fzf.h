@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef FZF_H_
 #define FZF_H_
 

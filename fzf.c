@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "fzf.h"
 
 #include <string.h>
