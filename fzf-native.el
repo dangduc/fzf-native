@@ -38,6 +38,13 @@
 (defconst fzf-native--dyn-name "fzf-native-module"
   "Dynamic module name.")
 
+(defvar fzf-native-loaded nil
+  "Non-nil after the fzf-native dynamic module has been loaded.
+Set by `fzf-native-load-dyn', `fzf-native-load-own-build-dyn', and
+`fzf-native-ensure-loaded'.  Libraries that depend on the C entry
+points can call `fzf-native-ensure-loaded' to guarantee the module
+is available without tracking load state themselves.")
+
 (defconst fzf-native--bin-dir
   (concat (file-name-directory load-file-name) "bin/")
   "Pre-built binaries directory path.")
@@ -294,6 +301,7 @@ on each module load."
                      (t (concat "Linux/" fzf-native--dyn-name ".so"))))
          (dyn-path (concat fzf-native--bin-dir dyn-name)))
     (module-load dyn-path)
+    (setq fzf-native-loaded t)
     (message "[INFO] Successfully load dynamic module, `%s`" dyn-name)))
 
 ;;;###autoload
@@ -308,7 +316,17 @@ on each module load."
                                                       fzf-native-module-cmake-args)))
             (fzf-native-module-compile))
           (require 'fzf-native-module))
-      (error "Fzf-Native will not work until `fzf-native-module' is compiled!"))))
+      (error "Fzf-Native will not work until `fzf-native-module' is compiled!")))
+  (setq fzf-native-loaded t))
+
+;;;###autoload
+(defun fzf-native-ensure-loaded ()
+  "Load the fzf-native dynamic module if it isn't loaded yet.
+Calls `fzf-native-load-dyn' on first use and is a no-op on
+subsequent calls.  Intended for library code that needs the C
+entry points available before invoking them."
+  (unless fzf-native-loaded
+    (fzf-native-load-dyn)))
 
 (provide 'fzf-native)
 ;;; fzf-native.el ends here
