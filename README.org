@@ -49,7 +49,8 @@ Pre-built shared libraries are in the [[bin][bin/]] directory.
 
 *** MELPA
 
-Not yet on MELPA.
+M-x package-install
+fzf-native
 
 *** Manually
 
