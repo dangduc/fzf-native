@@ -3,7 +3,7 @@
 ;; Copyright 2021 Duc Dang
 ;; Author: Duc Dang <me@dangduc.com>
 ;; Assisted-by: Claude:claude-opus-4-7
-;; Version: 1.0
+;; Version: 1.1
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: matching
 ;; Homepage: https://github.com/dangduc/fzf-native
@@ -33,6 +33,7 @@
 (declare-function fzf-native-async-generation "fzf-native-module" (handle))
 (declare-function fzf-native-async-candidates "fzf-native-module" (handle filter &optional limit))
 (declare-function fzf-native-async-stats "fzf-native-module" (handle))
+(declare-function fzf-native-async-result-fresh-p "fzf-native-module" (handle query))
 (declare-function fzf-native-filter-only-p "fzf-native-module" (query-length pool-size))
 
 (defconst fzf-native--dyn-name "fzf-native-module"

@@ -2342,6 +2342,47 @@ fzf_native_async_stats(emacs_env *env, ptrdiff_t UNUSED(nargs),
   });
 }
 
+/* fzf-native-async-result-fresh-p HANDLE QUERY -> t / nil
+
+   Returns t iff the result cache holds an entry for QUERY whose
+   `pool_gen' equals the current pool size — i.e. scoring has
+   completed for this exact query against every candidate streamed
+   so far.  In that state any value previously returned by
+   `fzf-native-async-candidates' for QUERY is authoritative, including
+   nil (zero matches): the cache entry exists and its top-K is empty.
+
+   Returns nil when no cache entry exists for QUERY, when the entry's
+   `pool_gen' lags the current pool (scoring is mid-refinement), or
+   when HANDLE is invalid.  In those states a nil return from
+   `fzf-native-async-candidates' is "no information yet", not zero. */
+static emacs_value
+fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
+                                emacs_value args[], void *UNUSED(data)) {
+  AsyncSession *s = env->get_user_ptr(env, args[0]);
+  if (!s) return Qnil;
+
+  ptrdiff_t qlen = 0;
+  if (!env->copy_string_contents(env, args[1], NULL, &qlen)) return Qnil;
+  char *query = malloc((size_t)qlen);
+  if (!query) return Qnil;
+  if (!env->copy_string_contents(env, args[1], query, &qlen)) {
+    free(query);
+    return Qnil;
+  }
+
+  pthread_mutex_lock(&s->mu);
+  size_t cur_pool = s->count;
+  pthread_mutex_unlock(&s->mu);
+
+  pthread_mutex_lock(&s->cache.mu);
+  CacheEntry *e = cache_find_locked(&s->cache, query);
+  bool fresh = (e != NULL && e->pool_gen == cur_pool);
+  pthread_mutex_unlock(&s->cache.mu);
+
+  free(query);
+  return fresh ? Qt : Qnil;
+}
+
 #endif /* APPLE || linux || FreeBSD */
 
 /* fzf-native-filter-only-p QUERY-LENGTH POOL-SIZE -> t / nil
@@ -2473,6 +2514,16 @@ int emacs_module_init(struct emacs_runtime *rt) {
       env->make_function(env, 1, 1, fzf_native_async_stats,
                          "Return (FILTERED . TOTAL) counts from the last async-candidates call.\n\n"
                          "\\(fn HANDLE)", NULL),
+    });
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-result-fresh-p"),
+      env->make_function(env, 2, 2, fzf_native_async_result_fresh_p,
+                         "Return non-nil when the result cache for QUERY is fresh on HANDLE.\n"
+                         "Fresh means scoring has completed for QUERY at the current pool\n"
+                         "size, so the most recent `fzf-native-async-candidates' return for\n"
+                         "QUERY is authoritative — a nil return in that state means zero\n"
+                         "matches, not in-flight.\n\n"
+                         "\\(fn HANDLE QUERY)", NULL),
     });
 #endif
 

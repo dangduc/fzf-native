@@ -283,6 +283,19 @@ TIMEOUT seconds (default 5), calling candidates each iteration."
       (fzf-native-async-candidates handle filter limit)
     (fzf-native-async-candidates handle filter)))
 
+(defun fzf-native-test--wait-for-fresh (handle filter &optional timeout)
+  "Drive scoring for FILTER and poll `result-fresh-p' until t.
+Unlike `wait-for-scoring' (which exits as soon as stats are updated by
+*any* candidates call, racing the actual scoring), this returns only
+once the result cache holds an entry for FILTER at the current pool
+size.  Times out after TIMEOUT seconds (default 5)."
+  (let ((deadline (+ (float-time) (or timeout 5.0))))
+    (while (and (not (fzf-native-async-result-fresh-p handle filter))
+                (< (float-time) deadline))
+      (fzf-native-async-candidates handle filter)
+      (sleep-for 0.05)))
+  (fzf-native-async-result-fresh-p handle filter))
+
 (ert-deftest fzf-native-async-lifecycle-test ()
   "Start → wait for data → generation advances → stop."
   (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz")))
@@ -445,4 +458,95 @@ in fzf and the cache should treat them so via term-set subsumption
             (should r1)
             (should (equal r1 r2))))
       (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-result-fresh-p-before-scoring-test ()
+  "`result-fresh-p' is nil for any query before scoring runs."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz")))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-data handle)
+          ;; No async-candidates call yet → no cache entry → not fresh.
+          (should-not (fzf-native-async-result-fresh-p handle ""))
+          (should-not (fzf-native-async-result-fresh-p handle "foo")))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-result-fresh-p-after-scoring-test ()
+  "`result-fresh-p' returns t for a query after its scoring completes."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz foobaz")))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-data handle)
+          (should (fzf-native-test--wait-for-fresh handle "foo")))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-result-fresh-p-per-query-test ()
+  "`result-fresh-p' is keyed by query: fresh for one, nil for another."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz foobaz")))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-data handle)
+          (should (fzf-native-test--wait-for-fresh handle "foo"))
+          (should     (fzf-native-async-result-fresh-p handle "foo"))
+          (should-not (fzf-native-async-result-fresh-p handle "bar"))
+          (should-not (fzf-native-async-result-fresh-p handle "qqq")))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-result-fresh-p-zero-match-test ()
+  "Authoritative zero: scoring done for a non-matching query — candidates
+returns nil AND fresh-p returns t.  This is the load-bearing case for
+distinguishing \"no matches\" from \"scoring in flight\"."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz")))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-data handle)
+          (should (fzf-native-test--wait-for-fresh handle "zzz"))
+          (should-not (fzf-native-async-candidates handle "zzz"))
+          (should (fzf-native-async-result-fresh-p handle "zzz")))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-result-fresh-p-pool-grew-stale-test ()
+  "After scoring at pool size N, the arrival of more candidates makes
+the cache entry stale: `pool_gen' lags `s->count' and `fresh-p' flips
+to nil.  Uses a two-phase Python producer with a deliberate pause:
+phase 1 emits 3 items so scoring can settle against a stable pool,
+phase 2 streams more items so the cache entry's `pool_gen' falls
+behind by the time `fresh-p' is checked."
+  (skip-unless (and (fboundp 'fzf-native-async-start)
+                    (executable-find "python3")))
+  (let ((handle (fzf-native-async-start
+                 "python3 -u -c 'import time
+for i in range(3): print(f\"a{i}\", flush=True)
+time.sleep(0.5)
+for i in range(40):
+    print(f\"b{i}\", flush=True)
+    time.sleep(0.005)
+'")))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-data handle)
+          ;; Let phase 1's 3 items settle, then score against the stable pool.
+          (sleep-for 0.1)
+          (should (fzf-native-test--wait-for-fresh handle "a"))
+          ;; Sleep through phase 2 — items stream in, pool grows.  No
+          ;; `async-candidates' calls in this window, so the cache entry
+          ;; for "a" stays at its phase-1 `pool_gen' rather than getting
+          ;; refreshed by a refinement run.
+          (sleep-for 0.5)
+          ;; Pool grew → cache entry's `pool_gen' < `s->count' → stale.
+          (should-not (fzf-native-async-result-fresh-p handle "a")))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-result-fresh-p-after-stop-test ()
+  "After `async-stop', `result-fresh-p' returns nil on the dead handle."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz")))
+    (fzf-native-test--wait-for-data handle)
+    (fzf-native-test--wait-for-fresh handle "foo")
+    (should (fzf-native-async-result-fresh-p handle "foo"))
+    (fzf-native-async-stop handle)
+    (should-not (fzf-native-async-result-fresh-p handle "foo"))))
 
