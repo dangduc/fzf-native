@@ -303,7 +303,8 @@ on each module load."
          (dyn-path (concat fzf-native--bin-dir dyn-name)))
     (module-load dyn-path)
     (setq fzf-native-loaded t)
-    (message "[INFO] Successfully load dynamic module, `%s`" dyn-name)))
+    (let ((inhibit-message t))
+      (message "[INFO] Successfully load dynamic module, `%s`" dyn-name))))
 
 ;;;###autoload
 (defun fzf-native-load-own-build-dyn ()
