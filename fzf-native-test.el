@@ -550,3 +550,117 @@ for i in range(40):
     (fzf-native-async-stop handle)
     (should-not (fzf-native-async-result-fresh-p handle "foo"))))
 
+;;
+;; Stress / robustness — exercise the corner-case paths that surfaced in
+;; on-machine crash investigation (06-06 finalizer-during-GC race,
+;; intermittent "memory buffer too small" reports).  Each test generates
+;; its own data inline; no fixture files are required.
+;;
+
+(ert-deftest fzf-native-async-invalid-unibyte-test ()
+  "Invalid UTF-8 bytes in the candidate stream must not signal.
+Exercises the async reader → arena_strdup → `make_string' path with
+byte junk that would otherwise trip `unicode-string-p' if the C side
+ever decoded these as Emacs strings without coercion."
+  (skip-unless (and (fboundp 'fzf-native-async-start)
+                    (executable-find "python3")))
+  (let ((handle (fzf-native-async-start
+                 "python3 -u -c 'import sys
+sys.stdout.buffer.write(b\"valid_line\\n\")
+sys.stdout.buffer.write(b\"junk\\x80\\x81\\xfe\\xff_more\\n\")
+sys.stdout.buffer.write(b\"another_valid\\n\")
+'")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let ((result (fzf-native-test--wait-for-scoring handle "valid")))
+            (should result)
+            ;; "valid_line" and "another_valid" both match "valid"; the
+            ;; byte-junk line should be either coerced or silently dropped.
+            (should (cl-some (lambda (s) (string-match-p "valid" s)) result))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-multibyte-candidates-test ()
+  "Async path scores multibyte candidates (CJK)."
+  (skip-unless (and (fboundp 'fzf-native-async-start)
+                    (executable-find "python3")))
+  (let ((handle (fzf-native-async-start
+                 "python3 -u -c 'print(\"你好世界\"); print(\"Hello\"); print(\"你是\")'")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let ((result (fzf-native-test--wait-for-scoring handle "你")))
+            (should (member "你好世界" result))
+            (should (member "你是" result))
+            (should-not (member "Hello" result))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-long-line-whole-test ()
+  "Lines much larger than the reader's initial buffer must arrive as a
+single whole candidate, not as fragments split at I/O boundaries.
+
+The reader uses `getline', which grows its buffer to fit each logical
+line.  Pre-getline, the reader used `fgets' with a fixed 8 KB stack
+buffer and chopped long lines into 8 KB shards at arbitrary positions
+— making fuzzy-matching against the original line impossible and
+leaking subtle partial-tail candidates whenever the line length
+landed in (8192, 8192+cap].  This test guards against regression to
+that behavior.
+
+`fzf-native-max-line-length' is lifted so the long line isn't excluded
+by the user-facing cap before we can observe whole-line delivery."
+  (skip-unless (and (fboundp 'fzf-native-async-start)
+                    (executable-find "python3")))
+  (let* ((fzf-native-max-line-length nil)
+         (handle (fzf-native-async-start
+                  "python3 -u -c 'print(\"a\" * 9000 + \"NEEDLE\" + \"b\" * 9000)'")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let ((result (fzf-native-test--wait-for-scoring handle "NEEDLE")))
+            (should result)
+            ;; Exactly one candidate, holding the full 18006-char line.
+            (should (= (length result) 1))
+            (should (= (length (car result)) (+ 9000 6 9000)))
+            (should (string-match-p "NEEDLE" (car result)))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-large-pool-finalize-test ()
+  "Ingest ~50k candidates, dispatch a typing progression, then stop
+cleanly.  Smoke-tests the destroy path under realistic load (arena
+chunks, multiple cache entries, scoring thread mid-run)."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (let ((handle (fzf-native-async-start "seq 1 50000")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle 15.0))
+          (dolist (q '("1" "12" "123" "1234"))
+            (fzf-native-test--wait-for-scoring handle q 100 5.0))
+          (should (consp (fzf-native-async-stats handle))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-gc-during-active-workers-test ()
+  "Drop the session handle while reader/scoring threads are still
+active, then force GC.  Emacs must not crash and must remain
+responsive.  This is the on-machine 06-06 finalizer-race reproducer:
+`async_session_destroy' is invoked from `sweep_vectors' during GC,
+calls `pthread_join' on workers that may be mid-malloc, and previously
+deadlocked on the macOS xzone fork-lock.
+
+The handle is bound only in the inner `let' so it becomes unreachable
+once the form exits; the trailing `(setq handle nil)' explicitly drops
+the lexical slot in case the byte compiler keeps it alive longer than
+needed.  No `async-stop' here on purpose — we want the finalizer path."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (dotimes (_ 5)
+    (let ((handle (fzf-native-async-start "seq 1 100000")))
+      (fzf-native-test--wait-for-data handle)
+      ;; Kick scoring so the score thread is also active when we drop.
+      (fzf-native-async-candidates handle "1" 100)
+      (setq handle nil))
+    (garbage-collect)
+    (garbage-collect))
+  ;; If we got here without aborting Emacs, the finalizer survived
+  ;; the race for this run.  Confirm the module is still usable.
+  (should (equal (fzf-native-score "abcdefghi" "acef") '(78))))
+

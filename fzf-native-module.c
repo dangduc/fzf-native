@@ -947,7 +947,6 @@ emacs_value fzf_native_make_slab(emacs_env *env,
 
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 
-#define ASYNC_LINE_MAX   8192
 #define ARENA_CHUNK_SIZE (4 * 1024 * 1024)  /* 4 MB per chunk */
 
 /* Chunked candidate-pointer storage.
@@ -1443,9 +1442,25 @@ typedef struct {
 static void *async_reader(void *arg) {
   AsyncSession *s = arg;
   fzf_log("async_reader START: pid=%d\n", (int)s->pid);
-  char line[ASYNC_LINE_MAX];
-  while (!atomic_load_explicit(&s->stop, memory_order_relaxed) && s->fp && fgets(line, sizeof line, s->fp)) {
-    size_t len = strlen(line);
+  /* getline manages a growable buffer that delivers whole logical
+     lines regardless of length.  Pre-getline, the reader used fgets
+     with a fixed 8 KB stack buffer and fragmented long lines at
+     arbitrary I/O boundaries.
+
+     No internal hard ceiling — matches the semantics of fzf, ripgrep,
+     and GNU grep, which all let the reader buffer grow until either
+     the line ends or the OS denies allocation.  The user-facing knob
+     `fzf-native-max-line-length' is checked *after* getline returns
+     (analogous to ripgrep's `--max-columns'), so pathological lines
+     are filtered from the candidate stream but the read itself still
+     happens.  Users who need to truncate before reading can set the
+     producer's output up-front (e.g. `awk 'length<256'`). */
+  char  *line   = NULL;
+  size_t bufcap = 0;
+  ssize_t glen;
+  while (!atomic_load_explicit(&s->stop, memory_order_relaxed) && s->fp &&
+         (glen = getline(&line, &bufcap, s->fp)) != -1) {
+    size_t len = (size_t)glen;
     while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
       line[--len] = '\0';
     len = async_strip_ansi(line, len);
@@ -1505,6 +1520,7 @@ static void *async_reader(void *arg) {
     pthread_mutex_unlock(&s->mu);
     atomic_fetch_add_explicit(&s->gen, 1, memory_order_relaxed);
   }
+  free(line);
   fzf_log("async_reader EXIT: total=%zu gen=%d\n",
           s->count, (int)atomic_load_explicit(&s->gen, memory_order_relaxed));
   return NULL;

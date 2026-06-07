@@ -364,6 +364,40 @@ static void test_async_reader_many_lines(void) {
   free_async_session(s);
 }
 
+/* Pre-getline, the reader used `fgets' into a fixed 8 KB stack buffer and
+   chopped any line longer than that into 8 KB shards at arbitrary I/O
+   boundaries.  After the switch to getline, a single 20 KB logical line
+   must arrive as exactly one candidate of length 20000.  Regression guard
+   for the fragmentation bug. */
+static void test_async_reader_long_line(void) {
+  enum { LINE_LEN = 20000 };
+  int pfd[2];
+  CHECK(pipe(pfd) == 0);
+  FILE *wfp = fdopen(pfd[1], "w");
+  CHECK(wfp != NULL);
+  for (int i = 0; i < LINE_LEN; i++) fputc('x', wfp);
+  fputc('\n', wfp);
+  fclose(wfp);
+
+  FILE *rfp = fdopen(pfd[0], "r");
+  CHECK(rfp != NULL);
+  AsyncSession *s = make_async_session(rfp, 8);
+  CHECK(s != NULL);
+  /* max_line_length=0 (calloc default) → unbounded mode; the long line
+     is delivered intact rather than excluded by the user-facing cap. */
+
+  async_reader((void *)s);
+
+  CHECK(s->count == 1);
+  const char *cand = cands_at(s, 0);
+  CHECK(cand != NULL);
+  CHECK(strlen(cand) == (size_t)LINE_LEN);
+  /* Sanity: first/last bytes match what we wrote, no I/O-boundary garbage. */
+  CHECK(cand[0]            == 'x');
+  CHECK(cand[LINE_LEN - 1] == 'x');
+  free_async_session(s);
+}
+
 /* =====================================================================
  * Chunked candidate storage — index split formula and accessor
  * ===================================================================== */
@@ -827,6 +861,7 @@ int main(void) {
   RUN(test_async_reader_basic);
   RUN(test_async_reader_ansi_stripping);
   RUN(test_async_reader_many_lines);
+  RUN(test_async_reader_long_line);
 
   printf("--- chunked cands_top ---\n");
   RUN(test_cands_top_index_split);
