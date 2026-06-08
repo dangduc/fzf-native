@@ -100,7 +100,7 @@ emacs_value Fsymbol_value;
 /* Cached defcustom name symbols — interned once at init, looked up via
    `defcustom_value' on each read.  The values themselves stay dynamic
    so user `setq' / `customize-set-variable' is respected. */
-emacs_value Qsym_case_mode, Qsym_batch_highlight, Qsym_async_highlight;
+emacs_value Qsym_case_mode, Qsym_fuzzy, Qsym_batch_highlight, Qsym_async_highlight;
 emacs_value Qsym_max_line_length, Qsym_async_cache_size, Qsym_filter_only_min_pool;
 emacs_value Qsym_filter_only_length, Qsym_filter_only_logic;
 emacs_value Qsym_shell_file_name, Qsym_shell_command_switch, Qsym_exec_path;
@@ -415,6 +415,14 @@ static fzf_case_types resolve_fzf_native_case_mode(emacs_env *env) {
   return CaseSmart;
 }
 
+/* Read `fzf-native-fuzzy' via symbol-value and resolve to a bool.
+   Returns false only for an explicit nil; defaults to true on any read
+   failure so the historical fuzzy-on behaviour is preserved. */
+static bool resolve_fzf_native_fuzzy(emacs_env *env) {
+  emacs_value v = defcustom_value(env, Qsym_fuzzy, Qt);
+  return !env->eq(env, v, Qnil);
+}
+
 /* Read fussy-fzf-native-highlight via symbol-value and resolve to a cap.
    Returns:
      0    — no highlighting (nil, negative, unreadable, or zero).
@@ -570,6 +578,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
   }
 
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
+  bool           fuzzy     = resolve_fzf_native_fuzzy(env);
 
   /* Decide filter-only mode from the two thresholds and the logic knob.
      Evaluated once before the workers spawn; the result rides on `shared'.
@@ -583,7 +592,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
           (int)filter_only_mode, fo_min_pool, fo_max_len,
           fo_logic_and ? "and" : "or", query.len, n);
 
-  fzf_pattern_t *pattern = fzf_parse_pattern(case_mode, false, query.b, true);
+  fzf_pattern_t *pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
   struct Shared shared = {
     .pattern = pattern,
     .batches = batches,
@@ -658,7 +667,7 @@ err_join_threads:
   fzf_pattern_t *hl_pattern = NULL;
   fzf_slab_t    *hl_slab    = NULL;
   if (hl_cap > 0) {
-    hl_pattern = fzf_parse_pattern(case_mode, false, query.b, true);
+    hl_pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
     if (hl_pattern) hl_slab = fzf_make_default_slab();
     if (!hl_slab) {
       if (hl_pattern) { fzf_free_pattern(hl_pattern); hl_pattern = NULL; }
@@ -781,7 +790,8 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
 
   if (!clear_only) {
     fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
-    pattern = fzf_parse_pattern(case_mode, false, query.b, true);
+    bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+    pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
     if (!pattern) goto done;
     slab = fzf_make_default_slab();
     if (!slab) goto done;
@@ -872,7 +882,8 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
    * fuzzy bool         : Enable or disable fuzzy matching
    */
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
-  fzf_pattern_t *pattern = fzf_parse_pattern(case_mode, false, query.b, true);
+  bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+  fzf_pattern_t *pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
   if (!pattern) { goto err; }
 
   fzf_slab_t *slab;
@@ -1182,11 +1193,12 @@ static bool subsumes_pattern(const fzf_pattern_t *p_prime,
    is empty or parsing fails.  fzf_parse_pattern mutates its input, so we
    strdup first and free after — the returned pattern is self-contained. */
 static fzf_pattern_t *parse_query_for_cache(const char *query,
-                                            fzf_case_types case_mode) {
+                                            fzf_case_types case_mode,
+                                            bool fuzzy) {
   if (!query || !*query) return NULL;
   char *dup = strdup(query);
   if (!dup) return NULL;
-  fzf_pattern_t *p = fzf_parse_pattern(case_mode, false, dup, true);
+  fzf_pattern_t *p = fzf_parse_pattern(case_mode, false, dup, fuzzy);
   free(dup);
   return p;
 }
@@ -1235,12 +1247,12 @@ static bool cache_lookup_exact(Cache *c, const char *query,
    back to byte-prefix-length tiebreak when both have equal term counts
    (or for entries whose parsed pattern is unavailable). */
 static bool cache_lookup_prefix(Cache *c, const char *query,
-                                fzf_case_types case_mode,
+                                fzf_case_types case_mode, bool fuzzy,
                                 ScoredStr **out_top, size_t *out_top_count,
                                 SharedIdx **out_m_idx, size_t *out_pool_gen) {
   if (strchr(query, '|')) return false;   /* fast reject */
 
-  fzf_pattern_t *p_query = parse_query_for_cache(query, case_mode);
+  fzf_pattern_t *p_query = parse_query_for_cache(query, case_mode, fuzzy);
   /* If parse failed and query isn't empty, fall back to byte-prefix only.
      Empty query has p_query == NULL but byte-prefix subsumes("", anything)
      also returns true so the loop still works. */
@@ -1297,7 +1309,7 @@ static bool cache_lookup_prefix(Cache *c, const char *query,
    or empty match sets); the entry is still inserted, but is then ineligible
    as a prefix-refinement source. */
 static void cache_insert(Cache *c, const char *query, size_t pool_gen,
-                         fzf_case_types case_mode,
+                         fzf_case_types case_mode, bool fuzzy,
                          const ScoredStr *top, size_t top_count,
                          const uint32_t *m_idx_src, size_t m_idx_count) {
   /* Pre-allocate everything outside the mutex. */
@@ -1313,7 +1325,7 @@ static void cache_insert(Cache *c, const char *query, size_t pool_gen,
   /* Parse once on insert so cache_lookup_prefix doesn't pay parse cost on
      every iteration of its scan loop.  NULL is fine — entries with NULL
      parsed only participate via the byte-prefix subsumption fallback. */
-  fzf_pattern_t *parsed = parse_query_for_cache(query, case_mode);
+  fzf_pattern_t *parsed = parse_query_for_cache(query, case_mode, fuzzy);
 
   if (!q_dup) {
     free(top_dup);
@@ -1399,6 +1411,7 @@ typedef struct {
   char            *score_req_filter;  /* owned; NULL = nothing pending */
   size_t           score_req_limit;
   fzf_case_types   score_req_case_mode;
+  bool             score_req_fuzzy;
   /* Refinement request: when score_req_refine_idx is non-NULL the next scoring
      run scores only those candidate indices plus s->cands[refine_delta_from..count].
      Ownership transfers to the scoring thread along with score_req_filter. */
@@ -1907,6 +1920,7 @@ static void *scoring_thread_fn(void *arg) {
     char           *filter           = s->score_req_filter;       /* steal ownership */
     size_t          limit            = s->score_req_limit;
     fzf_case_types  case_mode        = s->score_req_case_mode;
+    bool            fuzzy            = s->score_req_fuzzy;
     SharedIdx      *refine_idx       = s->score_req_refine_idx;   /* steal */
     size_t          refine_delta_from = s->score_req_refine_delta_from;
     size_t          fo_max_len       = s->score_req_filter_only_length;
@@ -2042,7 +2056,7 @@ static void *scoring_thread_fn(void *arg) {
     unsigned max_workers = (unsigned)sysconf(_SC_NPROCESSORS_ONLN);
 
     size_t flen = strlen(filter);
-    fzf_pattern_t *pattern = flen ? fzf_parse_pattern(case_mode, false, filter, true) : NULL;
+    fzf_pattern_t *pattern = flen ? fzf_parse_pattern(case_mode, false, filter, fuzzy) : NULL;
     bool has_pattern = (pattern != NULL);
 
     struct AsyncScoringShared shared = {
@@ -2123,7 +2137,7 @@ static void *scoring_thread_fn(void *arg) {
     /* Cache the result.  pool_gen = count (the pool size we actually scored).
        For refine runs, count may be > refine_delta_from, so the new entry
        supersedes the old one as a refinement source for the same query. */
-    cache_insert(&s->cache, filter, count, case_mode, flat, emit, m_idx_buf, pos);
+    cache_insert(&s->cache, filter, count, case_mode, fuzzy, flat, emit, m_idx_buf, pos);
     free(m_idx_buf);
 
     /* Clear active-filter marker before publishing results */
@@ -2175,6 +2189,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     limit = (size_t)env->extract_integer(env, args[2]);
 
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
+  bool           fuzzy     = resolve_fzf_native_fuzzy(env);
 
   /* Cache lookup.  Exact-fresh hits skip scoring entirely; exact-stale
      and prefix hits dispatch a refinement scoring run that scans only
@@ -2190,7 +2205,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
                                       &cached_m_idx, &cached_pool_gen);
   bool prefix_hit = false;
   if (!exact_hit)
-    prefix_hit = cache_lookup_prefix(&s->cache, filter, case_mode,
+    prefix_hit = cache_lookup_prefix(&s->cache, filter, case_mode, fuzzy,
                                      &cached_top, &cached_count,
                                      &cached_m_idx, &cached_pool_gen);
 
@@ -2238,6 +2253,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     s->score_req_filter            = filter;          /* transfer */
     s->score_req_limit             = limit;
     s->score_req_case_mode         = case_mode;
+    s->score_req_fuzzy             = fuzzy;
     s->score_req_refine_idx        = cached_m_idx;    /* transfer (NULL on miss) */
     s->score_req_refine_delta_from = cached_pool_gen;
     s->score_req_filter_only_length     = fo_max_len;
@@ -2302,7 +2318,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     /* nil or negative integer → hl_cap stays 0, no highlighting */
   }
   if (hl_cap > 0) {
-    hl_pattern = fzf_parse_pattern(case_mode, false, filter_for_hilit, true);
+    hl_pattern = fzf_parse_pattern(case_mode, false, filter_for_hilit, fuzzy);
     hl_slab    = fzf_make_default_slab();
   }
 
@@ -2607,6 +2623,7 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Fput_text_property = env->make_global_ref(env, env->intern(env, "put-text-property"));
   Fsymbol_value = env->make_global_ref(env, env->intern(env, "symbol-value"));
   Qsym_case_mode            = env->make_global_ref(env, env->intern(env, "fzf-native-case-mode"));
+  Qsym_fuzzy                = env->make_global_ref(env, env->intern(env, "fzf-native-fuzzy"));
   Qsym_batch_highlight      = env->make_global_ref(env, env->intern(env, "fzf-native-batch-highlight"));
   Qsym_async_highlight      = env->make_global_ref(env, env->intern(env, "fzf-native-async-highlight"));
   Qsym_max_line_length      = env->make_global_ref(env, env->intern(env, "fzf-native-max-line-length"));

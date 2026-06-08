@@ -476,7 +476,7 @@ static void test_cache_insert_then_lookup_hit(void) {
   cache_init(&c, 20);
   ScoredStr top[2] = { make_top("alpha", 42), make_top("beta", 17) };
 
-  cache_insert(&c, "fo", 1000, CaseSmart, top, 2, NULL, 0);
+  cache_insert(&c, "fo", 1000, CaseSmart, true, top, 2, NULL, 0);
 
   ScoredStr *out = NULL;
   SharedIdx *out_sidx = NULL;
@@ -498,7 +498,7 @@ static void test_cache_lookup_miss_distinct_query(void) {
   Cache c;
   cache_init(&c, 20);
   ScoredStr top[1] = { make_top("alpha", 42) };
-  cache_insert(&c, "fo", 100, CaseSmart, top, 1, NULL, 0);
+  cache_insert(&c, "fo", 100, CaseSmart, true, top, 1, NULL, 0);
 
   ScoredStr *out = NULL;
   SharedIdx *out_sidx = NULL;
@@ -517,8 +517,8 @@ static void test_cache_insert_updates_in_place(void) {
   ScoredStr v1[1] = { make_top("alpha", 10) };
   ScoredStr v2[2] = { make_top("alpha", 99), make_top("beta", 50) };
 
-  cache_insert(&c, "fo", 100, CaseSmart, v1, 1, NULL, 0);
-  cache_insert(&c, "fo", 200, CaseSmart, v2, 2, NULL, 0);
+  cache_insert(&c, "fo", 100, CaseSmart, true, v1, 1, NULL, 0);
+  cache_insert(&c, "fo", 200, CaseSmart, true, v2, 2, NULL, 0);
   CHECK(c.count == 1);
 
   ScoredStr *out = NULL;
@@ -544,12 +544,12 @@ static void test_cache_lru_eviction_at_capacity(void) {
   char qbuf[16];
   for (size_t i = 0; i < MAX; i++) {
     snprintf(qbuf, sizeof qbuf, "q%zu", i);
-    cache_insert(&c, qbuf, (size_t)i, CaseSmart, one, 1, NULL, 0);
+    cache_insert(&c, qbuf, (size_t)i, CaseSmart, true, one, 1, NULL, 0);
   }
   CHECK(c.count == MAX);
 
   /* Insert one more — should evict q0 (the LRU tail). */
-  cache_insert(&c, "extra", 999, CaseSmart, one, 1, NULL, 0);
+  cache_insert(&c, "extra", 999, CaseSmart, true, one, 1, NULL, 0);
   CHECK(c.count == MAX);
 
   ScoredStr *out = NULL;
@@ -587,7 +587,7 @@ static void test_cache_touch_on_hit(void) {
   char qbuf[16];
   for (size_t i = 0; i < MAX; i++) {
     snprintf(qbuf, sizeof qbuf, "q%zu", i);
-    cache_insert(&c, qbuf, (size_t)i, CaseSmart, one, 1, NULL, 0);
+    cache_insert(&c, qbuf, (size_t)i, CaseSmart, true, one, 1, NULL, 0);
   }
 
   /* Touch q0 — moves it to head (MRU). */
@@ -598,7 +598,7 @@ static void test_cache_touch_on_hit(void) {
   free(out);
 
   /* Now the LRU tail is q1.  Insert one more; q1 should be evicted. */
-  cache_insert(&c, "extra", 999, CaseSmart, one, 1, NULL, 0);
+  cache_insert(&c, "extra", 999, CaseSmart, true, one, 1, NULL, 0);
 
   out = NULL; out_sidx = NULL; out_count = 0; out_gen = 0;
   CHECK(cache_lookup_exact(&c, "q0", &out, &out_count, &out_sidx, &out_gen) == true);
@@ -615,7 +615,7 @@ static void test_cache_insert_zero_count(void) {
      stores and looks up cleanly. */
   Cache c;
   cache_init(&c, 20);
-  cache_insert(&c, "nothing", 500, CaseSmart, NULL, 0, NULL, 0);
+  cache_insert(&c, "nothing", 500, CaseSmart, true, NULL, 0, NULL, 0);
 
   ScoredStr *out = (ScoredStr *)0xdeadbeef;
   SharedIdx *out_sidx = NULL;
@@ -634,7 +634,7 @@ static void test_cache_pool_gen_distinguishes_stale(void) {
   Cache c;
   cache_init(&c, 20);
   ScoredStr top[1] = { make_top("alpha", 1) };
-  cache_insert(&c, "fo", 100, CaseSmart, top, 1, NULL, 0);
+  cache_insert(&c, "fo", 100, CaseSmart, true, top, 1, NULL, 0);
 
   ScoredStr *out = NULL;
   SharedIdx *out_sidx = NULL;
@@ -644,7 +644,7 @@ static void test_cache_pool_gen_distinguishes_stale(void) {
   free(out);
 
   /* Re-insert at a new pool_gen; lookup should reflect the latest. */
-  cache_insert(&c, "fo", 5000, CaseSmart, top, 1, NULL, 0);
+  cache_insert(&c, "fo", 5000, CaseSmart, true, top, 1, NULL, 0);
   out = NULL; out_count = 0; out_gen = 0;
   CHECK(cache_lookup_exact(&c, "fo", &out, &out_count, &out_sidx, &out_gen) == true);
   CHECK(out_gen == 5000);
@@ -667,8 +667,8 @@ static void test_subsumes_pattern_extending_term_via_byte_prefix(void) {
 
 static void test_subsumes_pattern_adding_term_at_end(void) {
   /* "fo" → "fo bar": both rules agree.  Verify term-set path. */
-  fzf_pattern_t *p1 = parse_query_for_cache("fo", CaseSmart);
-  fzf_pattern_t *p2 = parse_query_for_cache("fo bar", CaseSmart);
+  fzf_pattern_t *p1 = parse_query_for_cache("fo", CaseSmart, true);
+  fzf_pattern_t *p2 = parse_query_for_cache("fo bar", CaseSmart, true);
   CHECK(p1 && p2);
   CHECK(subsumes_pattern(p1, p2) == true);
   CHECK(subsumes_pattern(p2, p1) == false);
@@ -679,8 +679,8 @@ static void test_subsumes_pattern_adding_term_at_end(void) {
 static void test_subsumes_pattern_adding_term_at_start(void) {
   /* "fo" → "x fo": v2-only case.  Byte-prefix says NO (fo not prefix of
      x fo), term-set says YES (fo's terms ⊆ x fo's terms). */
-  fzf_pattern_t *p1 = parse_query_for_cache("fo", CaseSmart);
-  fzf_pattern_t *p2 = parse_query_for_cache("x fo", CaseSmart);
+  fzf_pattern_t *p1 = parse_query_for_cache("fo", CaseSmart, true);
+  fzf_pattern_t *p2 = parse_query_for_cache("x fo", CaseSmart, true);
   CHECK(p1 && p2);
   CHECK(subsumes("fo", "x fo") == false);            /* v1 misses */
   CHECK(subsumes_pattern(p1, p2) == true);           /* v2 catches */
@@ -693,8 +693,8 @@ static void test_subsumes_pattern_term_reorder(void) {
   /* "foo bar" and "bar foo" are semantically equivalent in fzf — same
      term set, different textual order.  Term-set rule sees mutual
      subsumption; byte-prefix rule sees neither. */
-  fzf_pattern_t *p1 = parse_query_for_cache("foo bar", CaseSmart);
-  fzf_pattern_t *p2 = parse_query_for_cache("bar foo", CaseSmart);
+  fzf_pattern_t *p1 = parse_query_for_cache("foo bar", CaseSmart, true);
+  fzf_pattern_t *p2 = parse_query_for_cache("bar foo", CaseSmart, true);
   CHECK(p1 && p2);
   CHECK(subsumes("foo bar", "bar foo") == false);
   CHECK(subsumes("bar foo", "foo bar") == false);
@@ -707,8 +707,8 @@ static void test_subsumes_pattern_term_reorder(void) {
 static void test_subsumes_pattern_negation_at_start(void) {
   /* "fo" → "!x fo": adding a negation term in non-prefix position.
      Term-set rule catches it; byte-prefix doesn't. */
-  fzf_pattern_t *p1 = parse_query_for_cache("fo", CaseSmart);
-  fzf_pattern_t *p2 = parse_query_for_cache("!x fo", CaseSmart);
+  fzf_pattern_t *p1 = parse_query_for_cache("fo", CaseSmart, true);
+  fzf_pattern_t *p2 = parse_query_for_cache("!x fo", CaseSmart, true);
   CHECK(p1 && p2);
   CHECK(subsumes_pattern(p1, p2) == true);
   fzf_free_pattern(p1);
@@ -719,8 +719,8 @@ static void test_subsumes_pattern_or_query_rejected(void) {
   /* "fo | bar" parses as ONE term-set with TWO terms (within a set =
      OR; across sets = AND).  subsumes_pattern rejects any term-set with
      >1 term — it can never serve as a refinement source. */
-  fzf_pattern_t *p1 = parse_query_for_cache("fo", CaseSmart);
-  fzf_pattern_t *p2 = parse_query_for_cache("fo | bar", CaseSmart);
+  fzf_pattern_t *p1 = parse_query_for_cache("fo", CaseSmart, true);
+  fzf_pattern_t *p2 = parse_query_for_cache("fo | bar", CaseSmart, true);
   CHECK(p1 && p2);
   CHECK(p1->size == 1 && p1->ptr[0]->size == 1);  /* "fo": 1 set, 1 term */
   CHECK(p2->size == 1 && p2->ptr[0]->size == 2);  /* "fo|bar": 1 set, 2 terms */
@@ -732,8 +732,8 @@ static void test_subsumes_pattern_or_query_rejected(void) {
 
 static void test_subsumes_pattern_distinct_terms(void) {
   /* "foo" and "bar" share no terms; neither subsumes the other. */
-  fzf_pattern_t *p1 = parse_query_for_cache("foo", CaseSmart);
-  fzf_pattern_t *p2 = parse_query_for_cache("bar", CaseSmart);
+  fzf_pattern_t *p1 = parse_query_for_cache("foo", CaseSmart, true);
+  fzf_pattern_t *p2 = parse_query_for_cache("bar", CaseSmart, true);
   CHECK(p1 && p2);
   CHECK(subsumes_pattern(p1, p2) == false);
   CHECK(subsumes_pattern(p2, p1) == false);
@@ -746,7 +746,7 @@ static void test_subsumes_pattern_distinct_terms(void) {
    the lookup logic without caring about the actual indices. */
 static void cache_insert_eligible(Cache *c, const char *query, size_t pool_gen) {
   uint32_t idx[1] = { 0 };
-  cache_insert(c, query, pool_gen, CaseSmart, NULL, 0, idx, 1);
+  cache_insert(c, query, pool_gen, CaseSmart, true, NULL, 0, idx, 1);
 }
 
 static void test_cache_lookup_prefix_v2_finds_term_subset(void) {
@@ -758,7 +758,7 @@ static void test_cache_lookup_prefix_v2_finds_term_subset(void) {
   ScoredStr *out = NULL;
   SharedIdx *out_sidx = NULL;
   size_t out_count = 0, out_gen = 0;
-  CHECK(cache_lookup_prefix(&c, "x fo", CaseSmart, &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(cache_lookup_prefix(&c, "x fo", CaseSmart, true, &out, &out_count, &out_sidx, &out_gen) == true);
   CHECK(out_gen == 100);
   shared_idx_release(out_sidx);
   free(out);
@@ -777,7 +777,7 @@ static void test_cache_lookup_prefix_v2_finds_reordered(void) {
   ScoredStr *out = NULL;
   SharedIdx *out_sidx = NULL;
   size_t out_count = 0, out_gen = 0;
-  CHECK(cache_lookup_prefix(&c, "bar foo", CaseSmart, &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(cache_lookup_prefix(&c, "bar foo", CaseSmart, true, &out, &out_count, &out_sidx, &out_gen) == true);
   CHECK(out_gen == 100);
   shared_idx_release(out_sidx);
   free(out);
@@ -796,7 +796,7 @@ static void test_cache_lookup_prefix_picks_most_terms(void) {
   ScoredStr *out = NULL;
   SharedIdx *out_sidx = NULL;
   size_t out_count = 0, out_gen = 0;
-  CHECK(cache_lookup_prefix(&c, "fo bar baz", CaseSmart, &out, &out_count, &out_sidx, &out_gen) == true);
+  CHECK(cache_lookup_prefix(&c, "fo bar baz", CaseSmart, true, &out, &out_count, &out_sidx, &out_gen) == true);
   CHECK(out_gen == 200);   /* "fo bar" entry wins */
   shared_idx_release(out_sidx);
   free(out);
@@ -813,7 +813,7 @@ static void test_cache_lookup_prefix_skips_or_in_query(void) {
   ScoredStr *out = NULL;
   SharedIdx *out_sidx = NULL;
   size_t out_count = 0, out_gen = 0;
-  CHECK(cache_lookup_prefix(&c, "fo | bar", CaseSmart, &out, &out_count, &out_sidx, &out_gen) == false);
+  CHECK(cache_lookup_prefix(&c, "fo | bar", CaseSmart, true, &out, &out_count, &out_sidx, &out_gen) == false);
   cache_free(&c);
 }
 
@@ -827,7 +827,7 @@ static void test_cache_lookup_prefix_skips_exact_match(void) {
   ScoredStr *out = NULL;
   SharedIdx *out_sidx = NULL;
   size_t out_count = 0, out_gen = 0;
-  CHECK(cache_lookup_prefix(&c, "fo bar", CaseSmart, &out, &out_count, &out_sidx, &out_gen) == false);
+  CHECK(cache_lookup_prefix(&c, "fo bar", CaseSmart, true, &out, &out_count, &out_sidx, &out_gen) == false);
   cache_free(&c);
 }
 

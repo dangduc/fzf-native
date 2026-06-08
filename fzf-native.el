@@ -3,7 +3,7 @@
 ;; Copyright 2021 Duc Dang
 ;; Author: Duc Dang <me@dangduc.com>
 ;; Assisted-by: Claude:claude-opus-4-7
-;; Version: 1.2
+;; Version: 1.3
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: matching
 ;; Homepage: https://github.com/dangduc/fzf-native
@@ -84,6 +84,19 @@ Read on every scoring call; changes take effect immediately."
   :type '(choice (const :tag "Smart case (default)" smart)
                  (const :tag "Ignore case"          ignore)
                  (const :tag "Respect case"         respect))
+  :group 'fzf-native)
+
+(defcustom fzf-native-fuzzy t
+  "Whether to fuzzy match with `fzf-native'.
+
+If t, use fuzzy matching, if nil, use exact/substring matching.
+
+If t, prefixing a term with ' switches that term to exact matching.
+
+If nil, prefixing a term with ' switches that term to fuzzy matching.
+
+Read at the start of every scoring call."
+  :type 'boolean
   :group 'fzf-native)
 
 (defcustom fzf-native-batch-highlight 25
@@ -308,7 +321,7 @@ on each module load."
 
 ;;;###autoload
 (defun fzf-native-load-own-build-dyn ()
-  "Loads user-compiled version of module, building it if necessary."
+  "Load user-compiled version of module, building it if necessary."
   (unless (require 'fzf-native-module nil t)
     (if (or fzf-native-always-compile-module
             (y-or-n-p "Fzf-Native needs `fzf-native-module' to work.  Compile it now? "))

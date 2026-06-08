@@ -97,6 +97,36 @@ case-insensitive, query with any uppercase becomes case-sensitive."
     (should (equal (fzf-native-score "Foo" "foo") '(0)))
     (should (equal (fzf-native-score "foo" "foo") '(80)))))
 
+(ert-deftest fzf-native-score-fuzzy-default-test ()
+  "Default `fzf-native-fuzzy' is t: non-contiguous query matches."
+  (should (eq fzf-native-fuzzy t))
+  (should (equal (fzf-native-score "src/foo.c" "sfc") '(70))))
+
+(ert-deftest fzf-native-score-fuzzy-disabled-no-fuzzy-test ()
+  "`fzf-native-fuzzy' = nil: non-contiguous query no longer matches."
+  (let ((fzf-native-fuzzy nil))
+    (should (equal (fzf-native-score "src/foo.c" "sfc") '(0)))))
+
+(ert-deftest fzf-native-score-fuzzy-disabled-substring-still-matches-test ()
+  "`fzf-native-fuzzy' = nil: contiguous substring still matches."
+  (let ((fzf-native-fuzzy nil))
+    (should (equal (fzf-native-score "src/foo.c" "foo") '(80)))))
+
+(ert-deftest fzf-native-score-fuzzy-disabled-quote-prefix-inverts-test ()
+  "`fzf-native-fuzzy' = nil: ' prefix re-enables fuzzy for that term."
+  (let ((fzf-native-fuzzy nil))
+    (should (equal (fzf-native-score "src/foo.c" "'sfc") '(70)))))
+
+(ert-deftest fzf-native-score-fuzzy-disabled-operators-still-work-test ()
+  "`fzf-native-fuzzy' = nil: ^, !, and AND tokenization keep working."
+  (let ((fzf-native-fuzzy nil))
+    ;; ^ prefix anchor matches at start.
+    (should (equal (fzf-native-score "src/foo.c" "^src") '(80)))
+    ;; ! negation excludes a term and the bare term still matches.
+    (should (equal (fzf-native-score "src/foo.c" "!xyz foo") '(80)))
+    ;; Space-separated AND: both substrings must match.
+    (should (equal (fzf-native-score "src/foo.c" "src foo") '(160)))))
+
 (ert-deftest fzf-native-score-with-default-slab-benchmark-test ()
   "Test scoring with slab is faster."
   (let* ((slab (fzf-native-make-default-slab))
