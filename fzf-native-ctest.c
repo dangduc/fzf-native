@@ -831,6 +831,120 @@ static void test_cache_lookup_prefix_skips_exact_match(void) {
   cache_free(&c);
 }
 
+/* =====================================================================
+ * async_session_destroy_async (off-main detached teardown)
+ * ===================================================================== */
+
+/* Reader stub: park until s->stop is signaled, then return.  Acts as a
+   stand-in for the real `async_reader' so the destroy path has a
+   join-able thread without us having to fork a subprocess. */
+static void *test_destroy_reader_stub(void *arg) {
+  AsyncSession *s = arg;
+  while (!atomic_load_explicit(&s->stop, memory_order_relaxed))
+    usleep(1000);   /* 1 ms */
+  return NULL;
+}
+
+/* Score stub: park on the request cond until score_req_stop is set,
+   mirroring `scoring_thread_fn's idle wait state at session start. */
+static void *test_destroy_score_stub(void *arg) {
+  AsyncSession *s = arg;
+  pthread_mutex_lock(&s->score_req_mu);
+  while (!s->score_req_stop)
+    pthread_cond_wait(&s->score_req_cond, &s->score_req_mu);
+  pthread_mutex_unlock(&s->score_req_mu);
+  return NULL;
+}
+
+/* Build a minimally-initialized session with real worker threads so
+   `async_session_destroy_async' has something join-able to tear down. */
+static AsyncSession *make_destroy_test_session(void) {
+  AsyncSession *s = calloc(1, sizeof *s);
+  if (!s) return NULL;
+  pthread_mutex_init(&s->mu, NULL);
+  pthread_mutex_init(&s->score_req_mu, NULL);
+  pthread_mutex_init(&s->score_res_mu, NULL);
+  pthread_cond_init(&s->score_req_cond, NULL);
+  cache_init(&s->cache, 4);
+  s->pid = -1;        /* no real subprocess */
+  s->fp  = NULL;
+  if (pthread_create(&s->reader, NULL, test_destroy_reader_stub, s) != 0)
+    return NULL;
+  if (pthread_create(&s->score_thread, NULL, test_destroy_score_stub, s) != 0)
+    return NULL;
+  return s;
+}
+
+static double monotonic_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static void test_destroy_async_returns_fast(void) {
+  AsyncSession *s = make_destroy_test_session();
+  CHECK(s != NULL);
+  uint64_t base = atomic_load_explicit(&async_destroy_completions,
+                                       memory_order_relaxed);
+
+  double t0 = monotonic_ms();
+  async_session_destroy_async(s);
+  double elapsed = monotonic_ms() - t0;
+
+  /* Returning fast is the entire point — the caller (Emacs main on
+     minibuffer exit) must not block on pthread_join.  20 ms gives wide
+     headroom over expected ~µs while still catching a regression where
+     someone wires the synchronous destroy back into the stop path. */
+  CHECK(elapsed < 20.0);
+
+  /* Detached worker eventually completes; wait up to 5 s. */
+  double deadline = monotonic_ms() + 5000.0;
+  while (atomic_load_explicit(&async_destroy_completions,
+                              memory_order_relaxed) == base
+         && monotonic_ms() < deadline) {
+    usleep(5000);   /* 5 ms */
+  }
+  CHECK(atomic_load_explicit(&async_destroy_completions,
+                             memory_order_relaxed) == base + 1);
+}
+
+static void test_destroy_async_handles_null(void) {
+  /* Defensive: NULL handle must be a no-op (matches the user_ptr-after-
+     stop GC path, where the finalizer sees nullptr). */
+  uint64_t base = atomic_load_explicit(&async_destroy_completions,
+                                       memory_order_relaxed);
+  async_session_destroy_async(NULL);
+  CHECK(atomic_load_explicit(&async_destroy_completions,
+                             memory_order_relaxed) == base);
+}
+
+static void test_destroy_async_many_in_flight(void) {
+  /* Multi-source scenario: N sessions destroyed back-to-back from main
+     must collectively return fast — proves the cost is per-call
+     pthread_create, not summed pthread_join time. */
+  enum { N = 8 };
+  AsyncSession *sessions[N];
+  for (int i = 0; i < N; i++) {
+    sessions[i] = make_destroy_test_session();
+    CHECK(sessions[i] != NULL);
+  }
+  uint64_t base = atomic_load_explicit(&async_destroy_completions,
+                                       memory_order_relaxed);
+  double t0 = monotonic_ms();
+  for (int i = 0; i < N; i++) async_session_destroy_async(sessions[i]);
+  double elapsed = monotonic_ms() - t0;
+  CHECK(elapsed < 50.0);
+
+  double deadline = monotonic_ms() + 5000.0;
+  while (atomic_load_explicit(&async_destroy_completions,
+                              memory_order_relaxed) - base < (uint64_t)N
+         && monotonic_ms() < deadline) {
+    usleep(5000);
+  }
+  CHECK(atomic_load_explicit(&async_destroy_completions,
+                             memory_order_relaxed) - base == (uint64_t)N);
+}
+
 /* ================================================================= */
 
 int main(void) {
@@ -890,6 +1004,11 @@ int main(void) {
   RUN(test_cache_lookup_prefix_picks_most_terms);
   RUN(test_cache_lookup_prefix_skips_or_in_query);
   RUN(test_cache_lookup_prefix_skips_exact_match);
+
+  printf("--- async_session_destroy_async ---\n");
+  RUN(test_destroy_async_handles_null);
+  RUN(test_destroy_async_returns_fast);
+  RUN(test_destroy_async_many_in_flight);
 
   if (failed == 0) {
     printf("\nAll tests passed.\n");

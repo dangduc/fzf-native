@@ -702,6 +702,57 @@ needed.  No `async-stop' here on purpose — we want the finalizer path."
   ;; the race for this run.  Confirm the module is still usable.
   (should (equal (fzf-native-score "abcdefghi" "acef") '(78))))
 
+(ert-deftest fzf-native-async-stop-returns-fast-test ()
+  "`fzf-native-async-stop' must return on the calling (Emacs main) thread
+within milliseconds, regardless of how much work the scoring/reader
+threads or arena teardown might cost.  The C side signals stop
+synchronously and offloads `pthread_join' + arena/cache free to a
+detached pthread; this test asserts that contract end-to-end.
+
+A ~200k-line pool with an active dispatched filter is large enough that
+a synchronous join would take 50ms+; a non-blocking stop returns in
+single-digit ms."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (let ((handle (fzf-native-async-start "seq 1 200000")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle 15.0))
+          ;; Kick scoring so both reader and score thread are busy when
+          ;; we stop.
+          (fzf-native-async-candidates handle "1" 100)
+          (let* ((t0 (float-time))
+                 (_  (fzf-native-async-stop handle))
+                 (elapsed-ms (* 1000.0 (- (float-time) t0))))
+            ;; 30 ms ceiling — sub-ms expected, headroom for CI jitter.
+            ;; A regression that re-introduces synchronous join would
+            ;; spike well over this on a 200k pool.
+            (should (< elapsed-ms 30.0))
+            ;; Handle invalidated regardless of when the detached
+            ;; worker actually finishes the join.
+            (should (null (fzf-native-async-generation handle)))))
+      ;; Already stopped — second stop is a no-op (s == NULL).
+      (ignore-errors (fzf-native-async-stop handle)))))
+
+(ert-deftest fzf-native-async-stop-many-sessions-fast-test ()
+  "Multi-source teardown: stopping N sessions back-to-back from Emacs
+main returns in roughly N × per-call cost (microseconds each), not the
+sum of their join times.  Models the `fzfa-find-any' minibuffer-exit
+path where ~10 async sources tear down in one unwind."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (let ((handles
+         (cl-loop repeat 6
+                  collect (fzf-native-async-start "seq 1 50000"))))
+    (unwind-protect
+        (progn
+          (dolist (h handles)
+            (fzf-native-test--wait-for-data h 15.0)
+            (fzf-native-async-candidates h "1" 100))
+          (let* ((t0 (float-time))
+                 (_  (dolist (h handles) (fzf-native-async-stop h)))
+                 (elapsed-ms (* 1000.0 (- (float-time) t0))))
+            (should (< elapsed-ms 60.0))))
+      (dolist (h handles) (ignore-errors (fzf-native-async-stop h))))))
+
 ;;; `fzf-native-highlight-all' caller-isolation tests
 ;;
 ;; Verify the C-side highlight pass substitutes face-bearing COPIES into

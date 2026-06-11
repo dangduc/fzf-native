@@ -1608,6 +1608,11 @@ static void *async_reader(void *arg) {
 
 static void *scoring_thread_fn(void *arg);  /* defined after async_scoring_worker */
 
+/* Test-visible counter: incremented once per detached destroy completion.
+   The ctest binary polls this to confirm a deferred teardown actually
+   ran; production builds increment-only and never read it. */
+static _Atomic uint64_t async_destroy_completions;
+
 static void async_session_destroy(void *ptr) {
   AsyncSession *s = ptr;
   if (!s) return;
@@ -1647,6 +1652,52 @@ static void async_session_destroy(void *ptr) {
   pthread_mutex_unlock(&s->mu);
   pthread_mutex_destroy(&s->mu);
   free(s);
+  atomic_fetch_add_explicit(&async_destroy_completions, 1,
+                            memory_order_relaxed);
+}
+
+static void *async_destroy_worker(void *arg) {
+  async_session_destroy(arg);
+  return NULL;
+}
+
+/* Non-blocking teardown.  Performs the cheap signaling on the caller
+   thread so the subprocess and worker threads start winding down
+   immediately, then offloads the blocking pthread_join + arena_free +
+   cache_free to a detached pthread.  Returns within microseconds even
+   for sessions with tens of millions of candidates.
+
+   `kill(pid, SIGKILL)` (vs SIGTERM in async_session_destroy) makes the
+   subprocess die immediately rather than running its own shutdown path.
+   The reader thread sees pipe EOF and exits; the scoring thread
+   short-circuits on score_abort.  The detached worker then joins both
+   without holding up the Emacs main thread on minibuffer dismissal.
+
+   Falls back to a synchronous destroy if pthread_create fails — the
+   join cost is preferable to a leak. */
+static void async_session_destroy_async(void *ptr) {
+  AsyncSession *s = ptr;
+  if (!s) return;
+  fzf_log("async_session_destroy_async: pid=%d count=%zu\n",
+          (int)s->pid, s->count);
+
+  atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
+  atomic_store_explicit(&s->stop, true, memory_order_relaxed);
+  if (s->pid > 0) kill(s->pid, SIGKILL);
+
+  pthread_mutex_lock(&s->score_req_mu);
+  s->score_req_stop = true;
+  pthread_cond_signal(&s->score_req_cond);
+  pthread_mutex_unlock(&s->score_req_mu);
+
+  pthread_t t;
+  if (pthread_create(&t, NULL, async_destroy_worker, s) == 0) {
+    pthread_detach(t);
+  } else {
+    fzf_log("async_session_destroy_async: pthread_create failed, "
+            "falling back to synchronous destroy\n");
+    async_session_destroy(s);
+  }
 }
 
 /* fzf-native-async-start COMMAND &optional DIR -> session handle */
@@ -1854,7 +1905,10 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     async_session_destroy(s);
     return Qnil;
   }
-  return env->make_user_ptr(env, async_session_destroy, s);
+  /* The user_ptr finalizer (GC sweep on Emacs main thread) routes through
+     the async path too: signaling + pthread_create are O(µs), so GC stays
+     fast and the blocking pthread_join runs off-main. */
+  return env->make_user_ptr(env, async_session_destroy_async, s);
 }
 
 /* fzf-native-async-stop HANDLE */
@@ -1866,7 +1920,7 @@ fzf_native_async_stop(emacs_env *env, ptrdiff_t nargs,
   if (s) {
     fzf_log("async_stop: pid=%d total=%zu\n", (int)s->pid, s->count);
     env->set_user_ptr(env, args[0], NULL);
-    async_session_destroy(s);
+    async_session_destroy_async(s);
   }
   return Qnil;
 }
