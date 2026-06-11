@@ -93,6 +93,7 @@ emacs_value Qnil, Qlistofzero, Fcons, Flist, Qt;
 emacs_value Fhashtablep, Fmessage, Fvectorp, Fconsp, Fcdr, Fcar, Fvconcat;
 emacs_value Ffunctionp, Fsymbolp, Fsymbolname, Flength, Fnth, Fprinc, Freverse;
 emacs_value Qcompletion_score, Fput_text_property, Qzero, Qone;
+emacs_value Fcopy_sequence, Fsetcar, Faset;
 emacs_value Fencode_coding_string, Qutf_8;
 emacs_value Qface, Qcompletions_common_part;
 emacs_value Fremove_text_properties, Qface_nil_plist;
@@ -357,6 +358,21 @@ static void maybe_put_position_runs(emacs_env *env, fzf_position_t *pos,
     Qface, Qcompletions_common_part, str };
   env->funcall(env, Fput_text_property, 5, a);
   env->non_local_exit_clear(env);
+}
+
+/* Attempt `copy-sequence' on VAL so callers can apply face / text properties
+   without polluting the caller's original Lisp string.  Returns the fresh
+   copy on success.  Returns VAL itself on allocation failure (e.g., heap
+   exhaustion inside the funcall) — graceful degradation: losing copy
+   isolation for a single candidate is preferable to dropping it from the
+   result and is rare enough in practice to be acceptable. */
+static emacs_value try_copy_string(emacs_env *env, emacs_value val) {
+  emacs_value cp = env->funcall(env, Fcopy_sequence, 1, &val);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    return val;
+  }
+  return cp;
 }
 
 /* Apply `completions-common-part' face to STR_VAL on positions matched by
@@ -676,6 +692,16 @@ err_join_threads:
   }
 
   for (size_t i = len; i-- > 0;) {
+    /* Top-N candidates get a fresh copy before face/completion-score
+       mutation so the caller's original strings (often long-lived shared
+       objects: buffer names, obarray symbol-names, history lists) stay
+       clean.  The tail (i >= hl_cap) never receives face here, so the
+       only mutation it could see is `completion-score' — that's a
+       single property at index 0, invisible to display, kept on the
+       original to skip the copy cost. */
+    bool highlight = hl_pattern && i < hl_cap;
+    emacs_value out_val = highlight ? try_copy_string(env, xs[i].value) : xs[i].value;
+
     /* `completion-score' is a meaningful ranking signal in full mode but
        not in filter-only (every survivor scored 1 from fzf_has_match).
        Skip attaching it so downstream sort routines don't pick up a
@@ -684,17 +710,14 @@ err_join_threads:
       env->funcall(env, Fput_text_property, 5,
                    (emacs_value[]) {
                      Qzero, Qone, Qcompletion_score,
-                     env->make_integer(env, xs[i].score),
-                     xs[i].value,
-                   });
+                     env->make_integer(env, xs[i].score), out_val });
     }
 
-    if (hl_pattern && i < hl_cap) {
-      apply_highlight_positions(env, xs[i].s.b, hl_pattern, hl_slab,
-                                xs[i].value);
+    if (highlight) {
+      apply_highlight_positions(env, xs[i].s.b, hl_pattern, hl_slab, out_val);
     }
 
-    result = env->funcall(env, Fcons, 2, (emacs_value[]) { xs[i].value, result });
+    result = env->funcall(env, Fcons, 2, (emacs_value[]) { out_val, result });
   }
 
   if (hl_pattern) fzf_free_pattern(hl_pattern);
@@ -749,7 +772,16 @@ static void clear_highlight_face(emacs_env *env, emacs_value str_val) {
 // does: nil → no-op, t → process all, N → process top N.  COLLECTION
 // is assumed to be in display order (highest-scoring first).
 //
-// Returns COLLECTION unchanged.  Mutates the candidate strings in-place.
+// Returns COLLECTION with face-bearing copies substituted into the top-N
+// slots (via aset for vectors, setcar for lists).  Caller's original
+// candidate strings are not mutated on the apply path.
+//
+// The clear path unconditionally strips face from the top-N candidates,
+// including the caller's originals when COLLECTION still holds them.  This
+// is intentional and matches the function's contract: clear means "I'm
+// telling you these strings carry stale face from a prior highlight pass;
+// remove it."  Callers who want to preserve face on their originals across
+// clears must hold their own pre-highlight copies.
 emacs_value fzf_native_highlight_all(emacs_env *env,
                                      ptrdiff_t UNUSED(nargs),
                                      emacs_value args[],
@@ -765,18 +797,12 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
   struct Str query = copy_emacs_string(env, &bump, args[1]);
   bool clear_only = (!query.b || query.len == 0);
 
-  /* Accept both lists and vectors; mirror score-all's normalization so
-     callers don't have to care which one they have on hand. */
-  emacs_value collection = args[0];
-  if (!env->eq(env, env->type_of(env, collection), Qvector)) {
-    collection = env->funcall(env, Fvconcat, 1, (emacs_value[]) { args[0] });
-    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
-      env->non_local_exit_clear(env);
-      goto done;
-    }
+  emacs_value len_v = env->funcall(env, Flength, 1, &args[0]);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    goto done;
   }
-
-  ptrdiff_t n = env->vec_size(env, collection);
+  ptrdiff_t n = (ptrdiff_t) env->extract_integer(env, len_v);
   if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
     env->non_local_exit_clear(env);
     goto done;
@@ -797,14 +823,57 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
     if (!slab) goto done;
   }
 
-  for (ptrdiff_t i = 0; i < (ptrdiff_t)hl_cap; i++) {
-    emacs_value value = env->vec_get(env, collection, i);
-    if (clear_only) {
-      clear_highlight_face(env, value);
-    } else {
-      struct Str s = copy_emacs_string(env, &bump, value);
-      if (!s.b) continue;
-      apply_highlight_positions(env, s.b, pattern, slab, value);
+  /* Explicit list / vector branches so each shape pays only its native
+     traversal cost — vectors hit `vec_get'/`aset' as C-pointer calls (no
+     Elisp boundary crossing); lists pay one `vconcat' (~equivalent to the
+     legacy fast path) plus a single `cdr' per iteration to advance the
+     cell cursor used for `setcar' substitution. */
+  bool is_vector = env->eq(env, env->type_of(env, args[0]), Qvector);
+  if (is_vector) {
+    for (ptrdiff_t i = 0; i < (ptrdiff_t)hl_cap; i++) {
+      emacs_value value = env->vec_get(env, args[0], i);
+      if (clear_only) {
+        clear_highlight_face(env, value);
+      } else {
+        struct Str s = copy_emacs_string(env, &bump, value);
+        if (s.b) {
+          emacs_value cp = try_copy_string(env, value);
+          apply_highlight_positions(env, s.b, pattern, slab, cp);
+          env->funcall(env, Faset, 3,
+                       (emacs_value[]) {
+                         args[0], env->make_integer(env, i), cp });
+          env->non_local_exit_clear(env);
+        }
+      }
+    }
+  } else {
+    /* Lists: vconcat once for O(1) reads, then walk the original list in
+       parallel one cdr per iter to keep a current-cell pointer for setcar
+       substitution.  ~Half the funcalls of a pure car/cdr cursor. */
+    emacs_value read_vec = env->funcall(env, Fvconcat, 1, &args[0]);
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+      env->non_local_exit_clear(env);
+      goto done;
+    }
+    emacs_value cell = args[0];
+    for (ptrdiff_t i = 0; i < (ptrdiff_t)hl_cap; i++) {
+      emacs_value value = env->vec_get(env, read_vec, i);
+      if (clear_only) {
+        clear_highlight_face(env, value);
+      } else {
+        struct Str s = copy_emacs_string(env, &bump, value);
+        if (s.b) {
+          emacs_value cp = try_copy_string(env, value);
+          apply_highlight_positions(env, s.b, pattern, slab, cp);
+          env->funcall(env, Fsetcar, 2, (emacs_value[]) { cell, cp });
+          env->non_local_exit_clear(env);
+        }
+      }
+      cell = env->funcall(env, Fcdr, 1, &cell);
+      if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+        env->non_local_exit_clear(env);
+        break;
+      }
     }
   }
 
@@ -812,8 +881,6 @@ done:
   if (slab)    fzf_free_slab(slab);
   if (pattern) fzf_free_pattern(pattern);
   bump_free(bump);
-  /* Always return the original COLLECTION (not the vector-coerced copy)
-     so list callers see their list back. */
   return args[0];
 }
 
@@ -2621,6 +2688,9 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Fcar = env->make_global_ref(env, env->intern(env, "car"));
   Qcompletion_score = env->make_global_ref(env, env->intern(env, "completion-score"));
   Fput_text_property = env->make_global_ref(env, env->intern(env, "put-text-property"));
+  Fcopy_sequence = env->make_global_ref(env, env->intern(env, "copy-sequence"));
+  Fsetcar = env->make_global_ref(env, env->intern(env, "setcar"));
+  Faset = env->make_global_ref(env, env->intern(env, "aset"));
   Fsymbol_value = env->make_global_ref(env, env->intern(env, "symbol-value"));
   Qsym_case_mode            = env->make_global_ref(env, env->intern(env, "fzf-native-case-mode"));
   Qsym_fuzzy                = env->make_global_ref(env, env->intern(env, "fzf-native-fuzzy"));

@@ -272,12 +272,20 @@ below assert the absence of a signal, not any particular score.")
     (should (member "你是" result))
     (should-not (member "Hello" result))))
 
-(ert-deftest fzf-native-score-all-preserves-object-identity-test ()
-  "Returned strings are the same object as the input (for text properties)."
-  (let* ((orig "你好")
+(ert-deftest fzf-native-score-all-isolates-caller-originals-test ()
+  "Top-N result strings are fresh copies; caller's originals stay clean.
+
+Earlier the C scorer returned the input objects so callers could read
+`completion-score' off them directly.  As of the highlight-isolation
+fix, top-N candidates are `copy-sequence'd before face / score
+attachment so the caller's shared strings (obarray symbol-names,
+buffer-name interns, etc.) don't accumulate stale face / score across
+calls.  `completion-score' still rides on the returned copy."
+  (let* ((orig (copy-sequence "你好"))
          (result (fzf-native-score-all (list orig) "你")))
-    (should (eq (car result) orig))
-    ;; `completion-score' is attached to the original object.
+    (should (equal (car result) orig))
+    (should-not (eq (car result) orig))
+    (should-not (get-text-property 0 'completion-score orig))
     (should (get-text-property 0 'completion-score (car result)))))
 
 (ert-deftest fzf-native-score-all-empty-query-test ()
@@ -693,4 +701,64 @@ needed.  No `async-stop' here on purpose — we want the finalizer path."
   ;; If we got here without aborting Emacs, the finalizer survived
   ;; the race for this run.  Confirm the module is still usable.
   (should (equal (fzf-native-score "abcdefghi" "acef") '(78))))
+
+;;; `fzf-native-highlight-all' caller-isolation tests
+;;
+;; Verify the C-side highlight pass substitutes face-bearing COPIES into
+;; the COLLECTION (via setcar / aset) rather than mutating the caller's
+;; original strings.  Prior to the fix, fussy and other callers saw their
+;; shared candidate strings accumulate stale `face' properties because the
+;; module did `put-text-property' on the originals.
+
+(ert-deftest fzf-native-highlight-all-preserves-list-originals-test ()
+  "Caller's original strings are not face-mutated by highlight-all (list).
+
+Builds a list of caller-owned strings, captures the originals by `eq'
+identity before the call, runs `fzf-native-highlight-all', and confirms
+that (a) the originals carry no `face' property after the call, and
+(b) the returned list's top-N slots hold face-bearing copies that are
+NOT `eq' to the originals."
+  (skip-unless (fboundp 'fzf-native-highlight-all))
+  (let* ((fussy-fzf-native-highlight t)
+         (orig-1 (copy-sequence "alpha"))
+         (orig-2 (copy-sequence "beta"))
+         (orig-3 (copy-sequence "gamma"))
+         (coll   (list orig-1 orig-2 orig-3))
+         (ret    (fzf-native-highlight-all coll "a")))
+    ;; Originals unmutated.
+    (should-not (text-property-not-all 0 (length orig-1) 'face nil orig-1))
+    (should-not (text-property-not-all 0 (length orig-2) 'face nil orig-2))
+    (should-not (text-property-not-all 0 (length orig-3) 'face nil orig-3))
+    ;; Top-N slots now hold copies (not eq to originals).
+    (should-not (eq (nth 0 ret) orig-1))
+    (should-not (eq (nth 1 ret) orig-2))
+    (should-not (eq (nth 2 ret) orig-3))
+    ;; Copies carry face on at least one position.
+    (should (text-property-not-all 0 (length (nth 0 ret)) 'face nil
+                                   (nth 0 ret)))))
+
+(ert-deftest fzf-native-highlight-all-preserves-vector-originals-test ()
+  "Caller's original strings are not face-mutated by highlight-all (vector)."
+  (skip-unless (fboundp 'fzf-native-highlight-all))
+  (let* ((fussy-fzf-native-highlight t)
+         (orig-1 (copy-sequence "alpha"))
+         (orig-2 (copy-sequence "beta"))
+         (coll   (vector orig-1 orig-2))
+         (ret    (fzf-native-highlight-all coll "a")))
+    (should-not (text-property-not-all 0 (length orig-1) 'face nil orig-1))
+    (should-not (text-property-not-all 0 (length orig-2) 'face nil orig-2))
+    ;; Vector slots substituted with copies.
+    (should-not (eq (aref ret 0) orig-1))
+    (should-not (eq (aref ret 1) orig-2))
+    (should (text-property-not-all 0 (length (aref ret 0)) 'face nil
+                                   (aref ret 0)))))
+
+(ert-deftest fzf-native-highlight-all-returns-same-collection-test ()
+  "Return value is `eq' to args[0] (substitution-in-place semantics)."
+  (skip-unless (fboundp 'fzf-native-highlight-all))
+  (let* ((fussy-fzf-native-highlight t)
+         (lst (list (copy-sequence "alpha") (copy-sequence "beta")))
+         (vec (vector (copy-sequence "alpha") (copy-sequence "beta"))))
+    (should (eq (fzf-native-highlight-all lst "a") lst))
+    (should (eq (fzf-native-highlight-all vec "a") vec))))
 
