@@ -298,12 +298,21 @@ calls.  `completion-score' still rides on the returned copy."
 ;;
 
 (defun fzf-native-test--wait-for-data (handle &optional timeout)
-  "Poll HANDLE until its generation advances past 0.
-Returns t when data has arrived, nil if TIMEOUT seconds elapsed (default 5)."
-  (let ((deadline (+ (float-time) (or timeout 5))))
-    (while (and (zerop (fzf-native-async-generation handle))
-                (< (float-time) deadline))
-      (sleep-for 0.05)))
+  "Poll HANDLE until its generation advances past 0 and then stabilises.
+Returns t when the reader has drained (generation unchanged for three
+consecutive 50ms polls after first becoming non-zero), nil if TIMEOUT
+seconds elapsed (default 5).  Waiting only for generation > 0 races the
+reader on small corpora — the first batch may carry just one line."
+  (let ((deadline (+ (float-time) (or timeout 5)))
+        (stable 0)
+        (prev   0))
+    (while (and (< (float-time) deadline)
+                (or (zerop (fzf-native-async-generation handle))
+                    (< stable 3)))
+      (sleep-for 0.05)
+      (let ((g (fzf-native-async-generation handle)))
+        (setq stable (if (and (> g 0) (= g prev)) (1+ stable) 0)
+              prev   g))))
   (> (fzf-native-async-generation handle) 0))
 
 (defun fzf-native-test--wait-for-scoring (handle filter &optional limit timeout)
