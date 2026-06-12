@@ -558,33 +558,39 @@ distinguishing \"no matches\" from \"scoring in flight\"."
 (ert-deftest fzf-native-async-result-fresh-p-pool-grew-stale-test ()
   "After scoring at pool size N, the arrival of more candidates makes
 the cache entry stale: `pool_gen' lags `s->count' and `fresh-p' flips
-to nil.  Uses a two-phase Python producer with a deliberate pause:
-phase 1 emits 3 items so scoring can settle against a stable pool,
-phase 2 streams more items so the cache entry's `pool_gen' falls
-behind by the time `fresh-p' is checked."
+to nil.  Uses a two-phase Python producer gated on a tempfile so phase
+2 provably runs *after* scoring has settled against the phase-1 pool,
+regardless of CI runner speed.  Phase 1 emits 3 items, then the
+producer polls until elisp deletes the gate, then phase 2 streams more
+items.  Between `wait-for-fresh' and the gate release, no
+`async-candidates' call dispatches, so the cache entry for \"a\" keeps
+its phase-1 `pool_gen' even as the pool grows."
   (skip-unless (and (fboundp 'fzf-native-async-start)
                     (executable-find "python3")))
-  (let ((handle (fzf-native-async-start
-                 "python3 -u -c 'import time
+  (let* ((gate (make-temp-file "fzf-native-gate-"))
+         (handle (fzf-native-async-start
+                  (format "python3 -u -c 'import os, sys, time
+gate = sys.argv[1]
 for i in range(3): print(f\"a{i}\", flush=True)
-time.sleep(0.5)
-for i in range(40):
-    print(f\"b{i}\", flush=True)
-    time.sleep(0.005)
-'")))
+while os.path.exists(gate): time.sleep(0.01)
+for i in range(40): print(f\"b{i}\", flush=True)
+' %s" (shell-quote-argument gate)))))
     (unwind-protect
         (progn
           (fzf-native-test--wait-for-data handle)
-          ;; Let phase 1's 3 items settle, then score against the stable pool.
-          (sleep-for 0.1)
           (should (fzf-native-test--wait-for-fresh handle "a"))
-          ;; Sleep through phase 2 — items stream in, pool grows.  No
-          ;; `async-candidates' calls in this window, so the cache entry
-          ;; for "a" stays at its phase-1 `pool_gen' rather than getting
-          ;; refreshed by a refinement run.
-          (sleep-for 0.5)
+          (let ((g0 (fzf-native-async-generation handle))
+                (deadline (+ (float-time) 5.0)))
+            ;; Release phase 2 now that scoring for "a" is settled.
+            (delete-file gate)
+            ;; Wait for at least one phase-2 batch to land so the reader
+            ;; has advanced `s->count' past the phase-1 pool.
+            (while (and (= (fzf-native-async-generation handle) g0)
+                        (< (float-time) deadline))
+              (sleep-for 0.05)))
           ;; Pool grew → cache entry's `pool_gen' < `s->count' → stale.
           (should-not (fzf-native-async-result-fresh-p handle "a")))
+      (when (file-exists-p gate) (delete-file gate))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-result-fresh-p-after-stop-test ()
