@@ -93,10 +93,29 @@ jobs:
         cp -R bin-artifacts/. bin/
         rm -rf bin-artifacts
 
+    - name: Bump version
+      id: bump
+      run: |
+        current=$(grep -E '^;; Version: ' fzf-native.el | sed -E 's/^;; Version: //')
+        major=$(echo "$current" | cut -d. -f1)
+        minor=$(echo "$current" | cut -d. -f2)
+        minor=$((minor + 1))
+        if [ "$minor" -ge 10 ]; then
+          major=$((major + 1))
+          minor=0
+        fi
+        new="${major}.${minor}"
+        sed -i "s/^;; Version: ${current}$/;; Version: ${new}/" fzf-native.el
+        echo "version=${new}" >> "$GITHUB_OUTPUT"
+        echo "Bumped $current -> $new"
+
     - name: Commit changes
       uses: EndBug/add-and-commit@v9
       with:
         author_name: github-actions
         author_email: github-actions@github.com
         message: Update binaries for all platforms
-        add: "bin/**"
+        add: |
+          bin/**
+          fzf-native.el
+        tag: ${{ steps.bump.outputs.version }}
