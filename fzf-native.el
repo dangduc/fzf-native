@@ -122,6 +122,63 @@ Bridged by fzfa from `fzfa-highlight' via `:around' advice."
                  (integer :tag "Top N candidates"))
   :group 'fzf-native)
 
+(defun fzf-native-default-highlight-fn (cand positions)
+  "Default `fzf-native-highlight-fn'.  Preserves caller-attached faces.
+
+Surgically removes any leftover `completions-common-part' face on CAND
+\(so reused candidate strings don't accumulate stale highlights across
+keystrokes), then layers a fresh `completions-common-part' on top of
+any other faces present at the match positions.
+
+POSITIONS is a vector of alternating character-offset start/end pairs:
+  [s0 e0 s1 e1 …]"
+  (let ((len (length cand))
+        (i 0))
+    ;; Surgical strip: walk face intervals, remove only
+    ;; `completions-common-part' from the value, leaving other faces.
+    (while (< i len)
+      (let* ((face (get-text-property i 'face cand))
+             (next (or (next-single-property-change i 'face cand) len)))
+        (cond
+         ((eq face 'completions-common-part)
+          (remove-text-properties i next '(face nil) cand))
+         ((and (consp face) (memq 'completions-common-part face))
+          (let ((survivors (remq 'completions-common-part face)))
+            (put-text-property
+             i next 'face
+             ;; Unwrap a 1-element list back to bare symbol/spec.
+             (if (cdr survivors) survivors (car survivors))
+             cand))))
+        (setq i next))))
+  ;; Additive apply at match positions; stacks on top of caller faces.
+  (let ((n (length positions)))
+    (dotimes (k (/ n 2))
+      (add-face-text-property (aref positions (* 2 k))
+                              (aref positions (1+ (* 2 k)))
+                              'completions-common-part nil cand))))
+
+(defvar fzf-native-highlight-fn #'fzf-native-default-highlight-fn
+  "Function invoked by the C scorer to apply match highlights.
+
+Called once per top-N highlighted candidate when highlighting is
+enabled (capped by `fzf-native-batch-highlight' /
+`fzf-native-async-highlight').
+
+Signature: (CAND POSITIONS) → ignored.
+
+  CAND       The fresh top-N copy made by fzf-native.  Mutate in
+             place to attach faces / text properties.
+  POSITIONS  Vector of alternating character-offset start/end pairs
+             describing contiguous fzf match runs:
+               [s0 e0 s1 e1 …]
+
+Set to nil to suppress highlight application entirely (scoring still
+happens).  Let-binding around a call swaps policy for that call.
+
+`fzf-native-default-highlight-fn' is the standard implementation:
+surgical strip of leftover `completions-common-part' followed by an
+additive apply that preserves any caller-attached faces.")
+
 (defcustom fzf-native-max-line-length 256
   "Per-line character cap applied by the async reader thread.
 nil        — no limit.

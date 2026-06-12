@@ -120,6 +120,7 @@ emacs_value Qsym_case_mode, Qsym_fuzzy, Qsym_batch_highlight, Qsym_async_highlig
 emacs_value Qsym_max_line_length, Qsym_async_cache_size, Qsym_filter_only_min_pool;
 emacs_value Qsym_filter_only_length, Qsym_filter_only_logic;
 emacs_value Qsym_shell_file_name, Qsym_shell_command_switch, Qsym_exec_path;
+emacs_value Qsym_highlight_fn;
 /* Cached value symbols for `type-of' comparisons and signal/error names. */
 emacs_value Qvector, Qstring, Qignore, Qrespect;
 emacs_value Qor, Qand;
@@ -345,35 +346,88 @@ static void *worker_routine(void *ptr) {
   return NULL;
 }
 
-/* Apply `completions-common-part' face to STR on contiguous runs derived
-   from POS->data[] (which fzf returns in descending order).  No-op if POS
-   is NULL or empty; caller still owns the fzf_free_positions call. */
-static void maybe_put_position_runs(emacs_env *env, fzf_position_t *pos,
-                              emacs_value str) {
+/* Convert ascending byte-offset runs to char offsets in place via one
+   UTF-8 walk over CSTR.  Continuation bytes (0x80-0xBF) do not advance
+   the character count.  Runs must be non-overlapping and ascending. */
+static void runs_byte_to_char(const char *cstr,
+                              size_t *starts, size_t *ends,
+                              size_t n_runs) {
+  if (n_runs == 0) return;
+  size_t byte_idx = 0;
+  size_t char_idx = 0;
+  for (size_t i = 0; i < n_runs; ++i) {
+    while (byte_idx < starts[i] && cstr[byte_idx] != '\0') {
+      unsigned char b = (unsigned char)cstr[byte_idx++];
+      if ((b & 0xc0) != 0x80) char_idx++;
+    }
+    size_t cs = char_idx;
+    while (byte_idx < ends[i] && cstr[byte_idx] != '\0') {
+      unsigned char b = (unsigned char)cstr[byte_idx++];
+      if ((b & 0xc0) != 0x80) char_idx++;
+    }
+    starts[i] = cs;
+    ends[i]   = char_idx;
+  }
+}
+
+/* Dispatch fzf positions on CSTR to HOOK as character-offset runs against
+   STR.  POS->data[] is fzf's descending byte-offset list; consolidated
+   into ascending contiguous runs, converted to char offsets via one UTF-8
+   walk, packed into [s0 e0 s1 e1 …] vector, and passed as
+   (funcall HOOK STR positions).  No-op if POS is NULL/empty, HOOK is nil,
+   or any intermediate allocation fails. */
+static void dispatch_highlight_runs(emacs_env *env, const char *cstr,
+                                    fzf_position_t *pos,
+                                    emacs_value str, emacs_value hook) {
   if (!pos || pos->size == 0) return;
-  size_t plen      = pos->size;
-  size_t run_start = pos->data[plen - 1];
-  size_t run_end   = run_start;
+  if (env->eq(env, hook, Qnil)) return;
+
+  size_t plen = pos->size;
+  size_t *starts = (size_t *)malloc(plen * sizeof(size_t));
+  size_t *ends   = (size_t *)malloc(plen * sizeof(size_t));
+  if (!starts || !ends) { free(starts); free(ends); return; }
+
+  /* Group ascending positions (fzf emits descending; we walk j = plen-2..0
+     against an ascending pos->data, with pos->data[plen-1] as the
+     smallest seed) into contiguous [start, end+1) runs. */
+  size_t n_runs = 0;
+  size_t cs = pos->data[plen - 1];
+  size_t ce = cs;
   for (ptrdiff_t j = (ptrdiff_t)plen - 2; j >= 0; j--) {
     size_t p = pos->data[j];
-    if (p == run_end + 1) {
-      run_end = p;
-      continue;
-    }
-    emacs_value a[5] = {
-      env->make_integer(env, (intmax_t)run_start),
-      env->make_integer(env, (intmax_t)(run_end + 1)),
-      Qface, Qcompletions_common_part, str };
-    env->funcall(env, Fput_text_property, 5, a);
-    env->non_local_exit_clear(env);
-    run_start = run_end = p;
+    if (p == ce + 1) { ce = p; continue; }
+    starts[n_runs] = cs;
+    ends[n_runs++] = ce + 1;
+    cs = ce = p;
   }
-  emacs_value a[5] = {
-    env->make_integer(env, (intmax_t)run_start),
-    env->make_integer(env, (intmax_t)(run_end + 1)),
-    Qface, Qcompletions_common_part, str };
-  env->funcall(env, Fput_text_property, 5, a);
-  env->non_local_exit_clear(env);
+  starts[n_runs] = cs;
+  ends[n_runs++] = ce + 1;
+
+  runs_byte_to_char(cstr, starts, ends, n_runs);
+
+  /* Pack into a vector of alternating start/end character offsets. */
+  emacs_value *vargs = (emacs_value *)malloc(n_runs * 2 * sizeof(emacs_value));
+  if (!vargs) { free(starts); free(ends); return; }
+  for (size_t i = 0; i < n_runs; ++i) {
+    vargs[2 * i]     = env->make_integer(env, (intmax_t)starts[i]);
+    vargs[2 * i + 1] = env->make_integer(env, (intmax_t)ends[i]);
+  }
+  free(starts); free(ends);
+
+  emacs_value positions = env->funcall(env, Qvector,
+                                       (ptrdiff_t)(n_runs * 2), vargs);
+  free(vargs);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+    return;
+  }
+
+  /* Errors from the user handler degrade to no-highlight for this
+     candidate; they never abort the surrounding score call. */
+  env->funcall(env, hook, 2, (emacs_value[]){ str, positions });
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+  }
 }
 
 /* Attempt `copy-sequence' on VAL so callers can apply face / text properties
@@ -391,35 +445,21 @@ static emacs_value try_copy_string(emacs_env *env, emacs_value val) {
   return cp;
 }
 
-/* Apply `completions-common-part' face to STR_VAL on positions matched by
-   PATTERN against CSTR.  Computes positions via fzf_get_positions and groups
-   them into contiguous runs to minimize put-text-property calls.
-
-   Byte offsets from fzf are used directly as character positions: accurate
-   for ASCII, may be slightly misaligned for multi-byte UTF-8 (same caveat
-   as the async highlight path). */
+/* Apply match highlights to STR_VAL using HOOK.  Computes positions via
+   fzf_get_positions, groups them into contiguous runs, converts byte→char
+   offsets, and dispatches to HOOK as `(funcall HOOK STR_VAL POSITIONS)'
+   — where POSITIONS is `[s0 e0 s1 e1 …]'.  HOOK owns all face mutation
+   on STR_VAL.  Skipped when CSTR is empty or HOOK is nil. */
 static void apply_highlight_positions(emacs_env *env,
                                       const char *cstr,
                                       fzf_pattern_t *pattern,
                                       fzf_slab_t *slab,
-                                      emacs_value str_val) {
-  /* Empty candidates can't carry text properties or matched positions; skip
-     the funcalls and the get_positions slab work entirely. */
+                                      emacs_value str_val,
+                                      emacs_value hook) {
   if (cstr[0] == '\0') return;
-  /* Strip any `completions-common-part' face left over from a prior highlight
-     pass on the same Emacs string (fussy reuses caller-owned candidate strings
-     across keystrokes; without this, e.g. "ab" highlight [0,2] persists when
-     the user backspaces to "a" because put-text-property only writes the new
-     [0,1] range and leaves byte [1,2] highlighted).  One funcall per
-     highlighted candidate; the (face nil) plist is interned at init. */
-  emacs_value len_v = env->funcall(env, Flength, 1, &str_val);
-  if (env->non_local_exit_check(env) == emacs_funcall_exit_return) {
-    emacs_value rargs[4] = { Qzero, len_v, Qface_nil_plist, str_val };
-    env->funcall(env, Fremove_text_properties, 4, rargs);
-  }
-  env->non_local_exit_clear(env);
+  if (env->eq(env, hook, Qnil)) return;
   fzf_position_t *pos = fzf_get_positions(cstr, pattern, slab);
-  maybe_put_position_runs(env, pos, str_val);
+  dispatch_highlight_runs(env, cstr, pos, str_val, hook);
   fzf_free_positions(pos);
 }
 
@@ -698,6 +738,7 @@ err_join_threads:
   size_t hl_cap = resolve_fussy_highlight_cap(env, len);
   fzf_pattern_t *hl_pattern = NULL;
   fzf_slab_t    *hl_slab    = NULL;
+  emacs_value    hl_hook    = Qnil;
   if (hl_cap > 0) {
     hl_pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
     if (hl_pattern) hl_slab = fzf_make_default_slab();
@@ -705,6 +746,9 @@ err_join_threads:
       if (hl_pattern) { fzf_free_pattern(hl_pattern); hl_pattern = NULL; }
       hl_cap = 0;
     }
+    /* Read the highlight handler once per call; nil short-circuits
+       per-candidate dispatch in `apply_highlight_positions'. */
+    if (hl_cap > 0) hl_hook = defcustom_value(env, Qsym_highlight_fn, Qnil);
   }
 
   for (size_t i = len; i-- > 0;) {
@@ -730,7 +774,7 @@ err_join_threads:
     }
 
     if (highlight) {
-      apply_highlight_positions(env, xs[i].s.b, hl_pattern, hl_slab, out_val);
+      apply_highlight_positions(env, xs[i].s.b, hl_pattern, hl_slab, out_val, hl_hook);
     }
 
     result = env->funcall(env, Fcons, 2, (emacs_value[]) { out_val, result });
@@ -830,6 +874,7 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
   size_t hl_cap = resolve_fussy_highlight_cap(env, (size_t)n);
   if (hl_cap == 0) goto done;
 
+  emacs_value hook = Qnil;
   if (!clear_only) {
     fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
     bool           fuzzy     = resolve_fzf_native_fuzzy(env);
@@ -837,6 +882,7 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
     if (!pattern) goto done;
     slab = fzf_make_default_slab();
     if (!slab) goto done;
+    hook = defcustom_value(env, Qsym_highlight_fn, Qnil);
   }
 
   /* Explicit list / vector branches so each shape pays only its native
@@ -854,7 +900,7 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
         struct Str s = copy_emacs_string(env, &bump, value);
         if (s.b) {
           emacs_value cp = try_copy_string(env, value);
-          apply_highlight_positions(env, s.b, pattern, slab, cp);
+          apply_highlight_positions(env, s.b, pattern, slab, cp, hook);
           env->funcall(env, Faset, 3,
                        (emacs_value[]) {
                          args[0], env->make_integer(env, i), cp });
@@ -880,7 +926,7 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
         struct Str s = copy_emacs_string(env, &bump, value);
         if (s.b) {
           emacs_value cp = try_copy_string(env, value);
-          apply_highlight_positions(env, s.b, pattern, slab, cp);
+          apply_highlight_positions(env, s.b, pattern, slab, cp, hook);
           env->funcall(env, Fsetcar, 2, (emacs_value[]) { cell, cp });
           env->non_local_exit_clear(env);
         }
@@ -984,7 +1030,8 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
      and the candidate matched.  The cap concept does not apply to a single
      candidate — any non-nil value enables highlighting for this call. */
   if (score > 0 && resolve_fussy_highlight_cap(env, 1) > 0) {
-    apply_highlight_positions(env, str.b, pattern, slab, args[0]);
+    emacs_value hook = defcustom_value(env, Qsym_highlight_fn, Qnil);
+    apply_highlight_positions(env, str.b, pattern, slab, args[0], hook);
   }
 
   /* Return (SCORE) — a single-element list.  Match indices are no longer
@@ -2458,17 +2505,17 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     }
     /* nil or negative integer → hl_cap stays 0, no highlighting */
   }
+  emacs_value hl_hook = Qnil;
   if (hl_cap > 0) {
     hl_pattern = fzf_parse_pattern(case_mode, false, filter_for_hilit, fuzzy);
     hl_slab    = fzf_make_default_slab();
+    hl_hook    = defcustom_value(env, Qsym_highlight_fn, Qnil);
   }
 
-  /* Build Emacs list from stale results — strings are stable until session destroy.
-     snap[0] is the highest-scoring candidate (prepend loop puts it at list head).
-     Apply fzf_get_positions highlighting for snap[0..hl_cap-1] (i < hl_cap).
-     NOTE: fzf positions are byte offsets; put-text-property uses character
-     positions.  For ASCII candidates these are identical.  Multi-byte UTF-8
-     candidates may have slightly misaligned highlights — acceptable for now. */
+  /* Build Emacs list from stale results — strings are stable until session
+     destroy.  snap[0] is the highest-scoring candidate (prepend loop puts it
+     at list head).  When the highlight hook is set, dispatch char-offset
+     match runs for snap[0..hl_cap-1] (i < hl_cap). */
   emacs_value result = Qnil;
   for (size_t i = rcount; i-- > 0;) {
     emacs_value str = env->make_string(env, snap[i].str,
@@ -2481,9 +2528,9 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
       break;
     }
 
-    if (hl_pattern && i < hl_cap) {
+    if (hl_pattern && i < hl_cap && !env->eq(env, hl_hook, Qnil)) {
       fzf_position_t *pos = fzf_get_positions(snap[i].str, hl_pattern, hl_slab);
-      maybe_put_position_runs(env, pos, str);
+      dispatch_highlight_runs(env, snap[i].str, pos, str, hl_hook);
       fzf_free_positions(pos);
     }
 
@@ -2775,6 +2822,7 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qsym_filter_only_min_pool = env->make_global_ref(env, env->intern(env, "fzf-native-filter-only-min-pool"));
   Qsym_filter_only_length   = env->make_global_ref(env, env->intern(env, "fzf-native-filter-only-length"));
   Qsym_filter_only_logic    = env->make_global_ref(env, env->intern(env, "fzf-native-filter-only-logic"));
+  Qsym_highlight_fn         = env->make_global_ref(env, env->intern(env, "fzf-native-highlight-fn"));
   Qor      = env->make_global_ref(env, env->intern(env, "or"));
   Qand     = env->make_global_ref(env, env->intern(env, "and"));
   Qsym_shell_file_name      = env->make_global_ref(env, env->intern(env, "shell-file-name"));

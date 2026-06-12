@@ -822,3 +822,127 @@ NOT `eq' to the originals."
     (should (eq (fzf-native-highlight-all lst "a") lst))
     (should (eq (fzf-native-highlight-all vec "a") vec))))
 
+
+
+;;;; fzf-native-default-highlight-fn tests
+
+(ert-deftest fzf-native-default-highlight-fn-symbol-face-preserved-test ()
+  "User's symbol face survives a highlight pass at non-match positions."
+  (let ((cand (copy-sequence "abcdef")))
+    (put-text-property 0 6 'face 'my-user-face cand)
+    (fzf-native-default-highlight-fn cand [0 2])
+    ;; Highlight positions [0,2) carry both faces (list).
+    (let ((f0 (get-text-property 0 'face cand)))
+      (should (and (listp f0)
+                   (memq 'completions-common-part f0)
+                   (memq 'my-user-face f0))))
+    ;; Non-match positions still hold the user face alone.
+    (let ((f2 (get-text-property 2 'face cand)))
+      (should (or (eq f2 'my-user-face)
+                  (and (listp f2)
+                       (memq 'my-user-face f2)
+                       (not (memq 'completions-common-part f2))))))))
+
+(ert-deftest fzf-native-default-highlight-fn-leftover-scrubbed-test ()
+  "Stale `completions-common-part' from a prior pass is removed."
+  (let ((cand (copy-sequence "abcdef")))
+    (fzf-native-default-highlight-fn cand [0 3])
+    ;; Now run again with a narrower highlight; the [1,3) span must scrub.
+    (fzf-native-default-highlight-fn cand [0 1])
+    (let ((f0 (get-text-property 0 'face cand))
+          (f1 (get-text-property 1 'face cand)))
+      (should (or (eq f0 'completions-common-part)
+                  (and (listp f0) (memq 'completions-common-part f0))))
+      (should (not (and (listp f1) (memq 'completions-common-part f1))))
+      (should (not (eq f1 'completions-common-part))))))
+
+(ert-deftest fzf-native-default-highlight-fn-list-face-cleaned-of-stale-only-test ()
+  "List face has `completions-common-part' stripped without touching other faces."
+  (let ((cand (copy-sequence "abc")))
+    (put-text-property 0 3 'face '(my-face completions-common-part) cand)
+    (fzf-native-default-highlight-fn cand [1 2])
+    ;; Position 0: only `my-face' (completions-common-part scrubbed).
+    (let ((f0 (get-text-property 0 'face cand)))
+      (should (eq f0 'my-face)))
+    ;; Position 1: highlight layered back on top of `my-face'.
+    (let ((f1 (get-text-property 1 'face cand)))
+      (should (and (listp f1)
+                   (memq 'my-face f1)
+                   (memq 'completions-common-part f1))))
+    ;; Position 2: only `my-face'.
+    (let ((f2 (get-text-property 2 'face cand)))
+      (should (eq f2 'my-face)))))
+
+(ert-deftest fzf-native-default-highlight-fn-empty-positions-clears-test ()
+  "Empty POSITIONS vector clears leftover `completions-common-part'."
+  (let ((cand (copy-sequence "abc")))
+    (put-text-property 0 3 'face 'completions-common-part cand)
+    (fzf-native-default-highlight-fn cand [])
+    (should-not (text-property-not-all 0 3 'face nil cand))))
+
+(ert-deftest fzf-native-default-highlight-fn-plist-face-survives-test ()
+  "Plist-form face (e.g. `(:foreground \"red\")') survives highlight pass."
+  (let ((cand (copy-sequence "abc"))
+        (spec '(:foreground "red")))
+    (put-text-property 0 3 'face spec cand)
+    (fzf-native-default-highlight-fn cand [0 1])
+    ;; A non-list (plist) face is left alone by the strip.  After additive
+    ;; apply at [0,1), position 0 should hold a list containing
+    ;; `completions-common-part' on top of the surviving plist.
+    (let ((f0 (get-text-property 0 'face cand)))
+      (should (and (listp f0)
+                   (memq 'completions-common-part f0))))
+    ;; Position 1: the plist alone (not a face symbol).
+    (let ((f1 (get-text-property 1 'face cand)))
+      (should (equal f1 spec)))))
+
+(ert-deftest fzf-native-score-all-preserves-user-face-test ()
+  "Caller-attached face survives an end-to-end `fzf-native-score-all' call."
+  (skip-unless (fboundp 'fzf-native-score-all))
+  (let* ((fzf-native-batch-highlight 25)
+         (cand (let ((s (copy-sequence "alpha-beta")))
+                 (put-text-property 0 5 'face 'my-tag-face s)
+                 s))
+         (result (fzf-native-score-all (vector cand) "alpha")))
+    (let ((out (car result)))
+      (should out)
+      ;; my-tag-face survives end-to-end.
+      (let ((f (get-text-property 0 'face out)))
+        (should (or (eq f 'my-tag-face)
+                    (and (listp f) (memq 'my-tag-face f))))))))
+
+(ert-deftest fzf-native-score-all-multibyte-positions-test ()
+  "Highlight positions are character offsets, not byte offsets, on multibyte.
+
+Candidate \"αβ-foo\" has 6 characters but more bytes due to the two
+Greek letters.  Query \"foo\" should highlight the 3 ASCII chars at
+character positions 3,4,5 — not bytes 5,6,7."
+  (skip-unless (fboundp 'fzf-native-score-all))
+  (let* ((fzf-native-batch-highlight 25)
+         (cand (copy-sequence "αβ-foo"))
+         (result (fzf-native-score-all (vector cand) "foo"))
+         (out (car result)))
+    (should out)
+    ;; Characters at char-positions 3,4,5 carry completions-common-part.
+    (dotimes (i 3)
+      (let* ((pos (+ 3 i))
+             (face (get-text-property pos 'face out)))
+        (should (or (eq face 'completions-common-part)
+                    (and (listp face)
+                         (memq 'completions-common-part face))))))
+    ;; Character at position 0 (α) carries no highlight.
+    (should-not (get-text-property 0 'face out))))
+
+(ert-deftest fzf-native-score-all-nil-highlight-fn-skips-test ()
+  "Setting `fzf-native-highlight-fn' to nil suppresses highlight application."
+  (skip-unless (fboundp 'fzf-native-score-all))
+  (let* ((fzf-native-batch-highlight 25)
+         (fzf-native-highlight-fn nil)
+         (result (fzf-native-score-all (vector "alpha") "alpha"))
+         (out (car result)))
+    (should out)
+    ;; No `completions-common-part' face attached anywhere.
+    (dotimes (i (length out))
+      (let ((face (get-text-property i 'face out)))
+        (should-not (eq face 'completions-common-part))
+        (should-not (and (listp face) (memq 'completions-common-part face)))))))
