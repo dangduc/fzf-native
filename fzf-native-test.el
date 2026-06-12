@@ -946,3 +946,25 @@ character positions 3,4,5 — not bytes 5,6,7."
       (let ((face (get-text-property i 'face out)))
         (should-not (eq face 'completions-common-part))
         (should-not (and (listp face) (memq 'completions-common-part face)))))))
+
+(ert-deftest fzf-native-highlight-all-empty-query-no-crash-test ()
+  "Regression: empty query → clear-only path → `hl_scratch_free' on
+zero-initialised scratch.  Used to abort with libmalloc complaining
+the pointer being freed was not allocated (declaration sat behind
+`goto done')."
+  (skip-unless (fboundp 'fzf-native-highlight-all))
+  (let* ((fzf-native-batch-highlight 25)
+         (coll (list (copy-sequence "alpha") (copy-sequence "beta"))))
+    ;; If the goto-skip bug returns, this call aborts the process.
+    (should (eq (fzf-native-highlight-all coll "") coll))
+    (let ((vec (vector "alpha" "beta")))
+      (should (eq (fzf-native-highlight-all vec "") vec)))))
+
+(ert-deftest fzf-native-score-all-empty-query-no-crash-test ()
+  "Regression: `fzf-native-score-all' with empty query delegates to
+`fzf-native-highlight-all'; the highlight_all path must not crash on
+the uninitialised scratch."
+  (skip-unless (fboundp 'fzf-native-score-all))
+  (let ((fzf-native-batch-highlight 25))
+    ;; Empty query → routes through highlight-all internally.
+    (should (vectorp (fzf-native-score-all (vector "alpha" "beta") "")))))

@@ -346,13 +346,66 @@ static void *worker_routine(void *ptr) {
   return NULL;
 }
 
+/* Per-call scratch for `dispatch_highlight_runs'.  Sized at the start of a
+   score / highlight-all / async-candidates call to the maximum possible
+   position count (the query length); reused across every top-N candidate
+   in that call to avoid per-candidate malloc/free churn.
+
+   `runs` is split into two halves: starts in [0, capacity), ends in
+   [capacity, 2*capacity).  `vargs` holds 2*capacity emacs_values
+   (alternating start-val/end-val) for the `vector' funcall. */
+typedef struct {
+  size_t *starts;
+  size_t *ends;
+  emacs_value *vargs;
+  size_t capacity;  /* max positions; 0 means uninitialized */
+} HlScratch;
+
+static bool hl_scratch_init(HlScratch *s, size_t max_pos) {
+  s->capacity = 0;
+  s->starts = NULL; s->ends = NULL; s->vargs = NULL;
+  if (max_pos == 0) return true;
+  s->starts = (size_t *)malloc(max_pos * sizeof(size_t));
+  s->ends   = (size_t *)malloc(max_pos * sizeof(size_t));
+  s->vargs  = (emacs_value *)malloc(max_pos * 2 * sizeof(emacs_value));
+  if (!s->starts || !s->ends || !s->vargs) {
+    free(s->starts); free(s->ends); free(s->vargs);
+    s->starts = NULL; s->ends = NULL; s->vargs = NULL;
+    return false;
+  }
+  s->capacity = max_pos;
+  return true;
+}
+
+static void hl_scratch_free(HlScratch *s) {
+  free(s->starts);
+  free(s->ends);
+  free(s->vargs);
+  s->starts = NULL; s->ends = NULL; s->vargs = NULL;
+  s->capacity = 0;
+}
+
 /* Convert ascending byte-offset runs to char offsets in place via one
    UTF-8 walk over CSTR.  Continuation bytes (0x80-0xBF) do not advance
-   the character count.  Runs must be non-overlapping and ascending. */
+   the character count.  Runs must be non-overlapping and ascending.
+
+   Fast path: scan the byte prefix `[0, ends[n_runs-1])' for the high
+   bit; if no byte is >= 0x80 the string is ASCII at every position we
+   care about, byte offsets equal character offsets, and we return
+   without the per-byte char-counting walk.  Common case for completion
+   workloads dominated by ASCII identifiers / paths / buffer names. */
 static void runs_byte_to_char(const char *cstr,
                               size_t *starts, size_t *ends,
                               size_t n_runs) {
   if (n_runs == 0) return;
+  size_t scan_end = ends[n_runs - 1];
+  for (size_t i = 0; i < scan_end; ++i) {
+    if ((unsigned char)cstr[i] >= 0x80) goto multibyte;
+    if (cstr[i] == '\0') return;  /* runs are within bounds anyway */
+  }
+  return;  /* all ASCII: byte offsets already equal char offsets */
+
+ multibyte:;
   size_t byte_idx = 0;
   size_t char_idx = 0;
   for (size_t i = 0; i < n_runs; ++i) {
@@ -372,20 +425,38 @@ static void runs_byte_to_char(const char *cstr,
 
 /* Dispatch fzf positions on CSTR to HOOK as character-offset runs against
    STR.  POS->data[] is fzf's descending byte-offset list; consolidated
-   into ascending contiguous runs, converted to char offsets via one UTF-8
-   walk, packed into [s0 e0 s1 e1 …] vector, and passed as
-   (funcall HOOK STR positions).  No-op if POS is NULL/empty, HOOK is nil,
-   or any intermediate allocation fails. */
+   into ascending contiguous runs, converted to char offsets, packed into
+   [s0 e0 s1 e1 …] vector, and passed as (funcall HOOK STR positions).
+   No-op if POS is NULL/empty or HOOK is nil.
+
+   SCRATCH provides reusable buffers sized at the start of the score call;
+   when NULL or undersized, falls back to a per-call malloc/free pair. */
 static void dispatch_highlight_runs(emacs_env *env, const char *cstr,
                                     fzf_position_t *pos,
-                                    emacs_value str, emacs_value hook) {
+                                    emacs_value str, emacs_value hook,
+                                    HlScratch *scratch) {
   if (!pos || pos->size == 0) return;
   if (env->eq(env, hook, Qnil)) return;
 
   size_t plen = pos->size;
-  size_t *starts = (size_t *)malloc(plen * sizeof(size_t));
-  size_t *ends   = (size_t *)malloc(plen * sizeof(size_t));
-  if (!starts || !ends) { free(starts); free(ends); return; }
+  size_t *starts;
+  size_t *ends;
+  emacs_value *vargs;
+  bool need_free = false;
+
+  if (scratch && plen <= scratch->capacity) {
+    starts = scratch->starts;
+    ends   = scratch->ends;
+    vargs  = scratch->vargs;
+  } else {
+    starts = (size_t *)malloc(plen * sizeof(size_t));
+    ends   = (size_t *)malloc(plen * sizeof(size_t));
+    vargs  = (emacs_value *)malloc(plen * 2 * sizeof(emacs_value));
+    if (!starts || !ends || !vargs) {
+      free(starts); free(ends); free(vargs); return;
+    }
+    need_free = true;
+  }
 
   /* Group ascending positions (fzf emits descending; we walk j = plen-2..0
      against an ascending pos->data, with pos->data[plen-1] as the
@@ -405,20 +476,16 @@ static void dispatch_highlight_runs(emacs_env *env, const char *cstr,
 
   runs_byte_to_char(cstr, starts, ends, n_runs);
 
-  /* Pack into a vector of alternating start/end character offsets. */
-  emacs_value *vargs = (emacs_value *)malloc(n_runs * 2 * sizeof(emacs_value));
-  if (!vargs) { free(starts); free(ends); return; }
   for (size_t i = 0; i < n_runs; ++i) {
     vargs[2 * i]     = env->make_integer(env, (intmax_t)starts[i]);
     vargs[2 * i + 1] = env->make_integer(env, (intmax_t)ends[i]);
   }
-  free(starts); free(ends);
 
   emacs_value positions = env->funcall(env, Qvector,
                                        (ptrdiff_t)(n_runs * 2), vargs);
-  free(vargs);
   if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
     env->non_local_exit_clear(env);
+    if (need_free) { free(starts); free(ends); free(vargs); }
     return;
   }
 
@@ -428,6 +495,8 @@ static void dispatch_highlight_runs(emacs_env *env, const char *cstr,
   if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
     env->non_local_exit_clear(env);
   }
+
+  if (need_free) { free(starts); free(ends); free(vargs); }
 }
 
 /* Attempt `copy-sequence' on VAL so callers can apply face / text properties
@@ -449,17 +518,19 @@ static emacs_value try_copy_string(emacs_env *env, emacs_value val) {
    fzf_get_positions, groups them into contiguous runs, converts byte→char
    offsets, and dispatches to HOOK as `(funcall HOOK STR_VAL POSITIONS)'
    — where POSITIONS is `[s0 e0 s1 e1 …]'.  HOOK owns all face mutation
-   on STR_VAL.  Skipped when CSTR is empty or HOOK is nil. */
+   on STR_VAL.  Skipped when CSTR is empty or HOOK is nil.  SCRATCH is
+   the per-call buffer pool; pass NULL for one-shot callers. */
 static void apply_highlight_positions(emacs_env *env,
                                       const char *cstr,
                                       fzf_pattern_t *pattern,
                                       fzf_slab_t *slab,
                                       emacs_value str_val,
-                                      emacs_value hook) {
+                                      emacs_value hook,
+                                      HlScratch *scratch) {
   if (cstr[0] == '\0') return;
   if (env->eq(env, hook, Qnil)) return;
   fzf_position_t *pos = fzf_get_positions(cstr, pattern, slab);
-  dispatch_highlight_runs(env, cstr, pos, str_val, hook);
+  dispatch_highlight_runs(env, cstr, pos, str_val, hook, scratch);
   fzf_free_positions(pos);
 }
 
@@ -739,6 +810,7 @@ err_join_threads:
   fzf_pattern_t *hl_pattern = NULL;
   fzf_slab_t    *hl_slab    = NULL;
   emacs_value    hl_hook    = Qnil;
+  HlScratch      hl_scratch = { 0 };
   if (hl_cap > 0) {
     hl_pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
     if (hl_pattern) hl_slab = fzf_make_default_slab();
@@ -747,8 +819,13 @@ err_join_threads:
       hl_cap = 0;
     }
     /* Read the highlight handler once per call; nil short-circuits
-       per-candidate dispatch in `apply_highlight_positions'. */
-    if (hl_cap > 0) hl_hook = defcustom_value(env, Qsym_highlight_fn, Qnil);
+       per-candidate dispatch in `apply_highlight_positions'.  Pre-size
+       the position scratch to the query length — the maximum possible
+       number of matched positions per candidate. */
+    if (hl_cap > 0) {
+      hl_hook = defcustom_value(env, Qsym_highlight_fn, Qnil);
+      hl_scratch_init(&hl_scratch, query.len > 0 ? query.len : 1);
+    }
   }
 
   for (size_t i = len; i-- > 0;) {
@@ -774,7 +851,8 @@ err_join_threads:
     }
 
     if (highlight) {
-      apply_highlight_positions(env, xs[i].s.b, hl_pattern, hl_slab, out_val, hl_hook);
+      apply_highlight_positions(env, xs[i].s.b, hl_pattern, hl_slab,
+                                out_val, hl_hook, &hl_scratch);
     }
 
     result = env->funcall(env, Fcons, 2, (emacs_value[]) { out_val, result });
@@ -782,6 +860,7 @@ err_join_threads:
 
   if (hl_pattern) fzf_free_pattern(hl_pattern);
   if (hl_slab)    fzf_free_slab(hl_slab);
+  hl_scratch_free(&hl_scratch);
 
   fzf_log("fzf_native_score_all DONE: query='%.*s' count=%zu\n", (int)query.len, query.b, n);
   free(xs);
@@ -849,6 +928,10 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
   struct Bump *bump = NULL;
   fzf_pattern_t *pattern = NULL;
   fzf_slab_t    *slab    = NULL;
+  /* Declared up here so the `goto done' early-exit paths below never skip
+     the zero-initialization that `hl_scratch_free' relies on. */
+  HlScratch hl_scratch = { 0 };
+  emacs_value hook = Qnil;
 
   /* Treat an empty *or* undecodable query as clear-only.  The stale face
      properties live on the COLLECTION strings, not on the query, so we still
@@ -874,7 +957,6 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
   size_t hl_cap = resolve_fussy_highlight_cap(env, (size_t)n);
   if (hl_cap == 0) goto done;
 
-  emacs_value hook = Qnil;
   if (!clear_only) {
     fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
     bool           fuzzy     = resolve_fzf_native_fuzzy(env);
@@ -883,6 +965,7 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
     slab = fzf_make_default_slab();
     if (!slab) goto done;
     hook = defcustom_value(env, Qsym_highlight_fn, Qnil);
+    hl_scratch_init(&hl_scratch, query.len > 0 ? query.len : 1);
   }
 
   /* Explicit list / vector branches so each shape pays only its native
@@ -900,7 +983,7 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
         struct Str s = copy_emacs_string(env, &bump, value);
         if (s.b) {
           emacs_value cp = try_copy_string(env, value);
-          apply_highlight_positions(env, s.b, pattern, slab, cp, hook);
+          apply_highlight_positions(env, s.b, pattern, slab, cp, hook, &hl_scratch);
           env->funcall(env, Faset, 3,
                        (emacs_value[]) {
                          args[0], env->make_integer(env, i), cp });
@@ -926,7 +1009,7 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
         struct Str s = copy_emacs_string(env, &bump, value);
         if (s.b) {
           emacs_value cp = try_copy_string(env, value);
-          apply_highlight_positions(env, s.b, pattern, slab, cp, hook);
+          apply_highlight_positions(env, s.b, pattern, slab, cp, hook, &hl_scratch);
           env->funcall(env, Fsetcar, 2, (emacs_value[]) { cell, cp });
           env->non_local_exit_clear(env);
         }
@@ -942,6 +1025,7 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
 done:
   if (slab)    fzf_free_slab(slab);
   if (pattern) fzf_free_pattern(pattern);
+  hl_scratch_free(&hl_scratch);
   bump_free(bump);
   return args[0];
 }
@@ -1031,7 +1115,7 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
      candidate — any non-nil value enables highlighting for this call. */
   if (score > 0 && resolve_fussy_highlight_cap(env, 1) > 0) {
     emacs_value hook = defcustom_value(env, Qsym_highlight_fn, Qnil);
-    apply_highlight_positions(env, str.b, pattern, slab, args[0], hook);
+    apply_highlight_positions(env, str.b, pattern, slab, args[0], hook, NULL);
   }
 
   /* Return (SCORE) — a single-element list.  Match indices are no longer
@@ -2506,10 +2590,13 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     /* nil or negative integer → hl_cap stays 0, no highlighting */
   }
   emacs_value hl_hook = Qnil;
+  HlScratch   hl_scratch = { 0 };
   if (hl_cap > 0) {
     hl_pattern = fzf_parse_pattern(case_mode, false, filter_for_hilit, fuzzy);
     hl_slab    = fzf_make_default_slab();
     hl_hook    = defcustom_value(env, Qsym_highlight_fn, Qnil);
+    hl_scratch_init(&hl_scratch, strlen(filter_for_hilit) > 0
+                                  ? strlen(filter_for_hilit) : 1);
   }
 
   /* Build Emacs list from stale results — strings are stable until session
@@ -2530,7 +2617,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
 
     if (hl_pattern && i < hl_cap && !env->eq(env, hl_hook, Qnil)) {
       fzf_position_t *pos = fzf_get_positions(snap[i].str, hl_pattern, hl_slab);
-      dispatch_highlight_runs(env, snap[i].str, pos, str, hl_hook);
+      dispatch_highlight_runs(env, snap[i].str, pos, str, hl_hook, &hl_scratch);
       fzf_free_positions(pos);
     }
 
@@ -2541,6 +2628,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
 
   if (hl_pattern) fzf_free_pattern(hl_pattern);
   if (hl_slab)    fzf_free_slab(hl_slab);
+  hl_scratch_free(&hl_scratch);
   free(filter_for_hilit);
   free(snap);
   return result;
