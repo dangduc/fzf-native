@@ -23,6 +23,18 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+
+/* Block all signals on the current thread.  Worker threads call this on
+   entry so async signals (SIGCHLD, SIGIO, ...) only ever land on Emacs's
+   main thread.  Otherwise Emacs's signal handler forwards via pthread_kill,
+   which can recursively lock an os_unfair_lock if it fires while the worker
+   is inside libsystem code — observed crash on macOS.  Synchronous faults
+   (SIGSEGV/etc.) are delivered by the kernel regardless of mask. */
+static inline void fzf_block_all_signals(void) {
+  sigset_t s;
+  sigfillset(&s);
+  pthread_sigmask(SIG_BLOCK, &s, NULL);
+}
 #endif
 
 #ifdef _WIN32
@@ -281,6 +293,7 @@ struct Shared {
 
 // Most of the threading lifted from https://github.com/axelf4/hotfuzz
 static void *worker_routine(void *ptr) {
+  fzf_block_all_signals();
   /* printf("-----\nStarting Worker Routine\n-----\n"); */
   // Create a one-time use slab.
   fzf_slab_t *slab = fzf_make_default_slab();
@@ -1520,6 +1533,7 @@ typedef struct {
 } AsyncSession;
 
 static void *async_reader(void *arg) {
+  fzf_block_all_signals();
   AsyncSession *s = arg;
   fzf_log("async_reader START: pid=%d\n", (int)s->pid);
   /* getline manages a growable buffer that delivers whole logical
@@ -1657,6 +1671,7 @@ static void async_session_destroy(void *ptr) {
 }
 
 static void *async_destroy_worker(void *arg) {
+  fzf_block_all_signals();
   async_session_destroy(arg);
   return NULL;
 }
@@ -1984,6 +1999,7 @@ struct AsyncScoringShared {
 };
 
 static void *async_scoring_worker(void *ptr) {
+  fzf_block_all_signals();
   struct AsyncScoringShared *shared = ptr;
   /* fzf_has_match doesn't need the slab; only the score path does.
      Allocating either way keeps the worker code uniform — slab create
@@ -2027,6 +2043,7 @@ static void *async_scoring_worker(void *ptr) {
 }
 
 static void *scoring_thread_fn(void *arg) {
+  fzf_block_all_signals();
   AsyncSession *s = arg;
   fzf_log("scoring_thread START\n");
 
