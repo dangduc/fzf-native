@@ -35,6 +35,9 @@ static inline void fzf_block_all_signals(void) {
   sigfillset(&s);
   pthread_sigmask(SIG_BLOCK, &s, NULL);
 }
+#else
+/* Non-POSIX (Windows): no signals to block, worker entry calls become no-ops. */
+static inline void fzf_block_all_signals(void) {}
 #endif
 
 #ifdef _WIN32
