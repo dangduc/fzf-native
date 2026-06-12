@@ -868,16 +868,20 @@ NOT `eq' to the originals."
     (put-text-property 0 3 'face '(my-face completions-common-part) cand)
     (fzf-native-default-highlight-fn cand [1 2])
     ;; Position 0: only `my-face' (completions-common-part scrubbed).
+    ;; Accept either bare symbol or single-element list — both render
+    ;; identically and the handler is allowed to keep the list form.
     (let ((f0 (get-text-property 0 'face cand)))
-      (should (eq f0 'my-face)))
+      (should (or (eq f0 'my-face)
+                  (equal f0 '(my-face)))))
     ;; Position 1: highlight layered back on top of `my-face'.
     (let ((f1 (get-text-property 1 'face cand)))
       (should (and (listp f1)
                    (memq 'my-face f1)
                    (memq 'completions-common-part f1))))
-    ;; Position 2: only `my-face'.
+    ;; Position 2: only `my-face' (bare or single-element list).
     (let ((f2 (get-text-property 2 'face cand)))
-      (should (eq f2 'my-face)))))
+      (should (or (eq f2 'my-face)
+                  (equal f2 '(my-face)))))))
 
 (ert-deftest fzf-native-default-highlight-fn-empty-positions-clears-test ()
   "Empty POSITIONS vector clears leftover `completions-common-part'."

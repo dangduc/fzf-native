@@ -136,6 +136,12 @@ POSITIONS is a vector of alternating character-offset start/end pairs:
         (i 0))
     ;; Surgical strip: walk face intervals, remove only
     ;; `completions-common-part' from the value, leaving other faces.
+    ;; Always store the residual as a list — never unwrap a one-element
+    ;; list back to its bare element.  Unwrapping is theoretically
+    ;; equivalent for display but propagates any non-symbol garbage that
+    ;; an upstream package may have left in the face list (numbers,
+    ;; opaque values) into a top-level position where the display
+    ;; engine signals `Invalid face reference'.
     (while (< i len)
       (let* ((face (get-text-property i 'face cand))
              (next (or (next-single-property-change i 'face cand) len)))
@@ -144,11 +150,9 @@ POSITIONS is a vector of alternating character-offset start/end pairs:
           (remove-text-properties i next '(face nil) cand))
          ((and (consp face) (memq 'completions-common-part face))
           (let ((survivors (remq 'completions-common-part face)))
-            (put-text-property
-             i next 'face
-             ;; Unwrap a 1-element list back to bare symbol/spec.
-             (if (cdr survivors) survivors (car survivors))
-             cand))))
+            (if survivors
+                (put-text-property i next 'face survivors cand)
+              (remove-text-properties i next '(face nil) cand)))))
         (setq i next))))
   ;; Additive apply at match positions; stacks on top of caller faces.
   (let ((n (length positions)))
