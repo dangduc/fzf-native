@@ -106,6 +106,7 @@ jobs:
         fi
         new="${major}.${minor}"
         sed -i "s/^;; Version: ${current}$/;; Version: ${new}/" fzf-native.el
+        sed -i -E "s/^([[:space:]]+)\"${current}\"$/\1\"${new}\"/" Eask
         echo "version=${new}" >> "$GITHUB_OUTPUT"
         echo "Bumped $current -> $new"
 
@@ -118,4 +119,5 @@ jobs:
         add: |
           bin/**
           fzf-native.el
+          Eask
         tag: ${{ steps.bump.outputs.version }}
