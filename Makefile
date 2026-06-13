@@ -2,13 +2,21 @@ export EMACS ?= $(shell which emacs)
 
 BUILD_DIR ?= build
 
+PACKAGE := fzf-native
+AUTOLOADS := $(PACKAGE)-autoloads.el
+
 .PHONY: install
 install:
 	eask package
 	eask install
 
+.PHONY: autoloads
+autoloads:
+	$(EMACS) -Q --batch \
+	  --eval "(loaddefs-generate default-directory \"$(AUTOLOADS)\" nil \"(add-to-list 'load-path (or (and load-file-name (file-name-directory load-file-name)) (car load-path)))\n\")"
+
 .PHONY: compile
-compile:
+compile: autoloads
 	eask compile
 
 .PHONY: test
