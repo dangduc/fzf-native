@@ -970,6 +970,80 @@ the pointer being freed was not allocated (declaration sat behind
     (let ((vec (vector "alpha" "beta")))
       (should (eq (fzf-native-highlight-all vec "") vec)))))
 
+(ert-deftest fzf-native-highlight-one-basic-test ()
+  "Single-char match attaches `completions-common-part' face at the
+matched position; caller's original is unmutated."
+  (skip-unless (fboundp 'fzf-native-highlight-one))
+  (let* ((orig (copy-sequence "find-file"))
+         (ret  (fzf-native-highlight-one orig "f")))
+    (should-not (eq ret orig))
+    (should-not (text-property-not-all 0 (length orig) 'face nil orig))
+    (let ((face (get-text-property 0 'face ret)))
+      (should (or (eq face 'completions-common-part)
+                  (and (listp face)
+                       (memq 'completions-common-part face)))))))
+
+(ert-deftest fzf-native-highlight-one-empty-query-test ()
+  "Empty query returns a face-stripped copy without crashing."
+  (skip-unless (fboundp 'fzf-native-highlight-one))
+  (let* ((orig (copy-sequence "find-file"))
+         (ret  (fzf-native-highlight-one orig "")))
+    (should-not (eq ret orig))
+    (should-not (text-property-not-all 0 (length ret) 'face nil ret))))
+
+(ert-deftest fzf-native-highlight-one-no-match-test ()
+  "Non-matching query returns a copy with no face applied."
+  (skip-unless (fboundp 'fzf-native-highlight-one))
+  (let* ((orig (copy-sequence "abc"))
+         (ret  (fzf-native-highlight-one orig "z")))
+    (should-not (eq ret orig))
+    (should-not (text-property-not-all 0 (length ret) 'face nil ret))))
+
+(ert-deftest fzf-native-highlight-one-fuzzy-test ()
+  "Multi-character fuzzy match attaches face at the matched positions."
+  (skip-unless (fboundp 'fzf-native-highlight-one))
+  (let* ((orig (copy-sequence "foobar"))
+         (ret  (fzf-native-highlight-one orig "fb"))
+         (faced-positions
+          (cl-loop for i below (length ret)
+                   for face = (get-text-property i 'face ret)
+                   when (or (eq face 'completions-common-part)
+                            (and (listp face)
+                                 (memq 'completions-common-part face)))
+                   collect i)))
+    (should (memq 0 faced-positions))
+    (should (memq 3 faced-positions))))
+
+(ert-deftest fzf-native-highlight-one-preserves-original-test ()
+  "Caller's CAND has no face property after the call, even on match."
+  (skip-unless (fboundp 'fzf-native-highlight-one))
+  (let ((orig (copy-sequence "alpha")))
+    (fzf-native-highlight-one orig "a")
+    (should-not (text-property-not-all 0 (length orig) 'face nil orig))))
+
+(ert-deftest fzf-native-highlight-one-honors-highlight-fn-test ()
+  "When `fzf-native-highlight-fn' is nil, no face is applied even on match."
+  (skip-unless (fboundp 'fzf-native-highlight-one))
+  (let* ((fzf-native-highlight-fn nil)
+         (orig (copy-sequence "find-file"))
+         (ret  (fzf-native-highlight-one orig "f")))
+    (should-not (text-property-not-all 0 (length ret) 'face nil ret))))
+
+(ert-deftest fzf-native-highlight-one-ignores-batch-highlight-cap-test ()
+  "`fzf-native-batch-highlight' must NOT gate `highlight-one'.  The cap
+applies to top-N selection in `highlight-all' / `score-all'; for a single
+candidate it's meaningless and ignoring it is the design — see Chunk 6
+of the sort-highlight design, where call sites bind it to nil to suppress
+eager passes but lazy highlights must still fire."
+  (skip-unless (fboundp 'fzf-native-highlight-one))
+  (let* ((fzf-native-batch-highlight nil)
+         (orig (copy-sequence "find-file"))
+         (ret  (fzf-native-highlight-one orig "f"))
+         (face (get-text-property 0 'face ret)))
+    (should (or (eq face 'completions-common-part)
+                (and (listp face)
+                     (memq 'completions-common-part face))))))
+
 (ert-deftest fzf-native-score-all-empty-query-no-crash-test ()
   "Regression: `fzf-native-score-all' with empty query delegates to
 `fzf-native-highlight-all'; the highlight_all path must not crash on

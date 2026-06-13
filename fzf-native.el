@@ -25,6 +25,7 @@
 
 (declare-function fzf-native-score-all "fzf-native-module" (collection query &optional slab))
 (declare-function fzf-native-highlight-all "fzf-native-module" (collection query))
+(declare-function fzf-native-highlight-one "fzf-native-module" (cand query))
 (declare-function fzf-native-score "fzf-native-module" (str query &optional slab))
 (declare-function fzf-native-make-default-slab "fzf-native-module" ())
 (declare-function fzf-native-make-slab "fzf-native-module" (size16 size32))

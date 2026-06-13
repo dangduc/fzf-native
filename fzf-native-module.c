@@ -1030,6 +1030,66 @@ done:
   return args[0];
 }
 
+// fzf-native-highlight-one CAND QUERY -> propertized-copy
+//
+// Per-candidate counterpart to `fzf-native-highlight-all'.  Returns a
+// fresh copy of CAND with `completions-common-part' face applied at
+// the match positions of QUERY.  Intended for `completion-lazy-hilit-fn'
+// callers (vertico / icomplete) that render highlights lazily per
+// displayed candidate rather than eagerly across a whole top-N.
+//
+// Caller's original CAND is never mutated.  Empty/undecodable QUERY
+// returns a fresh face-stripped copy (symmetric with the
+// `highlight-all' clear-only branch).  No-match returns a fresh copy
+// with no face applied.
+//
+// Unlike `highlight-all', this entry point ignores
+// `fzf-native-batch-highlight' — the cap is meaningless for a single
+// candidate.  The hook (`fzf-native-highlight-fn') is still honored;
+// when nil, no face is applied.
+emacs_value fzf_native_highlight_one(emacs_env *env,
+                                     ptrdiff_t UNUSED(nargs),
+                                     emacs_value args[],
+                                     void UNUSED(*data_ptr)) {
+  struct Bump *bump = NULL;
+  fzf_pattern_t *pattern = NULL;
+  fzf_slab_t    *slab    = NULL;
+  HlScratch hl_scratch = { 0 };
+
+  struct Str query = copy_emacs_string(env, &bump, args[1]);
+  bool clear_only = (!query.b || query.len == 0);
+
+  /* Fresh copy of CAND so caller's literal is never face-mutated.  Even
+     the clear-only path acts on the copy, not the original. */
+  emacs_value cp = try_copy_string(env, args[0]);
+
+  if (clear_only) {
+    clear_highlight_face(env, cp);
+    goto done;
+  }
+
+  fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
+  bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+  pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
+  if (!pattern) goto done;
+  slab = fzf_make_default_slab();
+  if (!slab) goto done;
+  emacs_value hook = defcustom_value(env, Qsym_highlight_fn, Qnil);
+  hl_scratch_init(&hl_scratch, query.len);
+
+  struct Str s = copy_emacs_string(env, &bump, args[0]);
+  if (s.b) {
+    apply_highlight_positions(env, s.b, pattern, slab, cp, hook, &hl_scratch);
+  }
+
+done:
+  if (slab)    fzf_free_slab(slab);
+  if (pattern) fzf_free_pattern(pattern);
+  hl_scratch_free(&hl_scratch);
+  bump_free(bump);
+  return cp;
+}
+
 /* Signal `(wrong-type-argument stringp VALUE)' if VALUE is not a string.
    Returns true on failure (caller should return immediately). */
 static bool signal_if_not_string(emacs_env *env, emacs_value value) {
@@ -2773,6 +2833,23 @@ int emacs_module_init(struct emacs_runtime *rt) {
                          "sorting is performed.\n"
                          "\n"
                          "\\(fn COLLECTION QUERY)",
+                         &data),
+    });
+
+  // fzf-native-highlight-one CAND QUERY
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-highlight-one"),
+      env->make_function(env, 2, 2, fzf_native_highlight_one,
+                         "Return a copy of CAND with fzf match face applied for QUERY.\n"
+                         "Per-candidate counterpart to `fzf-native-highlight-all'.\n"
+                         "Intended for `completion-lazy-hilit-fn' callers.\n"
+                         "\n"
+                         "Empty QUERY returns a face-stripped copy.  No-match returns\n"
+                         "an unfaced copy.  Caller's original CAND is never mutated.\n"
+                         "Ignores `fzf-native-batch-highlight' (the cap is meaningless\n"
+                         "for a single candidate).  Honors `fzf-native-highlight-fn'.\n"
+                         "\n"
+                         "\\(fn CAND QUERY)",
                          &data),
     });
 
