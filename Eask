@@ -1,10 +1,13 @@
 (package "fzf-native"
-         "0.2"
+         "1.9"
          "Fuzzy completion style")
 
 (package-file "fzf-native.el")
 
 (files "fzf-native.el" "bin")
+
+(website-url "https://github.com/dangduc/fzf-native")
+(keywords "matching")
 
 (source "gnu")
 (source "melpa")
@@ -15,6 +18,6 @@
   (depends-on "f")
   (depends-on "ert-runner")
   (depends-on "package-lint"))
- 
+
 ; see https://github.com/jcs090218/setup-emacs-windows/issues/156#issuecomment-932956432
 (setq network-security-level 'low)
