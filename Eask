@@ -1,5 +1,5 @@
 (package "fzf-native"
-         "2.0"
+         "2.1"
          "Fuzzy completion style")
 
 (package-file "fzf-native.el")
