@@ -1664,6 +1664,14 @@ typedef struct {
   pid_t         pid;
   FILE         *fp;
   _Atomic bool stop;
+  /* Set by the reader thread immediately before it exits — either
+     because the child producer closed its stdout (EOF) or because
+     `stop' was raised during teardown.  Read by
+     `fzf-native-async-result-fresh-p' to distinguish "pool=0 because
+     the producer hasn't streamed yet" (not authoritative) from
+     "pool=0 because the producer finished without emitting anything"
+     (authoritative zero). */
+  _Atomic bool reader_done;
 
   pthread_mutex_t mu;
   Arena           arena;   /* backing storage for all candidate strings */
@@ -1809,6 +1817,7 @@ static void *async_reader(void *arg) {
     atomic_fetch_add_explicit(&s->gen, 1, memory_order_relaxed);
   }
   free(line);
+  atomic_store_explicit(&s->reader_done, true, memory_order_release);
   fzf_log("async_reader EXIT: total=%zu gen=%d\n",
           s->count, (int)atomic_load_explicit(&s->gen, memory_order_relaxed));
   return NULL;
@@ -2713,16 +2722,23 @@ fzf_native_async_stats(emacs_env *env, ptrdiff_t UNUSED(nargs),
 /* fzf-native-async-result-fresh-p HANDLE QUERY -> t / nil
 
    Returns t iff the result cache holds an entry for QUERY whose
-   `pool_gen' equals the current pool size — i.e. scoring has
-   completed for this exact query against every candidate streamed
-   so far.  In that state any value previously returned by
+   `pool_gen' equals the current pool size AND the pool is either
+   non-empty or the producer has finished streaming — i.e. scoring
+   has completed for this exact query against a real (or finalized)
+   pool.  In that state any value previously returned by
    `fzf-native-async-candidates' for QUERY is authoritative, including
    nil (zero matches): the cache entry exists and its top-K is empty.
 
    Returns nil when no cache entry exists for QUERY, when the entry's
-   `pool_gen' lags the current pool (scoring is mid-refinement), or
-   when HANDLE is invalid.  In those states a nil return from
-   `fzf-native-async-candidates' is "no information yet", not zero. */
+   `pool_gen' lags the current pool (scoring is mid-refinement), when
+   HANDLE is invalid, OR when the pool is empty and the producer is
+   still streaming.  The last case is the post-restart warmup window:
+   `pool_gen == cur_pool == 0' would otherwise pass the cache check
+   trivially (nothing to score), but the producer may still emit
+   candidates that change the answer, so the empty result is not yet
+   authoritative.  Only once the reader thread observes EOF (or stop)
+   does `reader_done' become true, at which point a still-empty pool
+   IS the final answer. */
 static emacs_value
 fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
                                 emacs_value args[], void *UNUSED(data)) {
@@ -2746,6 +2762,13 @@ fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
   CacheEntry *e = cache_find_locked(&s->cache, query);
   bool fresh = (e != NULL && e->pool_gen == cur_pool);
   pthread_mutex_unlock(&s->cache.mu);
+
+  /* Empty pool while the producer is still streaming: cache match is
+     trivial (scoring 0 items), not authoritative. */
+  if (fresh && cur_pool == 0 &&
+      !atomic_load_explicit(&s->reader_done, memory_order_acquire)) {
+    fresh = false;
+  }
 
   free(query);
   return fresh ? Qt : Qnil;
