@@ -327,7 +327,7 @@ static void *worker_routine(void *ptr) {
         struct Candidate x = batch->xs[i];
         /* You can get the score/position for as many items as you want */
         int score = filter_only
-          ? (fzf_has_match(x.s.b, pattern) ? 1 : 0)
+          ? (fzf_has_match(x.s.b, pattern, slab) ? 1 : 0)
           : fzf_get_score(x.s.b, pattern, slab);
         if (score > 0) {
           /* printf("Str: %s # = %d | i = %d, batch->len = %d, batch_idx = %zd\n", */
@@ -385,43 +385,11 @@ static void hl_scratch_free(HlScratch *s) {
   s->capacity = 0;
 }
 
-/* Convert ascending byte-offset runs to char offsets in place via one
-   UTF-8 walk over CSTR.  Continuation bytes (0x80-0xBF) do not advance
-   the character count.  Runs must be non-overlapping and ascending.
-
-   Fast path: scan the byte prefix `[0, ends[n_runs-1])' for the high
-   bit; if no byte is >= 0x80 the string is ASCII at every position we
-   care about, byte offsets equal character offsets, and we return
-   without the per-byte char-counting walk.  Common case for completion
-   workloads dominated by ASCII identifiers / paths / buffer names. */
-static void runs_byte_to_char(const char *cstr,
-                              size_t *starts, size_t *ends,
-                              size_t n_runs) {
-  if (n_runs == 0) return;
-  size_t scan_end = ends[n_runs - 1];
-  for (size_t i = 0; i < scan_end; ++i) {
-    if ((unsigned char)cstr[i] >= 0x80) goto multibyte;
-    if (cstr[i] == '\0') return;  /* runs are within bounds anyway */
-  }
-  return;  /* all ASCII: byte offsets already equal char offsets */
-
- multibyte:;
-  size_t byte_idx = 0;
-  size_t char_idx = 0;
-  for (size_t i = 0; i < n_runs; ++i) {
-    while (byte_idx < starts[i] && cstr[byte_idx] != '\0') {
-      unsigned char b = (unsigned char)cstr[byte_idx++];
-      if ((b & 0xc0) != 0x80) char_idx++;
-    }
-    size_t cs = char_idx;
-    while (byte_idx < ends[i] && cstr[byte_idx] != '\0') {
-      unsigned char b = (unsigned char)cstr[byte_idx++];
-      if ((b & 0xc0) != 0x80) char_idx++;
-    }
-    starts[i] = cs;
-    ends[i]   = char_idx;
-  }
-}
+/* NOTE: upstream main carried a `runs_byte_to_char' helper here that converted
+   fzf's byte-offset positions to character offsets, because upstream fzf.c
+   returns byte positions.  This fork's UTF-8 fzf.c instead returns character
+   offsets directly (see `dispatch_highlight_runs'), so that conversion was
+   removed to avoid double-converting multibyte candidates. */
 
 /* Dispatch fzf positions on CSTR to HOOK as character-offset runs against
    STR.  POS->data[] is fzf's descending byte-offset list; consolidated
@@ -474,7 +442,12 @@ static void dispatch_highlight_runs(emacs_env *env, const char *cstr,
   starts[n_runs] = cs;
   ends[n_runs++] = ce + 1;
 
-  runs_byte_to_char(cstr, starts, ends, n_runs);
+  /* This fork's fzf.c (UTF-8 build) already emits *character* offsets, not
+     byte offsets: its `_utf8' matching variants convert via `utf8_byte_to_char'
+     before returning, and the ASCII path's byte offsets equal char offsets.
+     So consume `pos->data' directly; running module.c's own byte->char pass
+     here would double-convert and mis-highlight multibyte candidates. */
+  (void)cstr;
 
   for (size_t i = 0; i < n_runs; ++i) {
     vargs[2 * i]     = env->make_integer(env, (intmax_t)starts[i]);
@@ -2204,9 +2177,9 @@ struct AsyncScoringShared {
 static void *async_scoring_worker(void *ptr) {
   fzf_block_all_signals();
   struct AsyncScoringShared *shared = ptr;
-  /* fzf_has_match doesn't need the slab; only the score path does.
-     Allocating either way keeps the worker code uniform — slab create
-     is ~1 µs, dwarfed by the per-batch scoring work. */
+  /* Both paths need the slab: the score path directly, and fzf_has_match for
+     its full-scorer fallback on non-ASCII (UTF-8) terms.  Slab create is
+     ~1 µs, dwarfed by the per-batch scoring work. */
   fzf_slab_t    *slab         = fzf_make_default_slab();
   fzf_pattern_t *pattern      = shared->pattern;
   bool           filter_only  = shared->filter_only;
@@ -2228,7 +2201,7 @@ static void *async_scoring_worker(void *ptr) {
       if (!pattern) {
         sc = 1;                  /* empty filter: keep everything */
       } else if (filter_only) {
-        sc = fzf_has_match(batch->xs[i].str, pattern) ? 1 : 0;
+        sc = fzf_has_match(batch->xs[i].str, pattern, slab) ? 1 : 0;
       } else {
         sc = fzf_get_score(batch->xs[i].str, pattern, slab);
       }
