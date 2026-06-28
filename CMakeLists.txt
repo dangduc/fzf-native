@@ -1,9 +1,19 @@
 cmake_minimum_required(VERSION 3.19)
 project(fzf-native C)
 
+# UTF8PROC Configuration. The vendored utf8proc library provides the Unicode
+# case-folding / classification used by fzf.c's UTF-8 matching variants. It is
+# built by its own Makefile via the `utf8proc_build' custom target below and
+# linked into the module statically.
+set(UTF8PROC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/utf8proc-2.10.0")
+set(UTF8PROC_INCLUDE_DIR "${UTF8PROC_DIR}")
+set(UTF8PROC_LIB "${UTF8PROC_DIR}/libutf8proc.a")
+
 # Check compilers
 message(STATUS ">>>>>>>> ${CMAKE_CXX_COMPILER_ID}")
 message(STATUS ">>>>>>>> ${CMAKE_HOST_SYSTEM_PROCESSOR}")
+message(STATUS ">>>>>>>> UTF8PROC_DIR: ${UTF8PROC_DIR}")
+message(STATUS ">>>>>>>> UTF8PROC_LIB: ${UTF8PROC_LIB}")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(
@@ -52,6 +62,14 @@ endif()
 # https://blog.kitware.com/create-dlls-on-windows-without-declspec-using-new-cmake-export-all-feature/
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
+# Build the vendored utf8proc static library via its own Makefile. fzf.c's
+# UTF-8 matching variants link against it.
+add_custom_target(utf8proc_build ALL
+  COMMAND ${CMAKE_MAKE_PROGRAM} all
+  WORKING_DIRECTORY ${UTF8PROC_DIR}
+  COMMENT "Building utf8proc library"
+  BYPRODUCTS ${UTF8PROC_LIB})
+
 if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
   # Assume compiler MSVC.
   add_library(fzf-native-module SHARED fzf-native-module.c fzf.c fzf.h
@@ -60,6 +78,11 @@ else()
   add_library(fzf-native-module MODULE fzf-native-module.c fzf.c fzf.h
                                        fzf-additions.c fzf-additions.h)
 endif()
+
+# Pull in utf8proc headers + link the static lib, and ensure it is built first.
+target_include_directories(fzf-native-module PRIVATE ${UTF8PROC_INCLUDE_DIR})
+target_link_libraries(fzf-native-module PRIVATE ${UTF8PROC_LIB})
+add_dependencies(fzf-native-module utf8proc_build)
 
 set(OUTPUT_DIR ${CMAKE_SOURCE_DIR}/${FZF_NATIVE_MODULE_OUTPUT_DIR})
 set_target_properties(

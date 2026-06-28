@@ -137,8 +137,31 @@ static bool fzf_addn_term(const fzf_term_t *term,
   return term->inv ? !match : match;
 }
 
-bool fzf_has_match(const char *text, fzf_pattern_t *pattern) {
+/* True when FN is one of the ASCII-only algorithm variants that
+   fzf_addn_term evaluates cheaply.  fzf_parse_pattern assigns the `_utf8'
+   variants for any term containing non-ASCII bytes; those (and any future
+   algorithm) are not byte-wise matchable here and must go through the full
+   scorer instead. */
+static bool fzf_addn_is_ascii_algo(fzf_algo_t fn) {
+  return fn == fzf_fuzzy_match_v1 || fn == fzf_fuzzy_match_v2 ||
+         fn == fzf_exact_match_naive || fn == fzf_prefix_match ||
+         fn == fzf_suffix_match || fn == fzf_equal_match;
+}
+
+bool fzf_has_match(const char *text, fzf_pattern_t *pattern, fzf_slab_t *slab) {
   if (!pattern || pattern->size == 0) return true;
+  /* The cheap matchers below are byte-wise ASCII only (no Unicode case
+     folding) and dispatch on the ASCII algorithm function pointers.  If any
+     term uses a `_utf8' variant (chosen by fzf_parse_pattern for non-ASCII
+     query terms) or any unrecognized algorithm, defer to the full scorer,
+     whose match decision is authoritative — including correct handling of
+     Unicode case folding and `inv' negation. */
+  for (size_t i = 0; i < pattern->size; i++) {
+    fzf_term_set_t *set = pattern->ptr[i];
+    for (size_t j = 0; j < set->size; j++)
+      if (!fzf_addn_is_ascii_algo(set->ptr[j].fn))
+        return fzf_get_score(text, pattern, slab) > 0;
+  }
   size_t tn = strlen(text);
   /* AND across term-sets, OR within each term-set — same composition as
      fzf_get_score, just collapsed to bool. */
