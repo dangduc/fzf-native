@@ -40,6 +40,9 @@ jobs:
       - run: make lint
       - run: make ctest
         if: runner.os != 'Windows'
+      - name: ASan/UBSan C unit tests
+        run: make ctest-asan
+        if: runner.os != 'Windows'
 
       - name: Clean stale binaries
         shell: bash

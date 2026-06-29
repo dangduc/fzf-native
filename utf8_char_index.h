@@ -71,7 +71,9 @@ static inline utf8_char_map_t* utf8_build_char_map(const char *str, size_t byte_
         if (bytes <= 0) break;
         
         // All bytes in this character map to the same char position
-        for (size_t i = 0; i < bytes; i++) {
+        // bytes is guaranteed > 0 here (negative/zero returns broke out above),
+        // so the cast to size_t cannot wrap to a huge value.
+        for (size_t i = 0; i < (size_t)bytes; i++) {
             map->byte_to_char[byte_pos + i] = char_pos;
         }
         
