@@ -45,7 +45,7 @@ static void check_agreement(const char *label,
 
   int32_t score = fzf_get_score(text, p, slab);
   bool    score_says = (score > 0);
-  bool    addn_says  = fzf_has_match(text, p);
+  bool    addn_says  = fzf_has_match(text, p, slab);
 
   if (score_says != expect_match) {
     fprintf(stderr, "  NOTE %s: fzf_get_score disagrees with expectation "
@@ -185,6 +185,28 @@ static void test_compound_pattern(void) {
                   CaseIgnore, true, false);
 }
 
+/* UTF-8 / non-ASCII terms.  fzf_parse_pattern routes these to the `_utf8'
+   algorithm variants, which fzf_has_match cannot match byte-wise; it must
+   defer to the full scorer.  These cases guard that deferral: if it regresses
+   (e.g. the ASCII-only dispatch returns false for a `_utf8' term again),
+   fzf_has_match disagrees with fzf_get_score>0 and check_agreement FAILS.
+   They also independently oracle the match/no-match verdict for Greek,
+   Cyrillic, CJK, Latin-diacritic case folding, and inverted UTF-8 terms. */
+static void test_utf8_terms(void) {
+  check_agreement("utf8 greek fuzzy",   "ελληνικά", "ελ",  CaseSmart, true, true);
+  check_agreement("utf8 greek no-match","ελληνικά", "ζζ",  CaseSmart, true, false);
+  check_agreement("utf8 cyrillic",      "привет",   "при", CaseSmart, true, true);
+  check_agreement("utf8 cjk",           "文件名",    "文件", CaseSmart, true, true);
+  /* Smart-case, all-lowercase query folds against an uppercase accented
+     candidate (É -> é via utf8proc single-codepoint tolower). */
+  check_agreement("utf8 case-fold",     "CAFÉ",     "café", CaseSmart, true, true);
+  check_agreement("utf8 exact",         "héllo wörld", "'wör", CaseIgnore, true, true);
+  /* Inverted non-ASCII term: must EXCLUDE candidates containing it, and KEEP
+     those that don't (the false-positive direction of the deferral bug). */
+  check_agreement("utf8 inverted excludes", "αβγ", "!α", CaseIgnore, true, false);
+  check_agreement("utf8 inverted keeps",    "xyz", "!α", CaseIgnore, true, true);
+}
+
 int main(void) {
   printf("--- fzf-additions: fzf_has_match ---\n");
   RUN(test_fuzzy_basic_match);
@@ -208,6 +230,7 @@ int main(void) {
   RUN(test_smart_case_lowercase_query_ignores_case);
   RUN(test_smart_case_uppercase_query_respects_case);
   RUN(test_compound_pattern);
+  RUN(test_utf8_terms);
 
   if (failed == 0) {
     printf("\nAll fzf-additions tests passed.\n");
