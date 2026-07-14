@@ -152,43 +152,48 @@ static void bump_free(struct Bump *head) {
   }
 }
 
+/** Copies the Emacs string to make its contents accessible.
 
-// Copied from https://github.com/axelf4/hotfuzz
-/** Copies the Emacs string to make its contents accessible. */
+    Probes the required buffer size with a NULL-buf call first, then either
+    copies into remaining bump space (if it fits) or allocates a new block.
+    Avoids the opportunistic "try inline, catch memory-buffer-too-small,
+    retry" pattern: that signal is now caught by CATCHER_ALL_DEBUGGABLE
+    on Emacs 31+, which invokes `debug' before the module handler can
+    convert it to a pending exit -- so with `debug-on-error' on, the
+    silent retry pops the debugger. */
 static struct Str copy_valid_emacs_string(emacs_env *env, struct Bump **bump, emacs_value value) {
-  char *buf = NULL;
-  ptrdiff_t origlen, len;
-  if (*bump) {
-    // Opportunistically try to copy into remaining space
+  ptrdiff_t len;
+  if (!env->copy_string_contents(env, value, NULL, &len)) {
+    /* Length probe failed (e.g., unicode-string-p on an invalid unibyte
+       string). Leave the pending exit set so the caller can try the
+       encode-coding-string fallback. */
+    return (struct Str) { 0 };
+  }
+
+  char *buf;
+  if (*bump && (*bump)->limit - (*bump)->cursor >= len) {
+    /* Fits in current bump. Copy inline. */
     buf = (*bump)->cursor;
-    len = origlen = (*bump)->limit - (*bump)->cursor;
-  }
-  // Determine the size of the string (including null-terminator)
-  if (env->copy_string_contents(env, value, buf, &len)) {
-    if (buf) goto success;
   } else {
-    if (!buf || len == origlen) return (struct Str) { 0 };
-    env->non_local_exit_clear(env);
+    /* Need a new bump. Grow at least 2x the current head, and at least
+       enough to fit this string plus alignment slack. */
+    size_t capacity = *bump ? 2 * (size_t)((*bump)->limit - (*bump)->b) : 2048;
+    if (capacity < (size_t) len) capacity = len + alignof(uint64_t) - 1;
+    struct Bump *new;
+    if (!(new = malloc(sizeof *new + capacity))) return (struct Str) { 0 };
+    *new = (struct Bump) { .next = *bump, .cursor = new->b, .limit = new->b + capacity };
+    *bump = new;
+    buf = new->cursor;
   }
 
-  size_t capacity = *bump ? 2 * ((*bump)->limit - (*bump)->b) : 2048;
-  if (capacity < (size_t) len) capacity = len + alignof(uint64_t) - 1;
-  struct Bump *new;
-  if (!(new = malloc(sizeof *new + capacity))) return (struct Str) { 0 };
-  *new = (struct Bump) { .next = *bump, .cursor = new->b, .limit = new->b + capacity };
-  *bump = new;
-
-  if (!env->copy_string_contents(env, value, buf = new->cursor, &len)) {
-    /* Re-signal on the retry (e.g. unicode-string-p, or len shrunk between
-       calls): clear the pending exit so the caller can try the
-       encode-coding-string fallback, and drop this candidate. Without this
-       the signal would ride out on a "successful" Str and surface later from
-       deep inside Fapply / the byte-code interpreter. */
+  if (!env->copy_string_contents(env, value, buf, &len)) {
+    /* Rare: state changed between probe and copy (e.g. string mutated).
+       Clear any pending exit and drop the candidate. */
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
       env->non_local_exit_clear(env);
     return (struct Str) { 0 };
   }
-success:
+
   (*bump)->cursor = (char *) (((uintptr_t) (*bump)->cursor + len
                                + alignof(uint64_t) - 1) & ~(alignof(uint64_t) - 1));
   return (struct Str) { buf, len - 1 };
