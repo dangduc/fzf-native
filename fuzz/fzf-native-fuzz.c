@@ -1,0 +1,261 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Coverage-guided fuzzer for fzf-native's pure-C matcher.
+ *
+ * The first input byte selects case/fuzzy/slab options.  The remaining bytes
+ * are split at the first newline into QUERY and CANDIDATE.  If there is no
+ * newline, the option byte also selects a split point.  This deliberately
+ * keeps the format simple: a mutator can alter query syntax, UTF-8 bytes, and
+ * matcher options without first satisfying a checksum or nested structure.
+ *
+ * Build with libFuzzer via `make fuzz-build`, or as a deterministic corpus
+ * replay executable via `make fuzz-replay-build`.
+ */
+
+#include "fzf.h"
+#include "fzf-additions.h"
+#include "utf8_char_index.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+enum { FZF_NATIVE_FUZZ_MAX_INPUT = 4096 };
+
+static void fuzz_fail(const char *property) {
+  fprintf(stderr, "fzf-native fuzz invariant failed: %s\n", property);
+  abort();
+}
+
+static bool valid_utf8(const char *text, size_t len) {
+  size_t off = 0;
+  while (off < len) {
+    utf8proc_int32_t cp;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)text + off, (utf8proc_ssize_t)(len - off),
+        &cp);
+    if (width <= 0)
+      return false;
+    off += (size_t)width;
+  }
+  return true;
+}
+
+static size_t visible_character_count(const char *text) {
+  size_t bytes = strlen(text);
+  return valid_utf8(text, bytes) ? utf8_strlen(text, bytes) : bytes;
+}
+
+static fzf_slab_t *make_selected_slab(uint8_t options) {
+  static const size_t caps16[] = {1, 8, 64, 1024, 8192, 100 * 1024};
+  static const size_t caps32[] = {1, 8, 64, 256, 1024, 2048};
+  size_t which = (options >> 3) % (sizeof(caps16) / sizeof(caps16[0]));
+  return fzf_make_slab((fzf_slab_config_t){caps16[which], caps32[which]});
+}
+
+static void check_positions(const char *source, const char *candidate,
+                            bool matched, fzf_position_t *positions) {
+  if (!matched && positions != NULL && positions->size != 0) {
+    fprintf(stderr, "%s returned %zu positions for a failed match\n", source,
+            positions->size);
+    fuzz_fail("a non-match returned highlight positions");
+  }
+  if (!positions)
+    return;
+
+  size_t limit = visible_character_count(candidate);
+  for (size_t i = 0; i < positions->size; i++) {
+    if (positions->data[i] >= limit)
+      fuzz_fail("a highlight position is outside the candidate");
+  }
+}
+
+static void check_fuzzy_term_algorithms(const char *candidate,
+                                        const fzf_term_t *term,
+                                        fzf_slab_t *slab) {
+  bool fuzzy_term = term->fn == fzf_fuzzy_match_v2 ||
+                    term->fn == fzf_fuzzy_match_v2_utf8;
+  if (!fuzzy_term || !term->text)
+    return;
+
+  fzf_string_t input = {.data = candidate, .size = strlen(candidate)};
+  fzf_string_t *pattern = (fzf_string_t *)term->text;
+
+  /* Semantic comparisons on malformed UTF-8 do not have a stable oracle.
+     The general scorer still receives those inputs so sanitizers cover them. */
+  if (!valid_utf8(input.data, input.size) ||
+      !valid_utf8(pattern->data, pattern->size))
+    return;
+
+  bool utf8 = !is_ascii_utf8proc(input.data, input.size) ||
+              !is_ascii_utf8proc(pattern->data, pattern->size);
+  fzf_algo_t v1 = utf8 ? fzf_fuzzy_match_v1_utf8 : fzf_fuzzy_match_v1;
+  fzf_algo_t v2 = utf8 ? fzf_fuzzy_match_v2_utf8 : fzf_fuzzy_match_v2;
+
+  /* Avoid turning a single fuzz iteration into an unbounded DP allocation.
+     The selected slab still forces v2's documented v1 fallback at many
+     smaller boundary combinations. */
+  size_t text_units = utf8 ? utf8_strlen(input.data, input.size) : input.size;
+  size_t pat_units = utf8 ? utf8_strlen(pattern->data, pattern->size)
+                          : pattern->size;
+  if (text_units != 0 && pat_units > 100 * 1024 / text_units)
+    return;
+
+  fzf_result_t r1 = v1(term->case_sensitive, false, &input, pattern, NULL, slab);
+  fzf_result_t r2 = v2(term->case_sensitive, false, &input, pattern, NULL, slab);
+  if ((r1.start >= 0) != (r2.start >= 0))
+    fuzz_fail("fuzzy v1 and v2 disagree on match membership");
+
+  fzf_position_t *positions = fzf_pos_array(0);
+  fzf_result_t with_positions =
+      v2(term->case_sensitive, false, &input, pattern, positions, slab);
+  /* fzf v2 only backtracks to the true start when positions are requested,
+     so START is intentionally allowed to differ.  Match status and score
+     must remain identical. */
+  if ((with_positions.start >= 0) != (r2.start >= 0) ||
+      with_positions.score != r2.score) {
+    fprintf(stderr,
+            "without positions=(%d,%d,%d), with positions=(%d,%d,%d)\n",
+            r2.start, r2.end, r2.score, with_positions.start,
+            with_positions.end, with_positions.score);
+    fuzz_fail("requesting positions changed a fuzzy result");
+  }
+  if (with_positions.start < 0 && positions->size != 0)
+    fuzz_fail("a failed fuzzy term returned positions");
+  check_positions("direct fuzzy matcher", candidate,
+                  with_positions.start >= 0, positions);
+  fzf_free_positions(positions);
+}
+
+static void run_one(const uint8_t *data, size_t size) {
+  if (!data || size < 2 || size > FZF_NATIVE_FUZZ_MAX_INPUT)
+    return;
+
+  uint8_t options = data[0];
+  const uint8_t *payload = data + 1;
+  size_t payload_size = size - 1;
+  size_t query_size = 0;
+  bool found_separator = false;
+  for (; query_size < payload_size; query_size++) {
+    if (payload[query_size] == '\n') {
+      found_separator = true;
+      break;
+    }
+  }
+  size_t candidate_offset;
+  if (found_separator) {
+    candidate_offset = query_size + 1;
+  } else {
+    query_size = payload_size == 0 ? 0 : options % (payload_size + 1);
+    candidate_offset = query_size;
+  }
+  size_t candidate_size = payload_size - candidate_offset;
+
+  char *query = malloc(query_size + 1);
+  char *candidate = malloc(candidate_size + 1);
+  if (!query || !candidate)
+    abort();
+  memcpy(query, payload, query_size);
+  query[query_size] = '\0';
+  memcpy(candidate, payload + candidate_offset, candidate_size);
+  candidate[candidate_size] = '\0';
+
+  fzf_case_types case_mode = (fzf_case_types)(options % 3);
+  bool fuzzy = (options & 4) != 0;
+  fzf_pattern_t *pattern =
+      fzf_parse_pattern(case_mode, false, query, fuzzy);
+  fzf_slab_t *slab = make_selected_slab(options);
+  fzf_slab_t *default_slab = fzf_make_default_slab();
+  if (!pattern || !slab || !default_slab)
+    abort();
+
+  int32_t score = fzf_get_score(candidate, pattern, default_slab);
+  int32_t repeated_score = fzf_get_score(candidate, pattern, default_slab);
+  if (score != repeated_score)
+    fuzz_fail("repeated scoring is not deterministic");
+
+  bool fast_match = fzf_has_match(candidate, pattern, default_slab);
+  if (fast_match != (score > 0)) {
+    fprintf(stderr, "score=%d has_match=%d case=%d fuzzy=%d\n", score,
+            (int)fast_match, (int)case_mode, (int)fuzzy);
+    fuzz_fail("fzf_has_match disagrees with fzf_get_score");
+  }
+
+  int32_t fallback_score = fzf_get_score(candidate, pattern, slab);
+  if ((fallback_score > 0) != (score > 0)) {
+    fprintf(stderr, "default_score=%d fallback_score=%d selected_cap=%zu\n",
+            score, fallback_score, slab->I16.cap);
+    fuzz_fail("slab fallback changed match membership");
+  }
+
+  fzf_position_t *positions =
+      fzf_get_positions(candidate, pattern, default_slab);
+  check_positions("fzf_get_positions", candidate, score > 0, positions);
+  fzf_free_positions(positions);
+
+  for (size_t i = 0; i < pattern->size; i++) {
+    fzf_term_set_t *set = pattern->ptr[i];
+    for (size_t j = 0; j < set->size; j++)
+      check_fuzzy_term_algorithms(candidate, &set->ptr[j], slab);
+  }
+
+  fzf_free_slab(default_slab);
+  fzf_free_slab(slab);
+  fzf_free_pattern(pattern);
+  free(candidate);
+  free(query);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  run_one(data, size);
+  return 0;
+}
+
+#ifdef FZF_FUZZ_STANDALONE
+static int replay_file(const char *path) {
+  FILE *file = fopen(path, "rb");
+  if (!file) {
+    perror(path);
+    return 1;
+  }
+  if (fseek(file, 0, SEEK_END) != 0) {
+    fclose(file);
+    return 1;
+  }
+  long length = ftell(file);
+  if (length < 0 || length > FZF_NATIVE_FUZZ_MAX_INPUT) {
+    fprintf(stderr, "%s: unsupported corpus file length %ld\n", path, length);
+    fclose(file);
+    return 1;
+  }
+  rewind(file);
+  uint8_t *bytes = malloc((size_t)length + 1);
+  if (!bytes) {
+    fclose(file);
+    return 1;
+  }
+  size_t got = fread(bytes, 1, (size_t)length, file);
+  fclose(file);
+  if (got != (size_t)length) {
+    free(bytes);
+    return 1;
+  }
+  run_one(bytes, got);
+  free(bytes);
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  if (argc < 2) {
+    fprintf(stderr, "usage: %s CORPUS-FILE...\n", argv[0]);
+    return 2;
+  }
+  for (int i = 1; i < argc; i++) {
+    if (replay_file(argv[i]) != 0)
+      return 1;
+  }
+  printf("Replayed %d fzf-native fuzz corpus files.\n", argc - 1);
+  return 0;
+}
+#endif

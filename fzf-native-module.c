@@ -1135,15 +1135,6 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
     return Qlistofzero;
   }
 
-  // Short-circuit if STR is empty.
-  ptrdiff_t str_len;
-  if (!env->copy_string_contents(env, args[0], NULL, &str_len)) {
-    env->non_local_exit_clear(env);
-    str_len = 0;
-  } else if (str_len == /* solely null byte */ 1) {
-    return Qlistofzero;
-  }
-
   struct Bump *bump = NULL;
   /* Default result on coercion failure: `(0)' - same shape as the
      empty-string short-circuit, meaning "no match". A string that
@@ -1211,8 +1202,9 @@ err:
   bump_free(bump);
   /* On coercion failure we return Qlistofzero (no match) rather than
      signaling, so a single un-coerceable input doesn't blow up a
-     larger completion batch. Empty STR/QUERY short-circuit to the
-     same value above. */
+     larger completion batch. Empty QUERY short-circuits to the same
+     value above; empty STR must reach the matcher because an inverse
+     term can legitimately match it. */
   return result;
 }
 

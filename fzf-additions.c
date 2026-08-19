@@ -31,6 +31,10 @@ static inline char fzf_addn_lower(unsigned char c) {
   return (char)tolower(c);
 }
 
+static inline bool fzf_addn_space(unsigned char c) {
+  return c == ' ' || (c >= '\t' && c <= '\r');
+}
+
 /* Fuzzy: the pattern's characters appear in TEXT in order.  Pattern is
    already case-normalized by fzf_parse_pattern when case_sensitive is
    false, so we only need to lowercase the text side. */
@@ -76,10 +80,16 @@ static bool fzf_addn_prefix(bool case_sensitive,
                             const char *text, size_t tn,
                             const char *pat,  size_t pn) {
   if (pn == 0) return true;
-  if (tn < pn) return false;
-  if (case_sensitive) return memcmp(text, pat, pn) == 0;
+  size_t start = 0;
+  /* fzf's anchored matchers ignore surrounding candidate whitespace unless
+     the pattern itself anchors whitespace.  Keep the boolean fast path in
+     lockstep with fzf_prefix_match. */
+  if (!fzf_addn_space((unsigned char)pat[0]))
+    while (start < tn && fzf_addn_space((unsigned char)text[start])) start++;
+  if (tn - start < pn) return false;
+  if (case_sensitive) return memcmp(text + start, pat, pn) == 0;
   for (size_t i = 0; i < pn; i++)
-    if (fzf_addn_lower((unsigned char)text[i]) != pat[i]) return false;
+    if (fzf_addn_lower((unsigned char)text[start + i]) != pat[i]) return false;
   return true;
 }
 
@@ -87,8 +97,11 @@ static bool fzf_addn_suffix(bool case_sensitive,
                             const char *text, size_t tn,
                             const char *pat,  size_t pn) {
   if (pn == 0) return true;
-  if (tn < pn) return false;
-  const char *tail = text + (tn - pn);
+  size_t end = tn;
+  if (!fzf_addn_space((unsigned char)pat[pn - 1]))
+    while (end > 0 && fzf_addn_space((unsigned char)text[end - 1])) end--;
+  if (end < pn) return false;
+  const char *tail = text + (end - pn);
   if (case_sensitive) return memcmp(tail, pat, pn) == 0;
   for (size_t i = 0; i < pn; i++)
     if (fzf_addn_lower((unsigned char)tail[i]) != pat[i]) return false;
@@ -98,10 +111,14 @@ static bool fzf_addn_suffix(bool case_sensitive,
 static bool fzf_addn_equal(bool case_sensitive,
                            const char *text, size_t tn,
                            const char *pat,  size_t pn) {
-  if (tn != pn) return false;
-  if (case_sensitive) return memcmp(text, pat, pn) == 0;
+  size_t start = 0;
+  size_t end = tn;
+  while (start < end && fzf_addn_space((unsigned char)text[start])) start++;
+  while (end > start && fzf_addn_space((unsigned char)text[end - 1])) end--;
+  if (end - start != pn) return false;
+  if (case_sensitive) return memcmp(text + start, pat, pn) == 0;
   for (size_t i = 0; i < pn; i++)
-    if (fzf_addn_lower((unsigned char)text[i]) != pat[i]) return false;
+    if (fzf_addn_lower((unsigned char)text[start + i]) != pat[i]) return false;
   return true;
 }
 

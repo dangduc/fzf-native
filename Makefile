@@ -2,6 +2,23 @@ export EMACS ?= $(shell which emacs)
 
 BUILD_DIR ?= build
 
+# Coverage-guided matcher fuzzing.  FUZZ_CC must support libFuzzer (Clang on
+# macOS and Linux does).  Override FUZZ_SECONDS for longer local/nightly runs.
+# Apple system Clang does not ship the libFuzzer runtime.  Prefer Homebrew
+# LLVM when present, while retaining ordinary Clang on Linux.
+FUZZ_CC ?= $(or $(firstword $(wildcard /opt/homebrew/opt/llvm/bin/clang /usr/local/opt/llvm/bin/clang)),clang)
+FUZZ_SECONDS ?= 30
+FUZZ_MAX_LEN ?= 4096
+FUZZ_VERBOSITY ?= 0
+FUZZ_SEED_DIR ?= fuzz/corpus
+FUZZ_DICTIONARY ?= fuzz/fzf-native.dict
+FUZZ_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-corpus
+FUZZ_ARTIFACT_DIR ?= $(BUILD_DIR)/fuzz-artifacts
+FUZZ_BINARY := $(BUILD_DIR)/fzf-native-fuzz
+FUZZ_REPLAY_BINARY := $(BUILD_DIR)/fzf-native-fuzz-replay
+FZF_REFERENCE ?= fzf
+FZF_REFERENCE_VERSION ?=
+
 # Vendored utf8proc, linked into the C tests because fzf.c's UTF-8 matching
 # variants (via utf8_char_index.h -> utf8proc.h) depend on it.
 UTF8PROC_DIR ?= utf8proc-2.10.0
@@ -132,6 +149,69 @@ ctest-asan: $(UTF8PROC_LIB)
 		-I. -I$(UTF8PROC_DIR) -pthread \
 		-o $(BUILD_DIR)/fzf-additions-test-asan fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_LIB)
 	$(BUILD_DIR)/fzf-additions-test-asan
+
+# The core matcher fuzzer uses differential properties rather than fixed
+# expected scores.  libFuzzer supplies coverage-guided inputs; ASan/UBSan turn
+# memory-safety and undefined-behavior findings into reproducible crashes.
+.PHONY: fuzz-build
+fuzz-build: $(UTF8PROC_LIB)
+	mkdir -p $(BUILD_DIR)
+	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
+		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
+		-I. -I$(UTF8PROC_DIR) -o $(FUZZ_BINARY) \
+		fuzz/fzf-native-fuzz.c fzf.c fzf-additions.c $(UTF8PROC_LIB)
+
+.PHONY: fuzz
+fuzz: fuzz-build
+	mkdir -p $(FUZZ_CORPUS_DIR) $(FUZZ_ARTIFACT_DIR)
+	cp $(FUZZ_SEED_DIR)/* $(FUZZ_CORPUS_DIR)/
+	$(FUZZ_BINARY) $(FUZZ_CORPUS_DIR) -max_len=$(FUZZ_MAX_LEN) \
+		-dict=$(FUZZ_DICTIONARY) -verbosity=$(FUZZ_VERBOSITY) \
+		-artifact_prefix=$(FUZZ_ARTIFACT_DIR)/ \
+		-max_total_time=$(FUZZ_SECONDS) -print_final_stats=1
+
+# Deterministic replay is useful in pre-commit checks and works without the
+# libFuzzer runtime.  Every minimized finding should be added to fuzz/corpus.
+.PHONY: fuzz-replay-build
+fuzz-replay-build: $(UTF8PROC_LIB)
+	mkdir -p $(BUILD_DIR)
+	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
+		-DFZF_FUZZ_STANDALONE -fsanitize=address,undefined \
+		-fno-omit-frame-pointer -I. -I$(UTF8PROC_DIR) \
+		-o $(FUZZ_REPLAY_BINARY) fuzz/fzf-native-fuzz.c fzf.c \
+		fzf-additions.c $(UTF8PROC_LIB)
+
+.PHONY: fuzz-replay
+fuzz-replay: fuzz-replay-build
+	$(FUZZ_REPLAY_BINARY) $(FUZZ_SEED_DIR)/*
+
+# Randomized properties at the Emacs module boundary.  Override the seed and
+# case counts in the environment to reproduce or deepen a run.
+.PHONY: fuzz-elisp
+fuzz-elisp:
+	$(EMACS) -Q --batch -L . -l ./fuzz/fzf-native-fuzz-test.el \
+		--eval '(ert-run-tests-batch-and-exit "^fzf-native-fuzz-")'
+
+# Optional semantic differential against the upstream CLI.  CI pins the exact
+# reference release; local runs may set FZF_REFERENCE and
+# FZF_REFERENCE_VERSION to exercise the same binary.
+.PHONY: fuzz-upstream
+fuzz-upstream:
+	command -v $(FZF_REFERENCE)
+	FZF_REFERENCE=$(FZF_REFERENCE) FZF_REFERENCE_VERSION=$(FZF_REFERENCE_VERSION) \
+		$(EMACS) -Q --batch -L . -l ./fuzz/fzf-native-upstream-test.el \
+		--eval '(ert-run-tests-batch-and-exit "^fzf-native-fuzz-upstream-")'
+
+# ThreadSanitizer cannot be combined with AddressSanitizer.  This target runs
+# the module-internal async/cache/reader tests under TSan as a separate lane.
+.PHONY: ctest-tsan
+ctest-tsan: $(UTF8PROC_LIB)
+	mkdir -p $(BUILD_DIR)
+	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g -fsanitize=thread \
+		-fno-omit-frame-pointer -I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/fzf-native-ctest-tsan fzf-native-ctest.c fzf.c \
+		fzf-additions.c $(UTF8PROC_LIB)
+	$(BUILD_DIR)/fzf-native-ctest-tsan
 
 .PHONY: clean
 clean:
