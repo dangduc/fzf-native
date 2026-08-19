@@ -48,6 +48,11 @@
   (let ((result (fzf-native-score "" "acef")))
     (should (equal result '(0)))))
 
+(ert-deftest fzf-native-score-empty-str-inverse-query-test ()
+  "An empty candidate can match a non-empty inverse query."
+  (should (> (car (fzf-native-score "" "!acef")) 0))
+  (should (equal (fzf-native-score-all '("") "!acef") '(""))))
+
 (ert-deftest fzf-native-score-str-wrong-type-int-test ()
   (should-error (fzf-native-score 1 "1")
                 :type 'wrong-type-argument))

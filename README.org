@@ -176,6 +176,37 @@ involved.
 mkdir build && cmake -B build -DCMAKE_C_FLAGS='-O3 -march=native' && cmake --build build
 #+end_src
 
+** Fuzzing
+
+The fuzz suite has three complementary layers:
+
+- ~make fuzz-replay~ replays the checked-in UTF-8, query-parser, inverse-term,
+  and small-slab regression corpus under AddressSanitizer and
+  UndefinedBehaviorSanitizer.
+- ~make fuzz~ runs the same structured matcher harness with libFuzzer.  Set
+  ~FUZZ_SECONDS~ to control the run length.  New coverage lives in
+  ~build/fuzz-corpus~ and minimized failures in ~build/fuzz-artifacts~.
+- ~make fuzz-elisp~ checks scalar/batch/filter/highlight equivalence and
+  exercises async query refinement, broadening, term reordering, garbage
+  collection, and teardown.  Runs are deterministic; set
+  ~FZF_NATIVE_FUZZ_SEED~, ~FZF_NATIVE_FUZZ_CASES~, and
+  ~FZF_NATIVE_FUZZ_ASYNC_SESSIONS~ to reproduce or deepen them.  Set
+  ~FZF_NATIVE_FUZZ_TRACE_ITERATION~ to print one exact generated ABI case
+  before it executes (useful when reducing a signal-level failure).
+
+When an upstream ~fzf~ executable is available, ~make fuzz-upstream~ compares
+randomized match multisets with the reference CLI.  CI pins both its release
+and archive checksum.  Local runs can select the same reference explicitly:
+
+#+begin_src bash
+FZF_REFERENCE=/path/to/fzf FZF_REFERENCE_VERSION=0.74.3 make fuzz-upstream
+#+end_src
+
+The separate ~make ctest-tsan~ lane covers the async reader, result cache, and
+deferred teardown under ThreadSanitizer.  Every fuzz failure prints its seed
+or writes a replayable artifact; promote minimized permanent regressions into
+~fuzz/corpus~ or a focused unit test.
+
 ** Debugging fzf-native with emacs/lldb (EXAMPLE)
 *** Building Emacs
 #+begin_src shell :tangle yes

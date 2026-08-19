@@ -76,30 +76,55 @@ static int32_t index_byte(fzf_string_t *string, char b) {
   return -1;
 }
 
+static bool fzf_unicode_is_space(utf8proc_int32_t cp) {
+  if ((cp >= 0x09 && cp <= 0x0d) || cp == 0x85)
+    return true;
+  utf8proc_category_t category = utf8proc_category(cp);
+  return category == UTF8PROC_CATEGORY_ZS ||
+         category == UTF8PROC_CATEGORY_ZL ||
+         category == UTF8PROC_CATEGORY_ZP;
+}
+
+/* Return a byte count.  The anchored algorithms use byte slices even on the
+   UTF-8 path, so counting raw `isspace' bytes is both locale-dependent and
+   unsafe: in a UTF-8 locale a continuation byte such as 0xa0 can be classified
+   as whitespace and split a CJK codepoint. */
 static size_t leading_whitespaces(fzf_string_t *str) {
-  size_t whitespaces = 0;
-  for (size_t i = 0; i < str->size; i++) {
-    if (!isspace((uint8_t)str->data[i])) {
-      break;
+  size_t pos = 0;
+  while (pos < str->size) {
+    utf8proc_int32_t cp;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)str->data + pos,
+        (utf8proc_ssize_t)(str->size - pos), &cp);
+    if (width <= 0) {
+      cp = (uint8_t)str->data[pos];
+      width = 1;
     }
-    whitespaces++;
+    if (!fzf_unicode_is_space(cp)) break;
+    pos += (size_t)width;
   }
-  return whitespaces;
+  return pos;
 }
 
 static size_t trailing_whitespaces(fzf_string_t *str) {
-  size_t whitespaces = 0;
-  /* Count down with a 1-based index so the unsigned `i' never underflows:
-     the original `for (size_t i = str->size - 1; i >= 0; i--)' read
-     data[SIZE_MAX] on an empty string and looped past 0 on an all-whitespace
-     string (out-of-bounds reads). */
-  for (size_t i = str->size; i > 0; i--) {
-    if (!isspace((uint8_t)str->data[i - 1])) {
-      break;
+  size_t pos = 0;
+  size_t trailing = 0;
+  while (pos < str->size) {
+    utf8proc_int32_t cp;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)str->data + pos,
+        (utf8proc_ssize_t)(str->size - pos), &cp);
+    if (width <= 0) {
+      cp = (uint8_t)str->data[pos];
+      width = 1;
     }
-    whitespaces++;
+    if (fzf_unicode_is_space(cp))
+      trailing += (size_t)width;
+    else
+      trailing = 0;
+    pos += (size_t)width;
   }
-  return whitespaces;
+  return trailing;
 }
 
 static void copy_runes(fzf_string_t *src, fzf_i32_t *destination) {
@@ -1172,7 +1197,7 @@ fzf_result_t fzf_prefix_match(bool case_sensitive, bool normalize,
   }
   size_t trimmed_len = 0;
   /* TODO(conni2461): i feel this is wrong */
-  if (!isspace((uint8_t)pattern->data[0])) {
+  if (!fzf_unicode_is_space((uint8_t)pattern->data[0])) {
     trimmed_len = leading_whitespaces(text);
   }
   if (text->size - trimmed_len < M) {
@@ -1204,7 +1229,7 @@ fzf_result_t fzf_suffix_match(bool case_sensitive, bool normalize,
   size_t trimmed_len = text->size;
   const size_t M = pattern->size;
   /* TODO(conni2461): i think this is wrong */
-  if (M == 0 || !isspace((uint8_t)pattern->data[M - 1])) {
+  if (M == 0 || !fzf_unicode_is_space((uint8_t)pattern->data[M - 1])) {
     trimmed_len -= trailing_whitespaces(text);
   }
   if (M == 0) {
@@ -1250,8 +1275,11 @@ fzf_result_t fzf_equal_match(bool case_sensitive, bool normalize,
 
   size_t trimmed_len = leading_whitespaces(text);
   size_t trimmed_end_len = trailing_whitespaces(text);
+  size_t content_len = trimmed_len + trimmed_end_len >= text->size
+                         ? 0
+                         : text->size - trimmed_len - trimmed_end_len;
 
-  if ((text->size - trimmed_len - trimmed_end_len) != M) {
+  if (content_len != M) {
     return (fzf_result_t){-1, -1, 0};
   }
 
@@ -1467,7 +1495,7 @@ fzf_result_t fzf_prefix_match_utf8(bool case_sensitive, bool normalize,
   if (M > 0) {
     utf8proc_int32_t first_pattern_cp;
     utf8proc_iterate((const utf8proc_uint8_t*)pattern->data, M, &first_pattern_cp);
-    if (utf8proc_get_property(first_pattern_cp)->category != UTF8PROC_CATEGORY_ZS) {
+    if (!fzf_unicode_is_space(first_pattern_cp)) {
       trimmed_start = leading_whitespaces(text);
     }
   }
@@ -1550,8 +1578,7 @@ fzf_result_t fzf_suffix_match_utf8(bool case_sensitive, bool normalize,
       scan_pos += bytes;
     }
 
-    if (scan_pos > 0 &&
-        utf8proc_get_property(last_pattern_cp)->category != UTF8PROC_CATEGORY_ZS) {
+    if (scan_pos > 0 && !fzf_unicode_is_space(last_pattern_cp)) {
       trimmed_len -= trailing_whitespaces(text);
     }
   }
@@ -1653,7 +1680,12 @@ fzf_result_t fzf_equal_match_utf8(bool case_sensitive, bool normalize,
 
   size_t trimmed_start = leading_whitespaces(text);
   size_t trimmed_end_len = trailing_whitespaces(text);
-  size_t content_byte_len = text->size - trimmed_start - trimmed_end_len;
+  /* Leading and trailing whitespace regions overlap when the candidate is
+     entirely whitespace.  Clamp that case to an empty content slice instead
+     of underflowing size_t and asking utf8_strlen to scan arbitrary memory. */
+  size_t content_byte_len = trimmed_start + trimmed_end_len >= text->size
+                              ? 0
+                              : text->size - trimmed_start - trimmed_end_len;
 
   // Count codepoints in text content and pattern for accurate comparison
   size_t text_cp_count = utf8_strlen(text->data + trimmed_start, content_byte_len);
@@ -2430,12 +2462,22 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
         if (term->inv) {
           continue;
         }
-        current_score = res.score;
+        /* Score zero is the public no-match sentinel.  Some valid v1
+           matches with long gaps can accumulate a non-positive raw score,
+           especially when v2 falls back because a slab is small.  Preserve
+           match membership and use the lowest rankable score instead of
+           silently dropping the candidate. */
+        current_score = res.score > 0 ? res.score : 1;
         matched = true;
         break;
       }
 
       if (term->inv) {
+        /* A term-set can be satisfied solely by an inverse term, including an
+           OR group such as `!foo | bar'.  Keep inverse terms score-neutral
+           here so `foo !bar' retains foo's historical score.  If every
+           successful set is score-neutral, the final return below converts
+           the otherwise-ambiguous zero to the public minimum match score. */
         current_score = 0;
         matched = true;
       }
@@ -2443,12 +2485,11 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
     if (matched) {
       total_score += current_score;
     } else {
-      total_score = 0;
-      break;
+      return 0;
     }
   }
 
-  return total_score;
+  return total_score > 0 ? total_score : 1;
 }
 
 fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
