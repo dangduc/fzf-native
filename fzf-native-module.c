@@ -12,6 +12,7 @@
 #include "emacs-module.h"
 #include "fzf.h"
 #include "fzf-additions.h"
+#include "utf8proc-2.10.0/utf8proc.h"
 #include <stdio.h>
 #include <stdarg.h>
 
@@ -129,6 +130,42 @@ emacs_value Qstringp, Qwrong_type_argument, Qerror;
 
 /** An Emacs string made accessible by copying. */
 struct Str { char *b; size_t len; };
+
+/* Count Emacs-style characters (Unicode codepoints) in UTF-8 data.  Invalid
+   bytes count as one character each so byte-junk inputs always make progress
+   and retain the module's existing best-effort behavior. */
+static size_t utf8_character_count(const char *str, size_t byte_len) {
+  size_t byte_pos = 0;
+  size_t char_count = 0;
+
+  while (byte_pos < byte_len) {
+    utf8proc_int32_t codepoint;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)(str + byte_pos),
+        (utf8proc_ssize_t)(byte_len - byte_pos), &codepoint);
+    byte_pos += width > 0 ? (size_t)width : 1;
+    char_count++;
+  }
+  return char_count;
+}
+
+/* Return the byte length of the first CHAR_LIMIT codepoints without splitting
+   a valid UTF-8 sequence.  Invalid bytes count as one codepoint. */
+static size_t utf8_prefix_byte_length(const char *str, size_t byte_len,
+                                      size_t char_limit) {
+  size_t byte_pos = 0;
+  size_t char_count = 0;
+
+  while (byte_pos < byte_len && char_count < char_limit) {
+    utf8proc_int32_t codepoint;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)(str + byte_pos),
+        (utf8proc_ssize_t)(byte_len - byte_pos), &codepoint);
+    byte_pos += width > 0 ? (size_t)width : 1;
+    char_count++;
+  }
+  return byte_pos;
+}
 
 /** Module userdata that gets allocated once at initialization. */
 struct Data {
@@ -701,12 +738,13 @@ emacs_value fzf_native_score_all(emacs_env *env,
      Pool size for the decision is the candidate count we just batched. */
   size_t fo_min_pool = 0, fo_max_len = 0;
   bool   fo_logic_and = resolve_filter_only_settings(env, &fo_min_pool, &fo_max_len);
+  size_t query_char_len = utf8_character_count(query.b, query.len);
   bool   filter_only_mode = decide_filter_only(fo_min_pool, fo_max_len,
                                                fo_logic_and,
-                                               query.len, (size_t)n);
+                                               query_char_len, (size_t)n);
   fzf_log("fzf_native_score_all: filter_only=%d (min_pool=%zu max_len=%zu logic=%s qlen=%zu pool=%td)\n",
           (int)filter_only_mode, fo_min_pool, fo_max_len,
-          fo_logic_and ? "and" : "or", query.len, n);
+          fo_logic_and ? "and" : "or", query_char_len, n);
 
   fzf_pattern_t *pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
   struct Shared shared = {
@@ -1737,10 +1775,13 @@ static void *async_reader(void *arg) {
 
     ptrdiff_t mll = s->max_line_length;
     if (mll != 0) {
-      ptrdiff_t cap = mll > 0 ? mll : -mll;
-      if ((ptrdiff_t)len > cap) {
+      size_t cap = mll > 0
+                     ? (size_t)mll
+                     : (size_t)(-(mll + 1)) + 1;
+      size_t char_len = utf8_character_count(line, len);
+      if (char_len > cap) {
         if (mll > 0) continue;   /* exclude */
-        len = (size_t)cap;       /* truncate */
+        len = utf8_prefix_byte_length(line, len, cap); /* truncate */
         line[len] = '\0';
       }
     }
@@ -2329,7 +2370,10 @@ static void *scoring_thread_fn(void *arg) {
        The min-pool arm is cached at session start; the length arm and
        the logic knob were snapshot per dispatch on the main thread and
        carried here via the request slot. */
-    size_t flen_for_decision = filter ? strlen(filter) : 0;
+    size_t filter_byte_len = filter ? strlen(filter) : 0;
+    size_t flen_for_decision = filter
+                                   ? utf8_character_count(filter, filter_byte_len)
+                                   : 0;
     bool   filter_only_mode  = decide_filter_only(
         s->filter_only_min_pool, fo_max_len, fo_logic_and,
         flen_for_decision, count);

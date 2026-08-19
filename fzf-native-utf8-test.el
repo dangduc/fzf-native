@@ -4,6 +4,7 @@
 ;; to ensure the Emacs module handles them correctly
 
 (require 'ert)
+(require 'benchmark)
 (require 'fzf-native)
 
 ;; Load the dynamic module
@@ -121,6 +122,14 @@
   
   ;; Cyrillic case folding
   (should (> (fzf-native-utf8-test--get-score "Москва" "мос") 0)))
+
+(ert-deftest fzf-native-utf8-case-ignore-length-changing-fold-test ()
+  "CaseIgnore handles lowercase mappings that change UTF-8 byte length."
+  (let ((fzf-native-case-mode 'ignore))
+    ;; U+212A KELVIN SIGN occupies three UTF-8 bytes but lowercases to the
+    ;; one-byte ASCII letter k.  Both candidate/query directions must match.
+    (should (> (fzf-native-utf8-test--get-score "k" "K") 0))
+    (should (> (fzf-native-utf8-test--get-score "K" "k") 0))))
 
 ;; Test with all UTF-8 strings from C tests
 (ert-deftest fzf-native-utf8-comprehensive-test ()
@@ -341,18 +350,40 @@ text \"café\":
   (should (equal (fzf-native-score "café" "^caf | ^café$") '(80)))
   (should (equal (fzf-native-score "café" "zzz | ^café$")  '(104))))
 
-;; Performance test with UTF-8 strings
+;; Broad, relative guard only: the standalone completion benchmark remains the
+;; source of publishable timings.  This catches catastrophic UTF-8 regressions
+;; without asserting machine-specific absolute latency.
 (ert-deftest fzf-native-utf8-performance-test ()
-  "Test performance doesn't degrade significantly with UTF-8."
-  (let ((ascii-str "hello world test file")
-        (utf8-str "café résumé naïve über")
-        (cjk-str "中文测试字符串")
-        (query "test"))
-    
-    ;; Just verify they all work - actual benchmarking would be separate
-    (should (numberp (fzf-native-utf8-test--get-score ascii-str query)))
-    (should (numberp (fzf-native-utf8-test--get-score utf8-str query)))
-    (should (numberp (fzf-native-utf8-test--get-score cjk-str query)))))
+  "UTF-8 scoring stays within a broad relative bound of ASCII scoring."
+  (let* ((iterations 5000)
+         (slab (fzf-native-make-default-slab))
+         (ascii-str "hello-world-test-file-name")
+         (latin-str "héllo-wörld-tëst-fïle-nâme")
+         (cjk-str "你好世界测试文件列表目录项目源代码模块函数接口")
+         (ascii-query "hwt")
+         (latin-query "hwt")
+         (cjk-query "你测模"))
+    ;; Keep the timed calls meaningful: every workload must actually match.
+    (should (> (fzf-native-utf8-test--get-score ascii-str ascii-query) 0))
+    (should (> (fzf-native-utf8-test--get-score latin-str latin-query) 0))
+    (should (> (fzf-native-utf8-test--get-score cjk-str cjk-query) 0))
+    (let* ((ascii-time
+            (car (benchmark-run iterations
+                   (fzf-native-score ascii-str ascii-query slab))))
+           (latin-time
+            (car (benchmark-run iterations
+                   (fzf-native-score latin-str latin-query slab))))
+           (cjk-time
+            (car (benchmark-run iterations
+                   (fzf-native-score cjk-str cjk-query slab))))
+           ;; A deliberately broad ceiling avoids scheduler-noise flakes while
+           ;; still detecting runaway decoding or accidental quadratic work.
+           (ceiling (* 20.0 (max ascii-time 0.000001))))
+      (should (> ascii-time 0))
+      (should (> latin-time 0))
+      (should (> cjk-time 0))
+      (should (< latin-time ceiling))
+      (should (< cjk-time ceiling)))))
 
 (provide 'fzf-native-utf8-test)
 ;;; fzf-native-utf8-test.el ends here

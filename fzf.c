@@ -456,11 +456,21 @@ static int32_t ascii_fuzzy_index(fzf_string_t *input, const char *pattern,
 /* UTF-8 utility functions using utf8proc */
 
 bool is_ascii_utf8proc(const char *text, size_t len) {
-  for (size_t i = 0; i < len; i++) {
-    if ((unsigned char)text[i] > 127) {
-      return false;
-    }
+  const unsigned char *ptr = (const unsigned char *)text;
+
+  /* fzf_has_match uses this check for every filter-only candidate.  Inspect
+     eight bytes at a time so Unicode correctness does not add a byte-at-a-time
+     pre-pass to the overwhelmingly ASCII completion corpus.  memcpy keeps the
+     load valid for unaligned strings. */
+  while (len >= sizeof(uint64_t)) {
+    uint64_t word;
+    memcpy(&word, ptr, sizeof(word));
+    if (word & UINT64_C(0x8080808080808080)) return false;
+    ptr += sizeof(word);
+    len -= sizeof(word);
   }
+  while (len-- > 0)
+    if (*ptr++ & 0x80) return false;
   return true;
 }
 
@@ -2267,6 +2277,12 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
       SFREE(text);
       text = lower_text;
       og_str = lower_text;
+      /* Unicode lowercasing can change the encoded byte length (for example,
+         U+212A KELVIN SIGN is three UTF-8 bytes but lowercases to one-byte
+         ASCII "k").  Every parser check below, and fzf_string_t.size, uses
+         LEN as a byte count, so retain the transformed length rather than the
+         source token's length. */
+      len = strlen(text);
     } else {
       SFREE(lower_text);
     }

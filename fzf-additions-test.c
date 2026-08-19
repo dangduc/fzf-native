@@ -200,6 +200,11 @@ static void test_utf8_terms(void) {
   /* Smart-case, all-lowercase query folds against an uppercase accented
      candidate (É -> é via utf8proc single-codepoint tolower). */
   check_agreement("utf8 case-fold",     "CAFÉ",     "café", CaseSmart, true, true);
+  /* U+212A KELVIN SIGN lowercases from a three-byte UTF-8 sequence to the
+     one-byte ASCII letter k.  This guards both matching semantics and the
+     transformed pattern length under ASan/UBSan. */
+  check_agreement("utf8 shrinking case-fold", "k", "K", CaseIgnore, true, true);
+  check_agreement("utf8 shrinking candidate-fold", "K", "k", CaseIgnore, true, true);
   check_agreement("utf8 exact",         "héllo wörld", "'wör", CaseIgnore, true, true);
   /* Inverted non-ASCII term: must EXCLUDE candidates containing it, and KEEP
      those that don't (the false-positive direction of the deferral bug). */

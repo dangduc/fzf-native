@@ -469,6 +469,21 @@ including the UTF-8 / inverted cases that the regression broke."
          ((equal query "zzz")
           (should (null active))))))))
 
+(ert-deftest fzf-native-score-all-filter-only-length-counts-characters-test ()
+  "Filter-only query thresholds count characters, not UTF-8 bytes."
+  (let ((fzf-native-filter-only-min-pool nil)
+        (fzf-native-filter-only-length 1)
+        (fzf-native-filter-only-logic 'or)
+        (fzf-native-batch-highlight nil))
+    (let ((ascii (car (fzf-native-score-all (vector "abc") "a")))
+          (utf8 (car (fzf-native-score-all (vector "你好") "你"))))
+      ;; Filter-only deliberately omits `completion-score'.  Both one-character
+      ;; queries must therefore take that path despite differing byte lengths.
+      (should ascii)
+      (should utf8)
+      (should-not (get-text-property 0 'completion-score ascii))
+      (should-not (get-text-property 0 'completion-score utf8)))))
+
 ;;
 ;; Async path (fzf-native-async-*)
 ;;
@@ -822,6 +837,53 @@ sys.stdout.buffer.write(b\"another_valid\\n\")
             (should (member "你好世界" result))
             (should (member "你是" result))
             (should-not (member "Hello" result))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-max-line-length-counts-characters-test ()
+  "Async line limits count characters and truncate at UTF-8 boundaries."
+  (skip-unless (and (fboundp 'fzf-native-async-start)
+                    (executable-find "python3")))
+  ;; Positive cap: keep the two-character line and exclude the three-character
+  ;; line, regardless of their six- and nine-byte UTF-8 encodings.
+  (let* ((fzf-native-max-line-length 2)
+         (handle (fzf-native-async-start
+                  "python3 -u -c 'print(\"你好\"); print(\"你好吗\")'")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (should (fzf-native-test--wait-for-fresh handle ""))
+          (should (equal (fzf-native-async-candidates handle "") '("你好"))))
+      (fzf-native-async-stop handle)))
+  ;; Negative cap: retain two complete characters instead of two raw bytes.
+  (let* ((fzf-native-max-line-length -2)
+         (handle (fzf-native-async-start
+                  "python3 -u -c 'print(\"你好吗\")'")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (should (fzf-native-test--wait-for-fresh handle ""))
+          (should (equal (fzf-native-async-candidates handle "") '("你好"))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-filter-only-length-counts-characters-test ()
+  "Async filter-only thresholds count characters, not UTF-8 bytes."
+  (skip-unless (and (fboundp 'fzf-native-async-start)
+                    (executable-find "python3")))
+  (let* ((fzf-native-filter-only-min-pool nil)
+         (fzf-native-filter-only-length 1)
+         (fzf-native-filter-only-logic 'or)
+         (fzf-native-max-line-length nil)
+         (fzf-native-async-highlight nil)
+         (handle (fzf-native-async-start
+                  "python3 -u -c 'print(\"zzz你\"); print(\"你\")'")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (should (fzf-native-test--wait-for-fresh handle "你"))
+          ;; Filter-only preserves producer order; full scoring would rank the
+          ;; exact candidate "你" ahead of "zzz你".
+          (should (equal (fzf-native-async-candidates handle "你")
+                         '("zzz你" "你"))))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-long-line-whole-test ()
