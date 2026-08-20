@@ -433,6 +433,274 @@ static void check_case_monotonicity(const char *candidate, const char *query,
   free(respect_query);
 }
 
+typedef struct {
+  const char *data;
+  size_t size;
+} fuzz_query_token_t;
+
+static int32_t score_query(const char *candidate, const char *query,
+                           fzf_case_types case_mode, bool fuzzy,
+                           fzf_slab_t *slab) {
+  char *mutable_query = strdup(query);
+  if (!mutable_query) abort();
+  fzf_pattern_t *pattern =
+      fzf_parse_pattern(case_mode, false, mutable_query, fuzzy);
+  if (!pattern) abort();
+  int32_t score = fzf_get_score(candidate, pattern, slab);
+  fzf_free_pattern(pattern);
+  free(mutable_query);
+  return score;
+}
+
+static void check_equivalent_query_score(const char *candidate,
+                                         const char *query,
+                                         fzf_case_types case_mode,
+                                         bool fuzzy, fzf_slab_t *slab,
+                                         int32_t expected,
+                                         const char *property) {
+  int32_t actual = score_query(candidate, query, case_mode, fuzzy, slab);
+  if (actual != expected) {
+    fprintf(stderr, "expected_score=%d rewritten_score=%d fuzzy=%d\n",
+            expected, actual, (int)fuzzy);
+    fuzz_fail(property);
+  }
+}
+
+static void check_equivalent_query_membership(const char *candidate,
+                                              const char *query,
+                                              fzf_case_types case_mode,
+                                              bool fuzzy, fzf_slab_t *slab,
+                                              bool expected,
+                                              const char *property) {
+  int32_t actual = score_query(candidate, query, case_mode, fuzzy, slab);
+  if ((actual > 0) != expected) {
+    fprintf(stderr, "expected_match=%d rewritten_score=%d fuzzy=%d\n",
+            (int)expected, actual, (int)fuzzy);
+    fuzz_fail(property);
+  }
+}
+
+/* Split the subset of extended-search syntax in which spaces are true token
+   separators.  Escaped spaces and tokens ending in a backslash are rejected:
+   moving the latter before a separator would create a new escaped space. */
+static bool split_simple_query(const char *query, fuzz_query_token_t **tokens,
+                               size_t *count) {
+  *tokens = NULL;
+  *count = 0;
+  if (strstr(query, "\\ ") != NULL) return false;
+
+  size_t len = strlen(query);
+  size_t token_count = 0;
+  for (size_t pos = 0; pos < len;) {
+    while (pos < len && query[pos] == ' ') pos++;
+    if (pos == len) break;
+    token_count++;
+    while (pos < len && query[pos] != ' ') pos++;
+  }
+  if (token_count == 0) return true;
+
+  fuzz_query_token_t *result =
+      malloc(token_count * sizeof(fuzz_query_token_t));
+  if (!result) abort();
+  size_t index = 0;
+  for (size_t pos = 0; pos < len;) {
+    while (pos < len && query[pos] == ' ') pos++;
+    if (pos == len) break;
+    size_t start = pos;
+    while (pos < len && query[pos] != ' ') pos++;
+    if (query[pos - 1] == '\\') {
+      free(result);
+      return false;
+    }
+    result[index++] =
+        (fuzz_query_token_t){.data = query + start, .size = pos - start};
+  }
+  *tokens = result;
+  *count = token_count;
+  return true;
+}
+
+static bool query_token_is_bar(const fuzz_query_token_t *token) {
+  return token->size == 1 && token->data[0] == '|';
+}
+
+static void append_query_token(char *output, size_t *offset,
+                               const fuzz_query_token_t *token) {
+  memcpy(output + *offset, token->data, token->size);
+  *offset += token->size;
+}
+
+static bool pattern_is_simple_and(const fzf_pattern_t *pattern,
+                                  const fuzz_query_token_t *tokens,
+                                  size_t count) {
+  if (count < 2 || pattern->size != count) return false;
+  for (size_t i = 0; i < count; i++) {
+    if (query_token_is_bar(&tokens[i]) || pattern->ptr[i]->size != 1)
+      return false;
+  }
+  return true;
+}
+
+static bool pattern_is_simple_or(const fzf_pattern_t *pattern,
+                                 const fuzz_query_token_t *tokens,
+                                 size_t count) {
+  if (count < 3 || count % 2 == 0 || pattern->size != 1 ||
+      pattern->ptr[0]->size != (count + 1) / 2)
+    return false;
+  for (size_t i = 0; i < count; i++) {
+    if (query_token_is_bar(&tokens[i]) != (i % 2 == 1)) return false;
+  }
+  return true;
+}
+
+static void check_query_whitespace_metamorphisms(
+    const char *candidate, const char *query, fzf_case_types case_mode,
+    bool fuzzy, fzf_slab_t *slab, int32_t score) {
+  size_t len = strlen(query);
+
+  char *leading = malloc(len + 3);
+  if (!leading) abort();
+  memcpy(leading, "  ", 2);
+  memcpy(leading + 2, query, len + 1);
+  check_equivalent_query_score(
+      candidate, leading, case_mode, fuzzy, slab, score,
+      "leading query whitespace changed a score");
+  free(leading);
+
+  /* A trailing space immediately after a backslash becomes an escaped literal
+     in this parser.  Otherwise two extra spaces are trimmed back to QUERY,
+     including when QUERY already ends in an escaped space. */
+  if (len == 0 || query[len - 1] != '\\') {
+    char *trailing = malloc(len + 3);
+    if (!trailing) abort();
+    memcpy(trailing, query, len);
+    memcpy(trailing + len, "  ", 3);
+    check_equivalent_query_score(
+        candidate, trailing, case_mode, fuzzy, slab, score,
+        "trailing query whitespace changed a score");
+    free(trailing);
+  }
+
+  for (size_t i = 0; i < len; i++) {
+    if (query[i] != ' ' || (i > 0 && query[i - 1] == '\\')) continue;
+    char *expanded = malloc(len + 3);
+    if (!expanded) abort();
+    memcpy(expanded, query, i);
+    memcpy(expanded + i, "   ", 3);
+    memcpy(expanded + i + 3, query + i + 1, len - i);
+    check_equivalent_query_score(
+        candidate, expanded, case_mode, fuzzy, slab, score,
+        "expanding query whitespace changed a score");
+    free(expanded);
+    break;
+  }
+}
+
+static bool token_is_operator_free_literal(const fuzz_query_token_t *token) {
+  if (token->size == 0 || query_token_is_bar(token)) return false;
+  char first = token->data[0];
+  char last = token->data[token->size - 1];
+  return first != '!' && first != '\'' && first != '^' && last != '$';
+}
+
+static void check_query_structure_metamorphisms(
+    const char *candidate, const char *query, fzf_case_types case_mode,
+    bool fuzzy, const fzf_pattern_t *pattern, fzf_slab_t *slab,
+    int32_t score) {
+  fuzz_query_token_t *tokens = NULL;
+  size_t count = 0;
+  if (!split_simple_query(query, &tokens, &count)) return;
+
+  if (pattern_is_simple_and(pattern, tokens, count)) {
+    size_t output_len = count - 1;
+    for (size_t i = 0; i < count; i++) output_len += tokens[i].size;
+    char *reversed = malloc(output_len + 1);
+    if (!reversed) abort();
+    size_t offset = 0;
+    for (size_t i = count; i-- > 0;) {
+      if (offset > 0) reversed[offset++] = ' ';
+      append_query_token(reversed, &offset, &tokens[i]);
+    }
+    reversed[offset] = '\0';
+    check_equivalent_query_score(
+        candidate, reversed, case_mode, fuzzy, slab, score,
+        "reordering AND terms changed a score");
+    free(reversed);
+  }
+
+  if (pattern_is_simple_or(pattern, tokens, count)) {
+    size_t branches = (count + 1) / 2;
+    size_t output_len = (branches - 1) * 3;
+    for (size_t i = 0; i < count; i += 2) output_len += tokens[i].size;
+    char *reversed = malloc(output_len + 1);
+    if (!reversed) abort();
+    size_t offset = 0;
+    for (size_t branch = branches; branch-- > 0;) {
+      if (offset > 0) {
+        memcpy(reversed + offset, " | ", 3);
+        offset += 3;
+      }
+      append_query_token(reversed, &offset, &tokens[branch * 2]);
+    }
+    reversed[offset] = '\0';
+    check_equivalent_query_membership(
+        candidate, reversed, case_mode, fuzzy, slab, score > 0,
+        "reordering OR branches changed match membership");
+    free(reversed);
+  }
+
+  if (count == 1 && pattern->size == 1 && pattern->ptr[0]->size == 1 &&
+      !query_token_is_bar(&tokens[0])) {
+    size_t token_len = tokens[0].size;
+    char *duplicate_or = malloc(token_len * 2 + 4);
+    char *duplicate_and = malloc(token_len * 2 + 2);
+    if (!duplicate_or || !duplicate_and) abort();
+    memcpy(duplicate_or, tokens[0].data, token_len);
+    memcpy(duplicate_or + token_len, " | ", 3);
+    memcpy(duplicate_or + token_len + 3, tokens[0].data, token_len);
+    duplicate_or[token_len * 2 + 3] = '\0';
+    memcpy(duplicate_and, tokens[0].data, token_len);
+    duplicate_and[token_len] = ' ';
+    memcpy(duplicate_and + token_len + 1, tokens[0].data, token_len);
+    duplicate_and[token_len * 2 + 1] = '\0';
+
+    check_equivalent_query_score(
+        candidate, duplicate_or, case_mode, fuzzy, slab, score,
+        "duplicating an OR branch changed a score");
+    check_equivalent_query_membership(
+        candidate, duplicate_and, case_mode, fuzzy, slab, score > 0,
+        "duplicating an AND term changed match membership");
+    free(duplicate_and);
+    free(duplicate_or);
+
+    if (token_is_operator_free_literal(&tokens[0])) {
+      char *literal = malloc(token_len + 1);
+      char *quoted = malloc(token_len + 2);
+      if (!literal || !quoted) abort();
+      memcpy(literal, tokens[0].data, token_len);
+      literal[token_len] = '\0';
+      quoted[0] = '\'';
+      memcpy(quoted + 1, tokens[0].data, token_len);
+      quoted[token_len + 1] = '\0';
+
+      int32_t exact_score =
+          score_query(candidate, literal, case_mode, false, slab);
+      check_equivalent_query_score(
+          candidate, quoted, case_mode, true, slab, exact_score,
+          "quoted exact and global exact scores differ");
+      int32_t fuzzy_score =
+          score_query(candidate, literal, case_mode, true, slab);
+      check_equivalent_query_score(
+          candidate, quoted, case_mode, false, slab, fuzzy_score,
+          "quoted fuzzy and global fuzzy scores differ");
+      free(quoted);
+      free(literal);
+    }
+  }
+
+  free(tokens);
+}
+
 static void check_fuzzy_term_algorithms(const char *candidate,
                                         const fzf_term_t *term,
                                         fzf_slab_t *slab) {
@@ -518,6 +786,11 @@ static void run_one(const uint8_t *data, size_t size) {
   int32_t repeated_score = fzf_get_score(candidate, pattern, default_slab);
   if (score != repeated_score)
     fuzz_fail("repeated scoring is not deterministic");
+
+  check_query_whitespace_metamorphisms(candidate, query, case_mode, fuzzy,
+                                       default_slab, score);
+  check_query_structure_metamorphisms(candidate, query, case_mode, fuzzy,
+                                      pattern, default_slab, score);
 
   check_candidate_extension_monotonicity(candidate, pattern, score,
                                          default_slab);

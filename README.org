@@ -186,6 +186,11 @@ The fuzz suite has three complementary layers:
 - ~make fuzz~ runs the same structured matcher harness with libFuzzer.  Set
   ~FUZZ_SECONDS~ to control the run length.  New coverage lives in
   ~build/fuzz-corpus~ and minimized failures in ~build/fuzz-artifacts~.
+  In addition to matcher-level invariants, the harness rewrites extended-search
+  queries and checks whitespace equivalence, AND/OR reordering, duplicate-term
+  idempotence, and the duality between a leading quote and the global fuzzy
+  mode.  Score equality is required where term evaluation order is irrelevant;
+  otherwise the oracle compares match membership.
   ~make fuzz-continuous~ runs repeated 30-minute epochs.  Each epoch keeps the
   corpus and resets the sanitizer state.  A failure stops the loop.  Set
   ~FUZZ_EPOCH_SECONDS~ to change the epoch length.
