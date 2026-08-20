@@ -228,30 +228,44 @@ static bool extension_preserves_pattern(fzf_pattern_t *pattern,
 static void check_candidate_extension_monotonicity(
     const char *candidate, fzf_pattern_t *pattern, int32_t score,
     fzf_slab_t *slab) {
+  static const char *extensions[] = {"x", " ", "\xc3\xa9",
+                                     "\xf0\x9f\x9a\x80"};
   size_t len = strlen(candidate);
   if (score <= 0 || !valid_utf8(candidate, len))
     return;
 
-  char *extended = malloc(len + 2);
+  char *extended = malloc(len + 5);
   if (!extended)
     abort();
 
   /* A positive fuzzy, substring-exact, or prefix match remains a match when
      text is appended.  The symmetric relation holds for suffix-safe terms
-     when text is prepended.  Equal and inverse terms are excluded above. */
-  if (extension_preserves_pattern(pattern, false)) {
-    memcpy(extended, candidate, len);
-    extended[len] = 'x';
-    extended[len + 1] = '\0';
-    if (fzf_get_score(extended, pattern, slab) <= 0)
-      fuzz_fail("appending a character destroyed a prefix-safe match");
-  }
+     when text is prepended.  Equal and inverse terms are excluded above.
+     Non-ASCII extensions also force an ASCII candidate through the UTF-8
+     algorithm variants, checking that dispatch cannot change membership. */
+  bool append_safe = extension_preserves_pattern(pattern, false);
+  bool prepend_safe = extension_preserves_pattern(pattern, true);
+  for (size_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); i++) {
+    const char *extension = extensions[i];
+    size_t extension_len = strlen(extension);
 
-  if (extension_preserves_pattern(pattern, true)) {
-    extended[0] = 'x';
-    memcpy(extended + 1, candidate, len + 1);
-    if (fzf_get_score(extended, pattern, slab) <= 0)
-      fuzz_fail("prepending a character destroyed a suffix-safe match");
+    if (append_safe) {
+      memcpy(extended, candidate, len);
+      memcpy(extended + len, extension, extension_len + 1);
+      if (fzf_get_score(extended, pattern, slab) <= 0) {
+        fprintf(stderr, "extension=%zu direction=append\n", i);
+        fuzz_fail("appending text destroyed a prefix-safe match");
+      }
+    }
+
+    if (prepend_safe) {
+      memcpy(extended, extension, extension_len);
+      memcpy(extended + extension_len, candidate, len + 1);
+      if (fzf_get_score(extended, pattern, slab) <= 0) {
+        fprintf(stderr, "extension=%zu direction=prepend\n", i);
+        fuzz_fail("prepending text destroyed a suffix-safe match");
+      }
+    }
   }
 
   free(extended);
