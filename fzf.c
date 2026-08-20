@@ -2384,14 +2384,17 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
 
   fzf_string_t input = {.data = text, .size = strlen(text)};
   if (pattern->only_inv) {
-    int final = 0;
     for (size_t i = 0; i < pattern->size; i++) {
       fzf_term_set_t *term_set = pattern->ptr[i];
       fzf_term_t *term = &term_set->ptr[0];
-
-      final += CALL_ALG(term, false, input, NULL, slab).score;
+      /* Negation is a membership decision, not a ranking decision.  The v1
+         fallback can return a valid match with a non-positive raw score when
+         the matching characters have a long gap.  Testing SCORE here made a
+         small slab accept candidates that the default slab rejected. */
+      if (CALL_ALG(term, false, input, NULL, slab).start >= 0)
+        return 0;
     }
-    return (final > 0) ? 0 : 1;
+    return 1;
   }
 
   int32_t total_score = 0;
