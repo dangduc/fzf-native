@@ -71,6 +71,101 @@ static void check_positions(const char *source, const char *candidate,
   }
 }
 
+static fzf_algo_t utf8_variant(fzf_algo_t algo) {
+  if (algo == fzf_fuzzy_match_v2)
+    return fzf_fuzzy_match_v2_utf8;
+  if (algo == fzf_fuzzy_match_v1)
+    return fzf_fuzzy_match_v1_utf8;
+  if (algo == fzf_exact_match_naive)
+    return fzf_exact_match_utf8;
+  if (algo == fzf_prefix_match)
+    return fzf_prefix_match_utf8;
+  if (algo == fzf_suffix_match)
+    return fzf_suffix_match_utf8;
+  if (algo == fzf_equal_match)
+    return fzf_equal_match_utf8;
+  return algo;
+}
+
+static const char *algo_name(fzf_algo_t algo) {
+  if (algo == fzf_fuzzy_match_v2)
+    return "fuzzy-v2";
+  if (algo == fzf_fuzzy_match_v2_utf8)
+    return "fuzzy-v2-utf8";
+  if (algo == fzf_fuzzy_match_v1)
+    return "fuzzy-v1";
+  if (algo == fzf_fuzzy_match_v1_utf8)
+    return "fuzzy-v1-utf8";
+  if (algo == fzf_exact_match_naive)
+    return "exact";
+  if (algo == fzf_exact_match_utf8)
+    return "exact-utf8";
+  if (algo == fzf_prefix_match)
+    return "prefix";
+  if (algo == fzf_prefix_match_utf8)
+    return "prefix-utf8";
+  if (algo == fzf_suffix_match)
+    return "suffix";
+  if (algo == fzf_suffix_match_utf8)
+    return "suffix-utf8";
+  if (algo == fzf_equal_match)
+    return "equal";
+  if (algo == fzf_equal_match_utf8)
+    return "equal-utf8";
+  return "unknown";
+}
+
+static void check_term_positions(const char *candidate, const fzf_term_t *term,
+                                 fzf_slab_t *slab) {
+  if (!term->fn || !term->text)
+    return;
+
+  fzf_string_t input = {.data = candidate, .size = strlen(candidate)};
+  fzf_string_t *pattern = (fzf_string_t *)term->text;
+  fzf_algo_t algo = term->fn;
+  if (!is_ascii_utf8proc(input.data, input.size))
+    algo = utf8_variant(algo);
+
+  fzf_result_t without_positions =
+      algo(term->case_sensitive, false, &input, pattern, NULL, slab);
+  fzf_position_t *positions = fzf_pos_array(0);
+  fzf_result_t with_positions =
+      algo(term->case_sensitive, false, &input, pattern, positions, slab);
+
+  /* Fuzzy v2 backtracks to its true start only when positions are requested,
+     so START may differ.  Membership and score must remain observation-safe
+     for every matcher. */
+  if ((with_positions.start >= 0) != (without_positions.start >= 0) ||
+      with_positions.score != without_positions.score) {
+    fprintf(stderr,
+            "without positions=(%d,%d,%d), with positions=(%d,%d,%d)\n",
+            without_positions.start, without_positions.end,
+            without_positions.score, with_positions.start,
+            with_positions.end, with_positions.score);
+    fuzz_fail("requesting positions changed a term result");
+  }
+
+  bool matched = with_positions.start >= 0;
+  check_positions("direct term matcher", candidate, matched, positions);
+  /* A malformed byte string has no stable character-count oracle.  It still
+     exercises the matcher under ASan/UBSan and the bounds check above treats
+     each byte as the conservative limit, but require exact position counts
+     only when both sides have an unambiguous UTF-8 character sequence. */
+  if (matched && valid_utf8(input.data, input.size) &&
+      valid_utf8(pattern->data, pattern->size)) {
+    size_t pattern_chars = utf8_strlen(pattern->data, pattern->size);
+    if (positions->size != pattern_chars) {
+      fprintf(stderr,
+              "%s matched %zu-byte candidate with %zu-byte term but returned "
+              "%zu positions for %zu characters\n",
+              algo_name(algo), input.size, pattern->size, positions->size,
+              pattern_chars);
+      fuzz_fail("a matched term returned the wrong number of positions");
+    }
+  }
+  fzf_free_positions(positions);
+}
+
 static void check_fuzzy_term_algorithms(const char *candidate,
                                         const fzf_term_t *term,
                                         fzf_slab_t *slab) {
@@ -106,26 +201,6 @@ static void check_fuzzy_term_algorithms(const char *candidate,
   fzf_result_t r2 = v2(term->case_sensitive, false, &input, pattern, NULL, slab);
   if ((r1.start >= 0) != (r2.start >= 0))
     fuzz_fail("fuzzy v1 and v2 disagree on match membership");
-
-  fzf_position_t *positions = fzf_pos_array(0);
-  fzf_result_t with_positions =
-      v2(term->case_sensitive, false, &input, pattern, positions, slab);
-  /* fzf v2 only backtracks to the true start when positions are requested,
-     so START is intentionally allowed to differ.  Match status and score
-     must remain identical. */
-  if ((with_positions.start >= 0) != (r2.start >= 0) ||
-      with_positions.score != r2.score) {
-    fprintf(stderr,
-            "without positions=(%d,%d,%d), with positions=(%d,%d,%d)\n",
-            r2.start, r2.end, r2.score, with_positions.start,
-            with_positions.end, with_positions.score);
-    fuzz_fail("requesting positions changed a fuzzy result");
-  }
-  if (with_positions.start < 0 && positions->size != 0)
-    fuzz_fail("a failed fuzzy term returned positions");
-  check_positions("direct fuzzy matcher", candidate,
-                  with_positions.start >= 0, positions);
-  fzf_free_positions(positions);
 }
 
 static void run_one(const uint8_t *data, size_t size) {
@@ -196,8 +271,10 @@ static void run_one(const uint8_t *data, size_t size) {
 
   for (size_t i = 0; i < pattern->size; i++) {
     fzf_term_set_t *set = pattern->ptr[i];
-    for (size_t j = 0; j < set->size; j++)
+    for (size_t j = 0; j < set->size; j++) {
+      check_term_positions(candidate, &set->ptr[j], slab);
       check_fuzzy_term_algorithms(candidate, &set->ptr[j], slab);
+    }
   }
 
   fzf_free_slab(default_slab);
