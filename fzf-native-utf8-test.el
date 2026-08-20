@@ -148,6 +148,15 @@
       (should (= (fzf-native-utf8-test--get-score candidate "i")
                  ascii-score)))))
 
+(ert-deftest fzf-native-utf8-v1-reverse-scan-tightens-match-test ()
+  "UTF-8 fuzzy-v1 tightens the forward match without unsigned wraparound."
+  (let* ((slab (fzf-native-make-slab 1 1))
+         (ascii-score (car (fzf-native-score "a---ab" "ab" slab)))
+         (utf8-score
+          (car (fzf-native-score "a---ab\U0010ffff" "ab" slab))))
+    (should (= ascii-score 56))
+    (should (= utf8-score ascii-score))))
+
 ;; Test with all UTF-8 strings from C tests
 (ert-deftest fzf-native-utf8-comprehensive-test ()
   "Test scoring with all UTF-8 strings from C test suite."

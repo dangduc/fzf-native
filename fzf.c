@@ -646,6 +646,16 @@ static bool utf8_char_equal(utf8proc_int32_t cp1, utf8proc_int32_t cp2,
   return cp1 == cp2;
 }
 
+/* Return the byte offset of the UTF-8 character immediately before POS.
+   Callers validate the sequence with utf8proc_iterate after finding the
+   boundary, so malformed input remains a safe non-match. */
+static size_t utf8_previous_char_start(const char *data, size_t pos) {
+  if (pos == 0) return 0;
+  pos--;
+  while (pos > 0 && ((uint8_t)data[pos] & 0xc0) == 0x80) pos--;
+  return pos;
+}
+
 // UTF-8 aware bonus calculation
 static int16_t bonus_for_utf8(int32_t prev_class, int32_t class) {
   if (prev_class == CharNonWord && class != CharNonWord) {
@@ -1764,9 +1774,11 @@ fzf_result_t fzf_fuzzy_match_v1_utf8(bool case_sensitive, bool normalize,
   
   // Build byte-to-char mapping for position conversion
   utf8_char_map_t *char_map = utf8_build_char_map(text->data, N);
+  if (!char_map) {
+    return (fzf_result_t){-1, -1, 0};
+  }
   
   // Forward scan to find the first occurrence of all pattern characters
-  size_t pidx = 0;
   int32_t sidx = -1;
   int32_t eidx = -1;
   size_t text_pos = 0;
@@ -1793,7 +1805,6 @@ fzf_result_t fzf_fuzzy_match_v1_utf8(bool case_sensitive, bool normalize,
         sidx = (int32_t)text_pos;
       }
       pattern_pos += pattern_bytes;
-      pidx++;
       if (pattern_pos >= M) {
         eidx = (int32_t)(text_pos + text_bytes);
         break;
@@ -1807,71 +1818,31 @@ fzf_result_t fzf_fuzzy_match_v1_utf8(bool case_sensitive, bool normalize,
     // Backward scan to tighten the range
     size_t start = (size_t)sidx;
     size_t end = (size_t)eidx;
-    
-    // Count pattern characters backwards
-    pidx = 0;
+
+    /* Find the shortest suffix of the forward-match range that still
+       contains the pattern.  The old code used an unsigned character index
+       and waited for it to become negative; it instead wrapped to SIZE_MAX,
+       leaving START at the first forward match.  Track byte boundaries so
+       completion is represented by pattern_pos == 0 without underflow. */
     pattern_pos = M;
-    while (pattern_pos > 0 && pidx < M) {
-      // Move back one UTF-8 character in pattern
-      size_t temp_pos = 0;
-      size_t last_pos = 0;
-      while (temp_pos < pattern_pos) {
-        utf8proc_int32_t temp_cp;
-        utf8proc_ssize_t temp_bytes = utf8proc_iterate(
-          (const utf8proc_uint8_t*)(pattern->data + temp_pos),
-          pattern_pos - temp_pos, &temp_cp);
-        if (temp_bytes <= 0 || temp_pos + temp_bytes > pattern_pos) break;
-        last_pos = temp_pos;
-        temp_pos += temp_bytes;
-      }
-      pattern_pos = last_pos;
-      pidx++;
-    }
-    
-    // Now scan backwards in text
-    pidx--;
     text_pos = end;
-    while (text_pos > start && pidx >= 0) {
-      // Move back one UTF-8 character in text
-      size_t temp_pos = start;
-      size_t last_pos = start;
-      while (temp_pos < text_pos) {
-        utf8proc_int32_t temp_cp;
-        utf8proc_ssize_t temp_bytes = utf8proc_iterate(
-          (const utf8proc_uint8_t*)(text->data + temp_pos),
-          text_pos - temp_pos, &temp_cp);
-        if (temp_bytes <= 0 || temp_pos + temp_bytes > text_pos) break;
-        last_pos = temp_pos;
-        temp_pos += temp_bytes;
-      }
-      text_pos = last_pos;
-      
-      // Get pattern character at pidx
-      size_t p_pos = 0;
-      size_t p_idx = 0;
-      utf8proc_int32_t pattern_cp = 0;
-      while (p_pos < M && p_idx <= (size_t)pidx) {
-        utf8proc_ssize_t p_bytes = utf8proc_iterate(
-          (const utf8proc_uint8_t*)(pattern->data + p_pos),
-          M - p_pos, &pattern_cp);
-        if (p_bytes <= 0) break;
-        if (p_idx == (size_t)pidx) break;
-        p_pos += p_bytes;
-        p_idx++;
-      }
-      
-      // Get text character
-      utf8proc_int32_t text_cp;
+    while (text_pos > start && pattern_pos > 0) {
+      size_t previous_text_pos = utf8_previous_char_start(text->data, text_pos);
+      size_t previous_pattern_pos =
+          utf8_previous_char_start(pattern->data, pattern_pos);
+      utf8proc_int32_t text_cp, pattern_cp;
       utf8proc_ssize_t text_bytes = utf8proc_iterate(
-        (const utf8proc_uint8_t*)(text->data + text_pos),
-        end - text_pos, &text_cp);
-      
-      if (text_bytes > 0 && utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
-        pidx--;
-        if (pidx < 0) {
-          start = text_pos;
-          break;
-        }
+          (const utf8proc_uint8_t *)(text->data + previous_text_pos),
+          text_pos - previous_text_pos, &text_cp);
+      utf8proc_ssize_t pattern_bytes = utf8proc_iterate(
+          (const utf8proc_uint8_t *)(pattern->data + previous_pattern_pos),
+          pattern_pos - previous_pattern_pos, &pattern_cp);
+      if (text_bytes <= 0 || pattern_bytes <= 0) break;
+
+      text_pos = previous_text_pos;
+      if (utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
+        pattern_pos = previous_pattern_pos;
+        if (pattern_pos == 0) start = text_pos;
       }
     }
     

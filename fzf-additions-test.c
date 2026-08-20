@@ -204,6 +204,22 @@ static void test_small_slab_inverse_long_gap_preserves_membership(void) {
   free(dup);
 }
 
+static void test_utf8_v1_reverse_scan_tightens_match(void) {
+  char *dup = strdup("ab");
+  fzf_pattern_t *pattern = fzf_parse_pattern(CaseIgnore, false, dup, true);
+  /* Both candidates exceed this slab's v2 capacity and take the respective
+     ASCII/UTF-8 v1 paths.  Appending a non-matching scalar must not change
+     which `a' starts the shortest matching range. */
+  fzf_slab_t *slab = fzf_make_slab((fzf_slab_config_t){1, 1});
+  int32_t ascii_score = fzf_get_score("a---ab", pattern, slab);
+  int32_t utf8_score = fzf_get_score("a---ab\xf4\x8f\xbf\xbf", pattern, slab);
+  CHECK(ascii_score == 56);
+  CHECK(utf8_score == ascii_score);
+  fzf_free_slab(slab);
+  fzf_free_pattern(pattern);
+  free(dup);
+}
+
 static void test_case_ignore(void) {
   check_agreement("case-ignore matches", "SrcFooBar", "srcfoo",
                   CaseIgnore, true, true);
@@ -290,6 +306,7 @@ int main(void) {
   RUN(test_or_satisfied_only_by_inverse_term);
   RUN(test_small_slab_long_gap_preserves_match);
   RUN(test_small_slab_inverse_long_gap_preserves_membership);
+  RUN(test_utf8_v1_reverse_scan_tightens_match);
   RUN(test_case_ignore);
   RUN(test_case_respect_matches_when_case_aligns);
   RUN(test_case_respect_no_match_when_case_differs);
