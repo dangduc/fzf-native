@@ -186,6 +186,24 @@ static void test_small_slab_long_gap_preserves_match(void) {
   free(dup);
 }
 
+static void test_small_slab_inverse_long_gap_preserves_membership(void) {
+  const char *text = "nknnnnnnnnnnnnnnnnnnnnnnnnnnnnnk";
+  char *dup = strdup("!'kk");
+  /* With global exact matching disabled, a quote after `!' selects fuzzy
+     matching for the inverse term.  The tiny slab forces v2 to fall back to
+     v1, whose valid long-gap match has a non-positive raw score. */
+  fzf_pattern_t *pattern = fzf_parse_pattern(CaseSmart, false, dup, false);
+  fzf_slab_t *large = fzf_make_default_slab();
+  fzf_slab_t *small = fzf_make_slab((fzf_slab_config_t){1, 1});
+  CHECK(fzf_get_score(text, pattern, large) == 0);
+  CHECK(fzf_get_score(text, pattern, small) == 0);
+  CHECK(!fzf_has_match(text, pattern, small));
+  fzf_free_slab(small);
+  fzf_free_slab(large);
+  fzf_free_pattern(pattern);
+  free(dup);
+}
+
 static void test_case_ignore(void) {
   check_agreement("case-ignore matches", "SrcFooBar", "srcfoo",
                   CaseIgnore, true, true);
@@ -271,6 +289,7 @@ int main(void) {
   RUN(test_or_within_term_set);
   RUN(test_or_satisfied_only_by_inverse_term);
   RUN(test_small_slab_long_gap_preserves_match);
+  RUN(test_small_slab_inverse_long_gap_preserves_membership);
   RUN(test_case_ignore);
   RUN(test_case_respect_matches_when_case_aligns);
   RUN(test_case_respect_no_match_when_case_differs);
