@@ -186,6 +186,9 @@ The fuzz suite has three complementary layers:
 - ~make fuzz~ runs the same structured matcher harness with libFuzzer.  Set
   ~FUZZ_SECONDS~ to control the run length.  New coverage lives in
   ~build/fuzz-corpus~ and minimized failures in ~build/fuzz-artifacts~.
+  ~make fuzz-continuous~ runs repeated 30-minute epochs.  Each epoch keeps the
+  corpus and resets the sanitizer state.  A failure stops the loop.  Set
+  ~FUZZ_EPOCH_SECONDS~ to change the epoch length.
 - ~make fuzz-elisp~ checks scalar/batch/filter/highlight equivalence and
   exercises async query refinement, broadening, term reordering, garbage
   collection, and teardown.  Runs are deterministic; set

@@ -8,8 +8,11 @@ BUILD_DIR ?= build
 # LLVM when present, while retaining ordinary Clang on Linux.
 FUZZ_CC ?= $(or $(firstword $(wildcard /opt/homebrew/opt/llvm/bin/clang /usr/local/opt/llvm/bin/clang)),clang)
 FUZZ_SECONDS ?= 30
+FUZZ_EPOCH_SECONDS ?= 1800
 FUZZ_MAX_LEN ?= 4096
 FUZZ_VERBOSITY ?= 0
+FUZZ_RSS_LIMIT_MB ?= 2048
+FUZZ_ASAN_OPTIONS ?= quarantine_size_mb=64:malloc_context_size=5
 FUZZ_SEED_DIR ?= fuzz/corpus
 FUZZ_DICTIONARY ?= fuzz/fzf-native.dict
 FUZZ_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-corpus
@@ -165,10 +168,30 @@ fuzz-build: $(UTF8PROC_LIB)
 fuzz: fuzz-build
 	mkdir -p $(FUZZ_CORPUS_DIR) $(FUZZ_ARTIFACT_DIR)
 	cp $(FUZZ_SEED_DIR)/* $(FUZZ_CORPUS_DIR)/
+	ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
 	$(FUZZ_BINARY) $(FUZZ_CORPUS_DIR) -max_len=$(FUZZ_MAX_LEN) \
 		-dict=$(FUZZ_DICTIONARY) -verbosity=$(FUZZ_VERBOSITY) \
 		-artifact_prefix=$(FUZZ_ARTIFACT_DIR)/ \
+		-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) \
 		-max_total_time=$(FUZZ_SECONDS) -print_final_stats=1
+
+# Run bounded epochs in one process loop.  Each new libFuzzer process keeps
+# the on-disk corpus but releases sanitizer quarantine and feature metadata.
+# A real finding returns a nonzero status and stops the loop for diagnosis.
+.PHONY: fuzz-continuous
+fuzz-continuous: fuzz-build
+	mkdir -p $(FUZZ_CORPUS_DIR) $(FUZZ_ARTIFACT_DIR)
+	cp $(FUZZ_SEED_DIR)/* $(FUZZ_CORPUS_DIR)/
+	while true; do \
+		ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
+		$(FUZZ_BINARY) $(FUZZ_CORPUS_DIR) -max_len=$(FUZZ_MAX_LEN) \
+			-dict=$(FUZZ_DICTIONARY) -verbosity=$(FUZZ_VERBOSITY) \
+			-artifact_prefix=$(FUZZ_ARTIFACT_DIR)/ \
+			-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) \
+			-max_total_time=$(FUZZ_EPOCH_SECONDS) -print_final_stats=1; \
+		status=$$?; \
+		if test $$status -ne 0; then exit $$status; fi; \
+	done
 
 # Deterministic replay is useful in pre-commit checks and works without the
 # libFuzzer runtime.  Every minimized finding should be added to fuzz/corpus.
