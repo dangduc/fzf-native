@@ -144,9 +144,9 @@
                         (fzf-native-upstream--fzf
                          fzf collection query fzf-native-case-mode
                          fzf-native-fuzzy))))
-        (ert-info ((format "fzf=%s seed=%d iteration=%d mode=%S fuzzy=%S query=%S"
+        (ert-info ((format "fzf=%s seed=%d iteration=%d mode=%S fuzzy=%S query=%S collection=%S"
                            fzf seed iteration fzf-native-case-mode
-                           fzf-native-fuzzy query))
+                           fzf-native-fuzzy query collection))
           (should (equal native upstream)))))))
 
 (provide 'fzf-native-upstream-test)
