@@ -43,12 +43,14 @@
 
 (defconst fzf-native-fuzz--candidate-pieces
   ["a" "b" "c" "F" "K" "-" "_" "/" "." " " "\t"
-   "é" "É" "K" "你" "好" "界" "λ" "Λ" "ж" "Ж"
-   "א" "🚀" "🧑‍💻" "é" "\0"])
+   "é" "É" "K" "İ" "ı" "Σ" "σ" "ς" "ẞ" "ß" "Å" "å" "Å"
+   "Ａ" "ａ" "𐐀" "𐐨" "你" "好" "界" "λ" "Λ" "ж" "Ж"
+   "א" "ع" "가" "🚀" "🧑‍💻" "👩🏽‍💻" "é" "\0"])
 
 (defconst fzf-native-fuzz--query-pieces
-  ["a" "b" "c" "f" "F" "k" "K" "é" "É" "K" "你" "好"
-   "λ" "Λ" "ж" "Ж" "א" "🚀"])
+  ["a" "b" "c" "f" "F" "k" "K" "é" "É" "K" "İ" "ı" "Σ" "σ"
+   "ς" "ẞ" "ß" "Å" "å" "Å" "Ａ" "ａ" "𐐀" "𐐨" "你" "好"
+   "λ" "Λ" "ж" "Ж" "א" "ع" "가" "🚀" "👩🏽‍💻"])
 
 (defun fzf-native-fuzz--valid-string (&optional max-pieces)
   "Generate a valid Emacs string of at most MAX-PIECES pieces."

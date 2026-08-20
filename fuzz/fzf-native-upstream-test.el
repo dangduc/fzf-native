@@ -34,11 +34,14 @@
 
 (defconst fzf-native-upstream--pieces
   ["a" "b" "c" "F" "K" "-" "_" "/" "." " " "\t" " " "　"
-   "é" "É" "K" "你" "好" "界" "λ" "Λ" "ж" "Ж" "א" "🚀" "é"])
+   "é" "É" "K" "İ" "ı" "Σ" "σ" "ς" "ẞ" "ß" "Å" "å" "Å"
+   "Ａ" "ａ" "𐐀" "𐐨" "你" "好" "界" "λ" "Λ" "ж" "Ж" "א"
+   "ع" "가" "🚀" "👩🏽‍💻" "é"])
 
 (defconst fzf-native-upstream--literals
-  ["a" "b" "f" "F" "k" "K" "é" "É" "K" "你" "好" "λ" "Λ" "ж"
-   "Ж" "א" "🚀" "foo" "bar" "é"])
+  ["a" "b" "f" "F" "k" "K" "é" "É" "K" "İ" "ı" "Σ" "σ" "ς"
+   "ẞ" "ß" "Å" "å" "Å" "Ａ" "ａ" "𐐀" "𐐨" "你" "好" "λ" "Λ"
+   "ж" "Ж" "א" "ع" "가" "🚀" "👩🏽‍💻" "foo" "bar" "é"])
 
 (defun fzf-native-upstream--candidate ()
   "Generate a valid string accepted by fzf's NUL-delimited input."
