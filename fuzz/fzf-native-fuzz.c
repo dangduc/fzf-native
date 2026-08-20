@@ -71,6 +71,20 @@ static void check_positions(const char *source, const char *candidate,
   }
 }
 
+static void check_position_order(const fzf_position_t *positions) {
+  if (!positions || positions->size < 2)
+    return;
+
+  if (positions->data[0] == positions->data[1])
+    fuzz_fail("a term returned duplicate highlight positions");
+  bool increasing = positions->data[1] > positions->data[0];
+  for (size_t i = 2; i < positions->size; i++) {
+    if (positions->data[i] == positions->data[i - 1] ||
+        ((positions->data[i] > positions->data[i - 1]) != increasing))
+      fuzz_fail("a term returned unordered highlight positions");
+  }
+}
+
 static fzf_algo_t utf8_variant(fzf_algo_t algo) {
   if (algo == fzf_fuzzy_match_v2)
     return fzf_fuzzy_match_v2_utf8;
@@ -147,6 +161,7 @@ static void check_term_positions(const char *candidate, const fzf_term_t *term,
 
   bool matched = with_positions.start >= 0;
   check_positions("direct term matcher", candidate, matched, positions);
+  check_position_order(positions);
   /* A malformed byte string has no stable character-count oracle.  It still
      exercises the matcher under ASan/UBSan and the bounds check above treats
      each byte as the conservative limit, but require exact position counts
@@ -164,6 +179,53 @@ static void check_term_positions(const char *candidate, const fzf_term_t *term,
     }
   }
   fzf_free_positions(positions);
+}
+
+static bool pattern_has_inverse(const fzf_pattern_t *pattern) {
+  for (size_t i = 0; i < pattern->size; i++) {
+    const fzf_term_set_t *set = pattern->ptr[i];
+    for (size_t j = 0; j < set->size; j++)
+      if (set->ptr[j].inv)
+        return true;
+  }
+  return false;
+}
+
+static void check_case_monotonicity(const char *candidate, const char *query,
+                                    bool fuzzy, fzf_slab_t *slab) {
+  size_t candidate_len = strlen(candidate);
+  size_t query_len = strlen(query);
+  if (!valid_utf8(candidate, candidate_len) || !valid_utf8(query, query_len))
+    return;
+
+  char *respect_query = strdup(query);
+  char *ignore_query = strdup(query);
+  if (!respect_query || !ignore_query)
+    abort();
+  fzf_pattern_t *respect =
+      fzf_parse_pattern(CaseRespect, false, respect_query, fuzzy);
+  fzf_pattern_t *ignore =
+      fzf_parse_pattern(CaseIgnore, false, ignore_query, fuzzy);
+  if (!respect || !ignore)
+    abort();
+
+  /* Negation reverses this relation: !A can accept "a" in respect mode and
+     reject it in ignore mode.  With positive terms only, relaxing case can
+     add matches but must never remove one. */
+  if (!pattern_has_inverse(respect)) {
+    int32_t respect_score = fzf_get_score(candidate, respect, slab);
+    int32_t ignore_score = fzf_get_score(candidate, ignore, slab);
+    if (respect_score > 0 && ignore_score <= 0) {
+      fprintf(stderr, "respect_score=%d ignore_score=%d fuzzy=%d\n",
+              respect_score, ignore_score, (int)fuzzy);
+      fuzz_fail("case-ignore rejected a positive-only case-respect match");
+    }
+  }
+
+  fzf_free_pattern(ignore);
+  fzf_free_pattern(respect);
+  free(ignore_query);
+  free(respect_query);
 }
 
 static void check_fuzzy_term_algorithms(const char *candidate,
@@ -244,6 +306,8 @@ static void run_one(const uint8_t *data, size_t size) {
   fzf_slab_t *default_slab = fzf_make_default_slab();
   if (!pattern || !slab || !default_slab)
     abort();
+
+  check_case_monotonicity(candidate, query, fuzzy, default_slab);
 
   int32_t score = fzf_get_score(candidate, pattern, default_slab);
   int32_t repeated_score = fzf_get_score(candidate, pattern, default_slab);
