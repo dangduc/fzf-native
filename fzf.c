@@ -1903,8 +1903,13 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
     return (fzf_result_t){-1, -1, 0};
   }
 
-  // Convert byte position to character position
-  size_t idx = utf8_byte_to_char(char_map, (size_t)tmp_idx);
+  // Start one character before the first match, just as ascii_fuzzy_index
+  // does for the byte matcher.  Phase 2 needs that character to establish
+  // the real boundary/camel bonus at the first match; starting directly at
+  // the match incorrectly treats every non-initial UTF-8 match as a word
+  // boundary.
+  size_t match_idx = utf8_byte_to_char(char_map, (size_t)tmp_idx);
+  size_t idx = match_idx > 0 ? match_idx - 1 : 0;
 
   // Pre-decode pattern codepoints (case-folded if needed)
   utf8proc_int32_t *pattern_cps =

@@ -131,6 +131,16 @@
     (should (> (fzf-native-utf8-test--get-score "k" "K") 0))
     (should (> (fzf-native-utf8-test--get-score "K" "k") 0))))
 
+(ert-deftest fzf-native-utf8-fuzzy-score-keeps-pre-match-context-test ()
+  "UTF-8 dispatch does not invent a boundary before an interior match."
+  (let* ((fzf-native-case-mode 'ignore)
+         (fzf-native-fuzzy t)
+         (ascii-score (fzf-native-utf8-test--get-score "kelvin" "i")))
+    (should (= ascii-score 16))
+    (dolist (candidate '("Kelvin" "éelvin" "🚀elvin" "kelvin􏿿"))
+      (should (= (fzf-native-utf8-test--get-score candidate "i")
+                 ascii-score)))))
+
 ;; Test with all UTF-8 strings from C tests
 (ert-deftest fzf-native-utf8-comprehensive-test ()
   "Test scoring with all UTF-8 strings from C test suite."
