@@ -17,6 +17,8 @@ FUZZ_SEED_DIR ?= fuzz/corpus
 FUZZ_DICTIONARY ?= fuzz/fzf-native.dict
 FUZZ_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-corpus
 FUZZ_ARTIFACT_DIR ?= $(BUILD_DIR)/fuzz-artifacts
+FUZZ_MERGED_CORPUS_DIR ?= $(FUZZ_CORPUS_DIR)-merged
+FUZZ_OLD_CORPUS_DIR ?= $(FUZZ_CORPUS_DIR)-old
 FUZZ_BINARY := $(BUILD_DIR)/fzf-native-fuzz
 FUZZ_REPLAY_BINARY := $(BUILD_DIR)/fzf-native-fuzz-replay
 FZF_REFERENCE ?= fzf
@@ -175,22 +177,52 @@ fuzz: fuzz-build
 		-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) \
 		-max_total_time=$(FUZZ_SECONDS) -print_final_stats=1
 
-# Run bounded epochs in one process loop.  Each new libFuzzer process keeps
-# the on-disk corpus but releases sanitizer quarantine and feature metadata.
-# A real finding returns a nonzero status and stops the loop for diagnosis.
+# Keep one coverage-equivalent corpus input for each useful feature.  The
+# original corpus stays at FUZZ_OLD_CORPUS_DIR until the merged corpus is in
+# place, so an interrupted swap does not destroy the accumulated inputs.
+.PHONY: fuzz-merge fuzz-merge-run
+fuzz-merge: fuzz-build fuzz-merge-run
+
+fuzz-merge-run:
+	test -d $(FUZZ_CORPUS_DIR)
+	rm -rf $(FUZZ_MERGED_CORPUS_DIR)
+	mkdir -p $(FUZZ_MERGED_CORPUS_DIR)
+	ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
+	$(FUZZ_BINARY) $(FUZZ_MERGED_CORPUS_DIR) $(FUZZ_CORPUS_DIR) \
+		-merge=1 -max_len=$(FUZZ_MAX_LEN) -verbosity=$(FUZZ_VERBOSITY) \
+		-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB)
+	cp $(FUZZ_SEED_DIR)/* $(FUZZ_MERGED_CORPUS_DIR)/
+	rm -rf $(FUZZ_OLD_CORPUS_DIR)
+	mv $(FUZZ_CORPUS_DIR) $(FUZZ_OLD_CORPUS_DIR)
+	mv $(FUZZ_MERGED_CORPUS_DIR) $(FUZZ_CORPUS_DIR)
+	rm -rf $(FUZZ_OLD_CORPUS_DIR)
+
+# Run bounded epochs in one process loop.  Each new libFuzzer process releases
+# sanitizer quarantine and feature metadata.  A coverage merge bounds the
+# on-disk corpus before the next epoch.  A real finding stops the loop.
 .PHONY: fuzz-continuous
 fuzz-continuous: fuzz-build
 	mkdir -p $(FUZZ_CORPUS_DIR) $(FUZZ_ARTIFACT_DIR)
 	cp $(FUZZ_SEED_DIR)/* $(FUZZ_CORPUS_DIR)/
-	while true; do \
+	set -e; while true; do \
 		ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
 		$(FUZZ_BINARY) $(FUZZ_CORPUS_DIR) -max_len=$(FUZZ_MAX_LEN) \
 			-dict=$(FUZZ_DICTIONARY) -verbosity=$(FUZZ_VERBOSITY) \
 			-artifact_prefix=$(FUZZ_ARTIFACT_DIR)/ \
 			-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) \
 			-max_total_time=$(FUZZ_EPOCH_SECONDS) -print_final_stats=1; \
-		status=$$?; \
-		if test $$status -ne 0; then exit $$status; fi; \
+		rm -rf $(FUZZ_MERGED_CORPUS_DIR); \
+		mkdir -p $(FUZZ_MERGED_CORPUS_DIR); \
+		ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
+		$(FUZZ_BINARY) $(FUZZ_MERGED_CORPUS_DIR) $(FUZZ_CORPUS_DIR) \
+			-merge=1 -max_len=$(FUZZ_MAX_LEN) \
+			-verbosity=$(FUZZ_VERBOSITY) \
+			-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB); \
+		cp $(FUZZ_SEED_DIR)/* $(FUZZ_MERGED_CORPUS_DIR)/; \
+		rm -rf $(FUZZ_OLD_CORPUS_DIR); \
+		mv $(FUZZ_CORPUS_DIR) $(FUZZ_OLD_CORPUS_DIR); \
+		mv $(FUZZ_MERGED_CORPUS_DIR) $(FUZZ_CORPUS_DIR); \
+		rm -rf $(FUZZ_OLD_CORPUS_DIR); \
 	done
 
 # Deterministic replay is useful in pre-commit checks and works without the
