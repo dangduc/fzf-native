@@ -27,6 +27,7 @@ FUZZ_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-corpus
 FUZZ_ARTIFACT_DIR ?= $(BUILD_DIR)/fuzz-artifacts
 FUZZ_MERGED_CORPUS_DIR ?= $(FUZZ_CORPUS_DIR)-merged
 FUZZ_OLD_CORPUS_DIR ?= $(FUZZ_CORPUS_DIR)-old
+FUZZ_CONTINUOUS_LOCK_DIR ?= $(BUILD_DIR)/fuzz-continuous.lock
 FUZZ_BINARY := $(BUILD_DIR)/fzf-native-fuzz
 FUZZ_REPLAY_BINARY := $(BUILD_DIR)/fzf-native-fuzz-replay
 FZF_REFERENCE ?= fzf
@@ -211,7 +212,13 @@ fuzz-merge-run:
 .PHONY: fuzz-continuous
 fuzz-continuous: fuzz-build
 	mkdir -p $(FUZZ_CORPUS_DIR) $(FUZZ_ARTIFACT_DIR)
-	cp $(FUZZ_SEED_DIR)/* $(FUZZ_CORPUS_DIR)/
+	@if ! mkdir $(FUZZ_CONTINUOUS_LOCK_DIR) 2>/dev/null; then \
+		echo "fzf-native: another continuous fuzz campaign holds $(FUZZ_CONTINUOUS_LOCK_DIR)" >&2; \
+		exit 2; \
+	fi; \
+	trap 'status=$$?; rmdir $(FUZZ_CONTINUOUS_LOCK_DIR); exit $$status' EXIT; \
+	trap 'exit 130' HUP INT TERM; \
+	cp $(FUZZ_SEED_DIR)/* $(FUZZ_CORPUS_DIR)/; \
 	set -e; while true; do \
 		ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
 		$(FUZZ_BINARY) $(FUZZ_CORPUS_DIR) -max_len=$(FUZZ_MAX_LEN) \
