@@ -191,6 +191,72 @@ static bool pattern_has_inverse(const fzf_pattern_t *pattern) {
   return false;
 }
 
+static bool extension_preserves_term(const fzf_term_t *term, bool prepend) {
+  if (term->inv || !term->fn || !term->text)
+    return false;
+
+  fzf_string_t *text = (fzf_string_t *)term->text;
+  if (!valid_utf8(text->data, text->size))
+    return false;
+
+  if (term->fn == fzf_fuzzy_match_v1 ||
+      term->fn == fzf_fuzzy_match_v1_utf8 ||
+      term->fn == fzf_fuzzy_match_v2 ||
+      term->fn == fzf_fuzzy_match_v2_utf8 ||
+      term->fn == fzf_exact_match_naive ||
+      term->fn == fzf_exact_match_utf8)
+    return true;
+
+  return prepend
+             ? term->fn == fzf_suffix_match ||
+                   term->fn == fzf_suffix_match_utf8
+             : term->fn == fzf_prefix_match ||
+                   term->fn == fzf_prefix_match_utf8;
+}
+
+static bool extension_preserves_pattern(fzf_pattern_t *pattern,
+                                        bool prepend) {
+  for (size_t i = 0; i < pattern->size; i++) {
+    const fzf_term_set_t *set = pattern->ptr[i];
+    for (size_t j = 0; j < set->size; j++)
+      if (!extension_preserves_term(&set->ptr[j], prepend))
+        return false;
+  }
+  return true;
+}
+
+static void check_candidate_extension_monotonicity(
+    const char *candidate, fzf_pattern_t *pattern, int32_t score,
+    fzf_slab_t *slab) {
+  size_t len = strlen(candidate);
+  if (score <= 0 || !valid_utf8(candidate, len))
+    return;
+
+  char *extended = malloc(len + 2);
+  if (!extended)
+    abort();
+
+  /* A positive fuzzy, substring-exact, or prefix match remains a match when
+     text is appended.  The symmetric relation holds for suffix-safe terms
+     when text is prepended.  Equal and inverse terms are excluded above. */
+  if (extension_preserves_pattern(pattern, false)) {
+    memcpy(extended, candidate, len);
+    extended[len] = 'x';
+    extended[len + 1] = '\0';
+    if (fzf_get_score(extended, pattern, slab) <= 0)
+      fuzz_fail("appending a character destroyed a prefix-safe match");
+  }
+
+  if (extension_preserves_pattern(pattern, true)) {
+    extended[0] = 'x';
+    memcpy(extended + 1, candidate, len + 1);
+    if (fzf_get_score(extended, pattern, slab) <= 0)
+      fuzz_fail("prepending a character destroyed a suffix-safe match");
+  }
+
+  free(extended);
+}
+
 static void check_case_monotonicity(const char *candidate, const char *query,
                                     bool fuzzy, fzf_slab_t *slab) {
   size_t candidate_len = strlen(candidate);
@@ -313,6 +379,9 @@ static void run_one(const uint8_t *data, size_t size) {
   int32_t repeated_score = fzf_get_score(candidate, pattern, default_slab);
   if (score != repeated_score)
     fuzz_fail("repeated scoring is not deterministic");
+
+  check_candidate_extension_monotonicity(candidate, pattern, score,
+                                         default_slab);
 
   bool fast_match = fzf_has_match(candidate, pattern, default_slab);
   if (fast_match != (score > 0)) {
