@@ -248,6 +248,91 @@ static bool pattern_contains_codepoint(const fzf_pattern_t *pattern,
   return false;
 }
 
+static bool term_extension_keeps_slab_path(const fzf_term_t *term,
+                                           size_t candidate_units,
+                                           size_t extended_units,
+                                           const fzf_slab_t *slab) {
+  if (!slab || (term->fn != fzf_fuzzy_match_v2 &&
+                term->fn != fzf_fuzzy_match_v2_utf8))
+    return true;
+
+  const fzf_string_t *text = (const fzf_string_t *)term->text;
+  size_t pattern_units = utf8_strlen(text->data, text->size);
+  bool candidate_falls_back =
+      candidate_units != 0 &&
+      pattern_units > slab->I16.cap / candidate_units;
+  bool extended_falls_back =
+      extended_units != 0 &&
+      pattern_units > slab->I16.cap / extended_units;
+  return candidate_falls_back == extended_falls_back;
+}
+
+static bool extension_keeps_slab_path(const fzf_pattern_t *pattern,
+                                      size_t candidate_units,
+                                      size_t extended_units,
+                                      const fzf_slab_t *slab) {
+  if (!slab)
+    return true;
+
+  for (size_t i = 0; i < pattern->size; i++) {
+    const fzf_term_set_t *set = pattern->ptr[i];
+    for (size_t j = 0; j < set->size; j++) {
+      const fzf_term_t *term = &set->ptr[j];
+      if (!term_extension_keeps_slab_path(term, candidate_units,
+                                          extended_units, slab))
+        return false;
+    }
+  }
+  return true;
+}
+
+static void check_ascii_utf8_term_score(const char *candidate,
+                                        const fzf_term_t *term,
+                                        fzf_slab_t *slab) {
+  static const char extension[] = "\xf4\x8f\xbf\xbf";
+  size_t candidate_len = strlen(candidate);
+  const fzf_string_t *pattern = (const fzf_string_t *)term->text;
+  if (!extension_preserves_term(term, false) ||
+      !is_ascii_utf8proc(candidate, candidate_len) ||
+      !valid_utf8(pattern->data, pattern->size) ||
+      !term_extension_keeps_slab_path(term, candidate_len,
+                                      candidate_len + 1, slab))
+    return;
+
+  size_t offset = 0;
+  while (offset < pattern->size) {
+    utf8proc_int32_t cp;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)pattern->data + offset,
+        (utf8proc_ssize_t)(pattern->size - offset), &cp);
+    if (width <= 0 || cp == 0x10ffff) return;
+    offset += (size_t)width;
+  }
+
+  char *extended = malloc(candidate_len + sizeof(extension));
+  if (!extended) abort();
+  memcpy(extended, candidate, candidate_len);
+  memcpy(extended + candidate_len, extension, sizeof(extension));
+
+  fzf_string_t ascii_input = {.data = candidate, .size = candidate_len};
+  fzf_string_t utf8_input = {
+      .data = extended, .size = candidate_len + sizeof(extension) - 1};
+  fzf_algo_t ascii_algo = term->fn;
+  fzf_algo_t utf8_algo = utf8_variant(ascii_algo);
+  fzf_result_t ascii_result =
+      ascii_algo(term->case_sensitive, false, &ascii_input,
+                 (fzf_string_t *)pattern, NULL, slab);
+  fzf_result_t utf8_result =
+      utf8_algo(term->case_sensitive, false, &utf8_input,
+                (fzf_string_t *)pattern, NULL, slab);
+  if (ascii_result.score != utf8_result.score) {
+    fprintf(stderr, "%s_score=%d %s_score=%d\n", algo_name(ascii_algo),
+            ascii_result.score, algo_name(utf8_algo), utf8_result.score);
+    fuzz_fail("ASCII-to-UTF-8 dispatch changed a term score");
+  }
+  free(extended);
+}
+
 static void check_candidate_extension_monotonicity(
     const char *candidate, fzf_pattern_t *pattern, int32_t score,
     fzf_slab_t *slab) {
@@ -296,7 +381,8 @@ static void check_candidate_extension_monotonicity(
      matcher and compares its score with the byte matcher's score. */
   static const char score_extension[] = "\xf4\x8f\xbf\xbf";
   if (append_safe && is_ascii_utf8proc(candidate, len) &&
-      !pattern_contains_codepoint(pattern, 0x10ffff)) {
+      !pattern_contains_codepoint(pattern, 0x10ffff) &&
+      extension_keeps_slab_path(pattern, len, len + 1, slab)) {
     memcpy(extended, candidate, len);
     memcpy(extended + len, score_extension, sizeof(score_extension));
     int32_t extended_score = fzf_get_score(extended, pattern, slab);
@@ -459,6 +545,7 @@ static void run_one(const uint8_t *data, size_t size) {
     fzf_term_set_t *set = pattern->ptr[i];
     for (size_t j = 0; j < set->size; j++) {
       check_term_positions(candidate, &set->ptr[j], slab);
+      check_ascii_utf8_term_score(candidate, &set->ptr[j], slab);
       check_fuzzy_term_algorithms(candidate, &set->ptr[j], slab);
     }
   }
