@@ -280,17 +280,29 @@ static int cmp_candidate(const void *a, const void *b) {
   /* return ((struct Candidate *) a)->score - ((struct Candidate *) b)->score; */
 }
 
+static void insertion_sort_candidates(struct Candidate *xs, size_t n) {
+  for (size_t i = 1; i < n; i++) {
+    struct Candidate candidate = xs[i];
+    size_t j = i;
+    while (j > 0 && xs[j - 1].score < candidate.score) {
+      xs[j] = xs[j - 1];
+      j--;
+    }
+    xs[j] = candidate;
+  }
+}
+
 /* Counting sort of xs[0..n-1] by score, descending.
    O(n + max_score). Falls back to qsort if allocations fail.
-   Stable: same-score candidates keep input order.
+   The normal insertion/counting-sort paths are stable; the emergency qsort
+   fallback after an allocation failure may lose same-score input order.
    Caller must ensure every xs[i].score >= 0; negative scores would
    index count[] out of bounds (undefined behavior). */
 static void counting_sort_candidates(struct Candidate *xs, size_t n) {
   if (n <= 1) return;
-  /* For tiny inputs, qsort beats counting sort because the malloc/calloc
-     round-trip dominates. Threshold chosen empirically; below ~64 the two
-     are within noise on M-series and recent x86. */
-  if (n < 64) { qsort(xs, n, sizeof *xs, cmp_candidate); return; }
+  /* Avoid the counting-sort allocations for tiny inputs, but retain the
+     stable input-order tie-break promised by the large-input path. */
+  if (n < 64) { insertion_sort_candidates(xs, n); return; }
   int max_score = 0;
   for (size_t i = 0; i < n; i++)
     if (xs[i].score > max_score) max_score = xs[i].score;

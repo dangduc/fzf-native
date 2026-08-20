@@ -225,6 +225,29 @@ static bool extension_preserves_pattern(fzf_pattern_t *pattern,
   return true;
 }
 
+static bool pattern_contains_codepoint(const fzf_pattern_t *pattern,
+                                       utf8proc_int32_t wanted) {
+  for (size_t i = 0; i < pattern->size; i++) {
+    const fzf_term_set_t *set = pattern->ptr[i];
+    for (size_t j = 0; j < set->size; j++) {
+      const fzf_string_t *text = (const fzf_string_t *)set->ptr[j].text;
+      size_t offset = 0;
+      while (text && offset < text->size) {
+        utf8proc_int32_t cp;
+        utf8proc_ssize_t width = utf8proc_iterate(
+            (const utf8proc_uint8_t *)text->data + offset,
+            (utf8proc_ssize_t)(text->size - offset), &cp);
+        if (width <= 0)
+          return true;
+        if (cp == wanted)
+          return true;
+        offset += (size_t)width;
+      }
+    }
+  }
+  return false;
+}
+
 static void check_candidate_extension_monotonicity(
     const char *candidate, fzf_pattern_t *pattern, int32_t score,
     fzf_slab_t *slab) {
@@ -265,6 +288,22 @@ static void check_candidate_extension_monotonicity(
         fprintf(stderr, "extension=%zu direction=prepend\n", i);
         fuzz_fail("prepending text destroyed a suffix-safe match");
       }
+    }
+  }
+
+  /* Appending a non-matching scalar cannot change a prefix-safe score.  On
+     an ASCII candidate this deliberately switches dispatch to the UTF-8
+     matcher and compares its score with the byte matcher's score. */
+  static const char score_extension[] = "\xf4\x8f\xbf\xbf";
+  if (append_safe && is_ascii_utf8proc(candidate, len) &&
+      !pattern_contains_codepoint(pattern, 0x10ffff)) {
+    memcpy(extended, candidate, len);
+    memcpy(extended + len, score_extension, sizeof(score_extension));
+    int32_t extended_score = fzf_get_score(extended, pattern, slab);
+    if (extended_score != score) {
+      fprintf(stderr, "ascii_score=%d utf8_score=%d\n", score,
+              extended_score);
+      fuzz_fail("ASCII-to-UTF-8 dispatch changed a prefix-safe score");
     }
   }
 

@@ -880,15 +880,23 @@ sys.stdout.buffer.write(b\"another_valid\\n\")
          (fzf-native-max-line-length nil)
          (fzf-native-async-highlight nil)
          (handle (fzf-native-async-start
-                  "python3 -u -c 'print(\"zzz你\"); print(\"你\")'")))
+                  "python3 -u -c 'print(\"zzz你\"); print(\"zz你\"); print(\"你\")'")))
     (unwind-protect
         (progn
           (should (fzf-native-test--wait-for-data handle))
-          (should (fzf-native-test--wait-for-fresh handle "你"))
-          ;; Filter-only preserves producer order; full scoring would rank the
-          ;; exact candidate "你" ahead of "zzz你".
-          (should (equal (fzf-native-async-candidates handle "你")
-                         '("zzz你" "你"))))
+          ;; Drive the first request with LIMIT=2.  Filter-only evaluates all
+          ;; three memberships but ranks only the producer-order emit window;
+          ;; full scoring would select the later, higher-scoring exact
+          ;; candidate "你".  Excluding it proves the one-character threshold
+          ;; fired without relying on the display order within that window.
+          (let ((deadline (+ (float-time) 5.0)))
+            (while (and (not (fzf-native-async-result-fresh-p handle "你"))
+                        (< (float-time) deadline))
+              (fzf-native-async-candidates handle "你" 2)
+              (sleep-for 0.05)))
+          (should (fzf-native-async-result-fresh-p handle "你"))
+          (should (equal (fzf-native-async-candidates handle "你" 2)
+                         '("zzz你" "zz你"))))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-long-line-whole-test ()
