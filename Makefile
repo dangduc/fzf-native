@@ -1,4 +1,12 @@
-export EMACS ?= $(shell which emacs)
+# An inherited but empty EMACS variable suppresses Make's `?=' assignment and
+# leaves Emacs-backed test targets trying to execute `-Q' as a command.  Prefer
+# an explicit non-empty value, then PATH, then the usual source-tree/App bundle
+# locations used on macOS (including this repository's ~/emacs build).
+EMACS := $(or $(strip $(EMACS)),\
+	$(shell command -v emacs 2>/dev/null),\
+	$(firstword $(wildcard $(HOME)/emacs/nextstep/Emacs.app/Contents/MacOS/Emacs \
+		/Applications/Emacs.app/Contents/MacOS/Emacs)))
+export EMACS
 
 BUILD_DIR ?= build
 
