@@ -151,6 +151,64 @@ static void test_or_within_term_set(void) {
                   CaseIgnore, true, false);
 }
 
+static void test_or_satisfied_only_by_inverse_term(void) {
+  check_agreement("OR inverse branch", "", "!Do | be|",
+                  CaseRespect, false, true);
+  check_agreement("OR inverse branch with text", "quux", "!foo | bar",
+                  CaseIgnore, true, true);
+}
+
+static void test_small_slab_long_gap_preserves_match(void) {
+  const char *text =
+      "s........................................................................|";
+  char *dup = strdup("s|");
+  fzf_pattern_t *pattern = fzf_parse_pattern(CaseRespect, false, dup, true);
+  fzf_slab_t *large = fzf_make_default_slab();
+  fzf_slab_t *small =
+      fzf_make_slab((fzf_slab_config_t){64, 64});
+  CHECK(fzf_get_score(text, pattern, large) > 0);
+  CHECK(fzf_get_score(text, pattern, small) > 0);
+  CHECK(fzf_has_match(text, pattern, small));
+  fzf_free_slab(small);
+  fzf_free_slab(large);
+  fzf_free_pattern(pattern);
+  free(dup);
+}
+
+static void test_small_slab_inverse_long_gap_preserves_membership(void) {
+  const char *text = "nknnnnnnnnnnnnnnnnnnnnnnnnnnnnnk";
+  char *dup = strdup("!'kk");
+  /* With global exact matching disabled, a quote after `!' selects fuzzy
+     matching for the inverse term.  The tiny slab forces v2 to fall back to
+     v1, whose valid long-gap match has a non-positive raw score. */
+  fzf_pattern_t *pattern = fzf_parse_pattern(CaseSmart, false, dup, false);
+  fzf_slab_t *large = fzf_make_default_slab();
+  fzf_slab_t *small = fzf_make_slab((fzf_slab_config_t){1, 1});
+  CHECK(fzf_get_score(text, pattern, large) == 0);
+  CHECK(fzf_get_score(text, pattern, small) == 0);
+  CHECK(!fzf_has_match(text, pattern, small));
+  fzf_free_slab(small);
+  fzf_free_slab(large);
+  fzf_free_pattern(pattern);
+  free(dup);
+}
+
+static void test_utf8_v1_reverse_scan_tightens_match(void) {
+  char *dup = strdup("ab");
+  fzf_pattern_t *pattern = fzf_parse_pattern(CaseIgnore, false, dup, true);
+  /* Both candidates exceed this slab's v2 capacity and take the respective
+     ASCII/UTF-8 v1 paths.  Appending a non-matching scalar must not change
+     which `a' starts the shortest matching range. */
+  fzf_slab_t *slab = fzf_make_slab((fzf_slab_config_t){1, 1});
+  int32_t ascii_score = fzf_get_score("a---ab", pattern, slab);
+  int32_t utf8_score = fzf_get_score("a---ab\xf4\x8f\xbf\xbf", pattern, slab);
+  CHECK(ascii_score == 56);
+  CHECK(utf8_score == ascii_score);
+  fzf_free_slab(slab);
+  fzf_free_pattern(pattern);
+  free(dup);
+}
+
 static void test_case_ignore(void) {
   check_agreement("case-ignore matches", "SrcFooBar", "srcfoo",
                   CaseIgnore, true, true);
@@ -229,6 +287,10 @@ int main(void) {
   RUN(test_negation_term_excludes);
   RUN(test_and_across_term_sets);
   RUN(test_or_within_term_set);
+  RUN(test_or_satisfied_only_by_inverse_term);
+  RUN(test_small_slab_long_gap_preserves_match);
+  RUN(test_small_slab_inverse_long_gap_preserves_membership);
+  RUN(test_utf8_v1_reverse_scan_tightens_match);
   RUN(test_case_ignore);
   RUN(test_case_respect_matches_when_case_aligns);
   RUN(test_case_respect_no_match_when_case_differs);
