@@ -1,5 +1,5 @@
 #+title: Multi-round fzf-native session plan
-#+status: Design. Not implemented.
+#+status: Implemented and verified.
 
 * Goal
 
@@ -11,6 +11,44 @@ new producer process or creating a new set of worker threads.
 
 Keep the current batch and asynchronous APIs.  Add request-aware operations, then
 implement the old combined dispatch-and-read operation as a compatibility layer.
+
+* Implementation status
+
+The request-aware implementation is complete.  The session now assigns monotonic
+request IDs and keeps the last completed result during a new scan.
+
+The module now provides =fzf-native-async-submit=,
+=fzf-native-async-snapshot=, and =fzf-native-async-status=.  The old
+=fzf-native-async-candidates= function uses the same submission path.
+
+The exact-result cache now includes case mode and fuzzy mode in its key.  It
+also rejects a cached result that is too small for a later result limit.
+
+The reader now coalesces candidate-growth events after the first request.  The
+coordinator retries that request with the same request ID and a new pool
+boundary.  It keeps the prior completed result visible during the retry.
+
+Each session now owns one persistent pthread worker pool.  Each worker keeps
+one matcher slab for the session lifetime.
+
+Snapshots now have a separate generation and report scan progress for the
+requested ID.  Progress advances after each complete scoring batch.
+
+The stable-batch cache now keeps sparse or bitmap membership evidence from
+complete immutable batches.  It keeps that evidence after request cancellation.
+It uses a byte-budgeted LRU and skips dense or mutable batches.
+
+Snapshots now report producer state, exit status, producer errors, and matcher
+request errors.  A matcher failure keeps the prior completed result.
+
+fzfa now stores the native request ID for each source.  It accepts only a
+complete, fresh snapshot that belongs to that ID.  It keeps the prior display
+while a new request runs.  Query changes keep the same handle, producer, and
+native worker pool.
+
+The required implementation and verification work is complete.  Performance
+measurement and optional progressive top-K publication remain separate follow-up
+work.
 
 * Current fzf-native state
 
@@ -26,18 +64,19 @@ close to interactive fzf, but the API does not identify which request produced
 the returned list.
 
 The coordinator has one pending-request slot.  A changed query sets an abort
-flag and replaces the queued request.  Each scoring run creates and joins a new
-set of pthread workers.  Each worker also creates a new matcher slab.
+flag and replaces the queued request.  A session-owned pthread pool runs each
+scoring request.  Each worker reuses one matcher slab.
 
 The result cache stores a literal query, a top-K result, and the full set of
 matching candidate indexes.  It supports exact hits, narrowing refinement, and
-append-only candidate deltas.  It stores evidence only after a full request
-finishes.  Cancellation discards every partial batch from that request.
+append-only candidate deltas.  A separate stable-batch cache stores safe
+membership after each complete immutable batch.  Cancellation keeps that
+evidence but does not publish a cancelled whole result.
 
-The present cache key omits case mode, fuzzy mode, filter-only mode, and result
-capacity.  Thus, a limit-1 result can incorrectly serve a later limit-3 call.  A
-case-insensitive result can also serve a case-sensitive call.  Fix these defects
-before adding more reuse.
+The old cache key omitted case mode, fuzzy mode, filter-only mode, and result
+capacity.  The first implementation slice corrected case mode, fuzzy mode, and
+result-capacity handling.  It reuses membership across filter-only modes, but
+it does not reuse ranked results across those modes.
 
 The current generation counter also mixes two events.  The reader increments it
 for each candidate.  The scorer increments it for a completed result.  A caller
@@ -129,12 +168,12 @@ persistent pthread worker pool and reuse per-worker memory.
 |---------+------------+--------------------+--------------------|
 | Producer lifetime | One reader cycle | One child per async handle | Keep current behavior |
 | Query update | Cancel and coalesce | Abort and replace one slot | Add request IDs and fix cancellation races |
-| Input growth | Finish, then retry | Retry on a later API call | Coalesce growth and queue a retry |
+| Input growth | Finish, then retry | Coalesce growth and retry | Keep implemented behavior |
 | Result display | Keep prior completed list | Return prior or cached list | Keep behavior and label ownership |
 | Partial matches | Progress only | No partial publication | Defer optional top-K publication |
 | Safe reuse | Per-chunk membership bitmap | Per-query match-index array | Add stable per-batch evidence |
 | Exact reuse | Completed merger cache | Literal-query top-K cache | Use complete semantic keys |
-| Scan workers | New Go goroutines | New pthreads for each scan | Persistent pthread pool |
+| Scan workers | New Go goroutines | Persistent pthread pool | Keep implemented behavior |
 
 * Product behavior
 
@@ -178,8 +217,9 @@ builds an Emacs list and never waits for scoring.
 
 - request ID
 - pool generation
+- snapshot generation
 - state: =queued=, =running=, =complete=, =cancelled=, or =failed=
-- completed-candidate count and total-candidate count
+- completed-batch candidate count and total scan count
 - last completed result, query, and request ID
 - current result when the requested search is complete
 - total match count
@@ -388,6 +428,16 @@ Add a state-machine fuzzer.  Its operations include append, replace, submit,
 poll, change settings, stop, and collect.  Compare every completed session
 snapshot with a fresh batch calculation for the same stable pool boundary.
 
+Implemented: =fuzz/fzf-native-session-fuzz.c= includes the real module core and
+uses structured libFuzzer traces to append candidates, submit replacement
+requests with changing settings and limits, poll, wait, and stop active
+sessions.  It reaches the persistent scoring thread, worker pool, result cache,
+stable-batch cache, growth retry, cancellation, publication, and synchronous
+teardown paths.  At quiescent pool boundaries it compares the exact ordered
+top-K snapshot, including scores and duplicate identity, with an independent
+batch calculation.  Permanent seeds cover active cancellation, growth during a
+request, 2048-candidate batch boundaries, repeated cache rounds, and UTF-8.
+
 Keep the existing upstream fzf match-set oracle.  Run ASan, UBSan, TSan, the C
 tests, direct Emacs 30.2 tests, and upstream match-set tests.
 
@@ -420,10 +470,15 @@ provisional list and reorder count before completion.
 
 ** Milestone 0: Cache correctness
 
+Status: Complete for the current whole-result cache.
+
 Fix cache keys and result-capacity rules.  Add regressions for limit and case
 mode.  Keep the batch API unchanged.
 
 ** Milestone 1: Request identity
+
+Status: Complete.  The request API exposes a monotonic request ID, the pool
+boundary, and a snapshot generation.  Each result records exact ownership.
 
 Extend =AsyncSession= with separate pool, request, and snapshot generations.
 Add immutable request records and exact result ownership.  Retain the current
@@ -431,21 +486,34 @@ producer, reader, coordinator, and lifecycle management.
 
 ** Milestone 2: fzf-like request policy
 
+Status: Complete.  Query cancellation, queued-request replacement, candidate
+growth retry, and last-completed-result retention are implemented.
+
 Add query cancellation, latest-request coalescing, candidate-growth retry, and
 last-completed-result retention.
 
 ** Milestone 3: Per-batch membership evidence
 
-Add stable-batch IDs, sparse and bitmap values, safe prefix or suffix lookup,
+Status: Complete.  Full stable batches store sparse or bitmap membership under
+a byte-budgeted LRU.  Completed evidence survives whole-request cancellation.
+
+Add stable-batch IDs, sparse and bitmap values, safe query-refinement lookup,
 memory budgets, and eviction.  Commit a completed batch before checking whether
 the whole request became obsolete.
 
 ** Milestone 4: Persistent workers
 
+Status: Complete.  Each session owns one pthread pool.  Workers retain their
+matcher slabs across request rounds.
+
 Move query work to a session-owned pthread pool.  Reuse per-worker slabs and
 buffers.  Add deterministic shutdown and TSan coverage.
 
 ** Milestone 5: Native and Emacs snapshot API
+
+Status: Complete.  Submission, status, request state, stale-result ownership,
+completed snapshots, scan progress, and producer and matcher errors are
+implemented.
 
 Expose request-aware submission, status, progress, completed results, and
 errors.  Convert =fzf-native-async-candidates= and the freshness predicate to
@@ -453,19 +521,57 @@ compatibility wrappers.
 
 ** Milestone 6: Producer events and fzfa integration
 
+Status: Complete.  Reader growth events cause automatic retries.  fzfa keeps
+request ownership per source and polls snapshot generations without building
+candidate lists.
+
 Connect reader growth to coalesced retry events.  Keep one producer per session.
 Update the interactive Emacs caller to submit queries and poll snapshots.  Make
 the integration retain its handle for the full completion session.
 
 ** Milestone 7: Performance work
 
+Status: Not started.
+
 Benchmark cold, warm, narrowing, broadening, backspace, and growing-input cases.
 Evaluate local sorted lists with a fixed top-K merge.
 
 ** Milestone 8: Optional progressive top-K
 
+Status: Not started.
+
 Add provisional snapshots only when the benchmark results justify the added API
 and synchronization cost.
+
+* Verification record
+
+The following commands passed on 2026-08-20 against the current worktree:
+
+- The direct Emacs 30.2 run passed all 113 native and UTF-8 ERT tests.
+- =make ctest= passed all module and matcher tests.
+- =make ctest-asan= passed with AddressSanitizer and UndefinedBehaviorSanitizer.
+- =make ctest-tsan= passed the C tests and five interactive trace seeds with
+  ThreadSanitizer.
+- =make fuzz-replay= passed all 27 matcher and five interactive-session corpus
+  inputs with AddressSanitizer and UndefinedBehaviorSanitizer.
+- The interactive libFuzzer target completed a clean 20,000-run mutation smoke
+  test and the combined =make fuzz= entry point completed a clean bounded run.
+- =make fuzz-elisp= passed 500 module cases and 40 request-aware session runs.
+- =make fuzz-upstream= passed 500 cases against fzf 0.74.3.
+- The fzfa =make test= run passed strict compilation and all 226 ERT tests.
+
+The worker-pool test compares the thread IDs across request rounds.  The IDs do
+not change.
+
+The fzfa frontend tests run =alp=, =beta=, and =a= on one command source.  Both
+the completion-table path and the Helm path start one native handle.
+
+The request tests cover cancellation, result ownership, retained results, and
+automatic input-growth retries.  The randomized test changes case and fuzzy
+settings between requests.  Each completed snapshot equals a new batch result.
+
+The teardown tests stop active sessions and wait for detached cleanup.  The GC
+test releases live sessions while producer and matcher threads run.
 
 * Completion criteria
 

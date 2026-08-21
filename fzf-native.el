@@ -32,6 +32,9 @@
 (declare-function fzf-native-async-start "fzf-native-module" (command &optional dir))
 (declare-function fzf-native-async-stop "fzf-native-module" (handle))
 (declare-function fzf-native-async-generation "fzf-native-module" (handle))
+(declare-function fzf-native-async-submit "fzf-native-module" (handle query &optional limit))
+(declare-function fzf-native-async-snapshot "fzf-native-module" (handle &optional request-id))
+(declare-function fzf-native-async-status "fzf-native-module" (handle))
 (declare-function fzf-native-async-candidates "fzf-native-module" (handle filter &optional limit))
 (declare-function fzf-native-async-stats "fzf-native-module" (handle))
 (declare-function fzf-native-async-result-fresh-p "fzf-native-module" (handle query))
@@ -210,6 +213,20 @@ Read once at session start by `fzf-native-async-start'.
 
 Bridged by fzfa from `fzfa-cache-size' via `:around' advice."
   :type 'integer
+  :group 'fzf-native)
+
+(defcustom fzf-native-async-batch-cache-bytes (* 64 1024 1024)
+  "Maximum bytes for stable-batch membership data in one async session.
+
+The native scorer stores completed full-batch match sets before it checks
+request cancellation.  A later exact or narrower query can reuse those sets.
+
+Sparse match sets use local candidate indexes.  Denser sets use bitmaps.
+The scorer does not cache a batch when more than half its candidates match.
+
+Set this value to zero to disable stable-batch membership reuse.  The module
+reads the value once in `fzf-native-async-start'."
+  :type 'natnum
   :group 'fzf-native)
 
 (defcustom fzf-native-filter-only-min-pool 10000000

@@ -30,6 +30,15 @@ FUZZ_OLD_CORPUS_DIR ?= $(FUZZ_CORPUS_DIR)-old
 FUZZ_CONTINUOUS_LOCK_DIR ?= $(BUILD_DIR)/fuzz-continuous.lock
 FUZZ_BINARY := $(BUILD_DIR)/fzf-native-fuzz
 FUZZ_REPLAY_BINARY := $(BUILD_DIR)/fzf-native-fuzz-replay
+FUZZ_SESSION_MAX_LEN ?= 8192
+FUZZ_SESSION_SEED_DIR ?= fuzz/session-corpus
+FUZZ_SESSION_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-session-corpus
+FUZZ_SESSION_ARTIFACT_DIR ?= $(FUZZ_ARTIFACT_DIR)/session
+FUZZ_SESSION_MERGED_CORPUS_DIR ?= $(FUZZ_SESSION_CORPUS_DIR)-merged
+FUZZ_SESSION_OLD_CORPUS_DIR ?= $(FUZZ_SESSION_CORPUS_DIR)-old
+FUZZ_SESSION_BINARY := $(BUILD_DIR)/fzf-native-session-fuzz
+FUZZ_SESSION_REPLAY_BINARY := $(BUILD_DIR)/fzf-native-session-fuzz-replay
+FUZZ_SESSION_TSAN_BINARY := $(BUILD_DIR)/fzf-native-session-fuzz-tsan
 FZF_REFERENCE ?= fzf
 FZF_REFERENCE_VERSION ?=
 
@@ -164,19 +173,31 @@ ctest-asan: $(UTF8PROC_LIB)
 		-o $(BUILD_DIR)/fzf-additions-test-asan fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_LIB)
 	$(BUILD_DIR)/fzf-additions-test-asan
 
-# The core matcher fuzzer uses differential properties rather than fixed
-# expected scores.  libFuzzer supplies coverage-guided inputs; ASan/UBSan turn
-# memory-safety and undefined-behavior findings into reproducible crashes.
-.PHONY: fuzz-build
-fuzz-build: $(UTF8PROC_LIB)
+# The matcher and interactive-session fuzzers use differential properties
+# rather than fixed expected scores.  libFuzzer supplies coverage-guided
+# inputs; ASan/UBSan turn memory-safety and undefined-behavior findings into
+# reproducible crashes.
+.PHONY: fuzz-build fuzz-matcher-build fuzz-session-build
+fuzz-build: fuzz-matcher-build fuzz-session-build
+
+fuzz-matcher-build: $(UTF8PROC_LIB)
 	mkdir -p $(BUILD_DIR)
 	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
 		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
 		-I. -I$(UTF8PROC_DIR) -o $(FUZZ_BINARY) \
 		fuzz/fzf-native-fuzz.c fzf.c fzf-additions.c $(UTF8PROC_LIB)
 
-.PHONY: fuzz
-fuzz: fuzz-build
+fuzz-session-build: $(UTF8PROC_LIB)
+	mkdir -p $(BUILD_DIR)
+	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
+		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
+		-I. -I$(UTF8PROC_DIR) -pthread -o $(FUZZ_SESSION_BINARY) \
+		fuzz/fzf-native-session-fuzz.c fzf.c fzf-additions.c $(UTF8PROC_LIB)
+
+.PHONY: fuzz fuzz-matcher fuzz-session
+fuzz: fuzz-matcher fuzz-session
+
+fuzz-matcher: fuzz-matcher-build
 	mkdir -p $(FUZZ_CORPUS_DIR) $(FUZZ_ARTIFACT_DIR)
 	cp $(FUZZ_SEED_DIR)/* $(FUZZ_CORPUS_DIR)/
 	ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
@@ -186,11 +207,22 @@ fuzz: fuzz-build
 		-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) \
 		-max_total_time=$(FUZZ_SECONDS) -print_final_stats=1
 
+fuzz-session: fuzz-session-build
+	mkdir -p $(FUZZ_SESSION_CORPUS_DIR) $(FUZZ_SESSION_ARTIFACT_DIR)
+	cp $(FUZZ_SESSION_SEED_DIR)/* $(FUZZ_SESSION_CORPUS_DIR)/
+	ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
+	$(FUZZ_SESSION_BINARY) $(FUZZ_SESSION_CORPUS_DIR) \
+		-max_len=$(FUZZ_SESSION_MAX_LEN) -dict=$(FUZZ_DICTIONARY) \
+		-verbosity=$(FUZZ_VERBOSITY) \
+		-artifact_prefix=$(FUZZ_SESSION_ARTIFACT_DIR)/ \
+		-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) \
+		-max_total_time=$(FUZZ_SECONDS) -print_final_stats=1
+
 # Keep one coverage-equivalent corpus input for each useful feature.  The
 # original corpus stays at FUZZ_OLD_CORPUS_DIR until the merged corpus is in
 # place, so an interrupted swap does not destroy the accumulated inputs.
-.PHONY: fuzz-merge fuzz-merge-run
-fuzz-merge: fuzz-build fuzz-merge-run
+.PHONY: fuzz-merge fuzz-merge-run fuzz-session-merge-run
+fuzz-merge: fuzz-build fuzz-merge-run fuzz-session-merge-run
 
 fuzz-merge-run:
 	test -d $(FUZZ_CORPUS_DIR)
@@ -206,12 +238,28 @@ fuzz-merge-run:
 	mv $(FUZZ_MERGED_CORPUS_DIR) $(FUZZ_CORPUS_DIR)
 	rm -rf $(FUZZ_OLD_CORPUS_DIR)
 
+fuzz-session-merge-run:
+	test -d $(FUZZ_SESSION_CORPUS_DIR)
+	rm -rf $(FUZZ_SESSION_MERGED_CORPUS_DIR)
+	mkdir -p $(FUZZ_SESSION_MERGED_CORPUS_DIR)
+	ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
+	$(FUZZ_SESSION_BINARY) $(FUZZ_SESSION_MERGED_CORPUS_DIR) \
+		$(FUZZ_SESSION_CORPUS_DIR) -merge=1 \
+		-max_len=$(FUZZ_SESSION_MAX_LEN) -verbosity=$(FUZZ_VERBOSITY) \
+		-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB)
+	cp $(FUZZ_SESSION_SEED_DIR)/* $(FUZZ_SESSION_MERGED_CORPUS_DIR)/
+	rm -rf $(FUZZ_SESSION_OLD_CORPUS_DIR)
+	mv $(FUZZ_SESSION_CORPUS_DIR) $(FUZZ_SESSION_OLD_CORPUS_DIR)
+	mv $(FUZZ_SESSION_MERGED_CORPUS_DIR) $(FUZZ_SESSION_CORPUS_DIR)
+	rm -rf $(FUZZ_SESSION_OLD_CORPUS_DIR)
+
 # Run bounded epochs in one process loop.  Each new libFuzzer process releases
 # sanitizer quarantine and feature metadata.  A coverage merge bounds the
 # on-disk corpus before the next epoch.  A real finding stops the loop.
 .PHONY: fuzz-continuous
 fuzz-continuous: fuzz-build
-	mkdir -p $(FUZZ_CORPUS_DIR) $(FUZZ_ARTIFACT_DIR)
+	mkdir -p $(FUZZ_CORPUS_DIR) $(FUZZ_ARTIFACT_DIR) \
+		$(FUZZ_SESSION_CORPUS_DIR) $(FUZZ_SESSION_ARTIFACT_DIR)
 	@if ! mkdir $(FUZZ_CONTINUOUS_LOCK_DIR) 2>/dev/null; then \
 		echo "fzf-native: another continuous fuzz campaign holds $(FUZZ_CONTINUOUS_LOCK_DIR)" >&2; \
 		exit 2; \
@@ -219,6 +267,7 @@ fuzz-continuous: fuzz-build
 	trap 'status=$$?; rmdir $(FUZZ_CONTINUOUS_LOCK_DIR); exit $$status' EXIT; \
 	trap 'exit 130' HUP INT TERM; \
 	cp $(FUZZ_SEED_DIR)/* $(FUZZ_CORPUS_DIR)/; \
+	cp $(FUZZ_SESSION_SEED_DIR)/* $(FUZZ_SESSION_CORPUS_DIR)/; \
 	set -e; while true; do \
 		ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
 		$(FUZZ_BINARY) $(FUZZ_CORPUS_DIR) -max_len=$(FUZZ_MAX_LEN) \
@@ -238,12 +287,35 @@ fuzz-continuous: fuzz-build
 		mv $(FUZZ_CORPUS_DIR) $(FUZZ_OLD_CORPUS_DIR); \
 		mv $(FUZZ_MERGED_CORPUS_DIR) $(FUZZ_CORPUS_DIR); \
 		rm -rf $(FUZZ_OLD_CORPUS_DIR); \
+		ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
+		$(FUZZ_SESSION_BINARY) $(FUZZ_SESSION_CORPUS_DIR) \
+			-max_len=$(FUZZ_SESSION_MAX_LEN) \
+			-dict=$(FUZZ_DICTIONARY) -verbosity=$(FUZZ_VERBOSITY) \
+			-artifact_prefix=$(FUZZ_SESSION_ARTIFACT_DIR)/ \
+			-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) \
+			-max_total_time=$(FUZZ_EPOCH_SECONDS) -print_final_stats=1; \
+		rm -rf $(FUZZ_SESSION_MERGED_CORPUS_DIR); \
+		mkdir -p $(FUZZ_SESSION_MERGED_CORPUS_DIR); \
+		ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
+		$(FUZZ_SESSION_BINARY) $(FUZZ_SESSION_MERGED_CORPUS_DIR) \
+			$(FUZZ_SESSION_CORPUS_DIR) -merge=1 \
+			-max_len=$(FUZZ_SESSION_MAX_LEN) \
+			-verbosity=$(FUZZ_VERBOSITY) \
+			-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB); \
+		cp $(FUZZ_SESSION_SEED_DIR)/* $(FUZZ_SESSION_MERGED_CORPUS_DIR)/; \
+		rm -rf $(FUZZ_SESSION_OLD_CORPUS_DIR); \
+		mv $(FUZZ_SESSION_CORPUS_DIR) $(FUZZ_SESSION_OLD_CORPUS_DIR); \
+		mv $(FUZZ_SESSION_MERGED_CORPUS_DIR) $(FUZZ_SESSION_CORPUS_DIR); \
+		rm -rf $(FUZZ_SESSION_OLD_CORPUS_DIR); \
 	done
 
 # Deterministic replay is useful in pre-commit checks and works without the
-# libFuzzer runtime.  Every minimized finding should be added to fuzz/corpus.
-.PHONY: fuzz-replay-build
-fuzz-replay-build: $(UTF8PROC_LIB)
+# libFuzzer runtime.  Every minimized finding should be added to its permanent
+# matcher or interactive-session seed corpus.
+.PHONY: fuzz-replay-build fuzz-matcher-replay-build fuzz-session-replay-build
+fuzz-replay-build: fuzz-matcher-replay-build fuzz-session-replay-build
+
+fuzz-matcher-replay-build: $(UTF8PROC_LIB)
 	mkdir -p $(BUILD_DIR)
 	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
 		-DFZF_FUZZ_STANDALONE -fsanitize=address,undefined \
@@ -251,9 +323,18 @@ fuzz-replay-build: $(UTF8PROC_LIB)
 		-o $(FUZZ_REPLAY_BINARY) fuzz/fzf-native-fuzz.c fzf.c \
 		fzf-additions.c $(UTF8PROC_LIB)
 
+fuzz-session-replay-build: $(UTF8PROC_LIB)
+	mkdir -p $(BUILD_DIR)
+	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
+		-DFZF_SESSION_FUZZ_STANDALONE -fsanitize=address,undefined \
+		-fno-omit-frame-pointer -I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(FUZZ_SESSION_REPLAY_BINARY) \
+		fuzz/fzf-native-session-fuzz.c fzf.c fzf-additions.c $(UTF8PROC_LIB)
+
 .PHONY: fuzz-replay
 fuzz-replay: fuzz-replay-build
 	$(FUZZ_REPLAY_BINARY) $(FUZZ_SEED_DIR)/*
+	$(FUZZ_SESSION_REPLAY_BINARY) $(FUZZ_SESSION_SEED_DIR)/*
 
 # Randomized properties at the Emacs module boundary.  Override the seed and
 # case counts in the environment to reproduce or deepen a run.
@@ -282,6 +363,11 @@ ctest-tsan: $(UTF8PROC_LIB)
 		-o $(BUILD_DIR)/fzf-native-ctest-tsan fzf-native-ctest.c fzf.c \
 		fzf-additions.c $(UTF8PROC_LIB)
 	$(BUILD_DIR)/fzf-native-ctest-tsan
+	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g -fsanitize=thread \
+		-DFZF_SESSION_FUZZ_STANDALONE -fno-omit-frame-pointer \
+		-I. -I$(UTF8PROC_DIR) -pthread -o $(FUZZ_SESSION_TSAN_BINARY) \
+		fuzz/fzf-native-session-fuzz.c fzf.c fzf-additions.c $(UTF8PROC_LIB)
+	$(FUZZ_SESSION_TSAN_BINARY) $(FUZZ_SESSION_SEED_DIR)/*
 
 .PHONY: clean
 clean:
