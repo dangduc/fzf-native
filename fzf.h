@@ -109,4 +109,33 @@ fzf_slab_t *fzf_make_slab(fzf_slab_config_t config);
 fzf_slab_t *fzf_make_default_slab(void);
 void fzf_free_slab(fzf_slab_t *slab);
 
+/* UTF-8 utility functions for testing */
+#include "utf8proc-2.10.0/utf8proc.h"
+
+bool is_ascii_utf8proc(const char *text, size_t len);
+int32_t char_class_of_utf8proc(utf8proc_int32_t codepoint);
+utf8proc_int32_t utf8proc_case_fold(utf8proc_int32_t codepoint);
+int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
+                         size_t pattern_len, bool case_sensitive);
+
+/* UTF-8 aware matching algorithms */
+fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
+                                  fzf_string_t *text, fzf_string_t *pattern,
+                                  fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_prefix_match_utf8(bool case_sensitive, bool normalize,
+                                   fzf_string_t *text, fzf_string_t *pattern,
+                                   fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_suffix_match_utf8(bool case_sensitive, bool normalize,
+                                   fzf_string_t *text, fzf_string_t *pattern,
+                                   fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_equal_match_utf8(bool case_sensitive, bool normalize,
+                                  fzf_string_t *text, fzf_string_t *pattern,
+                                  fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_fuzzy_match_v1_utf8(bool case_sensitive, bool normalize,
+                                     fzf_string_t *text, fzf_string_t *pattern,
+                                     fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
+                                     fzf_string_t *text, fzf_string_t *pattern,
+                                     fzf_position_t *pos, fzf_slab_t *slab);
+
 #endif // FZF_H_

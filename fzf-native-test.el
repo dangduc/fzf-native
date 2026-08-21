@@ -48,6 +48,11 @@
   (let ((result (fzf-native-score "" "acef")))
     (should (equal result '(0)))))
 
+(ert-deftest fzf-native-score-empty-str-inverse-query-test ()
+  "An empty candidate can match a non-empty inverse query."
+  (should (> (car (fzf-native-score "" "!acef")) 0))
+  (should (equal (fzf-native-score-all '("") "!acef") '(""))))
+
 (ert-deftest fzf-native-score-str-wrong-type-int-test ()
   (should-error (fzf-native-score 1 "1")
                 :type 'wrong-type-argument))
@@ -126,6 +131,98 @@ case-insensitive, query with any uppercase becomes case-sensitive."
     (should (equal (fzf-native-score "src/foo.c" "!xyz foo") '(80)))
     ;; Space-separated AND: both substrings must match.
     (should (equal (fzf-native-score "src/foo.c" "src foo") '(160)))))
+
+;;
+;; Exact-value oracle tests for the operators that the rest of the
+;; CI-run main suite only exercises as booleans: suffix ($), equal
+;; (^...$), and OR (|).  Every expected number is derived BY HAND from
+;; the fzf scoring constants below; the binary merely confirms it.
+;;
+;; Constants (fzf.c:52-59):
+;;   ScoreMatch=16  ScoreGapStart=-3  ScoreGapExtention=-1
+;;   BonusBoundary=8  BonusNonWord=8  BonusCamel123=7
+;;   BonusConsecutive=4  BonusFirstCharMultiplier=2
+;; char_class_of (ASCII): a-z=Lower, A-Z=Upper, 0-9=Number, else=NonWord
+;;   ('.', '/', ' ' are all NonWord).
+;; bonus_for(prev,cur): NonWord->word = BonusBoundary(8); else 0 between
+;;   two word letters.  In a run, char k>0 takes
+;;   max(bonus, first_bonus, BonusConsecutive); first_bonus carries the
+;;   run's opening boundary bonus.  The first matched char's bonus is
+;;   doubled (BonusFirstCharMultiplier).
+;;
+;; Two closed forms used repeatedly:
+;;   * contiguous run of M chars whose first char sits at a word boundary:
+;;       (ScoreMatch + 2*BonusBoundary) + (M-1)*(ScoreMatch + BonusBoundary)
+;;       = 32 + 24*(M-1) = 24*M + 8.
+;;   * equal match (^X$): hardcoded (ScoreMatch+BonusBoundary)*M +
+;;       (BonusFirstCharMultiplier-1)*BonusBoundary = 24*M + 8 (fzf.c:1280).
+
+(ert-deftest fzf-native-score-suffix-operator-test ()
+  "Suffix ($) exact scores; boundary vs non-boundary first char.
+
+\"foobar\" \"bar$\": suffix \"bar\" sits at byte range [3,6).  The char
+before it is 'o' (Lower), so the run opens with NO boundary bonus.
+  b: ScoreMatch + 0*2          = 16
+  a: ScoreMatch + max(0,0,4)=4 = 20
+  r: ScoreMatch + 4            = 20   -> total 56.
+General form (no opening boundary): 16*M + 4*(M-1) = 16*3 + 4*2 = 56.
+
+\"foo.bar\" \"bar$\": suffix \"bar\" at [4,7); the char before it is '.'
+\(NonWord), so the run opens at a word boundary.
+  b: ScoreMatch + 2*BonusBoundary = 32
+  a: ScoreMatch + 8               = 24
+  r: ScoreMatch + 8               = 24   -> total 80 = 24*3 + 8."
+  (should (equal (fzf-native-score "foobar"  "bar$") '(56)))
+  (should (equal (fzf-native-score "foo.bar" "bar$") '(80)))
+  ;; A suffix that isn't actually at the end does not match.
+  (should (equal (fzf-native-score "barfoo"  "bar$") '(0))))
+
+(ert-deftest fzf-native-score-equal-operator-test ()
+  "Equal (^...$) exact scores: closed form 24*M + 8, length-exact.
+
+equal_match returns (ScoreMatch+BonusBoundary)*M +
+\(BonusFirstCharMultiplier-1)*BonusBoundary = 24*M + 8 (fzf.c:1280).
+  M=3 \"^abc$\"  -> 24*3 + 8 = 80
+  M=4 \"^abcd$\" -> 24*4 + 8 = 104
+The candidate length must equal the pattern length exactly, so a
+shorter pattern against a longer candidate scores 0."
+  (should (equal (fzf-native-score "abc"  "^abc$")  '(80)))
+  (should (equal (fzf-native-score "abcd" "^abcd$") '(104)))
+  ;; Length mismatch -> no equal match.
+  (should (equal (fzf-native-score "foobar" "^foo$")    '(0)))
+  (should (equal (fzf-native-score "abc"    "^abcd$")  '(0))))
+
+(ert-deftest fzf-native-score-or-operator-test ()
+  "OR (|) takes the FIRST matching term's score within the term-set.
+
+In a term-set the evaluator breaks on the first term that matches and
+uses that term's score (fzf.c:2410-2419); it is NOT the max.  Proof:
+the same two terms reordered give different totals.
+
+text \"abcdef\":
+  \"^abc | ^abcdef$\": term 1 is prefix \"abc\" -> contiguous run of 3 at
+     the start boundary = 24*3 + 8 = 80.  Matches first, so total 80
+     even though equal \"^abcdef$\" (24*6+8=152) would score higher.
+  \"^abcdef$ | ^abc\": term 1 is equal \"abcdef\" = 24*6 + 8 = 152.
+     Matches first -> total 152.
+  \"zzz | ^abc\": term 1 \"zzz\" does not match; falls through to prefix
+     \"abc\" = 80.
+  \"zzz | qqq\": neither term matches -> 0."
+  (should (equal (fzf-native-score "abcdef" "^abc | ^abcdef$") '(80)))
+  (should (equal (fzf-native-score "abcdef" "^abcdef$ | ^abc") '(152)))
+  (should (equal (fzf-native-score "abcdef" "zzz | ^abc")      '(80)))
+  (should (equal (fzf-native-score "abcdef" "zzz | qqq")       '(0))))
+
+(ert-deftest fzf-native-score-and-sum-of-operators-test ()
+  "AND (space) sums the per-term-set scores; combine new operators.
+
+text \"foo.bar\", query \"^foo bar$\" = two term-sets ANDed:
+  prefix \"foo\" : contiguous run of 3 at start boundary = 24*3 + 8 = 80.
+  suffix \"bar\" : opens after '.' (boundary)            = 24*3 + 8 = 80.
+Sum = 160."
+  (should (equal (fzf-native-score "foo.bar" "^foo bar$") '(160)))
+  ;; If either ANDed term fails, the whole pattern scores 0.
+  (should (equal (fzf-native-score "foo.bar" "^foo zzz$") '(0))))
 
 (ert-deftest fzf-native-score-with-default-slab-benchmark-test ()
   "Test scoring with slab is faster."
@@ -294,6 +391,105 @@ calls.  `completion-score' still rides on the returned copy."
     (should (equal result coll))))
 
 ;;
+;; Filter-only fast path (sync) — end-to-end guard.
+;;
+;; `fzf-native-score-all' switches to the cheap `fzf_has_match' path when
+;; `fzf-native-filter-only-p' fires (see the defcustoms
+;; `fzf-native-filter-only-min-pool' / `-length' / `-logic').  The fast
+;; path skips scoring and top-K sorting, so the *order* of results and the
+;; `completion-score' property differ from full scoring — but the matched
+;; candidate SET must be identical.
+;;
+;; This guards a real regression where the filter-only path used the
+;; byte-wise ASCII matcher for every term: it dropped ALL UTF-8 matches
+;; and let inverted UTF-8 terms (`!café') through.  The fix defers any
+;; non-ASCII / inverted term-set to the full scorer inside
+;; `fzf_has_match'.  We assert the active-vs-disabled sets are `equal'
+;; for ASCII, case-folded UTF-8, Greek, CJK, and inverted-non-ASCII
+;; queries.
+
+(defun fzf-native-test--score-all-set (coll query)
+  "Sorted, property-stripped match set for `fzf-native-score-all'.
+Neutralises the order / `completion-score' differences between the
+filter-only and full paths so only set membership is compared."
+  (sort (mapcar #'substring-no-properties
+                (fzf-native-score-all coll query))
+        #'string<))
+
+(ert-deftest fzf-native-score-all-filter-only-matches-full-test ()
+  "Filter-only active vs disabled return the SAME matched set.
+
+With `fzf-native-filter-only-min-pool' = 1 and OR logic, the predicate
+fires for any non-empty pool, so the fast path is genuinely exercised;
+with min-pool = 10000000 (default-ish) it never fires on this tiny
+collection.  Both settings must agree on the match set for every query,
+including the UTF-8 / inverted cases that the regression broke."
+  (skip-unless (fboundp 'fzf-native-filter-only-p))
+  (let ((coll '("café" "CAFÉ" "résumé" "naïve"
+                "中文" "测试中文" "中文测试"
+                "Θεσσαλονίκη" "θεωρία"
+                "hello" "HELLO" "world" "test")))
+    (dolist (query '("hello"     ; ASCII, case-fold (matches hello + HELLO)
+                     "café"      ; UTF-8, case-fold (matches café + CAFÉ)
+                     "θε"        ; Greek, case-fold (matches both Greek words)
+                     "中文"      ; CJK (matches all three 中文* candidates)
+                     "!café"     ; inverted non-ASCII term
+                     "résumé"    ; UTF-8 exact-ish
+                     "zzz"))     ; matches nothing
+      ;; Sanity: the predicate really does flip between the two settings,
+      ;; so a green assertion can't be vacuous (path never engaged).
+      (let ((fzf-native-filter-only-min-pool 1)
+            (fzf-native-filter-only-length nil)
+            (fzf-native-filter-only-logic 'or))
+        (should (fzf-native-filter-only-p (length query) (length coll))))
+      (let ((fzf-native-filter-only-min-pool 10000000)
+            (fzf-native-filter-only-length nil)
+            (fzf-native-filter-only-logic 'or))
+        (should-not (fzf-native-filter-only-p (length query) (length coll))))
+      ;; Same matched set under both settings.
+      (let ((active
+             (let ((fzf-native-filter-only-min-pool 1)
+                   (fzf-native-filter-only-length nil)
+                   (fzf-native-filter-only-logic 'or))
+               (fzf-native-test--score-all-set coll query)))
+            (disabled
+             (let ((fzf-native-filter-only-min-pool 10000000)
+                   (fzf-native-filter-only-length nil)
+                   (fzf-native-filter-only-logic 'or))
+               (fzf-native-test--score-all-set coll query))))
+        (should (equal active disabled))
+        ;; Spot-check the load-bearing cases actually carry content / are
+        ;; correctly empty, so "equal but both wrong" can't pass silently.
+        (cond
+         ((equal query "café")
+          (should (equal active '("CAFÉ" "café"))))
+         ((equal query "中文")
+          (should (equal active '("中文" "中文测试" "测试中文"))))
+         ((equal query "!café")
+          ;; Everything EXCEPT the two café candidates.
+          (should-not (member "café" active))
+          (should-not (member "CAFÉ" active))
+          (should (member "résumé" active))
+          (should (member "中文" active)))
+         ((equal query "zzz")
+          (should (null active))))))))
+
+(ert-deftest fzf-native-score-all-filter-only-length-counts-characters-test ()
+  "Filter-only query thresholds count characters, not UTF-8 bytes."
+  (let ((fzf-native-filter-only-min-pool nil)
+        (fzf-native-filter-only-length 1)
+        (fzf-native-filter-only-logic 'or)
+        (fzf-native-batch-highlight nil))
+    (let ((ascii (car (fzf-native-score-all (vector "abc") "a")))
+          (utf8 (car (fzf-native-score-all (vector "你好") "你"))))
+      ;; Filter-only deliberately omits `completion-score'.  Both one-character
+      ;; queries must therefore take that path despite differing byte lengths.
+      (should ascii)
+      (should utf8)
+      (should-not (get-text-property 0 'completion-score ascii))
+      (should-not (get-text-property 0 'completion-score utf8)))))
+
+;;
 ;; Async path (fzf-native-async-*)
 ;;
 
@@ -343,11 +539,67 @@ size.  Times out after TIMEOUT seconds (default 5)."
       (sleep-for 0.05)))
   (fzf-native-async-result-fresh-p handle filter))
 
+(defun fzf-native-test--wait-for-request (handle request-id &optional timeout)
+  "Wait for REQUEST-ID on HANDLE and return its terminal snapshot."
+  (let ((deadline (+ (float-time) (or timeout 5.0)))
+        snapshot)
+    (while (and (< (float-time) deadline)
+                (progn
+                  (setq snapshot
+                        (fzf-native-async-snapshot handle request-id))
+                  (memq (plist-get snapshot :state) '(queued running))))
+      (sleep-for 0.01))
+    snapshot))
+
+(defun fzf-native-test--wait-for-producer (handle &optional timeout)
+  "Wait for HANDLE's producer to finish and return its status."
+  (let ((deadline (+ (float-time) (or timeout 5.0)))
+        status)
+    (while (and (< (float-time) deadline)
+                (progn
+                  (setq status (fzf-native-async-status handle))
+                  (not (plist-get status :reader-done))))
+      (sleep-for 0.01))
+    status))
+
 (ert-deftest fzf-native-async-lifecycle-test ()
   "Start → wait for data → generation advances → stop."
   (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz")))
     (unwind-protect
         (should (fzf-native-test--wait-for-data handle))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-producer-clean-completion-test ()
+  "A zero producer exit is visible as a clean terminal state."
+  (skip-unless (fboundp 'fzf-native-async-status))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo")))
+    (unwind-protect
+        (let ((status (fzf-native-test--wait-for-producer handle)))
+          (should (plist-get status :reader-done))
+          (should (eq (plist-get status :producer-state) 'complete))
+          (should (= (plist-get status :producer-exit-status) 0))
+          (should-not (plist-get status :producer-error)))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-producer-nonzero-exit-test ()
+  "A nonzero producer exit reports an error without losing its candidates."
+  (skip-unless (fboundp 'fzf-native-async-status))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' foo; exit 7")))
+    (unwind-protect
+        (let ((status (fzf-native-test--wait-for-producer handle)))
+          (should (plist-get status :reader-done))
+          (should (eq (plist-get status :producer-state) 'failed))
+          (should (= (plist-get status :producer-exit-status) 7))
+          (should (equal (plist-get status :producer-error)
+                         "producer exited with status 7"))
+          (let* ((request-id (fzf-native-async-submit handle "foo" 10))
+                 (snapshot (fzf-native-test--wait-for-request
+                            handle request-id)))
+            (should (eq (plist-get snapshot :state) 'complete))
+            (should (equal (plist-get snapshot :candidates) '("foo")))
+            (should (equal (plist-get snapshot :producer-error)
+                           "producer exited with status 7"))))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-stop-invalidates-handle-test ()
@@ -356,6 +608,212 @@ size.  Times out after TIMEOUT seconds (default 5)."
     (fzf-native-test--wait-for-data handle)
     (fzf-native-async-stop handle)
     (should (null (fzf-native-async-generation handle)))))
+
+(ert-deftest fzf-native-async-submit-snapshot-lifecycle-test ()
+  "Submit once, poll snapshots, and receive an owned completed result."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' foo bar baz foobaz"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((request-id (fzf-native-async-submit handle "foo" 10))
+                 (initial (fzf-native-async-snapshot handle request-id))
+                 (final (fzf-native-test--wait-for-request
+                         handle request-id)))
+            (should (integerp request-id))
+            (should (> request-id 0))
+            (should (= (plist-get initial :request-id) request-id))
+            (should (memq (plist-get initial :state)
+                          '(queued running complete)))
+            (should (eq (plist-get final :state) 'complete))
+            (should (= (plist-get final :result-request-id) request-id))
+            (should-not (plist-get final :stale))
+            (should (equal (plist-get final :query) "foo"))
+            (should (member "foo" (plist-get final :candidates)))
+            (should (member "foobaz" (plist-get final :candidates)))
+            (should-not (member "bar" (plist-get final :candidates)))
+            (should (= (plist-get final :pool-generation)
+                       (plist-get final :result-pool-generation)))
+            (should (> (plist-get final :progress-total) 0))
+            (should (= (plist-get final :progress-completed)
+                       (plist-get final :progress-total)))
+            (let ((status (fzf-native-async-status handle)))
+              (should (eq (plist-get status :state) 'complete))
+              (should (= (plist-get status :request-id) request-id)))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-snapshot-retains-prior-result-while-running-test ()
+  "Keep the prior completed list while a new request scans the pool."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "seq 1 500000"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (let ((producer (fzf-native-test--wait-for-producer handle 15.0)))
+            (should (plist-get producer :reader-done))
+            (should (= (plist-get producer :pool-generation) 500000)))
+          (let* ((old-id (fzf-native-async-submit handle "1" 100))
+                 (old (fzf-native-test--wait-for-request handle old-id 10.0))
+                 (old-candidates (plist-get old :candidates))
+                 (new-id (fzf-native-async-submit handle "999999" 100))
+                 (pending (fzf-native-async-snapshot handle new-id)))
+            (should (eq (plist-get old :state) 'complete))
+            (should (= (length old-candidates) 100))
+            (should (memq (plist-get pending :state) '(queued running)))
+            (should (= (plist-get pending :request-id) new-id))
+            (should (= (plist-get pending :result-request-id) old-id))
+            (should (plist-get pending :stale))
+            (should (equal (plist-get pending :query) "1"))
+            (should (equal (plist-get pending :candidates) old-candidates))
+            (let ((final
+                   (fzf-native-test--wait-for-request handle new-id 10.0)))
+              (should (eq (plist-get final :state) 'complete))
+              (should (= (plist-get final :result-request-id) new-id))
+              (should-not (plist-get final :stale)))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-snapshot-preserves-request-query-test ()
+  "Pattern parsing must not mutate the query recorded in a snapshot."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo foobar"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((query "foo ")
+                 (request-id (fzf-native-async-submit handle query 10))
+                 (snapshot (fzf-native-test--wait-for-request
+                            handle request-id)))
+            (should (eq (plist-get snapshot :state) 'complete))
+            (should (equal (plist-get snapshot :query) query))
+            (should (= (plist-get snapshot :result-request-id)
+                       request-id))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-submit-supersedes-queued-request-test ()
+  "A new query cancels queued obsolete work and owns the final snapshot."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "seq 1 100000"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle 10.0))
+          (let* ((old-id (fzf-native-async-submit handle "11111" 20))
+                 (new-id (fzf-native-async-submit handle "99999" 20))
+                 (final (fzf-native-test--wait-for-request
+                         handle new-id 10.0)))
+            (should (> new-id old-id))
+            (should (eq (plist-get final :state) 'complete))
+            (should (= (plist-get final :result-request-id) new-id))
+            (should (member "99999" (plist-get final :candidates)))
+            (should (eq (plist-get
+                         (fzf-native-async-snapshot handle old-id)
+                         :state)
+                        'cancelled))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-submit-retries-after-input-growth-test ()
+  "Candidate growth retries the latest request without another submission."
+  (skip-unless (and (fboundp 'fzf-native-async-submit)
+                    (executable-find "python3")))
+  (let* ((gate (make-temp-file "fzf-native-growth-gate-"))
+         (handle (fzf-native-async-start
+                  (format "python3 -u -c 'import os, sys, time
+gate = sys.argv[1]
+for i in range(3): print(f\"a{i}\", flush=True)
+while os.path.exists(gate): time.sleep(0.01)
+print(\"a-late\", flush=True)
+for i in range(40): print(f\"b{i}\", flush=True)
+' %s" (shell-quote-argument gate))))
+         (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((request-id (fzf-native-async-submit handle "a" 100))
+                 (first (fzf-native-test--wait-for-request
+                         handle request-id)))
+            (should (eq (plist-get first :state) 'complete))
+            (should (> (plist-get first :snapshot-generation) 0))
+            (should-not (member "a-late" (plist-get first :candidates)))
+
+            ;; Release the producer.  From here onward, poll only snapshots.
+            ;; A second submit or compatibility candidates call would hide a
+            ;; missing native growth retry.
+            (delete-file gate)
+            (let ((deadline (+ (float-time) 10.0))
+                  snapshot)
+              (while (and (< (float-time) deadline)
+                          (progn
+                            (setq snapshot
+                                  (fzf-native-async-snapshot
+                                   handle request-id))
+                            (not (and
+                                  (eq (plist-get snapshot :state) 'complete)
+                                  (not (plist-get snapshot :stale))
+                                  (member "a-late"
+                                          (plist-get snapshot :candidates))))))
+                (sleep-for 0.01))
+              (should (eq (plist-get snapshot :state) 'complete))
+              (should-not (plist-get snapshot :stale))
+              (should (= (plist-get snapshot :request-id) request-id))
+              (should (= (plist-get snapshot :result-request-id)
+                         request-id))
+              (should (> (plist-get snapshot :snapshot-generation)
+                         (plist-get first :snapshot-generation)))
+              (should (member "a-late"
+                              (plist-get snapshot :candidates)))
+              (should (> (plist-get snapshot :progress-total) 0))
+              (should (= (plist-get snapshot :progress-completed)
+                         (plist-get snapshot :progress-total)))
+              (should (= (plist-get snapshot :pool-generation)
+                         (plist-get snapshot :result-pool-generation))))))
+      (when (file-exists-p gate) (delete-file gate))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-cache-expands-result-capacity-test ()
+  "A cached limit-1 result does not satisfy a later limit-3 request."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' alpha alpine alps beta"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((small-id (fzf-native-async-submit handle "al" 1))
+                 (small (fzf-native-test--wait-for-request handle small-id))
+                 (large-id (fzf-native-async-submit handle "al" 3))
+                 (large (fzf-native-test--wait-for-request handle large-id)))
+            (should (eq (plist-get small :state) 'complete))
+            (should (= (length (plist-get small :candidates)) 1))
+            (should (> large-id small-id))
+            (should (eq (plist-get large :state) 'complete))
+            (should (= (length (plist-get large :candidates)) 3))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-cache-separates-case-mode-test ()
+  "Changing case mode for one query cannot reuse an incompatible result."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' foo FOO Food bar"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((fzf-native-case-mode 'ignore)
+                 (ignore-id (fzf-native-async-submit handle "FOO" 10))
+                 (ignore (fzf-native-test--wait-for-request
+                          handle ignore-id)))
+            (should (> (length (plist-get ignore :candidates)) 1)))
+          (let* ((fzf-native-case-mode 'respect)
+                 (respect-id (fzf-native-async-submit handle "FOO" 10))
+                 (respect (fzf-native-test--wait-for-request
+                           handle respect-id)))
+            (should (eq (plist-get respect :state) 'complete))
+            (should (eq (plist-get respect :case-mode) 'respect))
+            (should (equal (plist-get respect :candidates) '("FOO")))))
+      (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-candidates-empty-filter-test ()
   "Empty filter returns all candidates."
@@ -506,6 +964,68 @@ in fzf and the cache should treat them so via term-set subsumption
             (should (equal r1 r2))))
       (fzf-native-async-stop handle))))
 
+(ert-deftest fzf-native-async-cache-inverse-extension-broadens-test ()
+  "Extending an inverse term must not refine from the narrower old set."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' foo foobar bar"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((first-id (fzf-native-async-submit handle "!foo" 10))
+                 (first (fzf-native-test--wait-for-request handle first-id))
+                 (second-id (fzf-native-async-submit handle "!foobar" 10))
+                 (second (fzf-native-test--wait-for-request
+                          handle second-id)))
+            (should (equal (plist-get first :candidates) '("bar")))
+            (should (equal (sort (copy-sequence
+                                  (plist-get second :candidates))
+                                 #'string<)
+                           '("bar" "foo")))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-stable-batch-cache-narrowing-test ()
+  "A narrower request reuses full-batch membership and matches batch scoring."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "seq 1 8192"))
+        (fzf-native-async-highlight nil)
+        (fzf-native-batch-highlight nil))
+    (unwind-protect
+        (let ((deadline (+ (float-time) 10.0)) first)
+          (should (fzf-native-test--wait-for-data handle 10.0))
+          (let ((request-id (fzf-native-async-submit handle "9" 200)))
+            (while (and (< (float-time) deadline)
+                        (progn
+                          (setq first
+                                (fzf-native-async-snapshot handle request-id))
+                          (not (and (eq (plist-get first :state) 'complete)
+                                    (plist-get first :reader-done)
+                                    (not (plist-get first :stale))))))
+              (sleep-for 0.01)))
+          (should (eq (plist-get first :state) 'complete))
+          (should (plist-get first :reader-done))
+          (should (> (plist-get first :batch-cache-entries) 0))
+          (let* ((hits-before (plist-get first :batch-cache-hits))
+                 (request-id (fzf-native-async-submit handle "99" 200))
+                 (final (fzf-native-test--wait-for-request
+                         handle request-id 10.0))
+                 (expected-all
+                  (fzf-native-score-all
+                   (mapcar #'number-to-string
+                           (number-sequence 1 8192))
+                   "99"))
+                 (expected
+                  (mapcar #'substring-no-properties
+                          (cl-subseq expected-all 0
+                                     (min 200 (length expected-all))))))
+            (should (eq (plist-get final :state) 'complete))
+            (should (> (plist-get final :batch-cache-hits) hits-before))
+            (should (< (plist-get final :progress-total)
+                       (plist-get final :pool-generation)))
+            (should (equal (plist-get final :candidates) expected))))
+      (fzf-native-async-stop handle))))
+
 (ert-deftest fzf-native-async-result-fresh-p-before-scoring-test ()
   "`result-fresh-p' is nil for any query before scoring runs."
   (skip-unless (fboundp 'fzf-native-async-start))
@@ -555,16 +1075,10 @@ distinguishing \"no matches\" from \"scoring in flight\"."
           (should (fzf-native-async-result-fresh-p handle "zzz")))
       (fzf-native-async-stop handle))))
 
-(ert-deftest fzf-native-async-result-fresh-p-pool-grew-stale-test ()
-  "After scoring at pool size N, the arrival of more candidates makes
-the cache entry stale: `pool_gen' lags `s->count' and `fresh-p' flips
-to nil.  Uses a two-phase Python producer gated on a tempfile so phase
-2 provably runs *after* scoring has settled against the phase-1 pool,
-regardless of CI runner speed.  Phase 1 emits 3 items, then the
-producer polls until elisp deletes the gate, then phase 2 streams more
-items.  Between `wait-for-fresh' and the gate release, no
-`async-candidates' call dispatches, so the cache entry for \"a\" keeps
-its phase-1 `pool_gen' even as the pool grows."
+(ert-deftest fzf-native-async-result-fresh-p-pool-growth-auto-refresh-test ()
+  "Input growth automatically refreshes the latest compatibility query.
+The second phase starts after the first result is fresh.  Snapshot and
+freshness polling do not submit more scoring work."
   (skip-unless (and (fboundp 'fzf-native-async-start)
                     (executable-find "python3")))
   (let* ((gate (make-temp-file "fzf-native-gate-"))
@@ -579,17 +1093,37 @@ for i in range(40): print(f\"b{i}\", flush=True)
         (progn
           (fzf-native-test--wait-for-data handle)
           (should (fzf-native-test--wait-for-fresh handle "a"))
-          (let ((g0 (fzf-native-async-generation handle))
-                (deadline (+ (float-time) 5.0)))
+          (let* ((request-id (plist-get (fzf-native-async-status handle)
+                                        :request-id))
+                 (initial (fzf-native-async-snapshot handle request-id))
+                 (initial-pool
+                  (plist-get initial :result-pool-generation))
+                 (deadline (+ (float-time) 5.0))
+                 snapshot)
             ;; Release phase 2 now that scoring for "a" is settled.
             (delete-file gate)
-            ;; Wait for at least one phase-2 batch to land so the reader
-            ;; has advanced `s->count' past the phase-1 pool.
-            (while (and (= (fzf-native-async-generation handle) g0)
-                        (< (float-time) deadline))
-              (sleep-for 0.05)))
-          ;; Pool grew → cache entry's `pool_gen' < `s->count' → stale.
-          (should-not (fzf-native-async-result-fresh-p handle "a")))
+            ;; Poll only ownership and freshness.  Neither function submits
+            ;; the query, so the native reader/coordinator path must retry it.
+            (while (and (< (float-time) deadline)
+                        (progn
+                          (setq snapshot
+                                (fzf-native-async-snapshot
+                                 handle request-id))
+                          (not (and
+                                (> (plist-get snapshot :pool-generation)
+                                   initial-pool)
+                                (= (plist-get snapshot :pool-generation)
+                                   (plist-get
+                                    snapshot :result-pool-generation))
+                                (fzf-native-async-result-fresh-p
+                                 handle "a")))))
+              (sleep-for 0.05))
+            (should (> (plist-get snapshot :pool-generation)
+                       initial-pool))
+            (should (= (plist-get snapshot :pool-generation)
+                       (plist-get snapshot :result-pool-generation)))
+            (should-not (plist-get snapshot :stale))
+            (should (fzf-native-async-result-fresh-p handle "a"))))
       (when (file-exists-p gate) (delete-file gate))
       (fzf-native-async-stop handle))))
 
@@ -646,6 +1180,61 @@ sys.stdout.buffer.write(b\"another_valid\\n\")
             (should (member "你好世界" result))
             (should (member "你是" result))
             (should-not (member "Hello" result))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-max-line-length-counts-characters-test ()
+  "Async line limits count characters and truncate at UTF-8 boundaries."
+  (skip-unless (and (fboundp 'fzf-native-async-start)
+                    (executable-find "python3")))
+  ;; Positive cap: keep the two-character line and exclude the three-character
+  ;; line, regardless of their six- and nine-byte UTF-8 encodings.
+  (let* ((fzf-native-max-line-length 2)
+         (handle (fzf-native-async-start
+                  "python3 -u -c 'print(\"你好\"); print(\"你好吗\")'")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (should (fzf-native-test--wait-for-fresh handle ""))
+          (should (equal (fzf-native-async-candidates handle "") '("你好"))))
+      (fzf-native-async-stop handle)))
+  ;; Negative cap: retain two complete characters instead of two raw bytes.
+  (let* ((fzf-native-max-line-length -2)
+         (handle (fzf-native-async-start
+                  "python3 -u -c 'print(\"你好吗\")'")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (should (fzf-native-test--wait-for-fresh handle ""))
+          (should (equal (fzf-native-async-candidates handle "") '("你好"))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-filter-only-length-counts-characters-test ()
+  "Async filter-only thresholds count characters, not UTF-8 bytes."
+  (skip-unless (and (fboundp 'fzf-native-async-start)
+                    (executable-find "python3")))
+  (let* ((fzf-native-filter-only-min-pool nil)
+         (fzf-native-filter-only-length 1)
+         (fzf-native-filter-only-logic 'or)
+         (fzf-native-max-line-length nil)
+         (fzf-native-async-highlight nil)
+         (handle (fzf-native-async-start
+                  "python3 -u -c 'print(\"zzz你\"); print(\"zz你\"); print(\"你\")'")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          ;; Drive the first request with LIMIT=2.  Filter-only evaluates all
+          ;; three memberships but ranks only the producer-order emit window;
+          ;; full scoring would select the later, higher-scoring exact
+          ;; candidate "你".  Excluding it proves the one-character threshold
+          ;; fired without relying on the display order within that window.
+          (let ((deadline (+ (float-time) 5.0)))
+            (while (and (not (fzf-native-async-result-fresh-p handle "你"))
+                        (< (float-time) deadline))
+              (fzf-native-async-candidates handle "你" 2)
+              (sleep-for 0.05)))
+          (should (fzf-native-async-result-fresh-p handle "你"))
+          (should (equal (fzf-native-async-candidates handle "你" 2)
+                         '("zzz你" "zz你"))))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-long-line-whole-test ()

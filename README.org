@@ -111,6 +111,47 @@ stream candidates from long-running shell commands (~find~, ~rg~,
 [[https://github.com/jojojames/fzfa/blob/HEAD/architecture.org][fzfa's architecture overview]]
 for the Elisp-side pipeline.
 
+** Request-aware asynchronous API
+
+One asynchronous handle keeps one producer process for its full lifetime.
+Submit each query to the same handle:
+
+#+begin_src emacs-lisp
+(let* ((handle (fzf-native-async-start "find . -type f"))
+       (request-id (fzf-native-async-submit handle "module" 200)))
+  (unwind-protect
+      (fzf-native-async-snapshot handle request-id)
+    (fzf-native-async-stop handle)))
+#+end_src
+
+~fzf-native-async-submit~ returns a monotonic request ID.  An identical queued
+or active request keeps its existing ID.  A changed query replaces obsolete
+queued work and cancels obsolete active work.
+
+~fzf-native-async-snapshot~ returns a plist.  The ~:state~ value is ~queued~,
+~running~, ~complete~, ~failed~, ~cancelled~, ~idle~, or ~unknown~.  The plist keeps the
+last completed ~:candidates~ while a newer request runs.  The
+~:result-request-id~ field identifies the owner of that list.  The ~:stale~
+field is non-nil for a different request or a newer candidate pool.
+The ~:snapshot-generation~ field increments for each published result.
+While a request runs, ~:progress-completed~ reports the number of candidates
+in fully scanned batches.  ~:progress-total~ reports the size of that scan.
+Both fields describe the requested ID, not the retained older result.
+
+The ~:producer-state~, ~:producer-exit-status~, and ~:producer-error~ fields
+describe the command reader.  A failed matcher request has state ~failed~ and
+an ~:error~ string.  A failure does not remove the prior completed candidates.
+
+~fzf-native-async-status~ returns the same request metadata without a candidate
+list.  ~fzf-native-async-candidates~ remains the combined compatibility API.
+
+Candidate input can continue after a request completes.  The native session
+coalesces these input events and retries the same request ID automatically.
+The old result remains available until the retry completes.
+
+Each asynchronous session owns one persistent scoring pool.  Query updates do
+not start a new process or create new scoring threads.
+
 ** Customization
 
 The C module reads the following defcustoms via ~symbol-value~ at call
@@ -129,6 +170,7 @@ yourself; otherwise prefer the package-level knob.
 | ~fzf-native-async-highlight~        | 200        | ~fzf-native-async-candidates~      | nil = off; t = all returned candidates; positive N = top N. |
 | ~fzf-native-max-line-length~        | 256        | ~fzf-native-async-start~ (once at session start) | nil = no limit; +N = drop lines longer than N; -N = truncate lines to N characters. |
 | ~fzf-native-async-cache-size~       | 40         | ~fzf-native-async-start~ (once at session start) | LRU result-cache entries.  Each entry stores top-K results plus the full matched-candidate index for one query, enabling exact-fresh hits and prefix-refinement hits. |
+| ~fzf-native-async-batch-cache-bytes~ | 64 MiB    | ~fzf-native-async-start~ (once at session start) | Byte budget for safe membership data from complete stable batches.  Set to 0 to disable. |
 | ~fzf-native-filter-only-min-pool~   | 10 000 000 | ~fzf-native-async-start~ (once at session start), ~fzf-native-score-all~ (per call) | Pool-size threshold for filter-only mode.  When the candidate pool reaches ≥ N, scoring swaps ~fzf_get_score~ for ~fzf_has_match~ (cheap boolean) and skips top-K sorting.  ~nil~/~0~ disables this arm. |
 | ~fzf-native-filter-only-length~     | nil        | every scoring call (sync + async)  | Query-length threshold for filter-only mode.  When set to a positive integer N and the query is at most N characters, take the cheap match path.  ~nil~/~0~ disables this arm. |
 | ~fzf-native-filter-only-logic~      | ~or~       | every scoring call (sync + async)  | How the two filter-only arms compose: ~or~ = either trigger is sufficient; ~and~ = every enabled arm must fire (a disabled arm is trivially satisfied). |
@@ -175,6 +217,55 @@ involved.
 #+begin_src bash
 mkdir build && cmake -B build -DCMAKE_C_FLAGS='-O3 -march=native' && cmake --build build
 #+end_src
+
+** Fuzzing
+
+The fuzz suite has four complementary local layers:
+
+- ~make fuzz-replay~ replays the checked-in UTF-8, query-parser, inverse-term,
+  small-slab, and interactive-session regression corpora under
+  AddressSanitizer and UndefinedBehaviorSanitizer.
+- ~make fuzz-matcher~ runs the structured matcher harness with libFuzzer.  New
+  coverage lives in ~build/fuzz-corpus~ and minimized failures in
+  ~build/fuzz-artifacts~.
+  In addition to matcher-level invariants, the harness rewrites extended-search
+  queries and checks whitespace equivalence, AND/OR reordering, duplicate-term
+  idempotence, and the duality between a leading quote and the global fuzzy
+  mode.  Score equality is required where term evaluation order is irrelevant;
+  otherwise the oracle compares match membership.
+- ~make fuzz-session~ drives the real native interactive session engine from a
+  compact operation trace.  It covers candidate growth, request replacement,
+  cancellation, worker scoring, exact and batch caches, publication, polling,
+  and active teardown.  Every quiescent snapshot is compared with an
+  independently sorted batch result at the same pool boundary.  Its corpus and
+  artifacts live in ~build/fuzz-session-corpus~ and
+  ~build/fuzz-artifacts/session~.
+- ~make fuzz-elisp~ checks scalar/batch/filter/highlight equivalence and
+  exercises async query refinement, broadening, term reordering, garbage
+  collection, and teardown.  Runs are deterministic; set
+  ~FZF_NATIVE_FUZZ_SEED~, ~FZF_NATIVE_FUZZ_CASES~, and
+  ~FZF_NATIVE_FUZZ_ASYNC_SESSIONS~ to reproduce or deepen them.  Set
+  ~FZF_NATIVE_FUZZ_TRACE_ITERATION~ to print one exact generated ABI case
+  before it executes (useful when reducing a signal-level failure).
+
+~make fuzz~ runs both native libFuzzer targets.  Set ~FUZZ_SECONDS~ to control
+each target's run length.  ~make fuzz-continuous~ runs and coverage-merges both
+targets in repeated 30-minute epochs; set ~FUZZ_EPOCH_SECONDS~ to change the
+per-target epoch length.
+
+When an upstream ~fzf~ executable is available, ~make fuzz-upstream~ compares
+randomized match multisets with the reference CLI.  CI pins both its release
+and archive checksum.  Local runs can select the same reference explicitly:
+
+#+begin_src bash
+FZF_REFERENCE=/path/to/fzf FZF_REFERENCE_VERSION=0.74.3 make fuzz-upstream
+#+end_src
+
+The separate ~make ctest-tsan~ lane covers the async reader, result cache,
+deferred teardown, and interactive trace corpus under ThreadSanitizer.  Every
+fuzz failure prints its seed or writes a replayable artifact; promote minimized
+permanent regressions into ~fuzz/corpus~, ~fuzz/session-corpus~, or a focused
+unit test.
 
 ** Debugging fzf-native with emacs/lldb (EXAMPLE)
 *** Building Emacs
