@@ -13,6 +13,11 @@
 (declare-function fzf-native-async-generation "fzf-native-module" (handle))
 (declare-function fzf-native-async-candidates "fzf-native-module" (handle query &optional limit))
 (declare-function fzf-native-async-result-fresh-p "fzf-native-module" (handle query))
+(declare-function fzf-native-async-submit "fzf-native-module"
+                  (handle query &optional limit))
+(declare-function fzf-native-async-snapshot "fzf-native-module"
+                  (handle &optional request-id))
+(declare-function fzf-native-async-status "fzf-native-module" (handle))
 
 (fzf-native-load-dyn)
 
@@ -207,8 +212,31 @@
     (error "async result did not become fresh for query %S" query))
   (fzf-native-async-candidates handle query limit))
 
+(defun fzf-native-fuzz--request-snapshot (handle query limit)
+  "Submit QUERY to HANDLE and return its complete owned snapshot."
+  (let ((request-id (fzf-native-async-submit handle query limit))
+        snapshot)
+    (should (integerp request-id))
+    (unless
+        (fzf-native-fuzz--wait-until
+         (lambda ()
+           (setq snapshot
+                 (fzf-native-async-snapshot handle request-id))
+           (memq (plist-get snapshot :state)
+                 '(complete failed cancelled)))
+         5.0)
+      (error "request %d did not finish for query %S" request-id query))
+    (should (eq (plist-get snapshot :state) 'complete))
+    (should (= (plist-get snapshot :request-id) request-id))
+    (should (= (plist-get snapshot :result-request-id) request-id))
+    (should (= (plist-get snapshot :latest-request-id) request-id))
+    (should-not (plist-get snapshot :stale))
+    (should (= (plist-get snapshot :pool-generation)
+               (plist-get snapshot :result-pool-generation)))
+    snapshot))
+
 (ert-deftest fzf-native-fuzz-async-state-machine ()
-  "Exercise repeated/refined/broadened/reordered queries, GC, and stop."
+  "Exercise request ownership, settings, query transitions, GC, and stop."
   (skip-unless (and (fboundp 'fzf-native-async-start)
                     (executable-find "cat")))
   (let* ((seed (fzf-native-fuzz--env-integer "FZF_NATIVE_FUZZ_SEED" 12648430))
@@ -246,19 +274,31 @@
                          (= (fzf-native-async-generation handle)
                             (length collection)))
                        5.0))
-              (let ((previous-generation
-                     (or (fzf-native-async-generation handle) 0)))
+              (let ((previous-generation 0))
                 (dolist (query queries)
-                  (let* ((async (fzf-native-fuzz--async-result
-                                 handle query (length collection)))
+                  (let* ((fzf-native-case-mode
+                          (aref [smart ignore respect]
+                                (fzf-native-fuzz--random 3)))
+                         (fzf-native-fuzzy
+                          (not (zerop (fzf-native-fuzz--random 2))))
+                         (snapshot
+                          (fzf-native-fuzz--request-snapshot
+                           handle query (length collection)))
+                         (async (plist-get snapshot :candidates))
                          (sync (fzf-native-score-all
                                 (fzf-native-fuzz--copies collection) query))
-                         (generation (fzf-native-async-generation handle)))
-                    (ert-info ((format "seed=%d async-iteration=%d query=%S"
-                                       seed iteration query))
+                         (generation
+                          (plist-get snapshot :snapshot-generation))
+                         (status (fzf-native-async-status handle)))
+                    (ert-info ((format
+                                "seed=%d async-iteration=%d query=%S mode=%S fuzzy=%S"
+                                seed iteration query fzf-native-case-mode
+                                fzf-native-fuzzy))
                       (should (equal (fzf-native-fuzz--keys async)
                                      (fzf-native-fuzz--keys sync)))
-                      (should (>= generation previous-generation)))
+                      (should (> generation previous-generation))
+                      (should (= (plist-get status :latest-request-id)
+                                 (plist-get snapshot :request-id))))
                     (setq previous-generation generation)))
               ;; The cached repeated query must be stable across a collection.
               (let ((first (fzf-native-fuzz--async-result
@@ -270,6 +310,8 @@
                                  handle "a" (length collection))))))
               (fzf-native-async-stop handle)
               (should-not (fzf-native-async-result-fresh-p handle "a"))
+              (should-not (fzf-native-async-snapshot handle))
+              (should-not (fzf-native-async-status handle))
               (setq handle nil)))
           (when handle (ignore-errors (fzf-native-async-stop handle)))
           (ignore-errors (delete-file file)))))))
