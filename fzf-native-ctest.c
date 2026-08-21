@@ -10,6 +10,7 @@
  * because no test path dereferences them.
  */
 
+#define FZF_NATIVE_CTEST 1
 #include "fzf-native-module.c"
 
 #include <assert.h>
@@ -58,8 +59,8 @@ static void test_n_one(void) {
   CHECK(xs[0].score == 42);
 }
 
-static void test_small_n_qsort_fallback(void) {
-  /* n=8 hits the n < 64 qsort fallback. Verify it still sorts descending. */
+static void test_small_n_insertion_sort(void) {
+  /* n=8 hits the n < 64 insertion-sort path. */
   struct Candidate xs[8] = {
     make_candidate(5, 0), make_candidate(3, 1), make_candidate(9, 2),
     make_candidate(1, 3), make_candidate(7, 4), make_candidate(0, 5),
@@ -69,6 +70,17 @@ static void test_small_n_qsort_fallback(void) {
   CHECK(is_descending_by_score(xs, 8));
   CHECK(xs[0].score == 9);
   CHECK(xs[7].score == 0);
+}
+
+static void test_small_n_stability(void) {
+  struct Candidate xs[8];
+  for (size_t i = 0; i < 8; i++)
+    xs[i] = make_candidate(7, i);
+  counting_sort_candidates(xs, 8);
+  for (size_t i = 0; i < 8; i++) {
+    CHECK(xs[i].score == 7);
+    CHECK(xs[i].s.len == i);
+  }
 }
 
 static void test_large_n_correctness(void) {
@@ -271,6 +283,8 @@ static AsyncSession *make_async_session(FILE *fp, size_t cap) {
   if (!s) return NULL;
   s->fp = fp;
   pthread_mutex_init(&s->mu, NULL);
+  pthread_mutex_init(&s->score_req_mu, NULL);
+  pthread_cond_init(&s->score_req_cond, NULL);
   return s;
 }
 
@@ -278,6 +292,8 @@ static void free_async_session(AsyncSession *s) {
   arena_free(&s->arena);
   for (size_t k = 0; k < CANDS_TOP_CAP; k++)
     if (s->cands_top[k]) free(s->cands_top[k]);
+  pthread_cond_destroy(&s->score_req_cond);
+  pthread_mutex_destroy(&s->score_req_mu);
   pthread_mutex_destroy(&s->mu);
   free(s);
 }
@@ -308,6 +324,30 @@ static void test_async_reader_basic(void) {
   CHECK(strcmp(cands_at(s, 0), "alpha") == 0);
   CHECK(strcmp(cands_at(s, 1), "beta")  == 0);
   CHECK(strcmp(cands_at(s, 2), "gamma") == 0);
+  CHECK(!atomic_load_explicit(&s->score_growth_pending,
+                              memory_order_acquire));
+  free_async_session(s);
+}
+
+static void test_async_reader_coalesces_growth_after_request(void) {
+  int pfd[2];
+  CHECK(pipe(pfd) == 0);
+  FILE *wfp = fdopen(pfd[1], "w");
+  CHECK(wfp != NULL);
+  fprintf(wfp, "alpha\nbeta\ngamma\n");
+  fclose(wfp);
+
+  FILE *rfp = fdopen(pfd[0], "r");
+  CHECK(rfp != NULL);
+  AsyncSession *s = make_async_session(rfp, 8);
+  CHECK(s != NULL);
+  atomic_store_explicit(&s->score_has_request, true, memory_order_release);
+
+  async_reader((void *)s);
+
+  CHECK(s->count == 3);
+  CHECK(atomic_load_explicit(&s->score_growth_pending,
+                             memory_order_acquire));
   free_async_session(s);
 }
 
@@ -652,6 +692,117 @@ static void test_cache_pool_gen_distinguishes_stale(void) {
   cache_free(&c);
 }
 
+static void test_cache_exact_separates_case_and_fuzzy_modes(void) {
+  Cache c;
+  cache_init(&c, 20);
+  ScoredStr ignore_top[1] = { make_top("ignore", 30) };
+  ScoredStr respect_top[1] = { make_top("respect", 20) };
+  ScoredStr exact_top[1] = { make_top("exact", 10) };
+
+  cache_insert_for_request(&c, "foo", 10, CaseIgnore, true, false,
+                           ignore_top, 1, 1, NULL, 0);
+  cache_insert_for_request(&c, "foo", 10, CaseRespect, true, false,
+                           respect_top, 1, 1, NULL, 0);
+  cache_insert_for_request(&c, "foo", 10, CaseIgnore, false, false,
+                           exact_top, 1, 1, NULL, 0);
+  CHECK(c.count == 3);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0, matched_count = 0;
+  bool covered = false;
+  CHECK(cache_lookup_exact_for_request(
+      &c, "foo", CaseIgnore, true, false, 1,
+      &out, &out_count, &out_sidx, &out_gen,
+      &matched_count, &covered));
+  CHECK(out_count == 1);
+  CHECK(strcmp(out[0].str, "ignore") == 0);
+  CHECK(covered);
+  free(out);
+
+  out = NULL;
+  CHECK(cache_lookup_exact_for_request(
+      &c, "foo", CaseRespect, true, false, 1,
+      &out, &out_count, &out_sidx, &out_gen,
+      &matched_count, &covered));
+  CHECK(strcmp(out[0].str, "respect") == 0);
+  free(out);
+
+  out = NULL;
+  CHECK(cache_lookup_exact_for_request(
+      &c, "foo", CaseIgnore, false, false, 1,
+      &out, &out_count, &out_sidx, &out_gen,
+      &matched_count, &covered));
+  CHECK(strcmp(out[0].str, "exact") == 0);
+  free(out);
+  cache_free(&c);
+}
+
+static void test_cache_exact_requires_sufficient_result_capacity(void) {
+  Cache c;
+  cache_init(&c, 20);
+  ScoredStr top_one[1] = { make_top("one", 30) };
+  uint32_t matches[3] = { 0, 1, 2 };
+  cache_insert_for_request(&c, "foo", 10, CaseSmart, true, false,
+                           top_one, 1, 3, matches, 3);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0, matched_count = 0;
+  bool covered = false;
+  CHECK(cache_lookup_exact_for_request(
+      &c, "foo", CaseSmart, true, false, 1,
+      &out, &out_count, &out_sidx, &out_gen,
+      &matched_count, &covered));
+  CHECK(covered);
+  CHECK(matched_count == 3);
+  free(out);
+  shared_idx_release(out_sidx);
+
+  out = NULL; out_sidx = NULL; covered = true;
+  CHECK(cache_lookup_exact_for_request(
+      &c, "foo", CaseSmart, true, false, 3,
+      &out, &out_count, &out_sidx, &out_gen,
+      &matched_count, &covered));
+  CHECK(!covered);
+  free(out);
+  shared_idx_release(out_sidx);
+
+  out = NULL; out_sidx = NULL; covered = true;
+  CHECK(cache_lookup_exact_for_request(
+      &c, "foo", CaseSmart, true, false, 0,
+      &out, &out_count, &out_sidx, &out_gen,
+      &matched_count, &covered));
+  CHECK(!covered);
+  free(out);
+  shared_idx_release(out_sidx);
+  cache_free(&c);
+}
+
+static void test_cache_exact_reuses_membership_across_filter_only_mode(void) {
+  Cache c;
+  cache_init(&c, 20);
+  ScoredStr top[1] = { make_top("one", 30) };
+  uint32_t matches[1] = { 0 };
+  cache_insert_for_request(&c, "foo", 10, CaseSmart, true, true,
+                           top, 1, 1, matches, 1);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0, matched_count = 0;
+  bool covered = true;
+  CHECK(cache_lookup_exact_for_request(
+      &c, "foo", CaseSmart, true, false, 1,
+      &out, &out_count, &out_sidx, &out_gen,
+      &matched_count, &covered));
+  CHECK(!covered);
+  CHECK(out_sidx != NULL);
+  CHECK(out_sidx->count == 1);
+  free(out);
+  shared_idx_release(out_sidx);
+  cache_free(&c);
+}
+
 /* =====================================================================
  * Result cache — phase 2: term-set subsumption + prefix lookup
  * ===================================================================== */
@@ -663,6 +814,14 @@ static void test_subsumes_pattern_extending_term_via_byte_prefix(void) {
      captures via the byte-prefix path.  Verify the byte-prefix subsumes()
      directly. */
   CHECK(subsumes("fo", "foo") == true);
+}
+
+static void test_byte_prefix_rejects_operator_source_terms(void) {
+  CHECK(subsumes("!foo", "!foobar") == false);
+  CHECK(subsumes("foo$", "foo$bar") == false);
+  CHECK(subsumes("^foo", "^foobar") == false);
+  CHECK(subsumes("'foo", "'foobar") == false);
+  CHECK(subsumes("foo bar", "foo bar baz") == false);
 }
 
 static void test_subsumes_pattern_adding_term_at_end(void) {
@@ -765,6 +924,21 @@ static void test_cache_lookup_prefix_v2_finds_term_subset(void) {
   cache_free(&c);
 }
 
+static void test_cache_lookup_prefix_rejects_inverse_extension(void) {
+  Cache c;
+  cache_init(&c, 20);
+  cache_insert_eligible(&c, "!foo", 100);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(!cache_lookup_prefix(&c, "!foobar", CaseSmart, true,
+                             &out, &out_count, &out_sidx, &out_gen));
+  CHECK(out == NULL);
+  CHECK(out_sidx == NULL);
+  cache_free(&c);
+}
+
 static void test_cache_lookup_prefix_v2_finds_reordered(void) {
   /* Cache has "foo bar".  New query "bar foo" should hit via term-set
      mutual subsumption.  We exclude exact-match entries from prefix
@@ -831,6 +1005,342 @@ static void test_cache_lookup_prefix_skips_exact_match(void) {
   cache_free(&c);
 }
 
+static void test_batch_cache_sparse_bitmap_and_selectivity_cutoff(void) {
+  BatchCache cache;
+  batch_cache_init(&cache, 1024 * 1024);
+  BatchQuery *query = batch_cache_acquire_query(
+      &cache, "foo", CaseSmart, true);
+  CHECK(query != NULL);
+
+  ScoredStr sparse[3] = {
+    {.idx = 2 * BATCH_SIZE + 0},
+    {.idx = 2 * BATCH_SIZE + 17},
+    {.idx = 2 * BATCH_SIZE + 2047},
+  };
+  batch_cache_insert(&cache, query, 2, sparse, 3);
+  uint16_t local[BATCH_SIZE];
+  size_t count = 0;
+  CHECK(batch_cache_copy_members(&cache, query, 2, local, &count));
+  CHECK(count == 3);
+  CHECK(local[0] == 0 && local[1] == 17 && local[2] == 2047);
+
+  ScoredStr bitmap[200];
+  for (size_t i = 0; i < 200; i++)
+    bitmap[i].idx = (uint32_t)(3 * BATCH_SIZE + i * 3);
+  batch_cache_insert(&cache, query, 3, bitmap, 200);
+  count = 0;
+  CHECK(batch_cache_copy_members(&cache, query, 3, local, &count));
+  CHECK(count == 200);
+  for (size_t i = 0; i < count; i++) CHECK(local[i] == i * 3);
+
+  ScoredStr *dense = calloc(BATCH_SIZE / 2 + 1, sizeof *dense);
+  CHECK(dense != NULL);
+  if (dense) {
+    for (size_t i = 0; i < BATCH_SIZE / 2 + 1; i++)
+      dense[i].idx = (uint32_t)(4 * BATCH_SIZE + i);
+    batch_cache_insert(&cache, query, 4, dense, BATCH_SIZE / 2 + 1);
+    count = 0;
+    CHECK(!batch_cache_copy_members(&cache, query, 4, local, &count));
+    free(dense);
+  }
+
+  batch_cache_release_query(&cache, query);
+  batch_cache_free(&cache);
+}
+
+static void test_batch_cache_selects_only_safe_query_ancestors(void) {
+  BatchCache cache;
+  batch_cache_init(&cache, 1024 * 1024);
+  BatchQuery *foo = batch_cache_acquire_query(
+      &cache, "foo", CaseSmart, true);
+  ScoredStr match = {.idx = 1};
+  batch_cache_insert(&cache, foo, 0, &match, 1);
+  batch_cache_release_query(&cache, foo);
+
+  BatchQuery *source = batch_cache_select_source(
+      &cache, "x foo", CaseSmart, true);
+  CHECK(source != NULL);
+  CHECK(source && strcmp(source->query, "foo") == 0);
+  batch_cache_release_query(&cache, source);
+
+  source = batch_cache_select_source(&cache, "fo", CaseSmart, true);
+  CHECK(source == NULL);
+  source = batch_cache_select_source(&cache, "x foo", CaseRespect, true);
+  CHECK(source == NULL);
+  source = batch_cache_select_source(&cache, "foo | bar", CaseSmart, true);
+  CHECK(source == NULL);
+
+  BatchQuery *inverse = batch_cache_acquire_query(
+      &cache, "!foo", CaseSmart, true);
+  batch_cache_insert(&cache, inverse, 0, &match, 1);
+  batch_cache_release_query(&cache, inverse);
+  source = batch_cache_select_source(
+      &cache, "!foobar", CaseSmart, true);
+  CHECK(source == NULL);
+
+  batch_cache_free(&cache);
+}
+
+static void test_batch_cache_evicts_to_byte_budget(void) {
+  size_t budget = sizeof(BatchQuery) + strlen("foo") + 1 +
+                  sizeof(BatchCacheEntry) + sizeof(uint16_t);
+  BatchCache cache;
+  batch_cache_init(&cache, budget);
+  BatchQuery *query = batch_cache_acquire_query(
+      &cache, "foo", CaseSmart, true);
+  ScoredStr match = {.idx = 0};
+  batch_cache_insert(&cache, query, 0, &match, 1);
+  match.idx = BATCH_SIZE;
+  batch_cache_insert(&cache, query, 1, &match, 1);
+
+  uint16_t local[BATCH_SIZE];
+  size_t count = 0;
+  CHECK(!batch_cache_copy_members(&cache, query, 0, local, &count));
+  CHECK(batch_cache_copy_members(&cache, query, 1, local, &count));
+  CHECK(count == 1 && local[0] == 0);
+  CHECK(cache.evictions == 1);
+  CHECK(cache.used_bytes <= cache.max_bytes);
+
+  batch_cache_release_query(&cache, query);
+  batch_cache_free(&cache);
+}
+
+static void test_completed_batch_evidence_survives_request_cancellation(void) {
+  BatchCache cache;
+  batch_cache_init(&cache, 1024 * 1024);
+  BatchQuery *target = batch_cache_acquire_query(
+      &cache, "a", CaseSmart, true);
+  struct AsyncScoringBatch *batch = calloc(1, sizeof *batch);
+  CHECK(target != NULL);
+  CHECK(batch != NULL);
+  if (!target || !batch) {
+    free(batch);
+    batch_cache_release_query(&cache, target);
+    batch_cache_free(&cache);
+    return;
+  }
+
+  batch->batch_id = 0;
+  batch->cacheable = true;
+  batch->len = BATCH_SIZE;
+  for (size_t i = 0; i < BATCH_SIZE; i++) {
+    batch->xs[i].str = i < 3 ? "alpha" : "zzz";
+    batch->xs[i].idx = (uint32_t)i;
+  }
+  char pattern_text[] = "a";
+  fzf_pattern_t *pattern = fzf_parse_pattern(
+      CaseSmart, false, pattern_text, true);
+  _Atomic bool abort = false;
+  _Atomic size_t progress = 0;
+  struct AsyncScoringShared shared = {
+    .pattern = pattern,
+    .batches = batch,
+    .remaining = 1,
+    .stop = &abort,
+    .progress_completed = &progress,
+    .batch_cache = &cache,
+    .target_query = target,
+    .filter_only = false,
+  };
+  fzf_slab_t *slab = fzf_make_default_slab();
+  async_score_batches(&shared, slab);
+  CHECK(batch->len == 3);
+  CHECK(atomic_load_explicit(&progress, memory_order_relaxed) == BATCH_SIZE);
+
+  /* No whole-request result is published.  The batch entry is already safe. */
+  uint16_t local[BATCH_SIZE];
+  size_t count = 0;
+  CHECK(batch_cache_copy_members(&cache, target, 0, local, &count));
+  CHECK(count == 3);
+  CHECK(local[0] == 0 && local[1] == 1 && local[2] == 2);
+
+  if (slab) fzf_free_slab(slab);
+  if (pattern) fzf_free_pattern(pattern);
+  free(batch);
+  batch_cache_release_query(&cache, target);
+  batch_cache_free(&cache);
+}
+
+static void test_mutable_partial_batch_does_not_enter_batch_cache(void) {
+  BatchCache cache;
+  batch_cache_init(&cache, 1024 * 1024);
+  BatchQuery *target = batch_cache_acquire_query(
+      &cache, "", CaseSmart, true);
+  struct AsyncScoringBatch batch = {
+    .len = 1,
+    .batch_id = 0,
+    .cacheable = false,
+    .xs = {{.str = "alpha", .idx = 0}},
+  };
+  _Atomic bool abort = false;
+  struct AsyncScoringShared shared = {
+    .pattern = NULL,
+    .batches = &batch,
+    .remaining = 1,
+    .stop = &abort,
+    .batch_cache = &cache,
+    .target_query = target,
+    .filter_only = false,
+  };
+  fzf_slab_t *slab = fzf_make_default_slab();
+  async_score_batches(&shared, slab);
+  uint16_t local[BATCH_SIZE];
+  size_t count = 0;
+  CHECK(!batch_cache_copy_members(&cache, target, 0, local, &count));
+
+  if (slab) fzf_free_slab(slab);
+  batch_cache_release_query(&cache, target);
+  batch_cache_free(&cache);
+}
+
+/* =====================================================================
+ * Interactive request identity
+ * ===================================================================== */
+
+static void test_async_request_state_precedence(void) {
+  CHECK(async_request_state(0, 0, 0, 0, 0, 0) == AsyncRequestIdle);
+  CHECK(async_request_state(4, 4, 4, 0, 3, 0) == AsyncRequestQueued);
+  CHECK(async_request_state(4, 4, 0, 4, 3, 0) == AsyncRequestRunning);
+  CHECK(async_request_state(4, 4, 4, 0, 4, 0) == AsyncRequestQueued);
+  CHECK(async_request_state(4, 4, 0, 4, 4, 0) == AsyncRequestRunning);
+  CHECK(async_request_state(4, 5, 5, 0, 4, 0) == AsyncRequestComplete);
+  CHECK(async_request_state(4, 4, 0, 0, 3, 4) == AsyncRequestFailed);
+  CHECK(async_request_state(4, 5, 5, 0, 3, 0) == AsyncRequestCancelled);
+  CHECK(async_request_state(6, 5, 0, 0, 5, 0) == AsyncRequestUnknown);
+}
+
+static void test_matcher_failure_retains_last_completed_result(void) {
+  AsyncSession *s = calloc(1, sizeof *s);
+  CHECK(s != NULL);
+  if (!s) return;
+  pthread_mutex_init(&s->score_req_mu, NULL);
+  pthread_mutex_init(&s->score_res_mu, NULL);
+  s->score_current_id = 8;
+  s->score_current_filter = strdup("new");
+  s->score_result_id = 7;
+  s->score_results = malloc(sizeof *s->score_results);
+  CHECK(s->score_current_filter != NULL);
+  CHECK(s->score_results != NULL);
+  if (s->score_results) {
+    s->score_results[0] = (ScoredStr){.str = "prior", .score = 10, .idx = 0};
+    s->score_count = 1;
+  }
+  s->score_snapshot_generation = 4;
+
+  async_publish_score_failure(s, 8, "matcher failed");
+
+  CHECK(s->score_current_id == 0);
+  CHECK(s->score_current_filter == NULL);
+  CHECK(s->score_error_id == 8);
+  CHECK(s->score_error && strcmp(s->score_error, "matcher failed") == 0);
+  CHECK(s->score_snapshot_generation == 5);
+  CHECK(s->score_result_id == 7);
+  CHECK(s->score_count == 1);
+  CHECK(s->score_results && strcmp(s->score_results[0].str, "prior") == 0);
+
+  free(s->score_results);
+  free(s->score_error);
+  pthread_mutex_destroy(&s->score_res_mu);
+  pthread_mutex_destroy(&s->score_req_mu);
+  free(s);
+}
+
+static void test_async_request_identity_includes_matching_options(void) {
+  CHECK(async_request_matches("foo", 10, CaseSmart, true, 2, false,
+                              "foo", 10, CaseSmart, true, 2, false));
+  CHECK(!async_request_matches("foo", 10, CaseSmart, true, 2, false,
+                               "bar", 10, CaseSmart, true, 2, false));
+  CHECK(!async_request_matches("foo", 10, CaseSmart, true, 2, false,
+                               "foo", 20, CaseSmart, true, 2, false));
+  CHECK(!async_request_matches("foo", 10, CaseSmart, true, 2, false,
+                               "foo", 10, CaseRespect, true, 2, false));
+  CHECK(!async_request_matches("foo", 10, CaseSmart, true, 2, false,
+                               "foo", 10, CaseSmart, false, 2, false));
+  CHECK(!async_request_matches("foo", 10, CaseSmart, true, 2, false,
+                               "foo", 10, CaseSmart, true, 3, false));
+  CHECK(!async_request_matches("foo", 10, CaseSmart, true, 2, false,
+                               "foo", 10, CaseSmart, true, 2, true));
+}
+
+static void test_async_running_request_reuse_requires_latest_slot(void) {
+  AsyncSession s = {0};
+  s.score_current_id = 7;
+  s.score_latest_id = 7;
+  s.score_current_filter = "foo";
+  s.score_current_limit = 10;
+  s.score_current_case_mode = CaseSmart;
+  s.score_current_fuzzy = true;
+  s.score_current_filter_only_length = 2;
+  s.score_current_filter_only_logic_and = false;
+
+  CHECK(async_current_request_reusable(
+      &s, "foo", 10, CaseSmart, true, 2, false));
+
+  /* A queued replacement means a later change back to the running query is
+     a new request.  Reusing ID 7 here would allow queued ID 8 to win. */
+  s.score_req_id = 8;
+  s.score_latest_id = 8;
+  CHECK(!async_current_request_reusable(
+      &s, "foo", 10, CaseSmart, true, 2, false));
+
+  s.score_req_id = 0;
+  CHECK(!async_current_request_reusable(
+      &s, "foo", 10, CaseSmart, true, 2, false));
+}
+
+static void test_async_worker_pool_reuses_threads_across_rounds(void) {
+  struct AsyncWorkerPool *pool = async_worker_pool_create(3);
+  CHECK(pool != NULL);
+  CHECK(pool->count > 0);
+  unsigned worker_count = pool->count;
+  pthread_t *worker_ids = malloc(worker_count * sizeof *worker_ids);
+  CHECK(worker_ids != NULL);
+  if (!worker_ids) {
+    async_worker_pool_destroy(pool);
+    return;
+  }
+  memcpy(worker_ids, pool->threads, worker_count * sizeof *worker_ids);
+
+  _Atomic bool abort = false;
+  _Atomic size_t progress_completed = 0;
+  for (unsigned round = 0; round < 2; round++) {
+    atomic_store_explicit(&progress_completed, 0, memory_order_relaxed);
+    struct AsyncScoringBatch *batches = calloc(2, sizeof *batches);
+    CHECK(batches != NULL);
+    if (!batches) break;
+    batches[0].len = 2;
+    batches[0].xs[0].str = "alpha";
+    batches[0].xs[1].str = "beta";
+    batches[1].len = 1;
+    batches[1].xs[0].str = "gamma";
+    struct AsyncScoringShared shared = {
+      .pattern = NULL,
+      .batches = batches,
+      .remaining = 2,
+      .stop = &abort,
+      .progress_completed = &progress_completed,
+      .filter_only = false,
+    };
+
+    async_worker_pool_run(pool, &shared);
+
+    CHECK(batches[0].len == 2);
+    CHECK(batches[1].len == 1);
+    CHECK(batches[0].xs[0].score == 1);
+    CHECK(batches[0].xs[1].score == 1);
+    CHECK(batches[1].xs[0].score == 1);
+    CHECK(atomic_load_explicit(&progress_completed,
+                               memory_order_relaxed) == 3);
+    CHECK(pool->count == worker_count);
+    for (unsigned i = 0; i < worker_count; i++)
+      CHECK(pthread_equal(worker_ids[i], pool->threads[i]));
+    free(batches);
+  }
+  CHECK(pool->epoch == 2);
+  free(worker_ids);
+  async_worker_pool_destroy(pool);
+}
+
 /* =====================================================================
  * async_session_destroy_async (off-main detached teardown)
  * ===================================================================== */
@@ -870,8 +1380,10 @@ static AsyncSession *make_destroy_test_session(void) {
   s->fp  = NULL;
   if (pthread_create(&s->reader, NULL, test_destroy_reader_stub, s) != 0)
     return NULL;
+  s->reader_started = true;
   if (pthread_create(&s->score_thread, NULL, test_destroy_score_stub, s) != 0)
     return NULL;
+  s->score_thread_started = true;
   return s;
 }
 
@@ -951,7 +1463,8 @@ int main(void) {
   printf("--- counting_sort_candidates ---\n");
   RUN(test_n_zero);
   RUN(test_n_one);
-  RUN(test_small_n_qsort_fallback);
+  RUN(test_small_n_insertion_sort);
+  RUN(test_small_n_stability);
   RUN(test_large_n_correctness);
   RUN(test_stability_with_ties);
   RUN(test_all_same_score);
@@ -973,6 +1486,7 @@ int main(void) {
 
   printf("--- async_reader ---\n");
   RUN(test_async_reader_basic);
+  RUN(test_async_reader_coalesces_growth_after_request);
   RUN(test_async_reader_ansi_stripping);
   RUN(test_async_reader_many_lines);
   RUN(test_async_reader_long_line);
@@ -990,9 +1504,13 @@ int main(void) {
   RUN(test_cache_touch_on_hit);
   RUN(test_cache_insert_zero_count);
   RUN(test_cache_pool_gen_distinguishes_stale);
+  RUN(test_cache_exact_separates_case_and_fuzzy_modes);
+  RUN(test_cache_exact_requires_sufficient_result_capacity);
+  RUN(test_cache_exact_reuses_membership_across_filter_only_mode);
 
   printf("--- cache (phase 2: term-set subsumption) ---\n");
   RUN(test_subsumes_pattern_extending_term_via_byte_prefix);
+  RUN(test_byte_prefix_rejects_operator_source_terms);
   RUN(test_subsumes_pattern_adding_term_at_end);
   RUN(test_subsumes_pattern_adding_term_at_start);
   RUN(test_subsumes_pattern_term_reorder);
@@ -1000,10 +1518,25 @@ int main(void) {
   RUN(test_subsumes_pattern_or_query_rejected);
   RUN(test_subsumes_pattern_distinct_terms);
   RUN(test_cache_lookup_prefix_v2_finds_term_subset);
+  RUN(test_cache_lookup_prefix_rejects_inverse_extension);
   RUN(test_cache_lookup_prefix_v2_finds_reordered);
   RUN(test_cache_lookup_prefix_picks_most_terms);
   RUN(test_cache_lookup_prefix_skips_or_in_query);
   RUN(test_cache_lookup_prefix_skips_exact_match);
+
+  printf("--- stable batch membership cache ---\n");
+  RUN(test_batch_cache_sparse_bitmap_and_selectivity_cutoff);
+  RUN(test_batch_cache_selects_only_safe_query_ancestors);
+  RUN(test_batch_cache_evicts_to_byte_budget);
+  RUN(test_completed_batch_evidence_survives_request_cancellation);
+  RUN(test_mutable_partial_batch_does_not_enter_batch_cache);
+
+  printf("--- interactive request identity ---\n");
+  RUN(test_async_request_state_precedence);
+  RUN(test_matcher_failure_retains_last_completed_result);
+  RUN(test_async_request_identity_includes_matching_options);
+  RUN(test_async_running_request_reuse_requires_latest_slot);
+  RUN(test_async_worker_pool_reuses_threads_across_rounds);
 
   printf("--- async_session_destroy_async ---\n");
   RUN(test_destroy_async_handles_null);

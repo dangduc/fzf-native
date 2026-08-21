@@ -31,6 +31,10 @@ static inline char fzf_addn_lower(unsigned char c) {
   return (char)tolower(c);
 }
 
+static inline bool fzf_addn_space(unsigned char c) {
+  return c == ' ' || (c >= '\t' && c <= '\r');
+}
+
 /* Fuzzy: the pattern's characters appear in TEXT in order.  Pattern is
    already case-normalized by fzf_parse_pattern when case_sensitive is
    false, so we only need to lowercase the text side. */
@@ -76,10 +80,16 @@ static bool fzf_addn_prefix(bool case_sensitive,
                             const char *text, size_t tn,
                             const char *pat,  size_t pn) {
   if (pn == 0) return true;
-  if (tn < pn) return false;
-  if (case_sensitive) return memcmp(text, pat, pn) == 0;
+  size_t start = 0;
+  /* fzf's anchored matchers ignore surrounding candidate whitespace unless
+     the pattern itself anchors whitespace.  Keep the boolean fast path in
+     lockstep with fzf_prefix_match. */
+  if (!fzf_addn_space((unsigned char)pat[0]))
+    while (start < tn && fzf_addn_space((unsigned char)text[start])) start++;
+  if (tn - start < pn) return false;
+  if (case_sensitive) return memcmp(text + start, pat, pn) == 0;
   for (size_t i = 0; i < pn; i++)
-    if (fzf_addn_lower((unsigned char)text[i]) != pat[i]) return false;
+    if (fzf_addn_lower((unsigned char)text[start + i]) != pat[i]) return false;
   return true;
 }
 
@@ -87,8 +97,11 @@ static bool fzf_addn_suffix(bool case_sensitive,
                             const char *text, size_t tn,
                             const char *pat,  size_t pn) {
   if (pn == 0) return true;
-  if (tn < pn) return false;
-  const char *tail = text + (tn - pn);
+  size_t end = tn;
+  if (!fzf_addn_space((unsigned char)pat[pn - 1]))
+    while (end > 0 && fzf_addn_space((unsigned char)text[end - 1])) end--;
+  if (end < pn) return false;
+  const char *tail = text + (end - pn);
   if (case_sensitive) return memcmp(tail, pat, pn) == 0;
   for (size_t i = 0; i < pn; i++)
     if (fzf_addn_lower((unsigned char)tail[i]) != pat[i]) return false;
@@ -98,10 +111,14 @@ static bool fzf_addn_suffix(bool case_sensitive,
 static bool fzf_addn_equal(bool case_sensitive,
                            const char *text, size_t tn,
                            const char *pat,  size_t pn) {
-  if (tn != pn) return false;
-  if (case_sensitive) return memcmp(text, pat, pn) == 0;
+  size_t start = 0;
+  size_t end = tn;
+  while (start < end && fzf_addn_space((unsigned char)text[start])) start++;
+  while (end > start && fzf_addn_space((unsigned char)text[end - 1])) end--;
+  if (end - start != pn) return false;
+  if (case_sensitive) return memcmp(text + start, pat, pn) == 0;
   for (size_t i = 0; i < pn; i++)
-    if (fzf_addn_lower((unsigned char)text[i]) != pat[i]) return false;
+    if (fzf_addn_lower((unsigned char)text[start + i]) != pat[i]) return false;
   return true;
 }
 
@@ -150,19 +167,22 @@ static bool fzf_addn_is_ascii_algo(fzf_algo_t fn) {
 
 bool fzf_has_match(const char *text, fzf_pattern_t *pattern, fzf_slab_t *slab) {
   if (!pattern || pattern->size == 0) return true;
+  size_t tn = strlen(text);
   /* The cheap matchers below are byte-wise ASCII only (no Unicode case
-     folding) and dispatch on the ASCII algorithm function pointers.  If any
-     term uses a `_utf8' variant (chosen by fzf_parse_pattern for non-ASCII
-     query terms) or any unrecognized algorithm, defer to the full scorer,
-     whose match decision is authoritative — including correct handling of
-     Unicode case folding and `inv' negation. */
+     folding).  A non-ASCII candidate must therefore use the full scorer even
+     when every query term is ASCII: Unicode lowercase mappings can cross that
+     boundary (for example U+212A KELVIN SIGN -> ASCII k).  Likewise, defer if
+     any term uses a `_utf8' variant (chosen for non-ASCII query terms) or an
+     unrecognized algorithm.  The full scorer is authoritative for Unicode
+     case folding and `inv' negation. */
+  if (!is_ascii_utf8proc(text, tn))
+    return fzf_get_score(text, pattern, slab) > 0;
   for (size_t i = 0; i < pattern->size; i++) {
     fzf_term_set_t *set = pattern->ptr[i];
     for (size_t j = 0; j < set->size; j++)
       if (!fzf_addn_is_ascii_algo(set->ptr[j].fn))
         return fzf_get_score(text, pattern, slab) > 0;
   }
-  size_t tn = strlen(text);
   /* AND across term-sets, OR within each term-set — same composition as
      fzf_get_score, just collapsed to bool. */
   for (size_t i = 0; i < pattern->size; i++) {
