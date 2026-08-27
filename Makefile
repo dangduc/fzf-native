@@ -5,7 +5,7 @@ BUILD_DIR ?= build
 # Vendored utf8proc, linked into the C tests because fzf.c's UTF-8 matching
 # variants (via utf8_char_index.h -> utf8proc.h) depend on it.
 UTF8PROC_DIR ?= utf8proc-2.10.0
-UTF8PROC_LIB := $(UTF8PROC_DIR)/libutf8proc.a
+UTF8PROC_SRC := $(UTF8PROC_DIR)/utf8proc.c
 
 PACKAGE := fzf-native
 AUTOLOADS := $(PACKAGE)-autoloads.el
@@ -91,27 +91,23 @@ emacs-asan:
 .PHONY: ctest
 ctest: ctest-module ctest-additions
 
-# Build the vendored utf8proc static lib (fzf.c links against it).
-$(UTF8PROC_LIB):
-	$(MAKE) -C $(UTF8PROC_DIR) all
-
 # Module-internal tests (counting sort, cache, async_reader, etc.).
 # Links fzf-additions.c because fzf-native-module.c now references
 # fzf_has_match in the scoring thread's filter-only path.
 .PHONY: ctest-module
-ctest-module: $(UTF8PROC_LIB)
+ctest-module:
 	mkdir -p $(BUILD_DIR)
 	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. -I$(UTF8PROC_DIR) -pthread \
-		-o $(BUILD_DIR)/fzf-native-ctest fzf-native-ctest.c fzf.c fzf-additions.c $(UTF8PROC_LIB)
+		-o $(BUILD_DIR)/fzf-native-ctest fzf-native-ctest.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-native-ctest
 
 # fzf-additions tests (fzf_has_match agreement with fzf_get_score).
 # Linked against fzf.c + fzf-additions.c + utf8proc — pure-C, no module deps.
 .PHONY: ctest-additions
-ctest-additions: $(UTF8PROC_LIB)
+ctest-additions:
 	mkdir -p $(BUILD_DIR)
 	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. -I$(UTF8PROC_DIR) \
-		-o $(BUILD_DIR)/fzf-additions-test fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_LIB)
+		-o $(BUILD_DIR)/fzf-additions-test fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-additions-test
 
 # AddressSanitizer + UndefinedBehaviorSanitizer run of the C unit tests.
@@ -122,15 +118,15 @@ ctest-additions: $(UTF8PROC_LIB)
 # UBSan diagnostic abort too, so any finding fails the target (and CI).
 .PHONY: ctest-asan
 ctest-asan: export UBSAN_OPTIONS = halt_on_error=1:print_stacktrace=1
-ctest-asan: $(UTF8PROC_LIB)
+ctest-asan:
 	mkdir -p $(BUILD_DIR)
 	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -g \
 		-I. -I$(UTF8PROC_DIR) -pthread \
-		-o $(BUILD_DIR)/fzf-native-ctest-asan fzf-native-ctest.c fzf.c fzf-additions.c $(UTF8PROC_LIB)
+		-o $(BUILD_DIR)/fzf-native-ctest-asan fzf-native-ctest.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-native-ctest-asan
 	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -g \
 		-I. -I$(UTF8PROC_DIR) -pthread \
-		-o $(BUILD_DIR)/fzf-additions-test-asan fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_LIB)
+		-o $(BUILD_DIR)/fzf-additions-test-asan fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-additions-test-asan
 
 .PHONY: clean
