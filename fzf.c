@@ -2170,12 +2170,11 @@ static fzf_algo_t get_utf8_algo(fzf_algo_t ascii_algo) {
   return ascii_algo; // fallback
 }
 
-static inline fzf_result_t call_alg_with_utf8_check(fzf_term_t *term, bool normalize,
-                                                    fzf_string_t *input, fzf_position_t *pos,
-                                                    fzf_slab_t *slab) {
+static inline fzf_result_t call_alg_for_input(
+    fzf_term_t *term, bool normalize, fzf_string_t *input,
+    bool input_is_ascii, fzf_position_t *pos, fzf_slab_t *slab) {
   fzf_algo_t algo = term->fn;
-  /* Check if input text contains UTF-8 */
-  if (!is_ascii_utf8proc(input->data, input->size)) {
+  if (!input_is_ascii) {
     /* Get UTF-8 version of the algorithm */
     algo = get_utf8_algo(algo);
   }
@@ -2183,8 +2182,8 @@ static inline fzf_result_t call_alg_with_utf8_check(fzf_term_t *term, bool norma
               (fzf_string_t *)term->text, pos, slab);
 }
 
-#define CALL_ALG(term, normalize, input, pos, slab) \
-  call_alg_with_utf8_check(term, normalize, &(input), pos, slab)
+#define CALL_ALG(term, normalize, input, input_is_ascii, pos, slab) \
+  call_alg_for_input(term, normalize, &(input), input_is_ascii, pos, slab)
 
 // TODO(conni2461): REFACTOR
 /* assumption (maybe i change that later)
@@ -2364,6 +2363,9 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
   }
 
   fzf_string_t input = {.data = text, .size = strlen(text)};
+  /* Every term is evaluated against the same immutable candidate.  Determine
+     its encoding once instead of rescanning all bytes for every AND/OR term. */
+  bool input_is_ascii = is_ascii_utf8proc(input.data, input.size);
   if (pattern->only_inv) {
     for (size_t i = 0; i < pattern->size; i++) {
       fzf_term_set_t *term_set = pattern->ptr[i];
@@ -2372,7 +2374,7 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
          fallback can return a valid match with a non-positive raw score when
          the matching characters have a long gap.  Testing SCORE here made a
          small slab accept candidates that the default slab rejected. */
-      if (CALL_ALG(term, false, input, NULL, slab).start >= 0)
+      if (CALL_ALG(term, false, input, input_is_ascii, NULL, slab).start >= 0)
         return 0;
     }
     return 1;
@@ -2385,7 +2387,8 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
     bool matched = false;
     for (size_t j = 0; j < term_set->size; j++) {
       fzf_term_t *term = &term_set->ptr[j];
-      fzf_result_t res = CALL_ALG(term, false, input, NULL, slab);
+      fzf_result_t res = CALL_ALG(
+          term, false, input, input_is_ascii, NULL, slab);
       if (res.start >= 0) {
         if (term->inv) {
           continue;
@@ -2429,6 +2432,7 @@ fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
   }
 
   fzf_string_t input = {.data = text, .size = strlen(text)};
+  bool input_is_ascii = is_ascii_utf8proc(input.data, input.size);
   fzf_position_t *all_pos = fzf_pos_array(0);
   for (size_t i = 0; i < pattern->size; i++) {
     fzf_term_set_t *term_set = pattern->ptr[i];
@@ -2439,13 +2443,15 @@ fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
         // If we have an inverse term we need to check if we have a match, but
         // we are not interested in the positions (for highlights) so to speed
         // this up we can pass in NULL here and don't calculate the positions
-        fzf_result_t res = CALL_ALG(term, false, input, NULL, slab);
+        fzf_result_t res = CALL_ALG(
+            term, false, input, input_is_ascii, NULL, slab);
         if (res.start < 0) {
           matched = true;
         }
         continue;
       }
-      fzf_result_t res = CALL_ALG(term, false, input, all_pos, slab);
+      fzf_result_t res = CALL_ALG(
+          term, false, input, input_is_ascii, all_pos, slab);
       if (res.start >= 0) {
         matched = true;
         break;
