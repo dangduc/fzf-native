@@ -84,7 +84,11 @@
   
   ;; CJK prefix
   (should (> (fzf-native-utf8-test--get-score "中文测试" "^中文") 0))
-  (should (> (fzf-native-utf8-test--get-score "こんにちは世界" "^こん") 0)))
+  (should (> (fzf-native-utf8-test--get-score "こんにちは世界" "^こん") 0))
+  ;; Anchors trim whitespace by Unicode codepoint, never by a locale-sensitive
+  ;; classification of individual UTF-8 bytes.
+  (should (> (fzf-native-utf8-test--get-score " 你" "^你") 0))
+  (should (> (fzf-native-utf8-test--get-score "　你" "^你") 0)))
 
 ;; Test suffix matching with UTF-8
 (ert-deftest fzf-native-utf8-suffix-match-test ()
@@ -92,6 +96,9 @@
   (should (> (fzf-native-utf8-test--get-score "café.txt" "txt$") 0))
   (should (> (fzf-native-utf8-test--get-score "ポケモン.txt" "txt$") 0))
   (should (> (fzf-native-utf8-test--get-score "restaurant café" "café$") 0))
+  (should (> (fzf-native-utf8-test--get-score "你 \t" "你$") 0))
+  (should (> (fzf-native-utf8-test--get-score "你 " "你$") 0))
+  (should (> (fzf-native-utf8-test--get-score "你　" "你$") 0))
   (should (= (fzf-native-utf8-test--get-score "café restaurant" "café$") 0)))
 
 ;; Test fuzzy matching with UTF-8
@@ -129,7 +136,23 @@
     ;; U+212A KELVIN SIGN occupies three UTF-8 bytes but lowercases to the
     ;; one-byte ASCII letter k.  Both candidate/query directions must match.
     (should (> (fzf-native-utf8-test--get-score "k" "K") 0))
-    (should (> (fzf-native-utf8-test--get-score "K" "k") 0))))
+    (should (> (fzf-native-utf8-test--get-score "K" "k") 0))
+    ;; U+023A occupies two UTF-8 bytes and lowercases to the three-byte
+    ;; U+2C65.  All anchored matchers compare characters, not bytes.
+    (should (> (fzf-native-utf8-test--get-score "Ⱥ" "'ⱥ") 0))
+    (should (> (fzf-native-utf8-test--get-score "Ⱥtail" "^ⱥ") 0))
+    (should (> (fzf-native-utf8-test--get-score "headȺ" "ⱥ$") 0))
+    (should (> (fzf-native-utf8-test--get-score "Ⱥ" "^ⱥ$") 0))
+    (should (= (fzf-native-utf8-test--get-score "A" "'ⱥ") 0))))
+
+(ert-deftest fzf-native-utf8-invalid-exact-query-is-lossless-test ()
+  "Raw invalid bytes remain distinct units throughout exact matching."
+  (let ((fzf-native-case-mode 'respect)
+        (candidate (unibyte-string ?c ?a ?f #xe9))
+        (different (unibyte-string ?c ?a ?f ?X #xe9))
+        (query (unibyte-string ?' ?c ?a ?f #xe9)))
+    (should (> (fzf-native-utf8-test--get-score candidate query) 0))
+    (should (= (fzf-native-utf8-test--get-score different query) 0))))
 
 (ert-deftest fzf-native-utf8-fuzzy-score-keeps-pre-match-context-test ()
   "UTF-8 dispatch does not invent a boundary before an interior match."

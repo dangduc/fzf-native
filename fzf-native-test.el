@@ -40,6 +40,12 @@
      (equal (fzf-native-score "sfsjoc" "jo" slab)
             '(36)))))
 
+(ert-deftest fzf-native-make-slab-rejects-invalid-size-test ()
+  "Invalid public slab sizes signal an error instead of aborting Emacs."
+  (should-error (fzf-native-make-slab -1 1))
+  (should-error (fzf-native-make-slab most-positive-fixnum
+                                      most-positive-fixnum)))
+
 (ert-deftest fzf-native-score-empty-query-test ()
   (let ((result (fzf-native-score "abcdefghi" "")))
     (should (equal result '(0)))))
@@ -47,6 +53,14 @@
 (ert-deftest fzf-native-score-empty-str-test ()
   (let ((result (fzf-native-score "" "acef")))
     (should (equal result '(0)))))
+
+(ert-deftest fzf-native-score-empty-str-inverse-query-test ()
+  "Scalar and batch scoring both accept empty text for inverse-only queries."
+  (let ((fzf-native-fuzzy t)
+        (fzf-native-case-mode 'smart)
+        (fzf-native-batch-highlight nil))
+    (should (equal (fzf-native-score "" "!x") '(1)))
+    (should (equal (fzf-native-score-all '("") "!x") '("")))))
 
 (ert-deftest fzf-native-score-str-wrong-type-int-test ()
   (should-error (fzf-native-score 1 "1")

@@ -116,6 +116,17 @@ static void test_suffix_no_match(void) {
                   CaseIgnore, true, false);
 }
 
+static void test_anchored_matches_trim_candidate_whitespace(void) {
+  check_agreement("prefix trims leading whitespace", " \tfoo", "^foo",
+                  CaseIgnore, true, true);
+  check_agreement("suffix trims trailing whitespace", "foo.c \n", ".c$",
+                  CaseIgnore, true, true);
+  check_agreement("equal trims surrounding whitespace", " \tabc \n", "^abc$",
+                  CaseIgnore, true, true);
+  check_agreement("compound suffix trims newline", "src/foo/main.c\n",
+                  "foo | bar !test .c$", CaseIgnore, true, true);
+}
+
 static void test_equal_match(void) {
   /* fzf produces fzf_equal_match only for ^...$ (prefix+suffix combo);
      'abc$ → exact substring (the `'` overrides the suffix anchor). */
@@ -263,11 +274,57 @@ static void test_utf8_terms(void) {
      transformed pattern length under ASan/UBSan. */
   check_agreement("utf8 shrinking case-fold", "k", "K", CaseIgnore, true, true);
   check_agreement("utf8 shrinking candidate-fold", "K", "k", CaseIgnore, true, true);
+  /* U+023A LATIN CAPITAL LETTER A WITH STROKE lowercases to U+2C65.
+     The candidate encoding is two bytes and the folded pattern encoding is
+     three, so byte-count feasibility guards incorrectly reject a match. */
+  check_agreement("utf8 expanding exact fold", "Ⱥ", "'ⱥ", CaseIgnore, true, true);
+  check_agreement("utf8 expanding prefix fold", "Ⱥtail", "^ⱥ", CaseIgnore, true, true);
+  check_agreement("utf8 expanding suffix fold", "headȺ", "ⱥ$", CaseIgnore, true, true);
+  check_agreement("utf8 expanding equal fold", "Ⱥ", "^ⱥ$", CaseIgnore, true, true);
+  check_agreement("utf8 expanding fold control", "A", "'ⱥ", CaseIgnore, true, false);
   check_agreement("utf8 exact",         "héllo wörld", "'wör", CaseIgnore, true, true);
+  check_agreement("utf8 suffix trims whitespace", "你 \t", "你$",
+                  CaseRespect, true, true);
+  check_agreement("utf8 equal rejects all-whitespace candidate", " \t", "^你$",
+                  CaseRespect, true, false);
   /* Inverted non-ASCII term: must EXCLUDE candidates containing it, and KEEP
      those that don't (the false-positive direction of the deferral bug). */
   check_agreement("utf8 inverted excludes", "αβγ", "!α", CaseIgnore, true, false);
   check_agreement("utf8 inverted keeps",    "xyz", "!α", CaseIgnore, true, true);
+}
+
+static void test_invalid_utf8_exact_is_lossless(void) {
+  /* Invalid bytes are individual lossy-decoder units.  An exact match must
+     consume each unit; it must not declare success after only the valid
+     prefix of the pattern. */
+  check_agreement("raw exact self", "caf\xe9", "'caf\xe9",
+                  CaseRespect, true, true);
+  check_agreement("raw exact rejects inserted byte", "cafX\xe9", "'caf\xe9",
+                  CaseRespect, true, false);
+}
+
+static void test_invalid_utf8_fuzzy_fallback_returns_positions(void) {
+  char query[] = "\xe9";
+  fzf_pattern_t *pattern =
+      fzf_parse_pattern(CaseRespect, false, query, true);
+  fzf_slab_t *slab = fzf_make_slab((fzf_slab_config_t){1, 1});
+  fzf_position_t *positions = fzf_get_positions("E\xe9", pattern, slab);
+  CHECK(positions != NULL);
+  if (positions) {
+    CHECK(positions->size == 1);
+    if (positions->size == 1)
+      CHECK(positions->data[0] == 1);
+  }
+  fzf_free_positions(positions);
+  fzf_free_slab(slab);
+  fzf_free_pattern(pattern);
+}
+
+static void test_slab_allocation_failure_is_reported(void) {
+  fzf_slab_t *slab =
+      fzf_make_slab((fzf_slab_config_t){SIZE_MAX, SIZE_MAX});
+  CHECK(slab == NULL);
+  fzf_free_slab(slab);
 }
 
 int main(void) {
@@ -282,6 +339,7 @@ int main(void) {
   RUN(test_prefix_no_match);
   RUN(test_suffix_match);
   RUN(test_suffix_no_match);
+  RUN(test_anchored_matches_trim_candidate_whitespace);
   RUN(test_equal_match);
   RUN(test_equal_no_match_different_string);
   RUN(test_negation_term_excludes);
@@ -298,6 +356,9 @@ int main(void) {
   RUN(test_smart_case_uppercase_query_respects_case);
   RUN(test_compound_pattern);
   RUN(test_utf8_terms);
+  RUN(test_invalid_utf8_exact_is_lossless);
+  RUN(test_invalid_utf8_fuzzy_fallback_returns_positions);
+  RUN(test_slab_allocation_failure_is_reported);
 
   if (failed == 0) {
     printf("\nAll fzf-additions tests passed.\n");

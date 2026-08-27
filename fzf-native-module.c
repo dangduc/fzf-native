@@ -1147,18 +1147,9 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
     return Qlistofzero;
   }
 
-  // Short-circuit if STR is empty.
-  ptrdiff_t str_len;
-  if (!env->copy_string_contents(env, args[0], NULL, &str_len)) {
-    env->non_local_exit_clear(env);
-    str_len = 0;
-  } else if (str_len == /* solely null byte */ 1) {
-    return Qlistofzero;
-  }
-
   struct Bump *bump = NULL;
   /* Default result on coercion failure: `(0)' - same shape as the
-     empty-string short-circuit, meaning "no match". A string that
+     empty-query short-circuit, meaning "no match". A string that
      cannot be coerced through `encode-coding-string' is treated as
      equivalent to a string with no matchable content. (In practice
      this path is rarely reached on Emacs 30+: encode-coding-string
@@ -1223,8 +1214,9 @@ err:
   bump_free(bump);
   /* On coercion failure we return Qlistofzero (no match) rather than
      signaling, so a single un-coerceable input doesn't blow up a
-     larger completion batch. Empty STR/QUERY short-circuit to the
-     same value above. */
+     larger completion batch.  An empty query short-circuits to the same
+     value above; an empty candidate must reach the matcher because an
+     inverse-only query can legitimately accept it. */
   return result;
 }
 
@@ -1233,11 +1225,23 @@ void slab_finalize(void *object) {
   fzf_free_slab(slab);
 }
 
+static emacs_value signal_slab_allocation_error(emacs_env *env) {
+  static const char message[] = "fzf-native: invalid or unavailable slab size";
+  emacs_value string =
+      env->make_string(env, message, (ptrdiff_t)(sizeof(message) - 1));
+  emacs_value data = env->funcall(env, Flist, 1, &string);
+  env->non_local_exit_signal(env, Qerror, data);
+  return Qnil;
+}
+
 emacs_value fzf_native_make_default_slab(emacs_env *env,
                                          ptrdiff_t UNUSED(nargs),
                                          emacs_value UNUSED(args[]),
                                          void UNUSED(*data_ptr)) {
   fzf_slab_t *slab = fzf_make_default_slab();
+
+  if (!slab)
+    return signal_slab_allocation_error(env);
 
   return env->make_user_ptr(env, slab_finalize, slab);
 }
@@ -1246,10 +1250,20 @@ emacs_value fzf_native_make_slab(emacs_env *env,
                                  ptrdiff_t UNUSED(nargs),
                                  emacs_value args[],
                                  void UNUSED(*data_ptr)) {
-  size_t slab16Size = env->extract_integer(env, args[0]);
-  size_t slab32Size = env->extract_integer(env, args[1]);
+  intmax_t slab16 = env->extract_integer(env, args[0]);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+    return Qnil;
+  intmax_t slab32 = env->extract_integer(env, args[1]);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+    return Qnil;
+  if (slab16 < 0 || slab32 < 0 ||
+      (uintmax_t)slab16 > SIZE_MAX || (uintmax_t)slab32 > SIZE_MAX)
+    return signal_slab_allocation_error(env);
 
-  fzf_slab_t *slab = fzf_make_slab((fzf_slab_config_t){slab16Size, slab32Size});
+  fzf_slab_t *slab = fzf_make_slab(
+      (fzf_slab_config_t){(size_t)slab16, (size_t)slab32});
+  if (!slab)
+    return signal_slab_allocation_error(env);
 
   return env->make_user_ptr(env, slab_finalize, slab);
 }

@@ -12,6 +12,18 @@
 // TODO(conni2461): UNICODE HEADER
 #define UNICODE_MAXASCII 0x7f
 
+/* Pattern parsing runs on the Emacs thread and on persistent scoring threads.
+   strtok stores its cursor in process-global state, so concurrent parses can
+   make one thread read another thread's freed pattern buffer.  Use the native
+   reentrant tokenizer on each supported platform. */
+static char *fzf_strtok_r(char *str, const char *delim, char **state) {
+#ifdef _WIN32
+  return strtok_s(str, delim, state);
+#else
+  return strtok_r(str, delim, state);
+#endif
+}
+
 #define SFREE(x)                                                               \
   if (x) {                                                                     \
     free(x);                                                                   \
@@ -76,30 +88,55 @@ static int32_t index_byte(fzf_string_t *string, char b) {
   return -1;
 }
 
+static bool fzf_unicode_is_space(utf8proc_int32_t cp) {
+  if ((cp >= 0x09 && cp <= 0x0d) || cp == 0x85)
+    return true;
+  utf8proc_category_t category = utf8proc_category(cp);
+  return category == UTF8PROC_CATEGORY_ZS ||
+         category == UTF8PROC_CATEGORY_ZL ||
+         category == UTF8PROC_CATEGORY_ZP;
+}
+
+/* Return a byte count.  The anchored algorithms use byte slices even on the
+   UTF-8 path, so counting raw `isspace' bytes is both locale-dependent and
+   unsafe: in a UTF-8 locale a continuation byte such as 0xa0 can be classified
+   as whitespace and split a CJK codepoint. */
 static size_t leading_whitespaces(fzf_string_t *str) {
-  size_t whitespaces = 0;
-  for (size_t i = 0; i < str->size; i++) {
-    if (!isspace((uint8_t)str->data[i])) {
-      break;
-    }
-    whitespaces++;
+  size_t pos = 0;
+  while (pos < str->size) {
+    utf8proc_int32_t cp;
+    utf8proc_ssize_t width = utf8_iterate_lossy(
+        (const utf8proc_uint8_t *)str->data + pos,
+        (utf8proc_ssize_t)(str->size - pos), &cp);
+    if (!fzf_unicode_is_space(cp)) break;
+    pos += (size_t)width;
   }
-  return whitespaces;
+  return pos;
 }
 
 static size_t trailing_whitespaces(fzf_string_t *str) {
-  size_t whitespaces = 0;
-  /* Count down with a 1-based index so the unsigned `i' never underflows:
-     the original `for (size_t i = str->size - 1; i >= 0; i--)' read
-     data[SIZE_MAX] on an empty string and looped past 0 on an all-whitespace
-     string (out-of-bounds reads). */
-  for (size_t i = str->size; i > 0; i--) {
-    if (!isspace((uint8_t)str->data[i - 1])) {
-      break;
-    }
-    whitespaces++;
+  size_t pos = 0;
+  size_t trailing = 0;
+  /* A string ending in an ASCII non-space (paths, identifiers -- the
+     common case for every `$'-anchored term) has no trailing whitespace;
+     answer without the full forward decode. */
+  if (str->size > 0) {
+    unsigned char last = (unsigned char)str->data[str->size - 1];
+    if (last < 0x80 && !((last >= 0x09 && last <= 0x0d) || last == 0x20))
+      return 0;
   }
-  return whitespaces;
+  while (pos < str->size) {
+    utf8proc_int32_t cp;
+    utf8proc_ssize_t width = utf8_iterate_lossy(
+        (const utf8proc_uint8_t *)str->data + pos,
+        (utf8proc_ssize_t)(str->size - pos), &cp);
+    if (fzf_unicode_is_space(cp))
+      trailing += (size_t)width;
+    else
+      trailing = 0;
+    pos += (size_t)width;
+  }
+  return trailing;
 }
 
 static void copy_runes(fzf_string_t *src, fzf_i32_t *destination) {
@@ -521,10 +558,9 @@ int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
     utf8proc_int32_t pattern_cp, input_cp;
     
     // Decode pattern character (handles both ASCII and UTF-8)
-    utf8proc_ssize_t pattern_bytes = utf8proc_iterate(
+    utf8proc_ssize_t pattern_bytes = utf8_iterate_lossy(
       (const utf8proc_uint8_t*)(pattern_ptr + pattern_pos),
       pattern_len - pattern_pos, &pattern_cp);
-    if (pattern_bytes < 0) return -1; // Invalid UTF-8
     
     if (!case_sensitive) {
       pattern_cp = utf8proc_case_fold(pattern_cp);
@@ -536,10 +572,9 @@ int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
     size_t search_pos = input_pos;
     
     while (search_pos < input->size) {
-      utf8proc_ssize_t input_bytes = utf8proc_iterate(
+      utf8proc_ssize_t input_bytes = utf8_iterate_lossy(
         (const utf8proc_uint8_t*)(input_ptr + search_pos),
         input->size - search_pos, &input_cp);
-      if (input_bytes < 0) return -1; // Invalid UTF-8
       
       utf8proc_int32_t input_cp_cmp = input_cp;
       if (!case_sensitive) {
@@ -629,6 +664,24 @@ static size_t utf8_previous_char_start(const char *data, size_t pos) {
   pos--;
   while (pos > 0 && ((uint8_t)data[pos] & 0xc0) == 0x80) pos--;
   return pos;
+}
+
+/* Backward counterpart of `utf8_iterate_lossy': the byte offset and
+   codepoint of the unit a forward lossy pass decodes immediately before
+   POS (POS > 0).  When the bytes between the previous lead-byte
+   boundary and POS are not one valid sequence, the previous unit is the
+   single (invalid) byte at POS-1, mirroring the forward policy. */
+static size_t utf8_lossy_previous_char(const char *data, size_t pos,
+                                       utf8proc_int32_t *cp) {
+  size_t start = utf8_previous_char_start(data, pos);
+  utf8proc_ssize_t bytes = utf8proc_iterate(
+      (const utf8proc_uint8_t *)(data + start),
+      (utf8proc_ssize_t)(pos - start), cp);
+  if (bytes != (utf8proc_ssize_t)(pos - start) || bytes <= 0 || *cp < 0) {
+    *cp = 0xDC00 + (utf8proc_int32_t)(uint8_t)data[pos - 1];
+    return pos - 1;
+  }
+  return start;
 }
 
 // UTF-8 aware bonus calculation
@@ -729,10 +782,9 @@ static int32_t calculate_score_utf8(bool case_sensitive, bool normalize,
     utf8proc_int32_t prev_cp = 0;
     while (scan < start) {
       utf8proc_int32_t cp;
-      utf8proc_ssize_t b = utf8proc_iterate(
+      utf8proc_ssize_t b = utf8_iterate_lossy(
         (const utf8proc_uint8_t*)(text->data + scan),
         N - scan, &cp);
-      if (b <= 0) break;
       prev_cp = cp;
       scan += b;
     }
@@ -744,10 +796,9 @@ static int32_t calculate_score_utf8(bool case_sensitive, bool normalize,
   while (text_pos < end) {
     utf8proc_int32_t text_cp;
 
-    utf8proc_ssize_t text_bytes = utf8proc_iterate(
+    utf8proc_ssize_t text_bytes = utf8_iterate_lossy(
       (const utf8proc_uint8_t*)(text->data + text_pos),
       end - text_pos, &text_cp);
-    if (text_bytes <= 0) break;
 
     int32_t class = char_class_of_utf8proc(text_cp);
     int16_t bonus = bonus_for_utf8(prev_class, class);
@@ -755,12 +806,11 @@ static int32_t calculate_score_utf8(bool case_sensitive, bool normalize,
     // Check if we still have pattern characters to match
     if (pat_byte_pos < M) {
       utf8proc_int32_t pattern_cp;
-      utf8proc_ssize_t pattern_bytes = utf8proc_iterate(
+      utf8proc_ssize_t pattern_bytes = utf8_iterate_lossy(
         (const utf8proc_uint8_t*)(pattern->data + pat_byte_pos),
         M - pat_byte_pos, &pattern_cp);
 
-      if (pattern_bytes > 0 &&
-          utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
+      if (utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
         append_pos(pos, text_pos);
         score += ScoreMatch;
 
@@ -1182,7 +1232,7 @@ fzf_result_t fzf_prefix_match(bool case_sensitive, bool normalize,
   }
   size_t trimmed_len = 0;
   /* TODO(conni2461): i feel this is wrong */
-  if (!isspace((uint8_t)pattern->data[0])) {
+  if (!fzf_unicode_is_space((uint8_t)pattern->data[0])) {
     trimmed_len = leading_whitespaces(text);
   }
   if (text->size - trimmed_len < M) {
@@ -1214,7 +1264,7 @@ fzf_result_t fzf_suffix_match(bool case_sensitive, bool normalize,
   size_t trimmed_len = text->size;
   const size_t M = pattern->size;
   /* TODO(conni2461): i think this is wrong */
-  if (M == 0 || !isspace((uint8_t)pattern->data[M - 1])) {
+  if (M == 0 || !fzf_unicode_is_space((uint8_t)pattern->data[M - 1])) {
     trimmed_len -= trailing_whitespaces(text);
   }
   if (M == 0) {
@@ -1260,8 +1310,11 @@ fzf_result_t fzf_equal_match(bool case_sensitive, bool normalize,
 
   size_t trimmed_len = leading_whitespaces(text);
   size_t trimmed_end_len = trailing_whitespaces(text);
+  size_t content_len = trimmed_len + trimmed_end_len >= text->size
+                         ? 0
+                         : text->size - trimmed_len - trimmed_end_len;
 
-  if ((text->size - trimmed_len - trimmed_end_len) != M) {
+  if (content_len != M) {
     return (fzf_result_t){-1, -1, 0};
   }
 
@@ -1314,7 +1367,7 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
   if (M == 0) {
     return (fzf_result_t){0, 0, 0};
   }
-  if (N < M) {
+  if (utf8_strlen(text->data, N) < utf8_strlen(pattern->data, M)) {
     return (fzf_result_t){-1, -1, 0};
   }
   if (utf8_fuzzy_index(text, pattern->data, M, case_sensitive) < 0) {
@@ -1324,19 +1377,9 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
   // Build byte-to-char mapping for position conversion
   utf8_char_map_t *char_map = utf8_build_char_map(text->data, N);
 
-  // Count pattern codepoints
-  size_t pattern_cp_count = 0;
-  {
-    size_t p = 0;
-    while (p < M) {
-      utf8proc_int32_t cp;
-      utf8proc_ssize_t b = utf8proc_iterate(
-        (const utf8proc_uint8_t*)(pattern->data + p), M - p, &cp);
-      if (b <= 0) break;
-      p += b;
-      pattern_cp_count++;
-    }
-  }
+  // Count with the same lossy decoder used by the matching loop.  A raw byte
+  // is one unit on both sides, so completion cannot be declared early.
+  size_t pattern_cp_count = utf8_strlen(pattern->data, M);
 
   // UTF-8 exact matching
   size_t text_pos = 0;
@@ -1352,16 +1395,14 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
     utf8proc_int32_t text_cp, pattern_cp;
 
     // Decode text character
-    utf8proc_ssize_t text_bytes = utf8proc_iterate(
+    utf8proc_ssize_t text_bytes = utf8_iterate_lossy(
       (const utf8proc_uint8_t*)(text->data + text_pos),
       N - text_pos, &text_cp);
-    if (text_bytes <= 0) break;
 
     // Decode pattern character
-    utf8proc_ssize_t pattern_bytes = utf8proc_iterate(
+    utf8proc_ssize_t pattern_bytes = utf8_iterate_lossy(
       (const utf8proc_uint8_t*)(pattern->data + pattern_pos),
       M - pattern_pos, &pattern_cp);
-    if (pattern_bytes <= 0) break;
 
     if (utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
       if (pidx == 0) {
@@ -1432,14 +1473,12 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
     while (pattern_pos < M && eidx < N) {
       utf8proc_int32_t text_cp_tmp, pattern_cp_tmp;
 
-      utf8proc_ssize_t tb = utf8proc_iterate(
+      utf8proc_ssize_t tb = utf8_iterate_lossy(
         (const utf8proc_uint8_t*)(text->data + eidx),
         N - eidx, &text_cp_tmp);
-      utf8proc_ssize_t pb = utf8proc_iterate(
+      utf8proc_ssize_t pb = utf8_iterate_lossy(
         (const utf8proc_uint8_t*)(pattern->data + pattern_pos),
         M - pattern_pos, &pattern_cp_tmp);
-
-      if (tb <= 0 || pb <= 0) break;
 
       eidx += tb;
       pattern_pos += pb;
@@ -1477,12 +1516,14 @@ fzf_result_t fzf_prefix_match_utf8(bool case_sensitive, bool normalize,
   if (M > 0) {
     utf8proc_int32_t first_pattern_cp;
     utf8proc_iterate((const utf8proc_uint8_t*)pattern->data, M, &first_pattern_cp);
-    if (utf8proc_get_property(first_pattern_cp)->category != UTF8PROC_CATEGORY_ZS) {
+    if (!fzf_unicode_is_space(first_pattern_cp)) {
       trimmed_start = leading_whitespaces(text);
     }
   }
   
-  if (text->size - trimmed_start < M) {
+  if (utf8_strlen(text->data + trimmed_start,
+                  text->size - trimmed_start) <
+      utf8_strlen(pattern->data, M)) {
     utf8_free_char_map(char_map);
     return (fzf_result_t){-1, -1, 0};
   }
@@ -1494,18 +1535,13 @@ fzf_result_t fzf_prefix_match_utf8(bool case_sensitive, bool normalize,
   while (pattern_pos < M && text_pos < text->size) {
     utf8proc_int32_t text_cp, pattern_cp;
     
-    utf8proc_ssize_t text_bytes = utf8proc_iterate(
+    utf8proc_ssize_t text_bytes = utf8_iterate_lossy(
       (const utf8proc_uint8_t*)(text->data + text_pos),
       text->size - text_pos, &text_cp);
-    utf8proc_ssize_t pattern_bytes = utf8proc_iterate(
+    utf8proc_ssize_t pattern_bytes = utf8_iterate_lossy(
       (const utf8proc_uint8_t*)(pattern->data + pattern_pos),
       M - pattern_pos, &pattern_cp);
-      
-    if (text_bytes <= 0 || pattern_bytes <= 0) {
-      utf8_free_char_map(char_map);
-      return (fzf_result_t){-1, -1, 0};
-    }
-    
+
     if (!utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
       utf8_free_char_map(char_map);
       return (fzf_result_t){-1, -1, 0};
@@ -1552,16 +1588,14 @@ fzf_result_t fzf_suffix_match_utf8(bool case_sensitive, bool normalize,
     size_t scan_pos = 0;
     while (scan_pos < M) {
       utf8proc_int32_t cp;
-      utf8proc_ssize_t bytes = utf8proc_iterate(
+      utf8proc_ssize_t bytes = utf8_iterate_lossy(
         (const utf8proc_uint8_t*)(pattern->data + scan_pos),
         M - scan_pos, &cp);
-      if (bytes <= 0) break;
       last_pattern_cp = cp;
       scan_pos += bytes;
     }
 
-    if (scan_pos > 0 &&
-        utf8proc_get_property(last_pattern_cp)->category != UTF8PROC_CATEGORY_ZS) {
+    if (scan_pos > 0 && !fzf_unicode_is_space(last_pattern_cp)) {
       trimmed_len -= trailing_whitespaces(text);
     }
   }
@@ -1572,69 +1606,30 @@ fzf_result_t fzf_suffix_match_utf8(bool case_sensitive, bool normalize,
     return (fzf_result_t){(int32_t)char_len, (int32_t)char_len, 0};
   }
   
-  if (trimmed_len < M) {
-    utf8_free_char_map(char_map);
-    return (fzf_result_t){-1, -1, 0};
+  /* Compare from the end in decoded units.  Byte lengths are not a valid
+     feasibility test because Unicode lowercasing can expand or shrink the
+     encoded pattern while preserving its character count. */
+  size_t text_pos = trimmed_len;
+  size_t pattern_pos = M;
+  while (pattern_pos > 0) {
+    if (text_pos == 0) {
+      utf8_free_char_map(char_map);
+      return (fzf_result_t){-1, -1, 0};
+    }
+    utf8proc_int32_t text_cp, pattern_cp;
+    size_t text_start =
+        utf8_lossy_previous_char(text->data, text_pos, &text_cp);
+    size_t pattern_start =
+        utf8_lossy_previous_char(pattern->data, pattern_pos, &pattern_cp);
+    if (!utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
+      utf8_free_char_map(char_map);
+      return (fzf_result_t){-1, -1, 0};
+    }
+    text_pos = text_start;
+    pattern_pos = pattern_start;
   }
 
-  // Simpler approach: scan from start to find the pattern at the end
-  size_t text_pos = 0;
-  size_t best_match_start = 0;
-  bool found_match = false;
-  
-  // Find all occurrences and keep the last one
-  while (text_pos <= trimmed_len - M) {
-    size_t temp_text_pos = text_pos;
-    size_t pattern_pos = 0;
-    bool match = true;
-    size_t start_pos = temp_text_pos;
-    
-    // Try to match the pattern at this position
-    while (pattern_pos < M && temp_text_pos < trimmed_len) {
-      utf8proc_int32_t text_cp, pattern_cp;
-      
-      utf8proc_ssize_t text_bytes = utf8proc_iterate(
-        (const utf8proc_uint8_t*)(text->data + temp_text_pos),
-        trimmed_len - temp_text_pos, &text_cp);
-      utf8proc_ssize_t pattern_bytes = utf8proc_iterate(
-        (const utf8proc_uint8_t*)(pattern->data + pattern_pos),
-        M - pattern_pos, &pattern_cp);
-        
-      if (text_bytes <= 0 || pattern_bytes <= 0) {
-        match = false;
-        break;
-      }
-      
-      if (!utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
-        match = false;
-        break;
-      }
-      
-      temp_text_pos += text_bytes;
-      pattern_pos += pattern_bytes;
-    }
-    
-    // Check if we matched the full pattern and it ends at trimmed_len
-    if (match && pattern_pos >= M && temp_text_pos == trimmed_len) {
-      found_match = true;
-      best_match_start = start_pos;
-      break; // This is a suffix match
-    }
-    
-    // Move to next byte position for next attempt
-    utf8proc_int32_t dummy;
-    utf8proc_ssize_t skip_bytes = utf8proc_iterate(
-      (const utf8proc_uint8_t*)(text->data + text_pos),
-      trimmed_len - text_pos, &dummy);
-    text_pos += (skip_bytes > 0) ? skip_bytes : 1;
-  }
-  
-  if (!found_match) {
-    utf8_free_char_map(char_map);
-    return (fzf_result_t){-1, -1, 0};
-  }
-  
-  size_t start = best_match_start;
+  size_t start = text_pos;
   size_t end = trimmed_len;
   int32_t score = calculate_score_utf8(case_sensitive, normalize, text, pattern,
                                        start, end, NULL);
@@ -1663,7 +1658,12 @@ fzf_result_t fzf_equal_match_utf8(bool case_sensitive, bool normalize,
 
   size_t trimmed_start = leading_whitespaces(text);
   size_t trimmed_end_len = trailing_whitespaces(text);
-  size_t content_byte_len = text->size - trimmed_start - trimmed_end_len;
+  /* Leading and trailing whitespace regions overlap when the candidate is
+     entirely whitespace.  Clamp that case to an empty content slice instead
+     of underflowing size_t and asking utf8_strlen to scan arbitrary memory. */
+  size_t content_byte_len = trimmed_start + trimmed_end_len >= text->size
+                              ? 0
+                              : text->size - trimmed_start - trimmed_end_len;
 
   // Count codepoints in text content and pattern for accurate comparison
   size_t text_cp_count = utf8_strlen(text->data + trimmed_start, content_byte_len);
@@ -1683,17 +1683,12 @@ fzf_result_t fzf_equal_match_utf8(bool case_sensitive, bool normalize,
   while (pattern_pos < M && text_pos < content_end) {
     utf8proc_int32_t text_cp, pattern_cp;
 
-    utf8proc_ssize_t text_bytes = utf8proc_iterate(
+    utf8proc_ssize_t text_bytes = utf8_iterate_lossy(
       (const utf8proc_uint8_t*)(text->data + text_pos),
       content_end - text_pos, &text_cp);
-    utf8proc_ssize_t pattern_bytes = utf8proc_iterate(
+    utf8proc_ssize_t pattern_bytes = utf8_iterate_lossy(
       (const utf8proc_uint8_t*)(pattern->data + pattern_pos),
       M - pattern_pos, &pattern_cp);
-
-    if (text_bytes <= 0 || pattern_bytes <= 0) {
-      utf8_free_char_map(char_map);
-      return (fzf_result_t){-1, -1, 0};
-    }
 
     if (!utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
       utf8_free_char_map(char_map);
@@ -1756,16 +1751,14 @@ fzf_result_t fzf_fuzzy_match_v1_utf8(bool case_sensitive, bool normalize,
     utf8proc_int32_t text_cp, pattern_cp;
     
     // Decode text character
-    utf8proc_ssize_t text_bytes = utf8proc_iterate(
+    utf8proc_ssize_t text_bytes = utf8_iterate_lossy(
       (const utf8proc_uint8_t*)(text->data + text_pos),
       N - text_pos, &text_cp);
-    if (text_bytes <= 0) break;
     
     // Decode pattern character
-    utf8proc_ssize_t pattern_bytes = utf8proc_iterate(
+    utf8proc_ssize_t pattern_bytes = utf8_iterate_lossy(
       (const utf8proc_uint8_t*)(pattern->data + pattern_pos),
       M - pattern_pos, &pattern_cp);
-    if (pattern_bytes <= 0) break;
     
     // Check if characters match
     if (utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
@@ -1795,17 +1788,11 @@ fzf_result_t fzf_fuzzy_match_v1_utf8(bool case_sensitive, bool normalize,
     pattern_pos = M;
     text_pos = end;
     while (text_pos > start && pattern_pos > 0) {
-      size_t previous_text_pos = utf8_previous_char_start(text->data, text_pos);
-      size_t previous_pattern_pos =
-          utf8_previous_char_start(pattern->data, pattern_pos);
       utf8proc_int32_t text_cp, pattern_cp;
-      utf8proc_ssize_t text_bytes = utf8proc_iterate(
-          (const utf8proc_uint8_t *)(text->data + previous_text_pos),
-          text_pos - previous_text_pos, &text_cp);
-      utf8proc_ssize_t pattern_bytes = utf8proc_iterate(
-          (const utf8proc_uint8_t *)(pattern->data + previous_pattern_pos),
-          pattern_pos - previous_pattern_pos, &pattern_cp);
-      if (text_bytes <= 0 || pattern_bytes <= 0) break;
+      size_t previous_text_pos =
+          utf8_lossy_previous_char(text->data, text_pos, &text_cp);
+      size_t previous_pattern_pos =
+          utf8_lossy_previous_char(pattern->data, pattern_pos, &pattern_cp);
 
       text_pos = previous_text_pos;
       if (utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
@@ -1892,14 +1879,9 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   {
     size_t p_pos = 0;
     for (size_t i = 0; i < Mc; i++) {
-      utf8proc_ssize_t bytes = utf8proc_iterate(
+      utf8proc_ssize_t bytes = utf8_iterate_lossy(
           (const utf8proc_uint8_t *)(pattern->data + p_pos), M - p_pos,
           &pattern_cps[i]);
-      if (bytes <= 0) {
-        free(pattern_cps);
-        utf8_free_char_map(char_map);
-        return (fzf_result_t){-1, -1, 0};
-      }
       if (!case_sensitive) {
         pattern_cps[i] = utf8proc_case_fold(pattern_cps[i]);
       }
@@ -1922,11 +1904,9 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
     size_t byte_pos = 0;
     for (size_t i = 0; i < Nc; i++) {
       utf8proc_int32_t cp;
-      utf8proc_ssize_t bytes = utf8proc_iterate(
+      utf8proc_ssize_t bytes = utf8_iterate_lossy(
           (const utf8proc_uint8_t *)(text->data + byte_pos), N - byte_pos,
           &cp);
-      if (bytes <= 0)
-        break;
       t.data[i] = cp;
       byte_pos += bytes;
     }
@@ -2229,7 +2209,8 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
 
   char *pattern_copy = str_replace(pattern, "\\ ", "\t");
   const char *delim = " ";
-  char *ptr = strtok(pattern_copy, delim);
+  char *token_state = NULL;
+  char *ptr = fzf_strtok_r(pattern_copy, delim, &token_state);
 
   fzf_term_set_t *set = (fzf_term_set_t *)malloc(sizeof(fzf_term_set_t));
   memset(set, 0, sizeof(*set));
@@ -2274,7 +2255,7 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
     if (set->size > 0 && !after_bar && strcmp(text, "|") == 0) {
       switch_set = false;
       after_bar = true;
-      ptr = strtok(NULL, delim);
+      ptr = fzf_strtok_r(NULL, delim, &token_state);
       SFREE(og_str);
       continue;
     }
@@ -2332,7 +2313,7 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
       SFREE(og_str);
     }
 
-    ptr = strtok(NULL, delim);
+    ptr = fzf_strtok_r(NULL, delim, &token_state);
   }
   if (set->size > 0) {
     append_pattern(pat_obj, set);
@@ -2409,12 +2390,22 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
         if (term->inv) {
           continue;
         }
-        current_score = res.score;
+        /* Score zero is the public no-match sentinel.  Some valid v1
+           matches with long gaps can accumulate a non-positive raw score,
+           especially when v2 falls back because a slab is small.  Preserve
+           match membership and use the lowest rankable score instead of
+           silently dropping the candidate. */
+        current_score = res.score > 0 ? res.score : 1;
         matched = true;
         break;
       }
 
       if (term->inv) {
+        /* A term-set can be satisfied solely by an inverse term, including an
+           OR group such as `!foo | bar'.  Keep inverse terms score-neutral
+           here so `foo !bar' retains foo's historical score.  If every
+           successful set is score-neutral, the final return below converts
+           the otherwise-ambiguous zero to the public minimum match score. */
         current_score = 0;
         matched = true;
       }
@@ -2422,12 +2413,11 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
     if (matched) {
       total_score += current_score;
     } else {
-      total_score = 0;
-      break;
+      return 0;
     }
   }
 
-  return total_score;
+  return total_score > 0 ? total_score : 1;
 }
 
 fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
@@ -2477,22 +2467,39 @@ void fzf_free_positions(fzf_position_t *pos) {
 }
 
 fzf_slab_t *fzf_make_slab(fzf_slab_config_t config) {
-  fzf_slab_t *slab = (fzf_slab_t *)malloc(sizeof(fzf_slab_t));
-  memset(slab, 0, sizeof(*slab));
+  if (config.size_16 > SIZE_MAX / sizeof(int16_t) ||
+      config.size_32 > SIZE_MAX / sizeof(int32_t))
+    return NULL;
 
-  slab->I16.data = (int16_t *)malloc(config.size_16 * sizeof(int16_t));
-  memset(slab->I16.data, 0, config.size_16 * sizeof(*slab->I16.data));
+  fzf_slab_t *slab = (fzf_slab_t *)calloc(1, sizeof(fzf_slab_t));
+  if (!slab)
+    return NULL;
+
+  if (config.size_16 > 0) {
+    slab->I16.data =
+        (int16_t *)calloc(config.size_16, sizeof(*slab->I16.data));
+    if (!slab->I16.data)
+      goto fail;
+  }
   slab->I16.cap = config.size_16;
   slab->I16.size = 0;
   slab->I16.allocated = true;
 
-  slab->I32.data = (int32_t *)malloc(config.size_32 * sizeof(int32_t));
-  memset(slab->I32.data, 0, config.size_32 * sizeof(*slab->I32.data));
+  if (config.size_32 > 0) {
+    slab->I32.data =
+        (int32_t *)calloc(config.size_32, sizeof(*slab->I32.data));
+    if (!slab->I32.data)
+      goto fail;
+  }
   slab->I32.cap = config.size_32;
   slab->I32.size = 0;
   slab->I32.allocated = true;
 
   return slab;
+
+fail:
+  fzf_free_slab(slab);
+  return NULL;
 }
 
 fzf_slab_t *fzf_make_default_slab(void) {

@@ -19,14 +19,25 @@ typedef struct {
     size_t char_count;      // Total characters in string
 } utf8_char_map_t;
 
-// UTF-8 string iterator with position tracking
-typedef struct {
-    const uint8_t *data;    // UTF-8 string data
-    size_t byte_pos;        // Current byte position
-    size_t char_pos;        // Current character position
-    size_t byte_len;        // Total byte length
-    utf8proc_int32_t current; // Current codepoint
-} utf8_iter_t;
+/* Decode one UTF-8 unit at BUF (LEN > 0 bytes remaining).  Valid
+   sequences decode normally.  An undecodable byte decodes as a
+   single-byte unit whose codepoint is 0xDC00+byte (the surrogate-escape
+   convention): it can never equal a codepoint decoded from valid UTF-8,
+   the same raw byte on both sides of a comparison still matches itself,
+   byte->char tables stay monotonic, and the one-char-per-raw-byte
+   counting agrees with how Emacs counts these strings.  utf8proc's
+   case/category functions pass surrogates through unchanged.  Never
+   returns a value < 1, so every decode loop makes progress. */
+static inline utf8proc_ssize_t utf8_iterate_lossy(
+    const utf8proc_uint8_t *buf, utf8proc_ssize_t len,
+    utf8proc_int32_t *cp) {
+    utf8proc_ssize_t bytes = utf8proc_iterate(buf, len, cp);
+    if (bytes <= 0 || *cp < 0) {
+        *cp = 0xDC00 + (utf8proc_int32_t)buf[0];
+        return 1;
+    }
+    return bytes;
+}
 
 // Create a byte↔char mapping for a UTF-8 string
 // Returns NULL on allocation failure
@@ -41,8 +52,7 @@ static inline utf8_char_map_t* utf8_build_char_map(const char *str, size_t byte_
     
     while (byte_pos < byte_len) {
         utf8proc_int32_t cp;
-        utf8proc_ssize_t bytes = utf8proc_iterate(ptr + byte_pos, byte_len - byte_pos, &cp);
-        if (bytes <= 0) break;
+        utf8proc_ssize_t bytes = utf8_iterate_lossy(ptr + byte_pos, byte_len - byte_pos, &cp);
         byte_pos += bytes;
         char_count++;
     }
@@ -67,12 +77,10 @@ static inline utf8_char_map_t* utf8_build_char_map(const char *str, size_t byte_
     
     while (byte_pos < byte_len) {
         utf8proc_int32_t cp;
-        utf8proc_ssize_t bytes = utf8proc_iterate(ptr + byte_pos, byte_len - byte_pos, &cp);
-        if (bytes <= 0) break;
+        utf8proc_ssize_t bytes = utf8_iterate_lossy(ptr + byte_pos, byte_len - byte_pos, &cp);
         
         // All bytes in this character map to the same char position
-        // bytes is guaranteed > 0 here (negative/zero returns broke out above),
-        // so the cast to size_t cannot wrap to a huge value.
+        // bytes is guaranteed >= 1, so the cast to size_t cannot wrap.
         for (size_t i = 0; i < (size_t)bytes; i++) {
             map->byte_to_char[byte_pos + i] = char_pos;
         }
@@ -106,71 +114,6 @@ static inline size_t utf8_byte_to_char(utf8_char_map_t *map, size_t byte_pos) {
     return map->byte_to_char[byte_pos];
 }
 
-// Convert character position to byte position
-static inline size_t utf8_char_to_byte(utf8_char_map_t *map, size_t char_pos) {
-    if (!map || char_pos > map->char_count) return 0;
-    return map->char_to_byte[char_pos];
-}
-
-// Initialize UTF-8 iterator
-static inline void utf8_iter_init(utf8_iter_t *iter, const char *str, size_t byte_len) {
-    iter->data = (const uint8_t *)str;
-    iter->byte_pos = 0;
-    iter->char_pos = 0;
-    iter->byte_len = byte_len;
-    iter->current = 0;
-}
-
-// Advance iterator to next character
-// Returns false at end of string
-static inline bool utf8_iter_next(utf8_iter_t *iter) {
-    if (iter->byte_pos >= iter->byte_len) {
-        return false;
-    }
-    
-    utf8proc_ssize_t bytes = utf8proc_iterate(
-        iter->data + iter->byte_pos,
-        iter->byte_len - iter->byte_pos,
-        &iter->current
-    );
-    
-    if (bytes <= 0) {
-        return false;
-    }
-    
-    iter->byte_pos += bytes;
-    iter->char_pos++;
-    return true;
-}
-
-// Get current character's byte position
-static inline size_t utf8_iter_byte_pos(utf8_iter_t *iter) {
-    // Return start of current character (before last advance)
-    const uint8_t *ptr = iter->data;
-    size_t pos = 0;
-    size_t char_idx = 0;
-    
-    while (char_idx < iter->char_pos - 1 && pos < iter->byte_len) {
-        utf8proc_int32_t cp;
-        utf8proc_ssize_t bytes = utf8proc_iterate(ptr + pos, iter->byte_len - pos, &cp);
-        if (bytes <= 0) break;
-        pos += bytes;
-        char_idx++;
-    }
-    
-    return pos;
-}
-
-// Check if string is pure ASCII (fast path optimization)
-static inline bool utf8_is_ascii(const char *str, size_t byte_len) {
-    for (size_t i = 0; i < byte_len; i++) {
-        if ((unsigned char)str[i] >= 128) {
-            return false;
-        }
-    }
-    return true;
-}
-
 // Count UTF-8 characters in string
 static inline size_t utf8_strlen(const char *str, size_t byte_len) {
     const uint8_t *ptr = (const uint8_t *)str;
@@ -179,8 +122,7 @@ static inline size_t utf8_strlen(const char *str, size_t byte_len) {
     
     while (byte_pos < byte_len) {
         utf8proc_int32_t cp;
-        utf8proc_ssize_t bytes = utf8proc_iterate(ptr + byte_pos, byte_len - byte_pos, &cp);
-        if (bytes <= 0) break;
+        utf8proc_ssize_t bytes = utf8_iterate_lossy(ptr + byte_pos, byte_len - byte_pos, &cp);
         byte_pos += bytes;
         char_count++;
     }
