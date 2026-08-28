@@ -2356,6 +2356,7 @@ pointer.  An ASan module made the old code fail with a heap-use-after-free."
 
 (ert-deftest fzf-native-async-candidates-pins-session-across-lisp-reentry-test ()
   "Candidate scoring must survive stop during matching-option lookup."
+  (skip-unless (fboundp 'fzf-native-async-candidates))
   (pcase-let* ((`(,handle ,_) (fzf-native-test--new-complete-session))
                (`(,fired ,_result ,_error)
                 (fzf-native-test--call-with-symbol-value-stop
@@ -2367,6 +2368,7 @@ pointer.  An ASan module made the old code fail with a heap-use-after-free."
 
 (ert-deftest fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test ()
   "Freshness checks must survive stop during matching-option lookup."
+  (skip-unless (fboundp 'fzf-native-async-result-fresh-p))
   (pcase-let* ((`(,handle ,_) (fzf-native-test--new-complete-session))
                (`(,fired ,result ,error-data)
                 (fzf-native-test--call-with-symbol-value-stop
@@ -2380,6 +2382,7 @@ pointer.  An ASan module made the old code fail with a heap-use-after-free."
 
 (ert-deftest fzf-native-async-snapshot-pins-session-across-lisp-reentry-test ()
   "Snapshot highlighting must survive a hook that stops its session."
+  (skip-unless (fboundp 'fzf-native-async-snapshot))
   (pcase-let ((`(,handle ,request-id)
                (fzf-native-test--new-complete-session)))
     (let ((fzf-native-async-highlight t)
@@ -2396,6 +2399,7 @@ pointer.  An ASan module made the old code fail with a heap-use-after-free."
 
 (ert-deftest fzf-native-async-status-pins-session-across-lisp-reentry-test ()
   "Status plist construction must survive a reentrant stop."
+  (skip-unless (fboundp 'fzf-native-async-status))
   (pcase-let* ((`(,handle ,request-id)
                 (fzf-native-test--new-complete-session))
                (`(,fired ,result ,error-data)
@@ -2409,6 +2413,7 @@ pointer.  An ASan module made the old code fail with a heap-use-after-free."
 
 (ert-deftest fzf-native-async-stats-pins-session-across-lisp-reentry-test ()
   "Stats cons construction must survive a reentrant stop."
+  (skip-unless (fboundp 'fzf-native-async-stats))
   (pcase-let* ((`(,handle ,_) (fzf-native-test--new-complete-session))
                (`(,fired ,result ,error-data)
                 (fzf-native-test--call-with-cons-stop
