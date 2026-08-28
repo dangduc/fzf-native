@@ -8,6 +8,11 @@ on:
         required: false
         default: false
         type: boolean
+      rebuild:
+        description: Build replacement binaries without committing them
+        required: false
+        default: false
+        type: boolean
   pull_request:
     paths:
       - "**.c"
@@ -74,7 +79,9 @@ jobs:
         version: 30.2
 
     - name: Smoke tracked artifact before rebuilding
-      if: github.event_name != 'workflow_dispatch' || inputs.publish != true
+      if: >-
+        github.event_name != 'workflow_dispatch' ||
+        (inputs.publish != true && inputs.rebuild != true)
       shell: bash
       run: |
         emacs -Q --batch -L . -l fzf-native \
@@ -197,7 +204,9 @@ jobs:
         github:purcell/nix-emacs-ci/b12b5b31e40df750478c9fc68c1e81c91ed079ec#emacs-30-2
 
     - name: Smoke tracked Linux artifact
-      if: github.event_name != 'workflow_dispatch' || inputs.publish != true
+      if: >-
+        github.event_name != 'workflow_dispatch' ||
+        (inputs.publish != true && inputs.rebuild != true)
       run: |
         emacs -Q --batch -L . -l fzf-native \
           -f fzf-native-load-dyn \
@@ -211,8 +220,11 @@ jobs:
     - name: Smoke fresh Linux artifact
       run: |
         FZF_NATIVE_TEST_MODULE=${{github.workspace}}/fresh-bin/Linux/fzf-native-module.so \
-          emacs -Q --batch -L . -l ert -l fzf-native-utf8-test.el \
-          --eval '(ert-run-tests-batch-and-exit "^fzf-native-utf8-case-ignore-length-changing-fold-test$")'
+          emacs -Q --batch -L . -l ert -l fzf-native-test.el \
+          -l fzf-native-utf8-test.el \
+          --eval "(ert-run-tests-batch-and-exit \
+            '(or fzf-native-async-submit-snapshot-lifecycle-test \
+                 fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
   build-freebsd:
     runs-on: ubuntu-latest
@@ -229,7 +241,8 @@ jobs:
           pkg install -y cmake emacs-nox
         run: |
           freebsd-version -u | grep -q '^14\.4'
-          if [ "${{ github.event_name }}" != workflow_dispatch ] || [ "${{ inputs.publish }}" != true ]; then
+          if [ "${{ github.event_name }}" != workflow_dispatch ] || \
+             { [ "${{ inputs.publish }}" != true ] && [ "${{ inputs.rebuild }}" != true ]; }; then
             emacs -Q --batch -L . -l fzf-native \
               -f fzf-native-load-dyn \
               --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"tracked UTF-8 artifact is stale\")))"
@@ -317,6 +330,14 @@ jobs:
           minor=0
         fi
         new="${major}.${minor}"
+        remote_tag=$(git ls-remote --tags origin "refs/tags/${new}") || {
+          echo "Could not check whether release tag ${new} exists" >&2
+          exit 1
+        }
+        if [ -n "$remote_tag" ]; then
+          echo "Release tag ${new} already exists; update the declared version before publishing" >&2
+          exit 1
+        fi
         sed -i "s/^;; Version: ${current}$/;; Version: ${new}/" fzf-native.el
         sed -i -E "s/^([[:space:]]+)\"${current}\"$/\1\"${new}\"/" Eask
         echo "version=${new}" >> "$GITHUB_OUTPUT"
