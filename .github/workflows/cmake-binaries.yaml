@@ -17,6 +17,7 @@ on:
     paths:
       - "**.c"
       - "**.h"
+      - "**.inc"
       - "fzf-native.el"
       - "fzf-native-test.el"
       - "fzf-native-utf8-test.el"
@@ -29,6 +30,7 @@ on:
     paths:
       - "**.c"
       - "**.h"
+      - "**.inc"
       - "fzf-native.el"
       - "fzf-native-module.def"
       - "fzf-native-module.map"

@@ -85,8 +85,11 @@ jobs:
         shell: bash
         run: |
           asan_runtime="$(cc -print-file-name=libasan.so)"
+          ubsan_runtime="$(cc -print-file-name=libubsan.so.1)"
+          test -f "$asan_runtime"
+          test -f "$ubsan_runtime"
           env \
-            LD_PRELOAD="$asan_runtime" \
+            LD_PRELOAD="$asan_runtime:$ubsan_runtime" \
             ASAN_OPTIONS=detect_leaks=0:halt_on_error=1:abort_on_error=1 \
             UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
             FZF_NATIVE_TEST_MODULE="$PWD/build-emacs-sanitized/module/fzf-native-module.so" \
