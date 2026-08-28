@@ -450,8 +450,32 @@ struct Shared {
      `fzf_get_score' and assign score=1 to survivors.  Caller is expected
      to skip the counting sort so input order is preserved. */
   bool filter_only;
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
   _Atomic bool allocation_failed;
+#else
+  /* Windows executes this worker synchronously on the calling thread.  MSVC's
+     C11 mode does not implement `_Atomic', so no synchronization is needed. */
+  bool allocation_failed;
+#endif
 };
+
+static bool shared_allocation_failed(struct Shared *shared) {
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+  return atomic_load_explicit(&shared->allocation_failed,
+                              memory_order_relaxed);
+#else
+  return shared->allocation_failed;
+#endif
+}
+
+static void shared_set_allocation_failed(struct Shared *shared) {
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+  atomic_store_explicit(&shared->allocation_failed, true,
+                        memory_order_relaxed);
+#else
+  shared->allocation_failed = true;
+#endif
+}
 
 // Most of the threading lifted from https://github.com/axelf4/hotfuzz
 static void *worker_routine(void *ptr) {
@@ -482,8 +506,7 @@ static void *worker_routine(void *ptr) {
 
     if (pattern) {
       for (unsigned i = 0; i < batch->len; ++i) {
-        if (atomic_load_explicit(&shared->allocation_failed,
-                                 memory_order_relaxed))
+        if (shared_allocation_failed(shared))
           break;
         struct Candidate x = batch->xs[i];
         /* You can get the score/position for as many items as you want */
@@ -491,8 +514,7 @@ static void *worker_routine(void *ptr) {
           ? (fzf_has_match(x.s.b, pattern, slab) ? 1 : 0)
           : fzf_get_score(x.s.b, pattern, slab);
         if (fzf_allocation_failed()) {
-          atomic_store_explicit(&shared->allocation_failed, true,
-                                memory_order_relaxed);
+          shared_set_allocation_failed(shared);
           break;
         }
         if (score > 0) {
@@ -944,8 +966,7 @@ err_join_threads:
   for (unsigned i = 0; i < num_workers; ++i) pthread_join(data->threads[i], NULL);
 #endif
   if (pattern) fzf_free_pattern(pattern);
-  if (atomic_load_explicit(&shared.allocation_failed,
-                           memory_order_relaxed)) {
+  if (shared_allocation_failed(&shared)) {
     success = false;
     async_signal_error(
         env, "fzf-native: matcher could not allocate scoring scratch");
