@@ -45,6 +45,13 @@ env:
   BUILD_TYPE: Release
 
 jobs:
+  validate-release:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish == true &&
+       github.ref == 'refs/heads/main')
+    uses: ./.github/workflows/test.yaml
+
   build:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -351,8 +358,11 @@ jobs:
         retention-days: 1
 
   commit:
-    if: github.event_name == 'push' || inputs.publish == true
-    needs: [build, build-linux, smoke-linux, build-freebsd]
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish == true &&
+       github.ref == 'refs/heads/main')
+    needs: [validate-release, build, build-linux, smoke-linux, build-freebsd]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -48,7 +48,7 @@ process and must never block the main thread.
 | Function                       | Args                                 | Returns                | Path        |
 |--------------------------------+--------------------------------------+------------------------+-------------|
 | =fzf-native-score=             | =(str query &optional slab)=         | =(score)=              | sync single |
-| =fzf-native-score-all=         | =(collection query &optional slab)=  | sorted candidate vector | sync batch  |
+| =fzf-native-score-all=         | =(collection query &optional slab)=  | sorted candidate list* | sync batch  |
 | =fzf-native-make-default-slab= | =()=                                 | slab                   | (helper)    |
 | =fzf-native-make-slab=         | =(size16 size32)=                    | slab                   | (helper)    |
 | =fzf-native-async-start=       | =(command &optional dir)=            | handle                 | async       |
@@ -64,6 +64,9 @@ process and must never block the main thread.
 | =fzf-native-filter-only-p=     | =(query-length pool-size)=           | t / nil                | predicate   |
 
 The async surface is Unix-only.  It uses =fork=, =execve=, and =pthread=.
+
+=* An empty query returns the input collection unchanged, so it preserves a
+list or vector.  A non-empty query returns a list of matching candidates.
 
 =fzf-native-filter-only-p= is the Elisp-exposed wrapper around the
 internal =decide_filter_only= and exists so external packages (fussy,
@@ -197,7 +200,7 @@ without the per-candidate Elisp ↔ C round-trip cost.
   │  - pthread_join all                          │
   │  - flatten survivors                         │
   │  - counting_sort_candidates (descending)     │
-  │  - return result vector                      │
+  │  - return result list                        │
   └──────────────────────────────────────────────┘
 #+end_src
 

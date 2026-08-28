@@ -2121,7 +2121,11 @@ the uninitialised scratch."
   (let ((system-type 'gnu/linux)
         (system-configuration "x86_64-pc-linux-gnu"))
     (should (equal (fzf-native--bundled-module-relative-path)
-                   "Linux/fzf-native-module.so"))))
+                   "Linux/fzf-native-module.so")))
+  (let ((system-type 'berkeley-unix)
+        (system-configuration "x86_64-unknown-freebsd14.1"))
+    (should (equal (fzf-native--bundled-module-relative-path)
+                   "FreeBSD/fzf-native-module.so"))))
 
 (ert-deftest fzf-native-bundled-module-path-rejects-unsupported-arch-test ()
   "A wrong-architecture artifact must not reach `module-load'."
@@ -2129,6 +2133,35 @@ the uninitialised scratch."
         (system-configuration "aarch64-unknown-linux-gnu"))
     (should-error (fzf-native--bundled-module-relative-path)
                   :type 'user-error)))
+
+(ert-deftest fzf-native-bundled-module-path-rejects-other-bsd-test ()
+  "A FreeBSD artifact must not load on another Berkeley Unix target."
+  (dolist (configuration '("x86_64-unknown-dragonfly6.4"
+                           "x86_64-unknown-netbsd10.0"
+                           "x86_64-unknown-openbsd7.6"))
+    (let ((system-type 'berkeley-unix)
+          (system-configuration configuration))
+      (should-not (fzf-native--freebsd-target-p))
+      (should-error (fzf-native--bundled-module-relative-path)
+                    :type 'user-error))))
+
+(ert-deftest fzf-native-session-abi-platform-matches-bundled-freebsd-test ()
+  "The ABI handshake and bundled loader must agree on FreeBSD support."
+  (let ((calls 0))
+    (cl-letf (((symbol-function 'fzf-native-session-abi-version)
+               (lambda ()
+                 (cl-incf calls)
+                 fzf-native-session-abi-required)))
+      (let ((system-type 'berkeley-unix)
+            (system-configuration "amd64-portbld-freebsd13.2"))
+        (should (fzf-native--session-platform-p))
+        (should (fzf-native--verify-session-abi))
+        (should (= calls 1)))
+      (let ((system-type 'berkeley-unix)
+            (system-configuration "x86_64-unknown-netbsd10.0"))
+        (should-not (fzf-native--session-platform-p))
+        (should (fzf-native--verify-session-abi))
+        (should (= calls 1))))))
 
 ;;; Review regression gates (PR #39 multi-agent review)
 

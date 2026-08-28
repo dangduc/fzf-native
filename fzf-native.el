@@ -54,12 +54,28 @@ is available without tracking load state themselves.")
 (defconst fzf-native-session-abi-required 1
   "Interactive-session ABI required by this version of fzf-native.el.")
 
+(defun fzf-native--freebsd-target-p ()
+  "Return non-nil when Emacs targets FreeBSD specifically.
+
+Emacs reports FreeBSD, DragonFly, NetBSD, and OpenBSD as
+`berkeley-unix'.  The configuration triplet is required to distinguish the
+FreeBSD module's libc and kernel ABI from the other BSD targets."
+  (and (eq system-type 'berkeley-unix)
+       (string-match-p
+        "-freebsd\\(?:[0-9.]*\\)?\\(?:-\\|\\'\\)"
+        (downcase system-configuration))))
+
+(defun fzf-native--session-platform-p ()
+  "Return non-nil when this target implements the POSIX session ABI."
+  (or (memq system-type '(darwin gnu/linux))
+      (fzf-native--freebsd-target-p)))
+
 (defun fzf-native--verify-session-abi ()
   "Fail if the loaded POSIX module has a stale session ABI.
 Windows modules retain batch-only support and do not implement the session
 entry points, so this handshake applies only where the native session API is
 available."
-  (when (memq system-type '(darwin gnu/linux berkeley-unix))
+  (when (fzf-native--session-platform-p)
     (unless (fboundp 'fzf-native-session-abi-version)
       (error (concat "Stale fzf-native module: interactive-session ABI "
                      "entry point is missing (need ABI %d); rebuild or "
@@ -450,6 +466,7 @@ before `module-load' reports a misleading bad-CPU-type or loader error."
             (arm64-p (concat "Darwin/arm64/" fzf-native--dyn-name ".so"))))
           (berkeley-unix
            (and x86-64-p
+                (fzf-native--freebsd-target-p)
                 (concat "FreeBSD/" fzf-native--dyn-name ".so")))
           (gnu/linux
            (and x86-64-p
