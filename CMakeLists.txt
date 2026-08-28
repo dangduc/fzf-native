@@ -76,7 +76,11 @@ endif()
 target_include_directories(fzf-native-module PRIVATE ${UTF8PROC_INCLUDE_DIR})
 target_link_libraries(fzf-native-module PRIVATE utf8proc)
 
-set(OUTPUT_DIR ${CMAKE_SOURCE_DIR}/${FZF_NATIVE_MODULE_OUTPUT_DIR})
+if(IS_ABSOLUTE "${FZF_NATIVE_MODULE_OUTPUT_DIR}")
+  set(OUTPUT_DIR "${FZF_NATIVE_MODULE_OUTPUT_DIR}")
+else()
+  set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/${FZF_NATIVE_MODULE_OUTPUT_DIR}")
+endif()
 set_target_properties(
   fzf-native-module
   PROPERTIES C_STANDARD 11
