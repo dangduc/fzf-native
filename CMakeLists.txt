@@ -66,13 +66,25 @@ target_include_directories(utf8proc PUBLIC ${UTF8PROC_INCLUDE_DIR})
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   # Assume compiler MSVC.
   add_library(
-    fzf-native-module SHARED fzf-native-module.c fzf.c fzf.h fzf-private.h
-                             fzf-score-input.inc fzf-additions.c
-                             fzf-additions.h fzf-native-module.def)
+    fzf-native-module SHARED
+    fzf-native-module.c
+    fzf.c
+    fzf.h
+    fzf-private.h
+    fzf-score-input.inc
+    fzf-additions.c
+    fzf-additions.h
+    fzf-native-module.def)
 else()
-  add_library(fzf-native-module MODULE fzf-native-module.c fzf.c fzf.h
-                                       fzf-private.h fzf-score-input.inc
-                                       fzf-additions.c fzf-additions.h)
+  add_library(
+    fzf-native-module MODULE
+    fzf-native-module.c
+    fzf.c
+    fzf.h
+    fzf-private.h
+    fzf-score-input.inc
+    fzf-additions.c
+    fzf-additions.h)
 endif()
 
 # Pull in utf8proc headers and link the static runtime.
@@ -167,7 +179,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
   endif()
 
 elseif(ENABLE_ASAN OR ENABLE_UBSAN)
-  message(FATAL_ERROR
-          "ENABLE_ASAN/ENABLE_UBSAN requires GCC, Clang, or AppleClang")
+  message(
+    FATAL_ERROR "ENABLE_ASAN/ENABLE_UBSAN requires GCC, Clang, or AppleClang")
 endif()
 # --- End debug / sanitizer flags ---
