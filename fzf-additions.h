@@ -13,8 +13,11 @@
    when PATTERN contains a non-ASCII (UTF-8) or otherwise unrecognized term;
    pure-ASCII patterns never touch it. */
 bool fzf_has_match(const char *text, fzf_pattern_t *pattern, fzf_slab_t *slab);
-/* Safe counterpart for a bounded byte string.  The function derives the byte
-   range's ASCII classification before it selects a matcher. */
+/* Safe counterpart for a bounded byte string.  TEXT must reference at least
+   TEXT_LEN readable bytes.  Every byte in that range is candidate data,
+   including embedded NUL bytes.  The legacy fzf_has_match wrapper stops at
+   the first NUL.  This function derives the exact range's ASCII
+   classification before it selects a matcher. */
 bool fzf_has_match_bytes(const char *text, size_t text_len,
                          fzf_pattern_t *pattern, fzf_slab_t *slab);
 

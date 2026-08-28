@@ -55,8 +55,8 @@ process and must never block the main thread.
 | =fzf-native-async-candidates=  | =(handle filter &optional limit)=    | Emacs list             | async       |
 | =fzf-native-async-submit=      | =(handle filter &optional limit)=    | request ID             | async       |
 | =fzf-native-async-status=      | =(handle &optional request-id)=      | metadata plist         | async       |
-| =fzf-native-async-snapshot=    | =(handle request-id)=                | owned result plist     | async       |
-| =fzf-native-async-result-fresh-p= | =(handle filter &optional limit)= | t / nil                | async       |
+| =fzf-native-async-snapshot=    | =(handle &optional request-id)=      | owned result plist     | async       |
+| =fzf-native-async-result-fresh-p= | =(handle query)=                  | t / nil                | async       |
 | =fzf-native-async-stats=       | =(handle)=                           | =(filtered . total)=   | async       |
 | =fzf-native-async-generation=  | =(handle)=                           | integer                | async       |
 | =fzf-native-async-stop=        | =(handle)=                           | nil                    | async       |
