@@ -73,6 +73,22 @@ available."
                actual fzf-native-session-abi-required))))
   t)
 
+(defun fzf-native--verify-initialized-module ()
+  "Verify the initialized module, or report the required safe recovery.
+
+Emacs does not unload a dynamic module when its feature is removed.  Loading a
+second ABI over live user pointers and worker callbacks is unsafe.  Therefore,
+after an incompatible initializer has run, recovery requires replacing or
+rebuilding the artifact and restarting Emacs."
+  (condition-case err
+      (fzf-native--verify-session-abi)
+    (error
+     (setq fzf-native-loaded nil)
+     (error (concat "%s.  The incompatible native module is already loaded "
+                    "and cannot be replaced safely in this Emacs process; "
+                    "rebuild or replace it, then restart Emacs")
+            (error-message-string err)))))
+
 (defconst fzf-native--bin-dir
   (concat (file-name-directory load-file-name) "bin/")
   "Pre-built binaries directory path.")
@@ -449,26 +465,37 @@ before `module-load' reports a misleading bad-CPU-type or loader error."
   (interactive)
   (let* ((dyn-name (fzf-native--bundled-module-relative-path))
          (dyn-path (concat fzf-native--bin-dir dyn-name)))
-    (module-load dyn-path)
-    (fzf-native--verify-session-abi)
+    ;; A module initializer may already have run even when the Lisp-side
+    ;; convenience flag is nil.  Verify that live image first: calling a
+    ;; second initializer cannot safely replace its functions or user pointers.
+    (unless (featurep 'fzf-native-module)
+      (module-load dyn-path))
+    (fzf-native--verify-initialized-module)
     (setq fzf-native-loaded t)
     (let ((inhibit-message t))
       (message "[INFO] Successfully load dynamic module, `%s`" dyn-name))))
 
 ;;;###autoload
 (defun fzf-native-load-own-build-dyn ()
-  "Load user-compiled version of module, building it if necessary."
-  (unless (require 'fzf-native-module nil t)
-    (if (or fzf-native-always-compile-module
-            (y-or-n-p "Fzf-Native needs `fzf-native-module' to work.  Compile it now? "))
-        (progn
-          (let ((fzf-native-module-cmake-args (concat "-DFZF_NATIVE_MODULE_OUTPUT_DIR=''"
-                                                      " "
-                                                      fzf-native-module-cmake-args)))
-            (fzf-native-module-compile))
-          (require 'fzf-native-module))
-      (error "Fzf-Native will not work until `fzf-native-module' is compiled!")))
-  (fzf-native--verify-session-abi)
+  "Load a user-compiled module, building it if necessary.
+
+If an incompatible module already initialized in this Emacs process, signal a
+restart-required error.  Replacing a loaded dynamic module in place is unsafe."
+  (if (featurep 'fzf-native-module)
+      (fzf-native--verify-initialized-module)
+    (unless (require 'fzf-native-module nil t)
+      (if (or fzf-native-always-compile-module
+              (y-or-n-p
+               "Fzf-Native needs `fzf-native-module' to work.  Compile it now? "))
+          (progn
+            (let ((fzf-native-module-cmake-args
+                   (concat "-DFZF_NATIVE_MODULE_OUTPUT_DIR='' "
+                           fzf-native-module-cmake-args)))
+              (fzf-native-module-compile))
+            (require 'fzf-native-module))
+        (error
+         "Fzf-Native will not work until `fzf-native-module' is compiled!")))
+    (fzf-native--verify-initialized-module))
   (setq fzf-native-loaded t))
 
 ;;;###autoload

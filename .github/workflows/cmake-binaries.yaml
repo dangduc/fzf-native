@@ -18,6 +18,8 @@ on:
       - "**.c"
       - "**.h"
       - "fzf-native.el"
+      - "fzf-native-test.el"
+      - "fzf-native-utf8-test.el"
       - "fzf-native-module.def"
       - "fzf-native-module.map"
       - "CMakeLists.txt"
@@ -85,8 +87,14 @@ jobs:
       shell: bash
       run: |
         emacs -Q --batch -L . -l fzf-native \
-          -f fzf-native-load-dyn \
-          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"tracked UTF-8 artifact is stale\")))"
+          -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+          -l fzf-native-utf8-test.el \
+          --eval "(ert-run-tests-batch-and-exit \
+            '(or fzf-native-session-abi-handshake-test \
+                 fzf-native-async-preserves-empty-line-candidates-test \
+                 fzf-native-async-public-results-own-strings-across-reentry-test \
+                 fzf-native-score-all-empty-string-candidate-test \
+                 fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
     - name: Clean stale binaries
       shell: bash
@@ -105,8 +113,14 @@ jobs:
       shell: bash
       run: |
         emacs -Q --batch -L . -l fzf-native \
-          -f fzf-native-load-dyn \
-          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"fresh UTF-8 artifact failed\")))"
+          -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+          -l fzf-native-utf8-test.el \
+          --eval "(ert-run-tests-batch-and-exit \
+            '(or fzf-native-session-abi-handshake-test \
+                 fzf-native-async-preserves-empty-line-candidates-test \
+                 fzf-native-async-public-results-own-strings-across-reentry-test \
+                 fzf-native-score-all-empty-string-candidate-test \
+                 fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
     - name: Check Darwin export surface
       if: runner.os == 'macOS'
@@ -209,8 +223,14 @@ jobs:
         (inputs.publish != true && inputs.rebuild != true)
       run: |
         emacs -Q --batch -L . -l fzf-native \
-          -f fzf-native-load-dyn \
-          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"tracked UTF-8 artifact is stale\")))"
+          -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+          -l fzf-native-utf8-test.el \
+          --eval "(ert-run-tests-batch-and-exit \
+            '(or fzf-native-session-abi-handshake-test \
+                 fzf-native-async-preserves-empty-line-candidates-test \
+                 fzf-native-async-public-results-own-strings-across-reentry-test \
+                 fzf-native-score-all-empty-string-candidate-test \
+                 fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
     - uses: actions/download-artifact@v4
       with:
@@ -223,7 +243,10 @@ jobs:
           emacs -Q --batch -L . -l ert -l fzf-native-test.el \
           -l fzf-native-utf8-test.el \
           --eval "(ert-run-tests-batch-and-exit \
-            '(or fzf-native-async-submit-snapshot-lifecycle-test \
+            '(or fzf-native-session-abi-handshake-test \
+                 fzf-native-async-preserves-empty-line-candidates-test \
+                 fzf-native-async-public-results-own-strings-across-reentry-test \
+                 fzf-native-score-all-empty-string-candidate-test \
                  fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
   build-freebsd:
@@ -244,15 +267,27 @@ jobs:
           if [ "${{ github.event_name }}" != workflow_dispatch ] || \
              { [ "${{ inputs.publish }}" != true ] && [ "${{ inputs.rebuild }}" != true ]; }; then
             emacs -Q --batch -L . -l fzf-native \
-              -f fzf-native-load-dyn \
-              --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"tracked UTF-8 artifact is stale\")))"
+              -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+              -l fzf-native-utf8-test.el \
+              --eval "(ert-run-tests-batch-and-exit \
+                '(or fzf-native-session-abi-handshake-test \
+                     fzf-native-async-preserves-empty-line-candidates-test \
+                     fzf-native-async-public-results-own-strings-across-reentry-test \
+                     fzf-native-score-all-empty-string-candidate-test \
+                     fzf-native-utf8-case-ignore-length-changing-fold-test))"
           fi
           rm -rf bin
           cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
           cmake --build build --verbose --config ${{ env.BUILD_TYPE }}
           emacs -Q --batch -L . -l fzf-native \
-            -f fzf-native-load-dyn \
-            --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"fresh UTF-8 artifact failed\")))"
+            -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+            -l fzf-native-utf8-test.el \
+            --eval "(ert-run-tests-batch-and-exit \
+              '(or fzf-native-session-abi-handshake-test \
+                   fzf-native-async-preserves-empty-line-candidates-test \
+                   fzf-native-async-public-results-own-strings-across-reentry-test \
+                   fzf-native-score-all-empty-string-candidate-test \
+                   fzf-native-utf8-case-ignore-length-changing-fold-test))"
           actual=$(nm -D --defined-only -P bin/FreeBSD/fzf-native-module.so | awk '{print $1}' | sort)
           expected=$(printf '%s\n' emacs_module_init plugin_is_GPL_compatible | sort)
           printf 'defined dynamic symbols:\n%s\n' "$actual"

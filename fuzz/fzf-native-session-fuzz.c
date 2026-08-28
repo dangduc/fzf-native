@@ -361,17 +361,18 @@ static void session_fuzz_check_invariants(FuzzSession *fuzz) {
   /* Exercise the same owned-copy boundary used by the Emacs candidate and
      snapshot APIs.  A concurrent publication may make this copy newer than
      the metadata above, so validate it independently. */
-  size_t copied_count = 0, copied_limit = 0, copied_pool = 0;
+  size_t copied_count = 0, copied_limit = 0;
   size_t copied_completed = 0, copied_total = 0;
   size_t copied_filtered = 0, copied_source_total = 0;
-  uint64_t copied_id = 0, copied_generation = 0, copied_error_id = 0;
+  uint64_t copied_generation = 0, copied_error_id = 0;
+  AsyncResultObservation copied_result = {0};
   char *copied_filter = NULL, *copied_error = NULL;
   fzf_case_types copied_case_mode = CaseSmart;
   bool copied_fuzzy = true, copied_filter_only = false;
   bool copied_allocation_failed = false;
   ScoredStr *copied = async_copy_public_result(
-      s, true, &copied_count, &copied_id, &copied_filter, &copied_limit,
-      &copied_case_mode, &copied_fuzzy, &copied_filter_only, &copied_pool,
+      s, true, &copied_count, &copied_result, &copied_filter, &copied_limit,
+      &copied_case_mode, &copied_fuzzy, &copied_filter_only,
       &copied_generation, &copied_completed, &copied_total,
       &copied_error_id, &copied_error, &copied_filtered,
       &copied_source_total, &copied_allocation_failed);
@@ -381,10 +382,10 @@ static void session_fuzz_check_invariants(FuzzSession *fuzz) {
     session_fuzz_fail(fuzz, "an owned result copy exceeds its limit");
   if (copied_completed > copied_total)
     session_fuzz_fail(fuzz, "owned result progress exceeds its total");
-  if (copied_id && !copied_filter)
+  if (copied_result.request_id && !copied_filter)
     session_fuzz_fail(fuzz, "an owned result copy lost its request query");
   for (size_t i = 0; i < copied_count; i++)
-    if (copied[i].idx >= copied_pool)
+    if (copied[i].idx >= copied_result.pool_generation)
       session_fuzz_fail(fuzz, "an owned result copy has an invalid index");
   (void)copied_case_mode;
   (void)copied_fuzzy;
@@ -393,7 +394,7 @@ static void session_fuzz_check_invariants(FuzzSession *fuzz) {
   (void)copied_error_id;
   (void)copied_filtered;
   (void)copied_source_total;
-  free(copied);
+  async_free_public_result(copied, copied_count);
   free(copied_filter);
   free(copied_error);
 }

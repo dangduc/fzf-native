@@ -2113,6 +2113,154 @@ the uninitialised scratch."
 
 ;;; Review regression gates (PR #39 multi-agent review)
 
+(ert-deftest fzf-native-stale-abi-requires-restart-after-initialization-test ()
+  "A stale initialized module must not enter a fake in-process rebuild loop."
+  (let ((fzf-native-loaded nil)
+        (fzf-native-always-compile-module t)
+        (compile-calls 0))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (eq feature 'fzf-native-module)))
+              ((symbol-function 'fzf-native--verify-session-abi)
+               (lambda ()
+                 (error "module has ABI 2, Elisp requires ABI 1")))
+              ((symbol-function 'fzf-native-module-compile)
+               (lambda () (cl-incf compile-calls))))
+      (let ((message
+             (error-message-string
+              (should-error (fzf-native-load-own-build-dyn)))))
+        (should (string-match-p "cannot be replaced safely" message))
+        (should (string-match-p "restart Emacs" message))
+        (should (= compile-calls 0))
+        (should-not fzf-native-loaded)))))
+
+(ert-deftest fzf-native-bundled-loader-reports-post-init-restart-test ()
+  "ABI rejection after `module-load' must state the real recovery contract."
+  (let ((fzf-native-loaded nil)
+        (module-loads 0))
+    (cl-letf (((symbol-function 'fzf-native--bundled-module-relative-path)
+               (lambda () "stale-module.so"))
+              ((symbol-function 'featurep)
+               (lambda (_feature) nil))
+              ((symbol-function 'module-load)
+               (lambda (_path) (cl-incf module-loads)))
+              ((symbol-function 'fzf-native--verify-session-abi)
+               (lambda ()
+                 (error "module has ABI 2, Elisp requires ABI 1"))))
+      (let ((message
+             (error-message-string (should-error (fzf-native-load-dyn)))))
+        (should (= module-loads 1))
+        (should (string-match-p "cannot be replaced safely" message))
+        (should (string-match-p "restart Emacs" message))
+        (should-not fzf-native-loaded)))))
+
+(ert-deftest fzf-native-bundled-loader-refuses-stale-reinitialization-test ()
+  "The bundled loader verifies an existing module before another initializer."
+  (let ((fzf-native-loaded nil)
+        (module-loads 0))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (eq feature 'fzf-native-module)))
+              ((symbol-function 'fzf-native--bundled-module-relative-path)
+               (lambda () "stale-module.so"))
+              ((symbol-function 'module-load)
+               (lambda (_path) (cl-incf module-loads)))
+              ((symbol-function 'fzf-native--verify-session-abi)
+               (lambda ()
+                 (error "module has ABI 2, Elisp requires ABI 1"))))
+      (let ((message
+             (error-message-string (should-error (fzf-native-load-dyn)))))
+        (should (= module-loads 0))
+        (should (string-match-p "cannot be replaced safely" message))
+        (should (string-match-p "restart Emacs" message))
+        (should-not fzf-native-loaded)))))
+
+(ert-deftest fzf-native-async-preserves-empty-line-candidates-test ()
+  "The async line protocol preserves blank, CR-only, and ANSI-only records."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let* ((expected '("" "alpha" "" "" "" "omega" ""))
+         (handle
+          (fzf-native-async-start
+           "printf '\nalpha\n\n\r\n\033[31m\033[0m\nomega\n\n'"))
+         (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle)
+                             :reader-done))
+          (dolist (query '("" "!x"))
+            (let* ((request-id (fzf-native-async-submit handle query 20))
+                   (snapshot (fzf-native-test--wait-for-request
+                              handle request-id))
+                   (actual
+                    (mapcar #'substring-no-properties
+                            (plist-get snapshot :candidates)))
+                   (batch
+                    (mapcar #'substring-no-properties
+                            (fzf-native-score-all expected query))))
+              (should (eq (plist-get snapshot :state) 'complete))
+              (should-not (plist-get snapshot :stale))
+              (should (equal actual expected))
+              (should (equal actual batch)))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-public-results-own-strings-across-reentry-test ()
+  "Stopping from reentrant Lisp cannot invalidate a public result copy.
+
+Both snapshot entry points build Lisp lists through the mutable `cons' symbol.
+The first call stops the same session and gives detached teardown time to free
+its arena.  Every later candidate must still come from memory owned by the
+in-flight public call.  Run this test against an ASan module to make a borrowed
+candidate pointer a deterministic heap-use-after-free."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (dolist (entry '(snapshot candidates))
+    (let* ((handle
+            (fzf-native-async-start
+             "awk 'BEGIN { for (i = 1; i <= 20000; i++) print i }'"))
+           request-id
+           deadline
+           (fzf-native-async-highlight nil)
+           status result fired)
+      (unwind-protect
+          (progn
+            ;; Do not accept the valid but transient complete result over an
+            ;; empty/growing pool.  Populate the fixed 20k arena first so both
+            ;; public entry points must traverse copied candidate strings.
+            (should (plist-get (fzf-native-test--wait-for-producer handle)
+                               :reader-done))
+            (setq request-id (fzf-native-async-submit handle "" 20000))
+            (setq deadline (+ (float-time) 10.0))
+            (while (and (< (float-time) deadline)
+                        (not (eq (plist-get
+                                  (setq status
+                                        (fzf-native-async-status
+                                         handle request-id))
+                                  :state)
+                                 'complete)))
+              (sleep-for 0.005))
+            (should (eq (plist-get status :state) 'complete))
+            (let ((original-cons (symbol-function 'cons)))
+              (unwind-protect
+                  (progn
+                    (fset 'cons
+                          (lambda (car cdr)
+                            (unless fired
+                              (setq fired t)
+                              (fzf-native-async-stop handle)
+                              (sleep-for 0.2))
+                            (funcall original-cons car cdr)))
+                    (setq result
+                          (if (eq entry 'snapshot)
+                              (fzf-native-async-snapshot handle request-id)
+                            (fzf-native-async-candidates
+                             handle "" 20000))))
+                (fset 'cons original-cons)))
+            (should fired)
+            (should (= (length (if (eq entry 'snapshot)
+                                   (plist-get result :candidates)
+                                 result))
+                       20000)))
+        (ignore-errors (fzf-native-async-stop handle))))))
+
 (ert-deftest fzf-native-async-empty-pool-result-not-final-test ()
   "A result completed over a still-empty pool is not authoritative.
 Gate for review JO2-1/DL2-1: with the warmup clause removed from the
