@@ -841,6 +841,36 @@ static void test_async_reader_final_unterminated_line(void) {
   free_async_session(s);
 }
 
+static void test_async_reader_rejects_embedded_nul(void) {
+  static const char output[] = {
+    'v', 'a', 'l', 'i', 'd', '\n',
+    'a', 'b', '\0', 'c', 'd', '\n',
+    'l', 'a', 't', 'e', '\n',
+  };
+  int pfd[2];
+  CHECK(pipe(pfd) == 0);
+  CHECK(write(pfd[1], output, sizeof output) == (ssize_t)sizeof output);
+  close(pfd[1]);
+
+  FILE *rfp = fdopen(pfd[0], "r");
+  CHECK(rfp != NULL);
+  AsyncSession *s = make_async_session(rfp, 8);
+  CHECK(s != NULL);
+
+  async_reader((void *)s);
+
+  CHECK(s->count == 1);
+  CHECK(strcmp(cands_at(s, 0), "valid") == 0);
+  uint64_t error = atomic_load_explicit(
+      &s->producer_error, memory_order_acquire);
+  CHECK(async_unpack_producer_error_kind(error) ==
+        AsyncProducerErrorInvalidData);
+  CHECK(atomic_load_explicit(&s->producer_state,
+                             memory_order_acquire) == AsyncProducerFailed);
+  CHECK(atomic_load_explicit(&s->reader_done, memory_order_acquire));
+  free_async_session(s);
+}
+
 /* =====================================================================
  * Chunked candidate storage — index split formula and accessor
  * ===================================================================== */
@@ -2857,6 +2887,7 @@ int main(void) {
   RUN(test_async_reader_many_lines);
   RUN(test_async_reader_long_line);
   RUN(test_async_reader_final_unterminated_line);
+  RUN(test_async_reader_rejects_embedded_nul);
 
   printf("--- chunked cands_top ---\n");
   RUN(test_cands_top_index_split);

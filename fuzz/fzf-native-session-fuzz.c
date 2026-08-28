@@ -109,6 +109,7 @@ static bool session_fuzz_write_all(int fd, const uint8_t *data, size_t size) {
    final unterminated-line publication. */
 static void session_fuzz_reader_probe(const uint8_t *data, size_t size) {
   if (!data || size == 0) return;
+  bool contains_nul = size > 1 && memchr(data + 1, 0, size - 1) != NULL;
   AsyncSession *s = session_fuzz_create(data[0]);
   if (!s) return;
 
@@ -152,6 +153,19 @@ static void session_fuzz_reader_probe(const uint8_t *data, size_t size) {
   s->reader_started = false;
   if (!atomic_load_explicit(&s->reader_done, memory_order_acquire))
     abort();
+  uint64_t producer_error = atomic_load_explicit(
+      &s->producer_error, memory_order_acquire);
+  enum AsyncProducerErrorKind error_kind =
+      async_unpack_producer_error_kind(producer_error);
+  enum AsyncProducerState producer_state =
+      atomic_load_explicit(&s->producer_state, memory_order_acquire);
+  if (contains_nul) {
+    if (error_kind != AsyncProducerErrorInvalidData ||
+        producer_state != AsyncProducerFailed)
+      abort();
+  } else if (error_kind == AsyncProducerErrorInvalidData) {
+    abort();
+  }
   async_session_destroy(s);
 }
 
