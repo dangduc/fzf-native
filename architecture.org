@@ -111,7 +111,7 @@ space for the dynamic-programming match. Reusing one slab across many
 
 - Sync single: caller may pass a slab; if not, one is created and freed.
 - Sync batch: each worker thread owns a thread-local slab.
-- Async: each worker thread allocates and frees its own slab per run.
+- Async: each process-wide persistent worker owns one slab for the process lifetime.
 
 ** Counting sort
 
@@ -292,22 +292,29 @@ ready."
   │ s->cands[]      │  ← protected by s->mu
   │ s->count        │  ← protected by s->mu
   │ s->arena        │  ← protected by s->mu (string storage)
-  │ s->gen (atomic) │  ← published on score completion
+  │ s->gen (atomic) │  ← compatibility change counter
   │ s->stop (atomic)│  ← shutdown signal
   ├─────────────────┤
   │ score_req_*     │  ← protected by score_req_mu
-  │   filter, limit │
+  │   id, filter    │
+  │   limit, modes  │
+  │   latest_*      │
+  │   growth flag   │
   │   cond, abort   │
   │   current_*     │
   ├─────────────────┤
   │ score_results[] │  ← protected by score_res_mu
   │ score_count     │
+  │ score_result_id │
+  │ result metadata │
   │ last_filtered   │
   │ last_total      │
   ├─────────────────┤
   │ cache           │  ← LRU result cache, own mutex
   │   head, tail    │
   │   count, max    │
+  ├─────────────────┤
+  │ worker_pool     │  ← persistent threads and slabs
   └─────────────────┘
 #+end_src
 
@@ -318,19 +325,21 @@ ready."
 | Main (Elisp)        | =score_results= (under res mu) | =score_req_*= (under req mu); signals cond |
 | Reader              | child fp                       | =s->cands=, =s->count=, =s->arena= (under s->mu) |
 | Scorer              | =s->cands= snapshot (under s->mu briefly), =score_req_*= | =score_results= (under res mu); =s->gen= |
-| Scorer's sub-workers (transient) | their batch slice, =shared->pattern= (read-only) | their batch slice (compaction in-place) |
+| Persistent workers  | their batch slice, =shared->pattern= (read-only) | their batch slice (compaction in-place) |
 
 Three locks, distinct purposes:
 
 - =s->mu= — guards the candidate array and the arena. Held briefly:
   read =count=, =memcpy= a candidate-pointer snapshot out, release.
-- =score_req_mu= — guards the request queue (one slot deep) and the
-  =score_current_filter= used for the same-filter-no-abort check.
+- =score_req_mu= — guards the one-slot request queue, request IDs, and the
+  active request metadata.
 - =score_res_mu= — guards the published top-K results.
+- =worker_pool->mu= — guards the worker epoch, active count, and pool shutdown.
 
-Locks are never nested. The scoring thread takes them sequentially:
-=score_req_mu= (steal request) → =s->mu= (snapshot candidates) →
-=score_res_mu= (publish results).
+Most lock operations are sequential.  Authoritative publication takes
+=score_req_mu= and then =score_res_mu=.  No path takes these locks in reverse
+order.  This order makes the authority check and result swap atomic relative
+to a new submission.
 
 ** Reader thread — =async_reader=
 
@@ -338,8 +347,10 @@ Locks are never nested. The scoring thread takes them sequentially:
   while (read line from child fp) {
     strip ANSI escapes (in place)
     arena_strdup(line)            ← arena owns the bytes
-    grow s->cands[] if at cap     ← realloc, doubling
-    s->cands[s->count++] = ptr    ← under s->mu
+    allocate a candidate block when necessary
+    publish candidate pointer     ← under s->mu
+    increment the compatibility generation
+    coalesce a growth event when a request exists
   }
   on EOF: just return; thread exits naturally.
 #+end_src
@@ -347,39 +358,98 @@ Locks are never nested. The scoring thread takes them sequentially:
 Why an arena: candidates are written once and freed all at once at
 session end. =arena_strdup= bumps a pointer into a 4 MB chunk;
 =arena_free= walks chunks and frees them — O(chunks), not
-O(candidates). For 60 M candidates this is the difference between
+O(candidates). For very large candidate pools this is the difference between
 "instant teardown" and "seconds of individual =free()= calls when ESC
 is pressed."
 
 ** Scoring thread — =scoring_thread_fn=
 
-Persistent. Sleeps on =score_req_cond= until the main thread enqueues
-a filter or sets =score_req_stop=.
+Persistent.  It sleeps on =score_req_cond= until a query, a growth event, or
+session shutdown arrives.
 
 #+begin_src
   loop:
     wait on score_req_cond
     if score_req_stop: exit thread
-    steal score_req_filter (set score_current_filter under req mu)
+    if candidate growth is pending:
+      queue the latest request ID at the newest pool boundary
+    steal score_req_filter and request ID
+    set current request metadata under req mu
     atomic_store(score_abort, false)
     parse pattern (once, on this thread)
-    snapshot s->cands pointers (brief s->mu, malloc outside lock)
-    spawn N worker pthreads, each scores its batch
-    pthread_join all workers   ← runs HERE, never on main thread
+    repeat over bounded 64-batch windows:
+      copy at most 131,072 candidate pointers (brief s->mu holds)
+      publish one or more worker-pool epochs
+      add every match to matched_total
+      append membership until its independent byte cap; otherwise discard it
+      if limit is positive and full mode:
+        sort this window and stable-merge it into running top-K
+      else if limit is positive and filter-only:
+        retain only the first K matches in producer order
+      else:
+        append every match for the caller's unlimited result
     if score_abort:            ← filter changed mid-run
       free, clear current_filter, loop
-    compact survivors, counting_sort_scored, apply limit
-    publish to score_results (under res mu), update stats
-    atomic_fetch_add(s->gen, 1)
+    rank the bounded filter-only window, if selected
+    cache completed work through abort-aware copies
+    if request ID is still latest:
+      publish score_results and result metadata
+      atomic_fetch_add(s->gen, 1)
 #+end_src
 
 Workers check =score_abort= every 256 items inside the batch loop, not
 just at batch boundaries. This bounds ESC latency at very large
 candidate counts.
 
-The batch loop also checks abort every 64 K items during the
-*snapshot construction* before workers spawn, so a filter change
-during a 25 M-item memcpy doesn't force a full pre-work pass.
+The coordinator checks abort before materializing each 2,048-item batch and
+while sorting, merging, ranking, building membership, and copying cache data.
+Thus, a filter change does not wait for an O(pool-size) snapshot or obsolete
+finalization.  If counting-sort scratch allocation fails, an allocationless
+heapsort fallback retains the same total order and the same abort checks.
+
+** Persistent worker pool
+
+=fzf-native-async-start= starts only the producer, reader, and scoring
+coordinator.  The first scoring request lazily creates one process-wide worker
+pool.  The pool uses at most 64 online CPUs.  All sessions submit work through
+this pool, so opening another source does not allocate another CPU-sized set of
+threads or slabs.
+
+Each worker waits for a new job epoch on =job_cond=.  It owns one matcher slab
+and reuses that slab for all request rounds.
+
+The coordinator materializes at most 64 batches (about 2 MiB) before it joins a
+FIFO of shared jobs.  Without contention, workers claim those batches through
+the atomic =remaining= counter and drain the window in one epoch.  The
+coordinator then compacts matches and prepares the next window.  When another
+session queues, active workers finish at most their current batch; if work
+remains, that scorer rejoins the FIFO tail.  A small request therefore waits
+for neither an O(pool-size) input copy nor the complete multi-million-candidate
+scan ahead of it.
+
+The logical progress total is fixed before the first window.  After a worker
+completes a batch, it advances progress by the selected candidate count; safe
+cache evidence advances it by candidates the cache already eliminated.  The
+completed count therefore reaches the fixed total without a per-window
+100-percent sawtooth.
+
+The last worker signals =done_cond=.  Under contention the scorer rotates an
+unfinished job; otherwise it compacts, ranks, caches, and publishes the
+completed result.
+
+** Candidate-growth retry
+
+The reader ignores growth notifications before the first request.  After that
+request, one atomic flag coalesces candidate appends.
+
+The scorer clears the flag when an attempt takes the newest visible pool
+boundary.  A later append sets the flag again.
+
+A growth retry keeps the current request ID.  It can reuse exact cached
+membership and scan the candidate delta.
+
+The request state is =queued= or =running= during the retry.  The prior
+completed list remains available and has an older pool generation.
 
 ** Filter-only mode
 
@@ -400,8 +470,8 @@ Elisp-exposed =fzf-native-filter-only-p= predicate, so callers never
 re-derive the rule.
 
 In filter-only the per-candidate work swaps =fzf_get_score= (full
-fuzzy-DP, ~500 ns per candidate) for =fzf_has_match= (boolean
-match-only check from =fzf-additions.c=, ~100 ns per candidate).  The
+fuzzy-DP) for =fzf_has_match= (a boolean match-only check from
+=fzf-additions.c=).  The
 candidate cap at the display layer (=fzfa-max-candidates=,
 default 10 000) is then re-scored with =fzf_get_score= and
 counting-sorted so the user still sees results ordered by score — but
@@ -416,14 +486,16 @@ In one pass through the same worker pipeline:
                               compacted into batches, pool order
                               preserved within each batch
   scoring thread
-    flatten + skip sort   ──► flat[0..499 999], pool order
-    emit = min(limit, n)  ──► first 10,000 in pool order
+    matched_total         ──► 500,000
+    retain first K        ──► flat[0..9 999], pool order
+    membership builder    ──► complete only if all indexes fit its cap;
+                              otherwise discard the partial evidence
     re-score those 10 K
       fzf_get_score each  ──► flat[0..9 999] now has real scores
     counting_sort_scored  ──► flat[0..9 999] descending by score
   publish + cache
     score_results = flat[0..9 999]  (top-K, score-ranked)
-    m_idx_buf      = all 500 K matched indices (exhaustive)
+    m_idx_buf      = all 500 K indexes, or absent if over budget
 #+end_src
 
 What the user sees:
@@ -435,23 +507,21 @@ What the user sees:
   on the visually-top entries.
 
 What refinement gets:
-- =m_idx_buf= contains *all 500 K* matched candidate indices —
-  identical to what full-scoring mode would have cached.  The next
-  keystroke's prefix-refinement scans only those 500 K, not the full
-  pool.  Set membership is unchanged across the threshold; only
-  display ordering differs.
+- If all 500 K indexes fit half of =fzf-native-async-cache-bytes=,
+  =m_idx_buf= is complete and the next safe refinement scans those indexes.
+- If they do not fit, the partial builder is discarded.  The next query uses
+  stable-batch evidence where available or safely scans the selected pool
+  boundary.  An incomplete prefix is never treated as membership authority.
 
-Cost comparison for a 1 M pool with ~50 % hit rate (parallel, 8 cores):
-
-| Stage              | Full scoring          | Filter-only           |
-|--------------------+-----------------------+-----------------------|
-| Per-candidate scan | ~500 ns × 1 M  ≈ 60 ms| ~100 ns × 1 M  ≈ 12 ms|
-| Re-score emit win  | (sort only) ~1 ms     | 500 ns × 10 K  ≈ 5 ms |
-| Total              | ~60 ms                | ~17 ms                |
-
-At 60 M pool the gap widens: full scoring ~4 s parallel, filter-only
-~700 ms parallel + 5 ms re-score.  The big-pool win is the per-pass
-cost, not the (constant-bound) re-score step.
+One bounded-memory regression measurement on 2026-08-28 used Emacs 30.2 on an
+8-core Apple M3 MacBook Air with 16 GiB RAM.  The producer emitted 10,000,000
+identical nine-byte candidates; the query was =a=, limit was 100, and both
+caches and highlighting were disabled.  Full mode completed its scoring pass
+in 127 ms with about 7 MiB additional peak RSS; filter-only completed in 127 ms
+with about 3 MiB additional peak RSS.  The already-ingested candidate arena
+(about 219 MiB in this run) is excluded from those deltas.  This is a memory
+regression fixture, not a general speed claim: query shape, candidate length,
+match density, hardware, and result limit all change latency.
 
 Tunable knobs:
 - =fzf-native-filter-only-min-pool= (nil/0 disables; 1 always-on for
@@ -509,38 +579,46 @@ same-filter polls are a no-op against the running computation.
 
 ** The generation counter
 
-=s->gen= is an atomic int. The scoring thread =atomic_fetch_add= bumps
-it after every publish to =score_results=. Callers poll
-=fzf-native-async-generation= and compare to the last value they saw.
-A change ⇒ "new data ready, time to re-display."
+=s->gen= is an atomic compatibility counter.  The reader increments it after
+candidate input arrives.  The scorer increments it after a result publication.
+Callers can poll =fzf-native-async-generation= to detect either change.
 
-This is the only "push" signal from C to Elisp. Stats and candidates
-are still pulled.
+The request API does not use this counter for result ownership.  It uses a
+monotonic request ID, a pool boundary, and a snapshot generation.
 
-(There is also =s->count=, the reader's "candidates seen" counter,
-which serves as the "has any data arrived yet" signal but is not the
-cross-thread publish signal.)
+This mixed counter remains for compatibility.
 
 ** Result cache
 
 A per-session LRU cache sits between the dispatch path and the scoring
-thread. Configured via the =fzfa-cache-size= defcustom (read
-once at session start; default 40 entries).
+thread.  Configure its entry and byte limits with
+=fzf-native-async-cache-size= and =fzf-native-async-cache-bytes=.  The byte
+budget includes the full matched-index set, so dense queries cannot multiply
+memory by the entry-count limit.  Higher-level
+callers can bridge their own setting.  The module reads the value once at
+session start.  The default is 40 entries.
 
 *Data model*:
 
 #+begin_src
   CacheEntry {
     query     : strdup'd filter string             ← owned
+    case_mode : matching case semantics
+    fuzzy     : fuzzy or exact matching semantics
+    filter_only : ranking mode for top[K]
     pool_gen  : s->count at time of scoring
     top[K]    : copy of top-K results published    ← owned
+    matched_count : full number of matches
     m_idx     : SharedIdx*, refcounted             ← shared
     parsed    : fzf_pattern_t* (parsed query)      ← owned
+    bytes     : total retained bytes for this entry
   }
 
   Cache {
     head, tail : doubly-linked list (MRU at head)
     count, max
+    used_bytes, max_bytes
+    evictions
     mu         : mutex
   }
 #+end_src
@@ -549,23 +627,33 @@ once at session start; default 40 entries).
 holding the *full set* of matched candidate indices for one scoring
 run (not just the top-K). Lookup consumers retain in O(1) under the
 cache mutex (atomic refcount bump — no memcpy); the last consumer
-frees it.
+frees it.  Membership evidence is optional and is built only when it fits in
+half of the configured whole-result cache budget.  Dense results therefore do
+not create an unbounded temporary index that the cache would immediately
+reject.
 
-*Dispatch flow* (=fzf_native_async_candidates=, main thread):
+*Dispatch flow* (=async_submit_request=, main thread):
 
-| Lookup result        | Display              | Scoring scheduled                 |
-|----------------------+----------------------+-----------------------------------|
-| Exact, pool_gen==now | Cached top-K         | None (no work)                    |
-| Exact, pool_gen<now  | Cached top-K         | Refine on m_idx + delta           |
-| Prefix hit           | Prefix's top-K       | Refine on prefix m_idx + delta    |
-| Miss                 | Current score_results | Full pool scoring                 |
+| Lookup result                 | Public result             | Scoring scheduled              |
+|-------------------------------+---------------------------+--------------------------------|
+| Exact, fresh, enough capacity | Publish cached top-K      | None                           |
+| Exact, stale or too small     | Keep last completed result | Refine on m_idx and delta      |
+| Prefix hit                    | Keep last completed result | Refine on prefix m_idx and delta |
+| Miss                          | Keep last completed result | Full pool scoring              |
+
+=fzf-native-async-submit= returns the request ID without building an Emacs
+candidate list.  =fzf-native-async-snapshot= returns the last completed list
+and identifies its request ID.  While that request runs, the snapshot also
+reports completed-batch candidate count and total scan count.  The
+compatibility function performs both operations in one call.
 
 *Subsumption rule* (cache_lookup_prefix). Q' subsumes Q if either
 holds:
 
-- *Byte-prefix* — Q' is a literal byte-prefix of Q and neither
-  contains =|=. Captures: extending a term, adding AND terms at the
-  end, adding negations/anchors at the end.
+- *Simple positive byte-prefix* — Q' is one operator-free positive term and is
+  a byte-prefix of Q.  This captures term extension and later AND terms.  An
+  operator-bearing source must use parsed-term proof because inverse extension
+  can broaden a match set.
 - *Term-set* — both queries parse to non-OR patterns (no term-set
   with >1 term) and every term-set in Q' has an equivalent term-set
   in Q. Captures: adding an AND term in non-prefix position
@@ -599,16 +687,55 @@ alternatives); across term-sets = AND. So =foo bar= parses as 2 sets
 (OR-of-two). The cache rejects any term-set with >1 term as an OR
 query.
 
+** Stable-batch membership cache
+
+The whole-result cache records evidence only after a request finishes.  The
+stable-batch cache records safe membership after each complete immutable batch.
+Therefore, a query cancellation does not discard evidence from batches that
+already finished.
+
+Each key contains the canonical query semantics and a stable batch ID.  A
+lookup can use an exact query or a safe narrower-query ancestor.  OR queries do
+not use ancestor reuse.
+
+The value is a sparse list when at most 128 of the 2,048 candidates match.  It
+is a bitmap through 50-percent selectivity.  Denser results do not enter the
+cache.  The mutable final partial batch never enters the cache.
+
+The cache uses a byte-budgeted LRU.  Configure the budget with
+=fzf-native-async-batch-cache-bytes=.  The default is 64 MiB per session.  A
+value of 0 disables the cache.
+
+Snapshots expose entry, byte, hit, miss, and eviction counters.  These counters
+make narrowing reuse measurable in module-boundary tests.
+
+** Producer and matcher failures
+
+The reader owns producer exit collection unless teardown claims it first.  This
+single-owner rule prevents two threads from waiting for the same PID.  Signal
+rights are separate: teardown can stop the producer process group even after
+the reader owns =waitpid=.  A snapshot reports =:producer-state=,
+=:producer-exit-status=, and =:producer-error=, and terminal producer state
+increments the public snapshot generation.
+
+A matcher allocation failure marks only its request as =failed= and supplies
+=:error=.  It does not replace or clear the prior completed result.  Successful
+requests still use the normal atomic ownership check before publication.
+
 ** Memory and string ownership
 
 | Object                  | Owner                            | Lifetime                                       |
 |-------------------------+----------------------------------+------------------------------------------------|
 | Candidate strings       | =s->arena=                       | Whole session — freed once at stop             |
-| =s->cands[]= (pointers) | =s->mu=-protected                | Reallocated as it grows; freed at stop         |
+| =s->cands_top= blocks   | =s->mu=-protected                | Published once; freed at stop                  |
 | =score_results[]=       | =score_res_mu=                   | Replaced on each publish; final free at stop   |
+| Input batch window      | Scoring coordinator              | At most 64 × 2,048 candidates; reused for each window |
+| Ranked result arrays    | Scoring coordinator, then =score_res_mu= | Positive limit: O(K) running top-K plus one bounded window; zero limit: grows with every requested match |
+| Membership builder      | Scoring coordinator / result cache      | Complete producer-order indexes up to half the whole-cache byte budget; discarded atomically on overflow |
 | =score_req_filter=      | =score_req_mu= owns the slot     | =strdup='d when stolen by scorer; freed before next steal |
 | =score_current_filter=  | Scoring thread owns; main thread reads under req mu | Cleared on every scoring exit path |
-| =fzf_pattern_t=         | Scoring thread                   | Parsed once per request, freed after workers join |
+| =fzf_pattern_t=         | Scoring thread                   | Parsed once per request, freed after the pool rendezvous |
+| Worker slabs            | Process-wide worker pool         | Created lazily with the pool and reused for the process lifetime |
 
 The arena is the key invariant: every char* exposed in =s->cands= or
 =score_results= points into arena memory and is valid until the
@@ -616,17 +743,16 @@ The arena is the key invariant: every char* exposed in =s->cands= or
 
 ** Stop / cleanup — =fzf_native_async_stop=
 
-1. =score_abort = true= and =score_req_stop = true=, signal cond.
-2. =pthread_join(score_thread)=. Workers (if any) abort within 256
-   items.
-3. =s->stop = true=. =pthread_join(reader_thread)=. Reader exits when
-   it next checks =stop= or hits EOF.
-4. =arena_free(&s->arena)= — frees all candidate strings in O(chunks).
-5. Free =s->cands=, =score_results=, mutexes, condvar, the session.
+1. Set =score_abort=, =score_req_stop=, and =stop=.  Then signal the scorer.
+2. Stop the producer so that the reader gets EOF.
+3. Join the scorer after the active worker epoch stops.
+4. Join the reader before destruction of =score_req_mu= and =score_req_cond=.
+5. Free the cache, candidate arena, result data, locks, and session.  The
+   process-wide worker pool remains available to other sessions.
 
 ESC in the minibuffer triggers this path. The two parallelizing
 optimizations — abort-every-256 in workers, arena teardown — are what
-make ESC feel responsive at 60 M candidates.
+keep cancellation latency bounded on very large candidate pools.
 
 * Async behavior reference (canonical input → output)
 
@@ -640,14 +766,15 @@ make ESC feel responsive at 60 M candidates.
 
 | Input                                                  | Output                  | Side effect                          |
 |--------------------------------------------------------+-------------------------+--------------------------------------|
-| =query == score_current_filter= (scorer running)       | Stale =score_results=   | Filter re-queued; abort *not* set    |
-| =query == score_current_filter= (scorer idle, just published) | Latest =score_results= | New scoring run starts (re-validates against any new candidates) |
+| =query == latest running or queued request=            | Stale =score_results=   | Reuse the existing request ID        |
+| =query == latest completed request=, pool unchanged    | Latest =score_results=  | Publish an exact cache hit            |
+| =query == latest completed request=, pool grew         | Latest =score_results=  | Queue refinement for the candidate delta |
 
 ** Filter changes mid-scoring
 
 | Stage scoring is in             | Effect of filter change                        |
 |---------------------------------+------------------------------------------------|
-| Building snapshot (memcpy loop) | =abort= seen every 64 K items → exit, restart  |
+| Building batch inputs           | =abort= checked at each batch → exit, restart  |
 | Workers running                 | =abort= seen every 256 items inside batch → workers exit, scoring thread sees =abort=, discards, restarts |
 | Just published                  | =score_results= still valid; next dispatch picks up the new filter |
 
@@ -657,13 +784,14 @@ make ESC feel responsive at 60 M candidates.
 |----------------------------------------------+----------|
 | Session start                                | 0        |
 | Scoring thread publishes new =score_results= | += 1     |
-| Reader appends candidates                    | unchanged (gen tracks scoring publishes, not reads) |
+| Reader appends candidates                    | += 1     |
 
 * Concurrency model — quick reference (async path)
 
 | Invariant                                                           | Why it holds                          |
 |---------------------------------------------------------------------+---------------------------------------|
-| Main thread never calls =pthread_join= during a candidates dispatch.| All joins happen on the scoring thread. |
+| Query submission creates no producer process or per-session worker thread. | The session creates its producer at start; the first scoring request lazily creates one process-wide worker pool. |
+| The main thread never calls =pthread_join= during query submission.         | A detached teardown thread performs session joins. |
 | =strtok= is never called concurrently.                              | Pattern is parsed once per scoring run on the scoring thread; workers receive a =fzf_pattern_t *= and only read it. |
 | Candidate strings outlive every reference in =score_results= and returned Emacs lists. | Strings live in the arena; arena is freed only after =async_session_destroy= and after Emacs has copied the strings into its own =make_string= results. |
 | =score_abort= is observed promptly by workers.                      | Atomic load (=memory_order_relaxed= is sufficient — abort doesn't synchronize other data) every 256 items inside the batch loop. |
