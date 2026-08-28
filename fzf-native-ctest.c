@@ -88,19 +88,7 @@ static void test_async_snapshot_staleness_covers_pool_growth(void) {
   CHECK(!async_snapshot_is_stale(7, 7, 0, 0, true));
 }
 
-static void test_batch_worker_stops_on_any_shared_failure(void) {
-  struct Shared embedded = {
-    .pattern = NULL,
-    .batches = NULL,
-    .remaining = 0,
-    .filter_only = false,
-    .allocation_failed = false,
-    .embedded_nul = false,
-  };
-  CHECK(!shared_worker_should_stop(&embedded));
-  shared_set_embedded_nul(&embedded);
-  CHECK(shared_worker_should_stop(&embedded));
-
+static void test_batch_worker_stops_on_shared_allocation_failure(void) {
   struct Shared allocation = {
     .pattern = NULL,
     .batches = NULL,
@@ -109,6 +97,11 @@ static void test_batch_worker_stops_on_any_shared_failure(void) {
     .allocation_failed = false,
     .embedded_nul = false,
   };
+  CHECK(!shared_worker_should_stop(&allocation));
+  shared_set_embedded_nul(&allocation);
+  CHECK(shared_embedded_nul(&allocation));
+  /* Invalid input is reported after join, but must not restore the ordinary
+     per-candidate cross-worker load that regressed ASCII scoring. */
   CHECK(!shared_worker_should_stop(&allocation));
   shared_set_allocation_failed(&allocation);
   CHECK(shared_worker_should_stop(&allocation));
@@ -368,16 +361,17 @@ static void test_status_metadata_does_not_copy_results(void) {
   s.score_count = 10000000;
   /* Deliberately no score_results allocation: metadata-only copying must
      retain the count without touching or allocating the candidate array. */
-  size_t count = 0, limit = 0, pool_gen = 0;
+  size_t count = 0, limit = 0;
   size_t progress_completed = 0, progress_total = 0;
   size_t filtered = 0, total = 0;
-  uint64_t request_id = 0, snapshot_generation = 0, error_id = 0;
+  uint64_t snapshot_generation = 0, error_id = 0;
+  AsyncResultObservation result_observation = {0};
   char *filter = NULL, *error = NULL;
   fzf_case_types case_mode = CaseSmart;
   bool fuzzy = false, filter_only = false, allocation_failed = false;
   ScoredStr *copy = async_copy_public_result(
-      &s, false, &count, &request_id, &filter, &limit, &case_mode,
-      &fuzzy, &filter_only, &pool_gen, &snapshot_generation,
+      &s, false, &count, &result_observation, &filter, &limit, &case_mode,
+      &fuzzy, &filter_only, &snapshot_generation,
       &progress_completed, &progress_total, &error_id, &error,
       &filtered, &total, &allocation_failed);
   CHECK(copy == NULL);
@@ -386,6 +380,61 @@ static void test_status_metadata_does_not_copy_results(void) {
   free(filter);
   free(error);
   pthread_mutex_destroy(&s.score_res_mu);
+}
+
+static void test_snapshot_capture_uses_live_pool_boundary(void) {
+  AsyncSession s = {0};
+  pthread_mutex_init(&s.mu, NULL);
+  pthread_mutex_init(&s.score_res_mu, NULL);
+  s.count = 2;
+  s.score_result_id = 7;
+  s.score_result_pool_gen = 1;
+  atomic_store_explicit(&s.reader_done, true, memory_order_release);
+
+  size_t count = 0, limit = 0;
+  size_t completed = 0, progress_total = 0, filtered = 0, source_total = 0;
+  uint64_t generation = 0, error_id = 0;
+  AsyncResultObservation result_observation = {0};
+  char *filter = NULL, *error = NULL;
+  fzf_case_types case_mode = CaseSmart;
+  bool fuzzy = false, filter_only = false, allocation_failed = false;
+  ScoredStr *copy = async_copy_public_result(
+      &s, false, &count, &result_observation, &filter, &limit, &case_mode,
+      &fuzzy, &filter_only, &generation,
+      &completed, &progress_total, &error_id, &error,
+      &filtered, &source_total, &allocation_failed);
+  AsyncSnapshotState state = async_capture_snapshot_state(
+      &s, 7, result_observation);
+
+  CHECK(copy == NULL);
+  CHECK(!allocation_failed);
+  CHECK(state.result.request_id == 7);
+  CHECK(state.result.pool_generation == 1);
+  CHECK(state.pool.count == 2);
+  CHECK(state.pool.reader_done);
+  CHECK(state.stale);
+  free(filter);
+  free(error);
+
+  s.score_result_pool_gen = 2;
+  filter = NULL;
+  error = NULL;
+  allocation_failed = false;
+  copy = async_copy_public_result(
+      &s, false, &count, &result_observation, &filter, &limit, &case_mode,
+      &fuzzy, &filter_only, &generation,
+      &completed, &progress_total, &error_id, &error,
+      &filtered, &source_total, &allocation_failed);
+  state = async_capture_snapshot_state(&s, 7, result_observation);
+  CHECK(copy == NULL);
+  CHECK(!allocation_failed);
+  CHECK(state.result.pool_generation == 2);
+  CHECK(!state.stale);
+  free(filter);
+  free(error);
+
+  pthread_mutex_destroy(&s.score_res_mu);
+  pthread_mutex_destroy(&s.mu);
 }
 
 static void test_snapshot_copy_oom_is_not_authoritative_empty(void) {
@@ -399,25 +448,97 @@ static void test_snapshot_copy_oom_is_not_authoritative_empty(void) {
   s.last_filtered = 1;
   s.last_total = 1;
 
-  size_t count = 0, limit = 0, pool_gen = 0;
+  size_t count = 0, limit = 0;
   size_t completed = 0, total = 0, filtered = 0, source_total = 0;
-  uint64_t request_id = 0, generation = 0, error_id = 0;
+  uint64_t generation = 0, error_id = 0;
+  AsyncResultObservation result_observation = {0};
   char *filter = NULL, *error = NULL;
   fzf_case_types case_mode = CaseSmart;
   bool fuzzy = false, filter_only = false, allocation_failed = false;
   atomic_store_explicit(&async_test_fail_result_copy_allocation, true,
                         memory_order_release);
   ScoredStr *copy = async_copy_public_result(
-      &s, true, &count, &request_id, &filter, &limit, &case_mode,
-      &fuzzy, &filter_only, &pool_gen, &generation,
+      &s, true, &count, &result_observation, &filter, &limit, &case_mode,
+      &fuzzy, &filter_only, &generation,
       &completed, &total, &error_id, &error,
       &filtered, &source_total, &allocation_failed);
 
   CHECK(copy == NULL);
   CHECK(allocation_failed);
   CHECK(count == 0);
-  CHECK(request_id == 9);
+  CHECK(result_observation.request_id == 9);
   CHECK(filtered == 1 && source_total == 1);
+  free(filter);
+  free(error);
+  pthread_mutex_destroy(&s.score_res_mu);
+}
+
+static void test_snapshot_copy_owns_candidate_strings(void) {
+  AsyncSession s = {0};
+  pthread_mutex_init(&s.score_res_mu, NULL);
+  char source[] = "alpha";
+  ScoredStr result = {.str = source, .score = 10, .idx = 3};
+  s.score_results = &result;
+  s.score_count = 1;
+
+  size_t count = 0, limit = 0;
+  size_t completed = 0, total = 0, filtered = 0, source_total = 0;
+  uint64_t generation = 0, error_id = 0;
+  AsyncResultObservation result_observation = {0};
+  char *filter = NULL, *error = NULL;
+  fzf_case_types case_mode = CaseSmart;
+  bool fuzzy = false, filter_only = false, allocation_failed = false;
+  ScoredStr *copy = async_copy_public_result(
+      &s, true, &count, &result_observation, &filter, &limit, &case_mode,
+      &fuzzy, &filter_only, &generation,
+      &completed, &total, &error_id, &error,
+      &filtered, &source_total, &allocation_failed);
+
+  CHECK(copy != NULL);
+  CHECK(count == 1);
+  CHECK(!allocation_failed);
+  if (copy) {
+    CHECK(copy[0].str != source);
+    source[0] = 'z';
+    CHECK(strcmp(copy[0].str, "alpha") == 0);
+    CHECK(copy[0].score == 10);
+    CHECK(copy[0].idx == 3);
+  }
+  async_free_public_result(copy, count);
+  free(filter);
+  free(error);
+  pthread_mutex_destroy(&s.score_res_mu);
+}
+
+static void test_snapshot_string_copy_oom_is_not_authoritative_empty(void) {
+  AsyncSession s = {0};
+  pthread_mutex_init(&s.score_res_mu, NULL);
+  ScoredStr result = {.str = "alpha", .score = 10, .idx = 0};
+  s.score_results = &result;
+  s.score_count = 1;
+
+  size_t count = 0, limit = 0;
+  size_t completed = 0, total = 0, filtered = 0, source_total = 0;
+  uint64_t generation = 0, error_id = 0;
+  AsyncResultObservation result_observation = {0};
+  char *filter = NULL, *error = NULL;
+  fzf_case_types case_mode = CaseSmart;
+  bool fuzzy = false, filter_only = false, allocation_failed = false;
+  size_t next_copy = atomic_load_explicit(
+      &ctest_strdup_calls, memory_order_relaxed) + 1;
+  atomic_store_explicit(&ctest_strdup_fail_at, next_copy,
+                        memory_order_relaxed);
+  ScoredStr *copy = async_copy_public_result(
+      &s, true, &count, &result_observation, &filter, &limit, &case_mode,
+      &fuzzy, &filter_only, &generation,
+      &completed, &total, &error_id, &error,
+      &filtered, &source_total, &allocation_failed);
+  atomic_store_explicit(&ctest_strdup_fail_at, 0, memory_order_relaxed);
+
+  CHECK(copy == NULL);
+  CHECK(count == 0);
+  CHECK(allocation_failed);
+  async_free_public_result(copy, count);
   free(filter);
   free(error);
   pthread_mutex_destroy(&s.score_res_mu);
@@ -888,6 +1009,33 @@ static void test_async_reader_ansi_stripping(void) {
   CHECK(s->count == 2);
   CHECK(strcmp(cands_at(s, 0), "file.txt") == 0);
   CHECK(strcmp(cands_at(s, 1), "plain.c")  == 0);
+  free_async_session(s);
+}
+
+static void test_async_reader_preserves_empty_records(void) {
+  static const char output[] =
+      "\nalpha\n\n\r\n\x1b[31m\x1b[0m\nomega\n\n";
+  int pfd[2];
+  CHECK(pipe(pfd) == 0);
+  CHECK(write(pfd[1], output, sizeof output - 1) ==
+        (ssize_t)(sizeof output - 1));
+  close(pfd[1]);
+
+  FILE *rfp = fdopen(pfd[0], "r");
+  CHECK(rfp != NULL);
+  AsyncSession *s = make_async_session(rfp, 8);
+  CHECK(s != NULL);
+
+  async_reader((void *)s);
+
+  static const char *expected[] = {
+      "", "alpha", "", "", "", "omega", "",
+  };
+  CHECK(s->count == sizeof expected / sizeof expected[0]);
+  for (size_t i = 0; i < sizeof expected / sizeof expected[0]; i++) {
+    CHECK(cands_at(s, i) != NULL);
+    CHECK(strcmp(cands_at(s, i), expected[i]) == 0);
+  }
   free_async_session(s);
 }
 
@@ -3029,6 +3177,7 @@ int main(void) {
   RUN(test_async_reader_coalesces_growth_after_request);
   RUN(test_async_reader_publishes_terminal_generation);
   RUN(test_async_reader_ansi_stripping);
+  RUN(test_async_reader_preserves_empty_records);
   RUN(test_async_reader_many_lines);
   RUN(test_async_reader_long_line);
   RUN(test_async_reader_final_unterminated_line);
@@ -3082,13 +3231,16 @@ int main(void) {
   printf("--- interactive request identity ---\n");
   RUN(test_session_abi_is_versioned);
   RUN(test_async_snapshot_staleness_covers_pool_growth);
-  RUN(test_batch_worker_stops_on_any_shared_failure);
+  RUN(test_batch_worker_stops_on_shared_allocation_failure);
   RUN(test_copy_emacs_string_fallback_is_bounded);
   RUN(test_lossless_string_conversion_preserves_runtime_errors);
   RUN(test_startup_posix_errors_are_descriptive);
   RUN(test_async_start_publishes_inert_handle_before_resources);
   RUN(test_status_metadata_does_not_copy_results);
+  RUN(test_snapshot_capture_uses_live_pool_boundary);
   RUN(test_snapshot_copy_oom_is_not_authoritative_empty);
+  RUN(test_snapshot_copy_owns_candidate_strings);
+  RUN(test_snapshot_string_copy_oom_is_not_authoritative_empty);
   RUN(test_growth_retry_query_oom_is_terminal);
   RUN(test_async_request_state_precedence);
   RUN(test_async_batch_window_bounds_preparation_memory);

@@ -530,7 +530,7 @@ static void shared_set_embedded_nul(struct Shared *shared) {
 }
 
 static bool shared_worker_should_stop(struct Shared *shared) {
-  return shared_allocation_failed(shared) || shared_embedded_nul(shared);
+  return shared_allocation_failed(shared);
 }
 
 // Most of the threading lifted from https://github.com/axelf4/hotfuzz
@@ -559,14 +559,26 @@ static void *worker_routine(void *ptr) {
 #endif
     struct Batch *batch = shared->batches + batch_idx;
     unsigned n = 0;
+    bool invalid_candidate = false;
+
+    /* A peer OOM is terminal.  Check once per immutable batch so the
+       exceptional cross-worker stop does not add an atomic load and branch
+       to every ordinary candidate.  The worker that observes its own OOM
+       still stops immediately below; peers finish at most one 2048-row
+       batch before seeing the shared failure. */
+    if (shared_worker_should_stop(shared))
+      break;
 
     if (pattern) {
       for (unsigned i = 0; i < batch->len; ++i) {
-        if (shared_worker_should_stop(shared))
-          break;
         struct Candidate x = batch->xs[i];
+        /* Validate candidate bytes on the worker that already owns this
+           batch.  NUL is an invalid-input exception: publish it with a
+           write-only relaxed flag and stop only this worker.  Other workers
+           may finish, but ordinary candidates pay no shared-state read. */
         if (str_has_embedded_nul(x.s)) {
           shared_set_embedded_nul(shared);
+          invalid_candidate = true;
           break;
         }
         /* You can get the score/position for as many items as you want */
@@ -586,6 +598,8 @@ static void *worker_routine(void *ptr) {
       }
     }
     batch->len = n;
+    if (invalid_candidate)
+      break;
   }
 
   // Free one-time use slab.
@@ -945,7 +959,6 @@ emacs_value fzf_native_score_all(emacs_env *env,
        occupy a batch slot. In practice this is rarely reached on
        Emacs 30+: the coercion path accepts almost any input. */
     if (!s.b) continue;
-
     if (!batches || (batches[batch_idx].len >= BATCH_SIZE && ++batch_idx >= capacity)) {
       capacity = batches ? 2 * capacity : 1;
       struct Batch *new_batches;
@@ -2855,6 +2868,17 @@ typedef struct {
   bool reader_done;
 } AsyncPoolObservation;
 
+typedef struct {
+  uint64_t request_id;
+  size_t pool_generation;
+} AsyncResultObservation;
+
+typedef struct {
+  AsyncResultObservation result;
+  AsyncPoolObservation pool;
+  bool stale;
+} AsyncSnapshotState;
+
 #ifdef FZF_NATIVE_CTEST
 /* Deterministic seam for the pool-observation ordering regression.  The test
    wakes a simulated reader after COUNT is sampled but before READER_DONE is
@@ -3170,10 +3194,7 @@ static bool async_process_candidate_line(AsyncSession *s, char *line,
   }
 
   while (len && line[len - 1] == '\r') line[--len] = '\0';
-  if (!len) return true;
-
   len = async_strip_ansi(line, len);
-  if (!len) return true;
 
   ptrdiff_t mll = s->max_line_length;
   if (mll != 0) {
@@ -5746,12 +5767,19 @@ static uint64_t async_submit_request(emacs_env *env, AsyncSession *s,
 static _Atomic bool async_test_fail_result_copy_allocation;
 #endif
 
+static void async_free_public_result(ScoredStr *result, size_t count) {
+  if (!result) return;
+  for (size_t i = 0; i < count; i++)
+    free(result[i].str);
+  free(result);
+}
+
 static ScoredStr *async_copy_public_result(
     AsyncSession *s, bool copy_candidates,
-    size_t *out_count, uint64_t *out_request_id,
+    size_t *out_count, AsyncResultObservation *out_result,
     char **out_filter, size_t *out_limit,
     fzf_case_types *out_case_mode, bool *out_fuzzy,
-    bool *out_filter_only, size_t *out_pool_gen,
+    bool *out_filter_only,
     uint64_t *out_snapshot_generation,
     size_t *out_progress_completed, size_t *out_progress_total,
     uint64_t *out_error_id, char **out_error,
@@ -5769,14 +5797,25 @@ static ScoredStr *async_copy_public_result(
         memory_order_acq_rel);
 #endif
     if (!force_failure && count <= SIZE_MAX / sizeof *copy)
-      copy = malloc(count * sizeof *copy);
-    if (copy && s->score_results)
-      memcpy(copy, s->score_results, count * sizeof *copy);
-    else {
-      free(copy);
+      copy = calloc(count, sizeof *copy);
+    if (copy && s->score_results) {
+      for (size_t i = 0; i < count; i++) {
+        copy[i].score = s->score_results[i].score;
+        copy[i].idx = s->score_results[i].idx;
+        if (s->score_results[i].str)
+          copy[i].str = strdup(s->score_results[i].str);
+        if (!copy[i].str) {
+          allocation_failed = true;
+          break;
+        }
+      }
+    } else {
+      allocation_failed = true;
+    }
+    if (allocation_failed) {
+      async_free_public_result(copy, count);
       copy = NULL;
       count = 0;
-      allocation_failed = true;
     }
   }
   char *filter = s->score_result_filter
@@ -5784,13 +5823,13 @@ static ScoredStr *async_copy_public_result(
                      : NULL;
   if (s->score_result_filter && !filter) allocation_failed = true;
   *out_count = count;
-  *out_request_id = s->score_result_id;
+  out_result->request_id = s->score_result_id;
+  out_result->pool_generation = s->score_result_pool_gen;
   *out_filter = filter;
   *out_limit = s->score_result_limit;
   *out_case_mode = s->score_result_case_mode;
   *out_fuzzy = s->score_result_fuzzy;
   *out_filter_only = s->score_result_filter_only;
-  *out_pool_gen = s->score_result_pool_gen;
   *out_snapshot_generation = s->score_snapshot_generation;
   *out_progress_completed = s->score_result_progress_completed;
   *out_progress_total = s->score_result_progress_total;
@@ -5872,13 +5911,12 @@ static emacs_value async_build_candidate_list(emacs_env *env,
     hl_scratch_init(&hl_scratch, strlen(filter));
   }
 
-  /* The highlight hook dispatches user Lisp, and Lisp reachable from it
-     (a timer firing inside `sit-for', say) can call
-     `fzf-native-async-stop', which frees the arena SNAP's strings point
-     into -- a use-after-free on the next iteration.  So this runs in
-     two phases: first materialise every Lisp string and position array
-     from the C pointers with no user Lisp in the loop, then run the
-     hook over data teardown cannot invalidate. */
+  /* `async_copy_public_result' deep-copies every SNAP string before this
+     function can dispatch Lisp.  User Lisp reached through `cons', a
+     highlight hook, or an advised primitive may stop the session and free
+     its arena, but the snapshot and pending highlight data remain owned by
+     this call.  Collect highlight positions before invoking the hook so the
+     hook cannot invalidate later position work either. */
   struct pending_hl { char *str; fzf_position_t *pos; emacs_value val; };
   struct pending_hl *pending = NULL;
   size_t pending_count = 0;
@@ -5971,25 +6009,25 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     return Qnil;
   }
 
-  size_t rcount = 0, result_limit = 0, result_pool_gen = 0;
+  size_t rcount = 0, result_limit = 0;
   size_t progress_completed = 0, progress_total = 0;
   size_t filtered = 0, total = 0;
-  uint64_t result_request_id = 0, error_id = 0;
+  uint64_t error_id = 0;
+  AsyncResultObservation result_observation = {0};
   uint64_t snapshot_generation = 0;
   char *result_filter = NULL, *score_error = NULL;
   fzf_case_types result_case_mode = CaseSmart;
   bool result_fuzzy = true, result_filter_only = false;
   bool copy_failed = false;
   ScoredStr *snap = async_copy_public_result(
-      s, true, &rcount, &result_request_id, &result_filter, &result_limit,
+      s, true, &rcount, &result_observation, &result_filter, &result_limit,
       &result_case_mode, &result_fuzzy, &result_filter_only,
-      &result_pool_gen, &snapshot_generation,
+      &snapshot_generation,
       &progress_completed, &progress_total, &error_id, &score_error,
       &filtered, &total, &copy_failed);
-  (void)result_request_id;
+  (void)result_observation;
   (void)result_limit;
   (void)result_filter_only;
-  (void)result_pool_gen;
   (void)snapshot_generation;
   (void)progress_completed;
   (void)progress_total;
@@ -6000,7 +6038,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
   if (copy_failed) {
     free(result_filter);
     free(score_error);
-    free(snap);
+    async_free_public_result(snap, rcount);
     async_signal_error(
         env, "fzf-native: could not copy asynchronous results");
     return Qnil;
@@ -6010,7 +6048,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
       env, snap, rcount, result_filter, result_case_mode, result_fuzzy);
   free(result_filter);
   free(score_error);
-  free(snap);
+  async_free_public_result(snap, rcount);
   return result;
 }
 
@@ -6119,6 +6157,24 @@ static bool async_snapshot_is_stale(uint64_t requested_id,
          (current_pool == 0 && !reader_done);
 }
 
+/* Capture the exact result/pool pair that `async_snapshot_value' serializes.
+   Keeping the named observations together prevents positional scalar wiring
+   from silently substituting the completed result boundary for the live pool
+   boundary.  C tests exercise this same production capture routine. */
+static AsyncSnapshotState async_capture_snapshot_state(
+    AsyncSession *s, uint64_t requested_id,
+    AsyncResultObservation result) {
+  AsyncSnapshotState state = {
+      .result = result,
+      .pool = async_observe_pool(s),
+  };
+  state.stale = async_snapshot_is_stale(
+      requested_id, state.result.request_id,
+      state.result.pool_generation, state.pool.count,
+      state.pool.reader_done);
+  return state;
+}
+
 static emacs_value async_snapshot_value(emacs_env *env, AsyncSession *s,
                                         uint64_t requested_id,
                                         bool include_candidates) {
@@ -6132,36 +6188,41 @@ static emacs_value async_snapshot_value(emacs_env *env, AsyncSession *s,
   uint64_t running_id = s->score_current_id;
   if (requested_id == 0) requested_id = latest_id;
 
-  size_t result_count = 0, result_limit = 0, result_pool_gen = 0;
+  size_t result_count = 0, result_limit = 0;
   size_t progress_completed = 0, progress_total = 0;
   size_t filtered = 0, total = 0;
-  uint64_t result_id = 0, error_id = 0;
+  uint64_t error_id = 0;
+  AsyncResultObservation result_observation = {0};
   uint64_t snapshot_generation = 0;
   char *result_filter = NULL, *score_error = NULL;
   fzf_case_types result_case_mode = CaseSmart;
   bool result_fuzzy = true, result_filter_only = false;
   bool copy_failed = false;
   ScoredStr *result_copy = async_copy_public_result(
-      s, include_candidates, &result_count, &result_id,
+      s, include_candidates, &result_count, &result_observation,
       &result_filter, &result_limit,
       &result_case_mode, &result_fuzzy, &result_filter_only,
-      &result_pool_gen, &snapshot_generation,
+      &snapshot_generation,
       &progress_completed, &progress_total, &error_id, &score_error,
       &filtered, &total, &copy_failed);
   pthread_mutex_unlock(&s->score_req_mu);
 
+  uint64_t result_id = result_observation.request_id;
+
   if (copy_failed) {
     free(result_filter);
     free(score_error);
-    free(result_copy);
+    async_free_public_result(result_copy, result_count);
     async_signal_error(
         env, "fzf-native: could not copy asynchronous snapshot");
     return Qnil;
   }
 
-  AsyncPoolObservation pool = async_observe_pool(s);
-  size_t current_pool = pool.count;
-  bool reader_done = pool.reader_done;
+  AsyncSnapshotState snapshot_state = async_capture_snapshot_state(
+      s, requested_id, result_observation);
+  size_t result_pool_gen = snapshot_state.result.pool_generation;
+  size_t current_pool = snapshot_state.pool.count;
+  bool reader_done = snapshot_state.pool.reader_done;
 
   if (requested_id == running_id) {
     progress_completed = atomic_load_explicit(
@@ -6284,8 +6345,7 @@ static emacs_value async_snapshot_value(emacs_env *env, AsyncSession *s,
      still emit candidates that change the answer.  Mirror the guard in
      `fzf-native-async-result-fresh-p': an empty-pool result is not
      authoritative until the reader has observed EOF (or stop). */
-  bool stale = async_snapshot_is_stale(
-      requested_id, result_id, result_pool_gen, current_pool, reader_done);
+  bool stale = snapshot_state.stale;
   plist = async_plist_put(env, plist, ":stale", stale ? Qt : Qnil);
   plist = async_plist_put(env, plist, ":result-pool-generation",
                           env->make_integer(env,
@@ -6306,7 +6366,7 @@ static emacs_value async_snapshot_value(emacs_env *env, AsyncSession *s,
 
   free(result_filter);
   free(score_error);
-  free(result_copy);
+  async_free_public_result(result_copy, result_count);
   return plist;
 }
 
