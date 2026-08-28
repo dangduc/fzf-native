@@ -1098,6 +1098,53 @@ from the bounded ranked result."
             (should (= (length result) 2))))
       (fzf-native-async-stop handle))))
 
+(ert-deftest fzf-native-async-candidates-rejects-invalid-query-test ()
+  "A bad compatibility query signals before it can reuse stale results."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' alpha beta")))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle)
+                             :reader-done))
+          (let* ((request-id (fzf-native-async-submit handle "a" 10))
+                 (snapshot (fzf-native-test--wait-for-request
+                            handle request-id)))
+            (should (eq (plist-get snapshot :state) 'complete))
+            ;; Omit LIMIT.  This exact shape used to continue after the
+            ;; pending type error and read a zero-byte allocation in strcmp.
+            (should-error (fzf-native-async-candidates handle 42)
+                          :type 'wrong-type-argument)
+            (should (= (plist-get (fzf-native-async-status handle)
+                                  :latest-request-id)
+                       request-id))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-query-apis-reject-embedded-nul-test ()
+  "All asynchronous query APIs reject NUL without changing ownership."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' alpha beta"))
+        (nul-query (concat "a" (string 0) "tail")))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle)
+                             :reader-done))
+          (let* ((request-id (fzf-native-async-submit handle "a" 10))
+                 (snapshot (fzf-native-test--wait-for-request
+                            handle request-id)))
+            (should (eq (plist-get snapshot :state) 'complete))
+            ;; A completed result makes the stale-result failure observable:
+            ;; the compatibility wrapper must signal, not return that result.
+            (should-error (fzf-native-async-candidates handle nul-query 10)
+                          :type 'error)
+            (should-error (fzf-native-async-submit handle nul-query 10)
+                          :type 'error)
+            (should-error (fzf-native-async-result-fresh-p handle nul-query)
+                          :type 'error)
+            (should (= (plist-get (fzf-native-async-status handle)
+                                  :latest-request-id)
+                       request-id))))
+      (fzf-native-async-stop handle))))
+
 (ert-deftest fzf-native-async-stats-test ()
   "Stats return (filtered . total) after scoring."
   (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz foobaz")))

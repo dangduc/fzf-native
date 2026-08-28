@@ -7,6 +7,7 @@
 #include <stdalign.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include "emacs-module.h"
@@ -139,6 +140,23 @@ typedef long ssize_t;
 #define ASYNC_WORKER_LIMIT 64
 #define BATCH_CACHE_BUCKETS 4096
 #define BATCH_CACHE_SPARSE_LIMIT 128
+
+/* Turn the fallible POSIX CPU-count probe into a bounded worker count.
+   WORK_ITEMS == 0 means that no per-call work cap applies (the persistent
+   async pool case).  A zero or negative probe must still run one worker;
+   casting it directly to unsigned can otherwise mean zero workers or a huge
+   allocation. */
+static unsigned fzf_worker_count(long detected_cpus, size_t work_items) {
+  unsigned count = detected_cpus > 0
+                       ? detected_cpus > ASYNC_WORKER_LIMIT
+                             ? ASYNC_WORKER_LIMIT
+                             : (unsigned)detected_cpus
+                       : 1;
+  if (work_items > 0 && work_items < count)
+    count = (unsigned)work_items;
+  return count;
+}
+
 /* Increment when the public interactive-session contract requires matching
    Elisp.  The loader checks this before it marks a bundled module usable. */
 #define FZF_NATIVE_SESSION_ABI 1
@@ -285,6 +303,10 @@ struct Bump {
   char *cursor, *limit, b[];
 };
 
+#ifdef FZF_NATIVE_CTEST
+static _Atomic bool copy_test_fail_bump_allocation;
+#endif
+
 static void bump_free(struct Bump *head) {
   while (head) {
     struct Bump *next = head->next;
@@ -320,8 +342,16 @@ static struct Str copy_valid_emacs_string(emacs_env *env, struct Bump **bump, em
        enough to fit this string plus alignment slack. */
     size_t capacity = *bump ? 2 * (size_t)((*bump)->limit - (*bump)->b) : 2048;
     if (capacity < (size_t) len) capacity = len + alignof(uint64_t) - 1;
-    struct Bump *new;
-    if (!(new = malloc(sizeof *new + capacity))) return (struct Str) { 0 };
+    struct Bump *new = NULL;
+#ifdef FZF_NATIVE_CTEST
+    bool force_allocation_failure = atomic_exchange_explicit(
+        &copy_test_fail_bump_allocation, false, memory_order_acq_rel);
+#else
+    bool force_allocation_failure = false;
+#endif
+    if (force_allocation_failure ||
+        !(new = malloc(sizeof *new + capacity)))
+      return (struct Str) { 0 };
     *new = (struct Bump) { .next = *bump, .cursor = new->b, .limit = new->b + capacity };
     *bump = new;
     buf = new->cursor;
@@ -356,12 +386,12 @@ static struct Str copy_emacs_string(emacs_env *env, struct Bump **bump,
   struct Str s = copy_valid_emacs_string(env, bump, value);
   if (s.b) return s;
 
-  /* copy_string_contents signaled (likely unicode-string-p). Clear the
-     pending non-local exit and try to coerce the string through
-     encode-coding-string, which handles the raw-byte case. */
-  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
-    env->non_local_exit_clear(env);
-  }
+  /* Only a direct-copy signal justifies representation conversion.  A bump
+     allocation failure leaves no pending exit; treating that as an encoding
+     failure used to recurse forever while the allocator kept returning NULL. */
+  if (env->non_local_exit_check(env) == emacs_funcall_exit_return)
+    return (struct Str) { 0 };
+  env->non_local_exit_clear(env);
 
   emacs_value encode_args[] = { value, Qutf_8, Qt };
   emacs_value encoded = env->funcall(env, Fencode_coding_string, 3, encode_args);
@@ -370,7 +400,10 @@ static struct Str copy_emacs_string(emacs_env *env, struct Bump **bump,
     return (struct Str) { 0 };
   }
 
-  s = copy_emacs_string(env, bump, encoded);
+  /* The encoded value is the one and only fallback.  Do not recurse if its
+     copy also fails: a second conversion cannot make progress and can turn a
+     runtime failure into unbounded recursion. */
+  s = copy_valid_emacs_string(env, bump, encoded);
   if (!s.b && env->non_local_exit_check(env) != emacs_funcall_exit_return) {
     env->non_local_exit_clear(env);
   }
@@ -496,6 +529,10 @@ static void shared_set_embedded_nul(struct Shared *shared) {
 #endif
 }
 
+static bool shared_worker_should_stop(struct Shared *shared) {
+  return shared_allocation_failed(shared) || shared_embedded_nul(shared);
+}
+
 // Most of the threading lifted from https://github.com/axelf4/hotfuzz
 static void *worker_routine(void *ptr) {
   fzf_block_all_signals();
@@ -525,7 +562,7 @@ static void *worker_routine(void *ptr) {
 
     if (pattern) {
       for (unsigned i = 0; i < batch->len; ++i) {
-        if (shared_allocation_failed(shared))
+        if (shared_worker_should_stop(shared))
           break;
         struct Candidate x = batch->xs[i];
         if (str_has_embedded_nul(x.s)) {
@@ -965,9 +1002,9 @@ emacs_value fzf_native_score_all(emacs_env *env,
   // Print the shared value.
   /* ssize_t value = atomic_load(&shared.remaining); */
   /* printf("shared Remaining: %zd\n", value); */
-  // Set up max number of workers according to processor.
-  // It's 8 on M1 Macbook.
-  unsigned max_workers = sysconf(_SC_NPROCESSORS_ONLN);
+  // Set up a bounded worker count from the fallible processor probe.
+  unsigned max_workers = fzf_worker_count(
+      sysconf(_SC_NPROCESSORS_ONLN), batch_idx + 1);
 
   if (!(data = malloc(sizeof *data + max_workers * sizeof *data->threads))) {
     fzf_free_pattern(pattern);
@@ -3328,7 +3365,7 @@ static _Atomic uint64_t async_destroy_completions;
 static void async_session_destroy(void *ptr) {
   AsyncSession *s = ptr;
   if (!s) return;
-  fzf_log("async_session_destroy: pid=%d count=%zu\n", (int)s->pid, s->count);
+  fzf_log("async_session_destroy: pid=%d\n", (int)s->pid);
 
   /* Signal everything to stop simultaneously so scoring and reader wind down
      in parallel rather than sequentially. */
@@ -3365,6 +3402,7 @@ static void async_session_destroy(void *ptr) {
      before the request mutex and condition variable are destroyed. */
   if (s->reader_started)
     pthread_join(s->reader, NULL);
+  fzf_log("async_session_destroy: reader joined count=%zu\n", s->count);
 
   free(s->score_results);
   free(s->score_result_filter);
@@ -3423,8 +3461,7 @@ static void *async_destroy_worker(void *arg) {
 static void async_session_destroy_async(void *ptr) {
   AsyncSession *s = ptr;
   if (!s) return;
-  fzf_log("async_session_destroy_async: pid=%d count=%zu\n",
-          (int)s->pid, s->count);
+  fzf_log("async_session_destroy_async: pid=%d\n", (int)s->pid);
 
   atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
   async_worker_pool_wake(atomic_load_explicit(
@@ -3530,22 +3567,28 @@ static void async_signal_spawn_failure(
   async_signal_error(env, message);
 }
 
-static char *async_copy_lisp_c_string(emacs_env *env, emacs_value value,
-                                      const char *what) {
+static bool async_copy_lisp_string(emacs_env *env, emacs_value value,
+                                   const char *what, struct Str *out) {
+  *out = (struct Str){0};
   ptrdiff_t length = 0;
-  if (!env->copy_string_contents(env, value, NULL, &length)) return NULL;
+  if (!env->copy_string_contents(env, value, NULL, &length)) return false;
   if (length <= 0) {
     async_signal_error(env, "fzf-native: invalid string length");
-    return NULL;
+    return false;
   }
   char *copy = malloc((size_t)length);
   if (!copy) {
     async_signal_error(env, "fzf-native: could not allocate a string copy");
-    return NULL;
+    return false;
   }
   if (!env->copy_string_contents(env, value, copy, &length)) {
     free(copy);
-    return NULL;
+    return false;
+  }
+  if (length <= 0) {
+    free(copy);
+    async_signal_error(env, "fzf-native: invalid copied string length");
+    return false;
   }
   /* copy_string_contents reports the trailing C NUL in LENGTH.  Every value
      copied here is subsequently passed to a C/POSIX string API, so an earlier
@@ -3554,9 +3597,17 @@ static char *async_copy_lisp_c_string(emacs_env *env, emacs_value value,
   struct Str copied = {.b = copy, .len = (size_t)length - 1};
   if (reject_embedded_nul(env, copied, what)) {
     free(copy);
-    return NULL;
+    return false;
   }
-  return copy;
+  *out = copied;
+  return true;
+}
+
+static char *async_copy_lisp_c_string(emacs_env *env, emacs_value value,
+                                      const char *what) {
+  struct Str copied;
+  return async_copy_lisp_string(env, value, what, &copied)
+             ? copied.b : NULL;
 }
 
 /* Build an execve environment in the parent.  Only the pointer vector and
@@ -3989,7 +4040,7 @@ fzf_native_async_stop(emacs_env *env, ptrdiff_t nargs,
       env, args[0], async_session_destroy_async,
       "an fzf-native async session handle");
   if (s) {
-    fzf_log("async_stop: pid=%d total=%zu\n", (int)s->pid, s->count);
+    fzf_log("async_stop: pid=%d\n", (int)s->pid);
     env->set_user_ptr(env, args[0], NULL);
     async_session_destroy_async(s);
   }
@@ -4578,8 +4629,7 @@ static struct AsyncWorkerPool *async_global_workers;
 
 static void async_global_worker_pool_init(void) {
   long detected_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-  unsigned count = detected_cpus > 0 ? (unsigned)detected_cpus : 1;
-  if (count > ASYNC_WORKER_LIMIT) count = ASYNC_WORKER_LIMIT;
+  unsigned count = fzf_worker_count(detected_cpus, 0);
   async_global_workers = async_worker_pool_create(count);
 }
 
@@ -5895,29 +5945,31 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
       "an fzf-native async session handle");
   if (!s) return Qnil;
 
-  ptrdiff_t flen = 0;
-  env->copy_string_contents(env, args[1], NULL, &flen);
-  char *filter = malloc((size_t)flen);
-  if (!filter) return Qnil;
-  env->copy_string_contents(env, args[1], filter, &flen);
+  struct Str filter;
+  if (!async_copy_lisp_string(env, args[1], "query", &filter)) return Qnil;
 
   size_t limit = 0;
   if (nargs > 2 && !env->eq(env, args[2], Qnil)) {
     intmax_t extracted = env->extract_integer(env, args[2]);
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
-      free(filter);
+      free(filter.b);
       return Qnil;
     }
     if (extracted < 0) {
-      free(filter);
+      free(filter.b);
       async_signal_not_natnum(env, args[2]);
       return Qnil;
     }
     limit = (size_t)extracted;
   }
 
-  async_submit_request(env, s, filter,
-                       flen > 0 ? (size_t)flen - 1 : 0, limit);
+  uint64_t request_id = async_submit_request(
+      env, s, filter.b, filter.len, limit);
+  if (!request_id) {
+    if (env->non_local_exit_check(env) == emacs_funcall_exit_return)
+      async_signal_error(env, "fzf-native-async-candidates failed");
+    return Qnil;
+  }
 
   size_t rcount = 0, result_limit = 0, result_pool_gen = 0;
   size_t progress_completed = 0, progress_total = 0;
@@ -6262,29 +6314,18 @@ fzf_native_async_submit(emacs_env *env, ptrdiff_t nargs,
     return Qnil;
   }
 
-  ptrdiff_t qlen = 0;
-  /* A failed copy (QUERY not a string, or not encodable) leaves its
-     own signal pending; propagate it. */
-  if (!env->copy_string_contents(env, args[1], NULL, &qlen)) return Qnil;
-  char *query = malloc((size_t)qlen);
-  if (!query) {
-    async_signal_error(env, "fzf-native-async-submit: out of memory");
-    return Qnil;
-  }
-  if (!env->copy_string_contents(env, args[1], query, &qlen)) {
-    free(query);
-    return Qnil;
-  }
+  struct Str query;
+  if (!async_copy_lisp_string(env, args[1], "query", &query)) return Qnil;
 
   size_t limit = 0;
   if (nargs > 2 && !env->eq(env, args[2], Qnil)) {
     intmax_t extracted = env->extract_integer(env, args[2]);
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
-      free(query);
+      free(query.b);
       return Qnil;
     }
     if (extracted < 0) {
-      free(query);
+      free(query.b);
       async_signal_not_natnum(env, args[2]);
       return Qnil;
     }
@@ -6292,7 +6333,7 @@ fzf_native_async_submit(emacs_env *env, ptrdiff_t nargs,
   }
 
   uint64_t request_id = async_submit_request(
-      env, s, query, qlen > 0 ? (size_t)qlen - 1 : 0, limit);
+      env, s, query.b, query.len, limit);
   if (!request_id) {
     if (env->non_local_exit_check(env) == emacs_funcall_exit_return)
       async_signal_error(env, "fzf-native-async-submit failed");
@@ -6391,14 +6432,8 @@ fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
       "an fzf-native async session handle");
   if (!s) return Qnil;
 
-  ptrdiff_t qlen = 0;
-  if (!env->copy_string_contents(env, args[1], NULL, &qlen)) return Qnil;
-  char *query = malloc((size_t)qlen);
-  if (!query) return Qnil;
-  if (!env->copy_string_contents(env, args[1], query, &qlen)) {
-    free(query);
-    return Qnil;
-  }
+  struct Str query;
+  if (!async_copy_lisp_string(env, args[1], "query", &query)) return Qnil;
 
   AsyncPoolObservation pool = async_observe_pool(s);
   size_t cur_pool = pool.count;
@@ -6409,15 +6444,13 @@ fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
   bool fo_logic_and = resolve_filter_only_settings(
       env, &fo_unused_min, &fo_max_len);
   (void)fo_unused_min;
-  size_t query_char_len = qlen > 1
-                              ? utf8_character_count(query, (size_t)qlen - 1)
-                              : 0;
+  size_t query_char_len = utf8_character_count(query.b, query.len);
   bool filter_only = decide_filter_only(
       s->filter_only_min_pool, fo_max_len, fo_logic_and,
       query_char_len, cur_pool);
 
   pthread_mutex_lock(&s->cache.mu);
-  CacheEntry *e = cache_find_locked(&s->cache, query, case_mode, fuzzy);
+  CacheEntry *e = cache_find_locked(&s->cache, query.b, case_mode, fuzzy);
   bool fresh = (e != NULL && e->pool_gen == cur_pool &&
                 e->filter_only == filter_only);
   pthread_mutex_unlock(&s->cache.mu);
@@ -6428,11 +6461,11 @@ fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
   pthread_mutex_lock(&s->score_req_mu);
   bool same_query_in_flight =
       (s->score_req_filter &&
-       strcmp(s->score_req_filter, query) == 0 &&
+       strcmp(s->score_req_filter, query.b) == 0 &&
        s->score_req_case_mode == case_mode &&
        s->score_req_fuzzy == fuzzy) ||
       (s->score_current_filter &&
-       strcmp(s->score_current_filter, query) == 0 &&
+       strcmp(s->score_current_filter, query.b) == 0 &&
        s->score_current_case_mode == case_mode &&
        s->score_current_fuzzy == fuzzy);
   pthread_mutex_unlock(&s->score_req_mu);
@@ -6444,7 +6477,7 @@ fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
     fresh = false;
   }
 
-  free(query);
+  free(query.b);
   return fresh ? Qt : Qnil;
 }
 
