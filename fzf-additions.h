@@ -2,6 +2,11 @@
 #ifndef FZF_ADDITIONS_H_
 #define FZF_ADDITIONS_H_
 
+/* This matcher generation gives fzf_has_match a slab for its Unicode
+   fallback.  Additive callers can retain compatibility with the two-argument
+   baseline by selecting the signature through this feature macro. */
+#define FZF_NATIVE_HAS_MATCH_SLAB 1
+
 #include "fzf.h"
 
 /* See fzf-additions.c.  SLAB is used only for the full-scorer fallback taken

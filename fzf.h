@@ -2,6 +2,11 @@
 #ifndef FZF_H_
 #define FZF_H_
 
+/* Feature contract for additive tooling such as the standalone fuzz layer.
+   Callers may use this to admit arbitrary byte strings only when the matcher
+   defines UTF-8 and malformed-byte behavior. */
+#define FZF_NATIVE_UTF8_MATCHING 1
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
