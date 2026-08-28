@@ -756,22 +756,33 @@ os.write(1, b\"valid\\nab\\x00cd\\nlate\\n\")
 (ert-deftest fzf-native-async-delayed-producer-failure-bumps-generation-test ()
   "A failure after stdout EOF is a new poll-visible session event."
   (skip-unless (fboundp 'fzf-native-async-status))
-  (let ((handle (fzf-native-async-start
-                 "printf '%s\\n' partial; exec 1>&-; sleep 0.3; exit 7")))
+  (let* ((gate-directory
+          (make-temp-file "fzf-native-producer-gate-" t))
+         (gate (expand-file-name "release" gate-directory))
+         handle)
     (unwind-protect
         (progn
+          (setq handle
+                (fzf-native-async-start
+                 (format
+                  (concat "printf '%%s\\n' partial; exec 1>&-; "
+                          "while test ! -e %s; do sleep 0.05; done; exit 7")
+                  (shell-quote-argument gate))))
           (should (fzf-native-test--wait-for-data handle))
           (let* ((before (fzf-native-async-status handle))
                  (before-generation
-                  (plist-get before :snapshot-generation))
-                 (final (fzf-native-test--wait-for-producer handle)))
+                  (plist-get before :snapshot-generation)))
             (should-not (plist-get before :reader-done))
-            (should (eq (plist-get final :producer-state) 'failed))
-            (should (equal (plist-get final :producer-error)
-                           "producer exited with status 7"))
-            (should (> (plist-get final :snapshot-generation)
-                       before-generation))))
-      (fzf-native-async-stop handle))))
+            (write-region "" nil gate nil 'silent)
+            (let ((final (fzf-native-test--wait-for-producer handle)))
+              (should (eq (plist-get final :producer-state) 'failed))
+              (should (equal (plist-get final :producer-error)
+                             "producer exited with status 7"))
+              (should (> (plist-get final :snapshot-generation)
+                         before-generation)))))
+      (when handle
+        (fzf-native-async-stop handle))
+      (delete-directory gate-directory t))))
 
 (ert-deftest fzf-native-async-stop-invalidates-handle-test ()
   "After stop, generation returns nil (handle is invalidated)."
