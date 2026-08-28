@@ -75,6 +75,127 @@ static void test_session_abi_is_versioned(void) {
   CHECK(FZF_NATIVE_SESSION_ABI == 1);
 }
 
+static void test_batch_worker_stops_on_any_shared_failure(void) {
+  struct Shared embedded = {
+    .pattern = NULL,
+    .batches = NULL,
+    .remaining = 0,
+    .filter_only = false,
+    .allocation_failed = false,
+    .embedded_nul = false,
+  };
+  CHECK(!shared_worker_should_stop(&embedded));
+  shared_set_embedded_nul(&embedded);
+  CHECK(shared_worker_should_stop(&embedded));
+
+  struct Shared allocation = {
+    .pattern = NULL,
+    .batches = NULL,
+    .remaining = 0,
+    .filter_only = false,
+    .allocation_failed = false,
+    .embedded_nul = false,
+  };
+  CHECK(!shared_worker_should_stop(&allocation));
+  shared_set_allocation_failed(&allocation);
+  CHECK(shared_worker_should_stop(&allocation));
+}
+
+static enum emacs_funcall_exit ctest_copy_pending_exit;
+static emacs_value ctest_copy_original;
+static emacs_value ctest_copy_encoded;
+static bool ctest_copy_fail_original;
+static bool ctest_copy_fail_encoded;
+static size_t ctest_encode_calls;
+
+static bool ctest_copy_string_contents(emacs_env *env, emacs_value value,
+                                       char *buffer, ptrdiff_t *length) {
+  (void)env;
+  if ((value == ctest_copy_original && ctest_copy_fail_original) ||
+      (value == ctest_copy_encoded && ctest_copy_fail_encoded)) {
+    ctest_copy_pending_exit = emacs_funcall_exit_signal;
+    return false;
+  }
+  if (!buffer) {
+    *length = 2;
+    return true;
+  }
+  if (*length < 2) return false;
+  buffer[0] = 'x';
+  buffer[1] = '\0';
+  *length = 2;
+  return true;
+}
+
+static enum emacs_funcall_exit ctest_copy_exit_check(emacs_env *env) {
+  (void)env;
+  return ctest_copy_pending_exit;
+}
+
+static void ctest_copy_exit_clear(emacs_env *env) {
+  (void)env;
+  ctest_copy_pending_exit = emacs_funcall_exit_return;
+}
+
+static emacs_value ctest_encode_string(emacs_env *env, emacs_value function,
+                                       ptrdiff_t nargs, emacs_value *args) {
+  (void)env;
+  (void)function;
+  (void)nargs;
+  (void)args;
+  ctest_encode_calls++;
+  return ctest_copy_encoded;
+}
+
+static void ctest_reset_copy_env(void) {
+  ctest_copy_pending_exit = emacs_funcall_exit_return;
+  ctest_copy_original = (emacs_value)(uintptr_t)0x31;
+  ctest_copy_encoded = (emacs_value)(uintptr_t)0x32;
+  ctest_copy_fail_original = false;
+  ctest_copy_fail_encoded = false;
+  ctest_encode_calls = 0;
+}
+
+static void test_copy_emacs_string_fallback_is_bounded(void) {
+  emacs_env env = {0};
+  env.copy_string_contents = ctest_copy_string_contents;
+  env.non_local_exit_check = ctest_copy_exit_check;
+  env.non_local_exit_clear = ctest_copy_exit_clear;
+  env.funcall = ctest_encode_string;
+
+  /* A native allocation failure is not a conversion failure.  It must return
+     directly without invoking encode-coding-string or recursing. */
+  ctest_reset_copy_env();
+  atomic_store_explicit(&copy_test_fail_bump_allocation, true,
+                        memory_order_release);
+  struct Bump *bump = NULL;
+  struct Str copied = copy_emacs_string(&env, &bump, ctest_copy_original);
+  CHECK(copied.b == NULL);
+  CHECK(bump == NULL);
+  CHECK(ctest_encode_calls == 0);
+
+  /* A direct conversion signal gets exactly one encoded retry. */
+  ctest_reset_copy_env();
+  ctest_copy_fail_original = true;
+  copied = copy_emacs_string(&env, &bump, ctest_copy_original);
+  CHECK(copied.b != NULL);
+  CHECK(copied.len == 1);
+  CHECK(copied.b[0] == 'x');
+  CHECK(ctest_encode_calls == 1);
+  bump_free(bump);
+  bump = NULL;
+
+  /* If the encoded value also fails, return after that one attempt. */
+  ctest_reset_copy_env();
+  ctest_copy_fail_original = true;
+  ctest_copy_fail_encoded = true;
+  copied = copy_emacs_string(&env, &bump, ctest_copy_original);
+  CHECK(copied.b == NULL);
+  CHECK(bump == NULL);
+  CHECK(ctest_encode_calls == 1);
+  CHECK(ctest_copy_pending_exit == emacs_funcall_exit_return);
+}
+
 static enum emacs_funcall_exit ctest_string_pending_exit;
 static bool ctest_make_string_should_signal;
 static size_t ctest_make_string_calls;
@@ -2850,6 +2971,15 @@ static void test_suffix_pattern_longer_than_candidate(void) {
   CHECK(lossy_score_of("caf\xe9", "caf\xe9zz$") == 0);
 }
 
+static void test_worker_count_bounds_fallible_cpu_probe(void) {
+  CHECK(fzf_worker_count(0, 4) == 1);
+  CHECK(fzf_worker_count(-1, 4) == 1);
+  CHECK(fzf_worker_count(1, 4) == 1);
+  CHECK(fzf_worker_count(8, 4) == 4);
+  CHECK(fzf_worker_count(LONG_MAX, 0) == ASYNC_WORKER_LIMIT);
+  CHECK(fzf_worker_count(LONG_MAX, 3) == 3);
+}
+
 int main(void) {
   printf("--- counting_sort_candidates ---\n");
   RUN(test_n_zero);
@@ -2936,6 +3066,8 @@ int main(void) {
 
   printf("--- interactive request identity ---\n");
   RUN(test_session_abi_is_versioned);
+  RUN(test_batch_worker_stops_on_any_shared_failure);
+  RUN(test_copy_emacs_string_fallback_is_bounded);
   RUN(test_lossless_string_conversion_preserves_runtime_errors);
   RUN(test_startup_posix_errors_are_descriptive);
   RUN(test_async_start_publishes_inert_handle_before_resources);
@@ -2968,6 +3100,7 @@ int main(void) {
   RUN(test_invalid_utf8_candidates_stay_matchable);
   RUN(test_invalid_utf8_highlight_positions);
   RUN(test_suffix_pattern_longer_than_candidate);
+  RUN(test_worker_count_bounds_fallible_cpu_probe);
 
   if (failed == 0) {
     printf("\nAll tests passed.\n");

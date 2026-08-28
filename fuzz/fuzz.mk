@@ -110,7 +110,8 @@ fuzz-session-replay: fuzz-session-replay-build
 fuzz-session-tsan-build:
 	mkdir -p $(BUILD_DIR)
 	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
-		-DFZF_SESSION_FUZZ_STANDALONE=1 -fsanitize=thread \
+		-DFZF_SESSION_FUZZ_STANDALONE=1 -DFZF_NATIVE_DEBUG=1 \
+		-fsanitize=thread \
 		-fno-omit-frame-pointer -I. $(FUZZ_UTF8PROC_FLAGS) -pthread \
 		-o $(FUZZ_SESSION_TSAN_BINARY) fuzz/fzf-native-session-fuzz.c \
 		fzf.c fzf-additions.c $(FUZZ_UTF8PROC_SOURCE)
