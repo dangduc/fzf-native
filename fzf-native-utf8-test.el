@@ -7,8 +7,16 @@
 (require 'benchmark)
 (require 'fzf-native)
 
-;; Load the dynamic module
-(fzf-native-load-dyn)
+;; Load one explicitly selected module, but never redefine native symbols by
+;; loading a second bundled artifact over an already loaded source build.
+(unless (fboundp 'fzf-native-score)
+  (if-let* ((module (getenv "FZF_NATIVE_TEST_MODULE")))
+      (progn
+        (module-load module)
+        (setq fzf-native-loaded t))
+    (fzf-native-load-dyn)))
+(when (fboundp 'fzf-native--verify-session-abi)
+  (fzf-native--verify-session-abi))
 
 ;; Helper function to get score from result
 (defun fzf-native-utf8-test--get-score (str query)

@@ -2,7 +2,14 @@
 (require 'ert)
 (require 'fzf-native)
 
-(fzf-native-load-dyn)
+(unless (fboundp 'fzf-native-score)
+  (if-let* ((module (getenv "FZF_NATIVE_TEST_MODULE")))
+      (progn
+        (module-load module)
+        (setq fzf-native-loaded t))
+    (fzf-native-load-dyn)))
+(when (fboundp 'fzf-native--verify-session-abi)
+  (fzf-native--verify-session-abi))
 
 
 

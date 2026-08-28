@@ -327,6 +327,84 @@ static void test_slab_allocation_failure_is_reported(void) {
   fzf_free_slab(slab);
 }
 
+static void test_utf8_char_map_scratch_reuse_and_cap(void) {
+  utf8_char_map_scratch_t scratch = {0};
+  const char small[] = "a\xE4\xBD\xA0z";
+  utf8_char_map_t *first = utf8_build_char_map(
+      small, sizeof small - 1, &scratch);
+  CHECK(first == &scratch.map);
+  if (!first) return;
+  CHECK(!first->owned);
+  CHECK(first->char_count == 3);
+  CHECK(utf8_byte_to_char(first, 0) == 0);
+  CHECK(utf8_byte_to_char(first, 1) == 1);
+  CHECK(utf8_byte_to_char(first, 2) == 1);
+  CHECK(utf8_byte_to_char(first, 4) == 2);
+  size_t *retained = first->byte_to_char;
+  size_t retained_capacity = scratch.byte_slot_capacity;
+
+  utf8_char_map_t *second = utf8_build_char_map("xy", 2, &scratch);
+  CHECK(second == first);
+  if (!second) {
+    free(scratch.map.byte_to_char);
+    return;
+  }
+  CHECK(second->byte_to_char == retained);
+  CHECK(scratch.byte_slot_capacity == retained_capacity);
+  CHECK(second->char_count == 2);
+
+  const size_t retained_slots =
+      FZF_UTF8_CHAR_MAP_RETAINED_BYTES_MAX / sizeof(size_t);
+  CHECK(retained_slots > 1);
+  const size_t large_len = retained_slots;
+  char *large = malloc(large_len);
+  CHECK(large != NULL);
+  if (large) {
+    memset(large, 'x', large_len);
+    utf8_char_map_t *one_shot = utf8_build_char_map(
+        large, large_len, &scratch);
+    CHECK(one_shot != NULL);
+    if (one_shot) {
+      CHECK(one_shot != &scratch.map);
+      CHECK(one_shot->owned);
+      CHECK(one_shot->char_count == large_len);
+      CHECK(one_shot->byte_to_char[large_len] == large_len);
+      utf8_free_char_map(one_shot);
+    }
+    free(large);
+  }
+  CHECK(scratch.map.byte_to_char == retained);
+  CHECK(scratch.byte_slot_capacity == retained_capacity);
+  free(scratch.map.byte_to_char);
+
+  /* Parsed patterns fuse immutable decoded codepoints with the term object.
+     Two real scorer calls reuse one slab-owned map; the slab destructor owns
+     that retained allocation and sanitizer builds check the final free. */
+  char query[] = "组件";
+  fzf_pattern_t *pattern = fzf_parse_pattern(
+      CaseSmart, false, query, true);
+  fzf_slab_t *slab = fzf_make_default_slab();
+  CHECK(pattern != NULL);
+  CHECK(slab != NULL);
+  if (pattern && slab) {
+    fzf_string_t *parsed = pattern->ptr[0]->ptr[0].text;
+    CHECK(parsed->codepoint_count == 2);
+    CHECK(parsed->codepoints ==
+          (const utf8proc_int32_t *)(parsed + 1));
+    CHECK(parsed->codepoints_case_folded);
+    CHECK(fzf_get_score("路径/组件-123", pattern, slab) > 0);
+    size_t *scorer_retained = slab->UTF8.map.byte_to_char;
+    size_t scorer_capacity = slab->UTF8.byte_slot_capacity;
+    CHECK(scorer_retained != NULL);
+    CHECK(scorer_capacity > 0);
+    CHECK(fzf_get_score("组件", pattern, slab) > 0);
+    CHECK(slab->UTF8.map.byte_to_char == scorer_retained);
+    CHECK(slab->UTF8.byte_slot_capacity == scorer_capacity);
+  }
+  fzf_free_pattern(pattern);
+  fzf_free_slab(slab);
+}
+
 int main(void) {
   printf("--- fzf-additions: fzf_has_match ---\n");
   RUN(test_fuzzy_basic_match);
@@ -359,6 +437,7 @@ int main(void) {
   RUN(test_invalid_utf8_exact_is_lossless);
   RUN(test_invalid_utf8_fuzzy_fallback_returns_positions);
   RUN(test_slab_allocation_failure_is_reported);
+  RUN(test_utf8_char_map_scratch_reuse_and_cap);
 
   if (failed == 0) {
     printf("\nAll fzf-additions tests passed.\n");

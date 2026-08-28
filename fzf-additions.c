@@ -166,6 +166,7 @@ static bool fzf_addn_is_ascii_algo(fzf_algo_t fn) {
 }
 
 bool fzf_has_match(const char *text, fzf_pattern_t *pattern, fzf_slab_t *slab) {
+  fzf_clear_allocation_failure();
   if (!pattern || pattern->size == 0) return true;
   size_t tn = strlen(text);
   /* The cheap matchers below are byte-wise ASCII only (no Unicode case

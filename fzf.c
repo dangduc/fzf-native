@@ -9,6 +9,26 @@
 #include "utf8proc-2.10.0/utf8proc.h"
 #include "utf8_char_index.h"
 
+#ifdef _MSC_VER
+#define FZF_THREAD_LOCAL __declspec(thread)
+#else
+#define FZF_THREAD_LOCAL _Thread_local
+#endif
+
+static FZF_THREAD_LOCAL bool fzf_allocation_failure;
+
+void fzf_clear_allocation_failure(void) {
+  fzf_allocation_failure = false;
+}
+
+bool fzf_allocation_failed(void) {
+  return fzf_allocation_failure;
+}
+
+static void fzf_mark_allocation_failure(void) {
+  fzf_allocation_failure = true;
+}
+
 // TODO(conni2461): UNICODE HEADER
 #define UNICODE_MAXASCII 0x7f
 
@@ -208,7 +228,22 @@ static char *str_replace(char *orig, char *rep, char *with) {
     ins = tmp + len_rep;
   }
 
-  tmp = result = (char *)malloc(len_orig + (len_with - len_rep) * count + 1);
+  size_t result_len = len_orig;
+  if (len_with >= len_rep) {
+    size_t growth = len_with - len_rep;
+    if (growth && count > (SIZE_MAX - result_len - 1) / growth) {
+      return NULL;
+    }
+    result_len += growth * count;
+  } else {
+    size_t shrink = len_rep - len_with;
+    if (count > result_len / shrink) {
+      return NULL;
+    }
+    result_len -= shrink * count;
+  }
+
+  tmp = result = (char *)malloc(result_len + 1);
   if (!result) {
     return NULL;
   }
@@ -226,12 +261,23 @@ static char *str_replace(char *orig, char *rep, char *with) {
   return result;
 }
 
+static char *str_duplicate(const char *str, size_t size) {
+  if (size == SIZE_MAX) return NULL;
+  char *copy = malloc(size + 1);
+  if (!copy) return NULL;
+  memcpy(copy, str, size);
+  copy[size] = '\0';
+  return copy;
+}
+
 // UTF-8 aware lowercase conversion
-static char *str_tolower(char *str, size_t size) {
+static char *str_tolower(const char *str, size_t size) {
   // Check if string is pure ASCII for fast path
   if (is_ascii_utf8proc(str, size)) {
     // Fast ASCII path
-    char *lower_str = (char *)malloc((size + 1) * sizeof(char));
+    if (size == SIZE_MAX) return NULL;
+    char *lower_str = (char *)malloc(size + 1);
+    if (!lower_str) return NULL;
     for (size_t i = 0; i < size; i++) {
       lower_str[i] = (char)tolower((uint8_t)str[i]);
     }
@@ -241,7 +287,9 @@ static char *str_tolower(char *str, size_t size) {
   
   // UTF-8 path: need to handle multibyte characters
   // Allocate worst case (each char could expand to 4 bytes)
-  char *lower_str = (char *)malloc((size * 4 + 1) * sizeof(char));
+  if (size > (SIZE_MAX - 1) / 4) return NULL;
+  char *lower_str = (char *)malloc(size * 4 + 1);
+  if (!lower_str) return NULL;
   size_t out_pos = 0;
   size_t in_pos = 0;
   
@@ -291,58 +339,92 @@ static size_t min64u(size_t a, size_t b) {
 }
 
 fzf_position_t *fzf_pos_array(size_t len) {
+  if (len > SIZE_MAX / sizeof(uint32_t)) {
+    fzf_mark_allocation_failure();
+    return NULL;
+  }
   fzf_position_t *pos = (fzf_position_t *)malloc(sizeof(fzf_position_t));
+  if (!pos) {
+    fzf_mark_allocation_failure();
+    return NULL;
+  }
   pos->size = 0;
   pos->cap = len;
   if (len > 0) {
     pos->data = (uint32_t *)malloc(len * sizeof(uint32_t));
+    if (!pos->data) {
+      free(pos);
+      fzf_mark_allocation_failure();
+      return NULL;
+    }
   } else {
     pos->data = NULL;
   }
   return pos;
 }
 
-static void resize_pos(fzf_position_t *pos, size_t add_len, size_t comp) {
+static bool resize_pos(fzf_position_t *pos, size_t add_len, size_t comp) {
   if (!pos) {
-    return;
+    return true;
   }
-  if (pos->size + comp > pos->cap) {
-    pos->cap += add_len > 0 ? add_len : 1;
-    pos->data = (uint32_t *)realloc(pos->data, sizeof(uint32_t) * pos->cap);
+  if (comp > SIZE_MAX - pos->size) {
+    fzf_mark_allocation_failure();
+    return false;
   }
+  size_t needed = pos->size + comp;
+  if (needed <= pos->cap) return true;
+
+  size_t growth = add_len > 0 ? add_len : 1;
+  size_t new_cap = pos->cap;
+  if (growth > SIZE_MAX - new_cap)
+    new_cap = needed;
+  else
+    new_cap += growth;
+  if (new_cap < needed) new_cap = needed;
+  if (new_cap > SIZE_MAX / sizeof(uint32_t)) {
+    fzf_mark_allocation_failure();
+    return false;
+  }
+  uint32_t *new_data =
+      (uint32_t *)realloc(pos->data, sizeof(uint32_t) * new_cap);
+  if (!new_data) {
+    fzf_mark_allocation_failure();
+    return false;
+  }
+  pos->data = new_data;
+  pos->cap = new_cap;
+  return true;
 }
 
-static void unsafe_append_pos(fzf_position_t *pos, size_t value) {
-  resize_pos(pos, pos->cap, 1);
+static bool unsafe_append_pos(fzf_position_t *pos, size_t value) {
+  if (!resize_pos(pos, pos->cap, 1)) return false;
   pos->data[pos->size] = value;
   pos->size++;
+  return true;
 }
 
-static void append_pos(fzf_position_t *pos, size_t value) {
-  if (pos) {
-    unsafe_append_pos(pos, value);
-  }
+static bool append_pos(fzf_position_t *pos, size_t value) {
+  return !pos || unsafe_append_pos(pos, value);
 }
 
-static void insert_range(fzf_position_t *pos, size_t start, size_t end) {
+static bool insert_range(fzf_position_t *pos, size_t start, size_t end) {
   if (!pos) {
-    return;
+    return true;
   }
 
-  int32_t diff = ((int32_t)end - (int32_t)start);
-  if (diff <= 0) {
-    return;
-  }
+  if (end <= start) return true;
 
-  resize_pos(pos, end - start, end - start);
+  if (!resize_pos(pos, end - start, end - start)) return false;
   for (size_t k = start; k < end; k++) {
     pos->data[pos->size] = k;
     pos->size++;
   }
+  return true;
 }
 
 static fzf_i16_t alloc16(size_t *offset, fzf_slab_t *slab, size_t size) {
-  if (slab != NULL && slab->I16.cap > *offset + size) {
+  if (slab != NULL && *offset <= slab->I16.cap &&
+      size <= slab->I16.cap - *offset) {
     i16_slice_t slice = slice_i16(slab->I16.data, *offset, (*offset) + size);
     *offset = *offset + size;
     return (fzf_i16_t){.data = slice.data,
@@ -350,14 +432,23 @@ static fzf_i16_t alloc16(size_t *offset, fzf_slab_t *slab, size_t size) {
                        .cap = slice.size,
                        .allocated = false};
   }
+  if (size > SIZE_MAX / sizeof(int16_t)) {
+    fzf_mark_allocation_failure();
+    return (fzf_i16_t){0};
+  }
   int16_t *data = (int16_t *)malloc(size * sizeof(int16_t));
+  if (size > 0 && !data) {
+    fzf_mark_allocation_failure();
+    return (fzf_i16_t){0};
+  }
   memset(data, 0, size * sizeof(int16_t));
   return (fzf_i16_t){
       .data = data, .size = size, .cap = size, .allocated = true};
 }
 
 static fzf_i32_t alloc32(size_t *offset, fzf_slab_t *slab, size_t size) {
-  if (slab != NULL && slab->I32.cap > *offset + size) {
+  if (slab != NULL && *offset <= slab->I32.cap &&
+      size <= slab->I32.cap - *offset) {
     i32_slice_t slice = slice_i32(slab->I32.data, *offset, (*offset) + size);
     *offset = *offset + size;
     return (fzf_i32_t){.data = slice.data,
@@ -365,7 +456,15 @@ static fzf_i32_t alloc32(size_t *offset, fzf_slab_t *slab, size_t size) {
                        .cap = slice.size,
                        .allocated = false};
   }
+  if (size > SIZE_MAX / sizeof(int32_t)) {
+    fzf_mark_allocation_failure();
+    return (fzf_i32_t){0};
+  }
   int32_t *data = (int32_t *)malloc(size * sizeof(int32_t));
+  if (size > 0 && !data) {
+    fzf_mark_allocation_failure();
+    return (fzf_i32_t){0};
+  }
   memset(data, 0, size * sizeof(int32_t));
   return (fzf_i32_t){
       .data = data, .size = size, .cap = size, .allocated = true};
@@ -710,7 +809,7 @@ static int32_t calculate_score(bool case_sensitive, bool normalize,
   bool in_gap = false;
   int16_t first_bonus = 0;
 
-  resize_pos(pos, M, M);
+  if (!resize_pos(pos, M, M)) return 0;
   int32_t prev_class = CharNonWord;
   if (sidx > 0) {
     prev_class = char_class_of(text->data[sidx - 1]);
@@ -726,7 +825,7 @@ static int32_t calculate_score(bool case_sensitive, bool normalize,
       c = normalize_rune(c);
     }
     if (c == pattern->data[pidx]) {
-      append_pos(pos, idx);
+      if (!append_pos(pos, idx)) return 0;
       score += ScoreMatch;
       int16_t bonus = bonus_for(prev_class, class);
       if (consecutive == 0) {
@@ -811,7 +910,7 @@ static int32_t calculate_score_utf8(bool case_sensitive, bool normalize,
         M - pat_byte_pos, &pattern_cp);
 
       if (utf8_char_equal(text_cp, pattern_cp, case_sensitive, normalize)) {
-        append_pos(pos, text_pos);
+        if (!append_pos(pos, text_pos)) return 0;
         score += ScoreMatch;
 
         if (consecutive == 0) {
@@ -921,7 +1020,8 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
   if (M == 0) {
     return (fzf_result_t){0, 0, 0};
   }
-  if (slab != NULL && N * M > slab->I16.cap) {
+  if (slab != NULL &&
+      (N != 0 && M > SIZE_MAX / N ? true : N * M > slab->I16.cap)) {
     return fzf_fuzzy_match_v1(case_sensitive, normalize, text, pattern, pos,
                               slab);
   }
@@ -946,6 +1046,14 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
   fzf_i32_t f = alloc32(&offset32, slab, M);
   // Rune array
   fzf_i32_t t = alloc32(&offset32, slab, N);
+  if (fzf_allocation_failed()) {
+    free_alloc(t);
+    free_alloc(f);
+    free_alloc(bo);
+    free_alloc(c0);
+    free_alloc(h0);
+    return (fzf_result_t){-1, -1, 0};
+  }
   copy_runes(text, &t); // input.CopyRunes(T)
 
   // Phase 2. Calculate bonus for each point
@@ -1039,13 +1147,42 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
 
   size_t f0 = (size_t)f.data[0];
   size_t width = last_idx - f0 + 1;
-  fzf_i16_t h = alloc16(&offset16, slab, width * M);
+  if (M != 0 && width > SIZE_MAX / M) {
+    fzf_mark_allocation_failure();
+    free_alloc(t);
+    free_alloc(f);
+    free_alloc(bo);
+    free_alloc(c0);
+    free_alloc(h0);
+    return (fzf_result_t){-1, -1, 0};
+  }
+  size_t matrix_size = width * M;
+  fzf_i16_t h = alloc16(&offset16, slab, matrix_size);
+  if (fzf_allocation_failed()) {
+    free_alloc(h);
+    free_alloc(t);
+    free_alloc(f);
+    free_alloc(bo);
+    free_alloc(c0);
+    free_alloc(h0);
+    return (fzf_result_t){-1, -1, 0};
+  }
   {
     i16_slice_t h0_tmp_slice = slice_i16(h0.data, f0, last_idx + 1);
     copy_into_i16(&h0_tmp_slice, &h);
   }
 
-  fzf_i16_t c = alloc16(&offset16, slab, width * M);
+  fzf_i16_t c = alloc16(&offset16, slab, matrix_size);
+  if (fzf_allocation_failed()) {
+    free_alloc(c);
+    free_alloc(h);
+    free_alloc(t);
+    free_alloc(f);
+    free_alloc(bo);
+    free_alloc(c0);
+    free_alloc(h0);
+    return (fzf_result_t){-1, -1, 0};
+  }
   {
     i16_slice_t c0_tmp_slice = slice_i16(c0.data, f0, last_idx + 1);
     copy_into_i16(&c0_tmp_slice, &c);
@@ -1375,7 +1512,12 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
   }
   
   // Build byte-to-char mapping for position conversion
-  utf8_char_map_t *char_map = utf8_build_char_map(text->data, N);
+  utf8_char_map_t *char_map = utf8_build_char_map(
+      text->data, N, slab ? &slab->UTF8 : NULL);
+  if (!char_map) {
+    fzf_mark_allocation_failure();
+    return (fzf_result_t){-1, -1, 0};
+  }
 
   // Count with the same lossy decoder used by the matching loop.  A raw byte
   // is one unit on both sides, so completion cannot be declared early.
@@ -1509,7 +1651,12 @@ fzf_result_t fzf_prefix_match_utf8(bool case_sensitive, bool normalize,
   }
 
   // Build byte-to-char mapping for position conversion
-  utf8_char_map_t *char_map = utf8_build_char_map(text->data, text->size);
+  utf8_char_map_t *char_map = utf8_build_char_map(
+      text->data, text->size, slab ? &slab->UTF8 : NULL);
+  if (!char_map) {
+    fzf_mark_allocation_failure();
+    return (fzf_result_t){-1, -1, 0};
+  }
 
   // Skip leading whitespace if pattern doesn't start with whitespace
   size_t trimmed_start = 0;
@@ -1579,7 +1726,12 @@ fzf_result_t fzf_suffix_match_utf8(bool case_sensitive, bool normalize,
   size_t trimmed_len = text->size;
   
   // Build byte-to-char mapping for position conversion
-  utf8_char_map_t *char_map = utf8_build_char_map(text->data, text->size);
+  utf8_char_map_t *char_map = utf8_build_char_map(
+      text->data, text->size, slab ? &slab->UTF8 : NULL);
+  if (!char_map) {
+    fzf_mark_allocation_failure();
+    return (fzf_result_t){-1, -1, 0};
+  }
   
   // Skip trailing whitespace if pattern doesn't end with whitespace
   if (M > 0) {
@@ -1654,7 +1806,12 @@ fzf_result_t fzf_equal_match_utf8(bool case_sensitive, bool normalize,
   }
 
   // Build byte-to-char mapping for position conversion
-  utf8_char_map_t *char_map = utf8_build_char_map(text->data, text->size);
+  utf8_char_map_t *char_map = utf8_build_char_map(
+      text->data, text->size, slab ? &slab->UTF8 : NULL);
+  if (!char_map) {
+    fzf_mark_allocation_failure();
+    return (fzf_result_t){-1, -1, 0};
+  }
 
   size_t trimmed_start = leading_whitespaces(text);
   size_t trimmed_end_len = trailing_whitespaces(text);
@@ -1736,8 +1893,10 @@ fzf_result_t fzf_fuzzy_match_v1_utf8(bool case_sensitive, bool normalize,
   }
   
   // Build byte-to-char mapping for position conversion
-  utf8_char_map_t *char_map = utf8_build_char_map(text->data, N);
+  utf8_char_map_t *char_map = utf8_build_char_map(
+      text->data, N, slab ? &slab->UTF8 : NULL);
   if (!char_map) {
+    fzf_mark_allocation_failure();
     return (fzf_result_t){-1, -1, 0};
   }
   
@@ -1834,13 +1993,19 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   }
 
   // Build byte-to-char mapping for character position tracking
-  utf8_char_map_t *char_map = utf8_build_char_map(text->data, N);
+  utf8_char_map_t *char_map = utf8_build_char_map(
+      text->data, N, slab ? &slab->UTF8 : NULL);
   if (!char_map) {
+    fzf_mark_allocation_failure();
     return (fzf_result_t){-1, -1, 0};
   }
 
   const size_t Nc = char_map->char_count;
-  const size_t Mc = utf8_strlen(pattern->data, M);
+  bool cached_pattern_cps = pattern->codepoints != NULL &&
+      pattern->codepoints_case_folded == !case_sensitive;
+  const size_t Mc = cached_pattern_cps
+                      ? pattern->codepoint_count
+                      : utf8_strlen(pattern->data, M);
 
   if (Mc == 0) {
     utf8_free_char_map(char_map);
@@ -1848,7 +2013,8 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   }
 
   // Fall back to v1 if slab is insufficient (use character counts)
-  if (slab != NULL && Nc * Mc > slab->I16.cap) {
+  if (slab != NULL &&
+      (Nc != 0 && Mc > SIZE_MAX / Nc ? true : Nc * Mc > slab->I16.cap)) {
     utf8_free_char_map(char_map);
     return fzf_fuzzy_match_v1_utf8(case_sensitive, normalize, text, pattern,
                                    pos, slab);
@@ -1870,20 +2036,28 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   size_t idx = match_idx > 0 ? match_idx - 1 : 0;
 
   // Pre-decode pattern codepoints (case-folded if needed)
-  utf8proc_int32_t *pattern_cps =
-      (utf8proc_int32_t *)malloc(Mc * sizeof(utf8proc_int32_t));
-  if (!pattern_cps) {
+  if (Mc > SIZE_MAX / sizeof(utf8proc_int32_t)) {
+    fzf_mark_allocation_failure();
     utf8_free_char_map(char_map);
     return (fzf_result_t){-1, -1, 0};
   }
-  {
+  utf8proc_int32_t *owned_pattern_cps = NULL;
+  const utf8proc_int32_t *pattern_cps = pattern->codepoints;
+  if (!cached_pattern_cps) {
+    owned_pattern_cps = malloc(Mc * sizeof *owned_pattern_cps);
+    if (!owned_pattern_cps) {
+      fzf_mark_allocation_failure();
+      utf8_free_char_map(char_map);
+      return (fzf_result_t){-1, -1, 0};
+    }
+    pattern_cps = owned_pattern_cps;
     size_t p_pos = 0;
     for (size_t i = 0; i < Mc; i++) {
       utf8proc_ssize_t bytes = utf8_iterate_lossy(
           (const utf8proc_uint8_t *)(pattern->data + p_pos), M - p_pos,
-          &pattern_cps[i]);
+          &owned_pattern_cps[i]);
       if (!case_sensitive) {
-        pattern_cps[i] = utf8proc_case_fold(pattern_cps[i]);
+        owned_pattern_cps[i] = utf8proc_case_fold(owned_pattern_cps[i]);
       }
       p_pos += bytes;
     }
@@ -1898,6 +2072,16 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   fzf_i16_t bo = alloc16(&offset16, slab, Nc);
   fzf_i32_t f = alloc32(&offset32, slab, Mc);
   fzf_i32_t t = alloc32(&offset32, slab, Nc);
+  if (fzf_allocation_failed()) {
+    free(owned_pattern_cps);
+    free_alloc(t);
+    free_alloc(f);
+    free_alloc(bo);
+    free_alloc(c0);
+    free_alloc(h0);
+    utf8_free_char_map(char_map);
+    return (fzf_result_t){-1, -1, 0};
+  }
 
   // Decode all text codepoints into t[]
   {
@@ -1981,7 +2165,7 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   }
 
   if (pidx != Mc) {
-    free(pattern_cps);
+    free(owned_pattern_cps);
     free_alloc(t);
     free_alloc(f);
     free_alloc(bo);
@@ -1992,7 +2176,7 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   }
 
   if (Mc == 1) {
-    free(pattern_cps);
+    free(owned_pattern_cps);
     free_alloc(t);
     free_alloc(f);
     free_alloc(bo);
@@ -2008,13 +2192,48 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   // Phase 3: DP matrix
   size_t f0 = (size_t)f.data[0];
   size_t width = last_idx - f0 + 1;
-  fzf_i16_t h = alloc16(&offset16, slab, width * Mc);
+  if (Mc != 0 && width > SIZE_MAX / Mc) {
+    fzf_mark_allocation_failure();
+    free(owned_pattern_cps);
+    free_alloc(t);
+    free_alloc(f);
+    free_alloc(bo);
+    free_alloc(c0);
+    free_alloc(h0);
+    utf8_free_char_map(char_map);
+    return (fzf_result_t){-1, -1, 0};
+  }
+  size_t matrix_size = width * Mc;
+  fzf_i16_t h = alloc16(&offset16, slab, matrix_size);
+  if (fzf_allocation_failed()) {
+    free(owned_pattern_cps);
+    free_alloc(h);
+    free_alloc(t);
+    free_alloc(f);
+    free_alloc(bo);
+    free_alloc(c0);
+    free_alloc(h0);
+    utf8_free_char_map(char_map);
+    return (fzf_result_t){-1, -1, 0};
+  }
   {
     i16_slice_t h0_tmp_slice = slice_i16(h0.data, f0, last_idx + 1);
     copy_into_i16(&h0_tmp_slice, &h);
   }
 
-  fzf_i16_t c = alloc16(&offset16, slab, width * Mc);
+  fzf_i16_t c = alloc16(&offset16, slab, matrix_size);
+  if (fzf_allocation_failed()) {
+    free(owned_pattern_cps);
+    free_alloc(c);
+    free_alloc(h);
+    free_alloc(t);
+    free_alloc(f);
+    free_alloc(bo);
+    free_alloc(c0);
+    free_alloc(h0);
+    utf8_free_char_map(char_map);
+    return (fzf_result_t){-1, -1, 0};
+  }
   {
     i16_slice_t c0_tmp_slice = slice_i16(c0.data, f0, last_idx + 1);
     copy_into_i16(&c0_tmp_slice, &c);
@@ -2120,7 +2339,7 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   }
 
   // Cleanup
-  free(pattern_cps);
+  free(owned_pattern_cps);
   free_alloc(h);
   free_alloc(c);
   free_alloc(t);
@@ -2134,29 +2353,90 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
                         (int32_t)max_score};
 }
 
-static void append_set(fzf_term_set_t *set, fzf_term_t value) {
-  if (set->cap == 0) {
-    set->cap = 1;
-    set->ptr = (fzf_term_t *)malloc(sizeof(fzf_term_t));
-  } else if (set->size + 1 > set->cap) {
-    set->cap *= 2;
-    set->ptr = realloc(set->ptr, sizeof(fzf_term_t) * set->cap);
+static bool append_set(fzf_term_set_t *set, fzf_term_t value) {
+  if (set->size == SIZE_MAX) return false;
+  size_t needed = set->size + 1;
+  if (needed > set->cap) {
+    size_t new_cap = set->cap ? set->cap : 1;
+    while (new_cap < needed) {
+      if (new_cap > SIZE_MAX / 2) {
+        new_cap = needed;
+        break;
+      }
+      new_cap *= 2;
+    }
+    if (new_cap > SIZE_MAX / sizeof *set->ptr) return false;
+    fzf_term_t *new_ptr = realloc(
+        set->ptr, new_cap * sizeof *set->ptr);
+    if (!new_ptr) return false;
+    set->ptr = new_ptr;
+    set->cap = new_cap;
   }
   set->ptr[set->size] = value;
   set->size++;
+  return true;
 }
 
-static void append_pattern(fzf_pattern_t *pattern, fzf_term_set_t *value) {
-  if (pattern->cap == 0) {
-    pattern->cap = 1;
-    pattern->ptr = (fzf_term_set_t **)malloc(sizeof(fzf_term_set_t *));
-  } else if (pattern->size + 1 > pattern->cap) {
-    pattern->cap *= 2;
-    pattern->ptr =
-        realloc(pattern->ptr, sizeof(fzf_term_set_t *) * pattern->cap);
+static bool append_pattern(fzf_pattern_t *pattern, fzf_term_set_t *value) {
+  if (pattern->size == SIZE_MAX) return false;
+  size_t needed = pattern->size + 1;
+  if (needed > pattern->cap) {
+    size_t new_cap = pattern->cap ? pattern->cap : 1;
+    while (new_cap < needed) {
+      if (new_cap > SIZE_MAX / 2) {
+        new_cap = needed;
+        break;
+      }
+      new_cap *= 2;
+    }
+    if (new_cap > SIZE_MAX / sizeof *pattern->ptr) return false;
+    fzf_term_set_t **new_ptr = realloc(
+        pattern->ptr, new_cap * sizeof *pattern->ptr);
+    if (!new_ptr) return false;
+    pattern->ptr = new_ptr;
+    pattern->cap = new_cap;
   }
   pattern->ptr[pattern->size] = value;
   pattern->size++;
+  return true;
+}
+
+static fzf_string_t *make_pattern_text(const char *data, size_t size,
+                                       bool case_sensitive) {
+  size_t count = utf8_strlen(data, size);
+  if (count > (SIZE_MAX - sizeof(fzf_string_t)) /
+                  sizeof(utf8proc_int32_t))
+    return NULL;
+  fzf_string_t *text = malloc(
+      sizeof *text + count * sizeof(utf8proc_int32_t));
+  if (!text) return NULL;
+  utf8proc_int32_t *codepoints = (utf8proc_int32_t *)(text + 1);
+  *text = (fzf_string_t){
+      .data = data,
+      .size = size,
+      .codepoints = codepoints,
+      .codepoint_count = count,
+      .codepoints_case_folded = !case_sensitive,
+  };
+  size_t byte_pos = 0;
+  for (size_t i = 0; i < count; i++) {
+    utf8proc_ssize_t width = utf8_iterate_lossy(
+        (const utf8proc_uint8_t *)data + byte_pos,
+        (utf8proc_ssize_t)(size - byte_pos), &codepoints[i]);
+    if (!case_sensitive) codepoints[i] = utf8proc_case_fold(codepoints[i]);
+    byte_pos += (size_t)width;
+  }
+  return text;
+}
+
+static void free_term_set(fzf_term_set_t *set) {
+  if (!set) return;
+  for (size_t i = 0; i < set->size; i++) {
+    free(set->ptr[i].ptr);
+    free(set->ptr[i].text);
+  }
+  free(set->ptr);
+  free(set);
 }
 
 // Helper function to get the UTF-8 version of an algorithm
@@ -2192,8 +2472,11 @@ static inline fzf_result_t call_alg_for_input(
  */
 fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
                                  char *pattern, bool fuzzy) {
-  fzf_pattern_t *pat_obj = (fzf_pattern_t *)malloc(sizeof(fzf_pattern_t));
-  memset(pat_obj, 0, sizeof(*pat_obj));
+  if (!pattern) return NULL;
+  fzf_pattern_t *pat_obj = calloc(1, sizeof *pat_obj);
+  if (!pat_obj) return NULL;
+  char *pattern_copy = NULL;
+  fzf_term_set_t *set = NULL;
 
   size_t pat_len = strlen(pattern);
   if (pat_len == 0) {
@@ -2206,13 +2489,14 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
     pat_len--;
   }
 
-  char *pattern_copy = str_replace(pattern, "\\ ", "\t");
+  pattern_copy = str_replace(pattern, "\\ ", "\t");
+  if (!pattern_copy) goto parse_failure;
   const char *delim = " ";
   char *token_state = NULL;
   char *ptr = fzf_strtok_r(pattern_copy, delim, &token_state);
 
-  fzf_term_set_t *set = (fzf_term_set_t *)malloc(sizeof(fzf_term_set_t));
-  memset(set, 0, sizeof(*set));
+  set = calloc(1, sizeof *set);
+  if (!set) goto parse_failure;
 
   bool switch_set = false;
   bool after_bar = false;
@@ -2222,10 +2506,15 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
 
     size_t len = strlen(ptr);
     str_replace_char(ptr, '\t', ' ');
-    char *text = strdup(ptr);
+    char *text = str_duplicate(ptr, len);
+    if (!text) goto parse_failure;
 
     char *og_str = text;
     char *lower_text = str_tolower(text, len);
+    if (!lower_text) {
+      free(og_str);
+      goto parse_failure;
+    }
     bool case_sensitive =
         case_mode == CaseRespect ||
         (case_mode == CaseSmart && strcmp(text, lower_text) != 0);
@@ -2294,19 +2583,31 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
 
     if (len > 0) {
       if (switch_set) {
-        append_pattern(pat_obj, set);
-        set = (fzf_term_set_t *)malloc(sizeof(fzf_term_set_t));
-        set->cap = 0;
-        set->size = 0;
+        if (!append_pattern(pat_obj, set)) {
+          free(og_str);
+          goto parse_failure;
+        }
+        set = NULL;
+        set = calloc(1, sizeof *set);
+        if (!set) {
+          free(og_str);
+          goto parse_failure;
+        }
       }
-      fzf_string_t *text_ptr = (fzf_string_t *)malloc(sizeof(fzf_string_t));
-      text_ptr->data = text;
-      text_ptr->size = len;
-      append_set(set, (fzf_term_t){.fn = fn,
-                                   .inv = inv,
-                                   .ptr = og_str,
-                                   .text = text_ptr,
-                                   .case_sensitive = case_sensitive});
+      fzf_string_t *text_ptr = make_pattern_text(text, len, case_sensitive);
+      if (!text_ptr) {
+        free(og_str);
+        goto parse_failure;
+      }
+      if (!append_set(set, (fzf_term_t){.fn = fn,
+                                        .inv = inv,
+                                        .ptr = og_str,
+                                        .text = text_ptr,
+                                        .case_sensitive = case_sensitive})) {
+        free(text_ptr);
+        free(og_str);
+        goto parse_failure;
+      }
       switch_set = true;
     } else {
       SFREE(og_str);
@@ -2315,10 +2616,11 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
     ptr = fzf_strtok_r(NULL, delim, &token_state);
   }
   if (set->size > 0) {
-    append_pattern(pat_obj, set);
+    if (!append_pattern(pat_obj, set)) goto parse_failure;
+    set = NULL;
   } else {
-    SFREE(set->ptr);
-    SFREE(set);
+    free_term_set(set);
+    set = NULL;
   }
   bool only = true;
   for (size_t i = 0; i < pat_obj->size; i++) {
@@ -2335,19 +2637,19 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
   pat_obj->only_inv = only;
   SFREE(pattern_copy);
   return pat_obj;
+
+parse_failure:
+  free_term_set(set);
+  free(pattern_copy);
+  fzf_free_pattern(pat_obj);
+  return NULL;
 }
 
 void fzf_free_pattern(fzf_pattern_t *pattern) {
+  if (!pattern) return;
   if (pattern->ptr) {
     for (size_t i = 0; i < pattern->size; i++) {
-      fzf_term_set_t *term_set = pattern->ptr[i];
-      for (size_t j = 0; j < term_set->size; j++) {
-        fzf_term_t *term = &term_set->ptr[j];
-        free(term->ptr);
-        free(term->text);
-      }
-      free(term_set->ptr);
-      free(term_set);
+      free_term_set(pattern->ptr[i]);
     }
     free(pattern->ptr);
   }
@@ -2356,6 +2658,7 @@ void fzf_free_pattern(fzf_pattern_t *pattern) {
 
 int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
                       fzf_slab_t *slab) {
+  fzf_clear_allocation_failure();
   // If the pattern is an empty string then pattern->ptr will be NULL and we
   // basically don't want to filter. Return 1 for telescope
   if (pattern->ptr == NULL) {
@@ -2374,7 +2677,10 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
          fallback can return a valid match with a non-positive raw score when
          the matching characters have a long gap.  Testing SCORE here made a
          small slab accept candidates that the default slab rejected. */
-      if (CALL_ALG(term, false, input, input_is_ascii, NULL, slab).start >= 0)
+      fzf_result_t res = CALL_ALG(
+          term, false, input, input_is_ascii, NULL, slab);
+      if (fzf_allocation_failed()) return 0;
+      if (res.start >= 0)
         return 0;
     }
     return 1;
@@ -2389,6 +2695,7 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
       fzf_term_t *term = &term_set->ptr[j];
       fzf_result_t res = CALL_ALG(
           term, false, input, input_is_ascii, NULL, slab);
+      if (fzf_allocation_failed()) return 0;
       if (res.start >= 0) {
         if (term->inv) {
           continue;
@@ -2425,6 +2732,7 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
 
 fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
                                   fzf_slab_t *slab) {
+  fzf_clear_allocation_failure();
   // If the pattern is an empty string then pattern->ptr will be NULL and we
   // basically don't want to filter. Return 1 for telescope
   if (pattern->ptr == NULL) {
@@ -2434,6 +2742,7 @@ fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
   fzf_string_t input = {.data = text, .size = strlen(text)};
   bool input_is_ascii = is_ascii_utf8proc(input.data, input.size);
   fzf_position_t *all_pos = fzf_pos_array(0);
+  if (!all_pos) return NULL;
   for (size_t i = 0; i < pattern->size; i++) {
     fzf_term_set_t *term_set = pattern->ptr[i];
     bool matched = false;
@@ -2445,6 +2754,10 @@ fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
         // this up we can pass in NULL here and don't calculate the positions
         fzf_result_t res = CALL_ALG(
             term, false, input, input_is_ascii, NULL, slab);
+        if (fzf_allocation_failed()) {
+          fzf_free_positions(all_pos);
+          return NULL;
+        }
         if (res.start < 0) {
           matched = true;
         }
@@ -2452,6 +2765,10 @@ fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
       }
       fzf_result_t res = CALL_ALG(
           term, false, input, input_is_ascii, all_pos, slab);
+      if (fzf_allocation_failed()) {
+        fzf_free_positions(all_pos);
+        return NULL;
+      }
       if (res.start >= 0) {
         matched = true;
         break;
@@ -2516,6 +2833,7 @@ void fzf_free_slab(fzf_slab_t *slab) {
   if (slab) {
     free(slab->I16.data);
     free(slab->I32.data);
+    free(slab->UTF8.map.byte_to_char);
     free(slab);
   }
 }
