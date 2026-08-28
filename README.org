@@ -181,6 +181,22 @@ involved.
 mkdir build && cmake -B build -DCMAKE_C_FLAGS='-O3 -march=native' && cmake --build build
 #+end_src
 
+** Fuzzing
+
+The fuzzing layer is additive: it links the existing matcher sources into a
+test-only libFuzzer binary and does not change the shipped matcher or module.
+
+- ~make fuzz-replay~ replays the permanent sanitizer corpus.
+- ~make fuzz~ runs a bounded libFuzzer campaign.  Override ~FUZZ_SECONDS~ for
+  longer runs.
+- ~make fuzz-elisp~ checks randomized properties at the Emacs module boundary.
+- ~make fuzz-upstream~ compares randomized ASCII match sets with an installed
+  ~fzf~ executable.  CI pins the reference release.
+
+Failures print a deterministic seed or produce an artifact under
+~build/fuzz-artifacts/~ so they can be replayed and promoted into the permanent
+corpus.
+
 ** Debugging fzf-native with emacs/lldb (EXAMPLE)
 *** Building Emacs
 #+begin_src shell :tangle yes

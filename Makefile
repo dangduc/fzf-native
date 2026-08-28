@@ -166,3 +166,7 @@ ctest-asan:
 .PHONY: clean
 clean:
 	rm -rf $(BUILD_DIR)
+
+# Coverage-guided and differential test targets live in a separate include so
+# they do not alter the release build or the public module ABI.
+include fuzz/fuzz.mk
