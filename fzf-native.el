@@ -363,18 +363,40 @@ on each module load."
         (error "Compilation of `fzf-native' module with logging failed!")))))
 
 ;;;###autoload
+(defun fzf-native--bundled-module-relative-path ()
+  "Return the bundled module path for this target, or signal an error.
+
+The release currently bundles both macOS architectures and x86-64
+artifacts for Linux, FreeBSD, and Windows.  Refuse unsupported targets
+before `module-load' reports a misleading bad-CPU-type or loader error."
+  (let ((x86-64-p
+         (string-match-p "\\`\\(?:x86_64\\|amd64\\)-" system-configuration))
+        (arm64-p
+         (string-match-p "\\`\\(?:arm64\\|aarch64\\)-" system-configuration)))
+    (or (cl-case system-type
+          ((windows-nt ms-dos cygwin)
+           (and x86-64-p
+                (concat "Windows/Release/" fzf-native--dyn-name ".dll")))
+          (darwin
+           (cond
+            (x86-64-p (concat "Darwin/" fzf-native--dyn-name ".so"))
+            (arm64-p (concat "Darwin/arm64/" fzf-native--dyn-name ".so"))))
+          (berkeley-unix
+           (and x86-64-p
+                (concat "FreeBSD/" fzf-native--dyn-name ".so")))
+          (gnu/linux
+           (and x86-64-p
+                (concat "Linux/" fzf-native--dyn-name ".so"))))
+        (user-error
+         (concat "No bundled fzf-native module for %s; "
+                 "run M-x fzf-native-load-own-build-dyn")
+         system-configuration))))
+
+;;;###autoload
 (defun fzf-native-load-dyn ()
-  "Load dynamic module."
+  "Load the bundled dynamic module for the current target."
   (interactive)
-  (let* ((dyn-name (cl-case system-type
-                     ((windows-nt ms-dos cygwin) (concat "Windows/Release/" fzf-native--dyn-name ".dll"))
-                     (darwin (if (string-prefix-p "x86_64" system-configuration)
-                                 ;; Intel
-                                 (concat "Darwin/" fzf-native--dyn-name ".so")
-                               ;; Apple Silicon
-                               (concat "Darwin/arm64/" fzf-native--dyn-name ".so")))
-                     (berkeley-unix (concat  "FreeBSD/" fzf-native--dyn-name ".so"))
-                     (t (concat "Linux/" fzf-native--dyn-name ".so"))))
+  (let* ((dyn-name (fzf-native--bundled-module-relative-path))
          (dyn-path (concat fzf-native--bin-dir dyn-name)))
     (module-load dyn-path)
     (setq fzf-native-loaded t)

@@ -42,7 +42,11 @@ See [[fzf-native-test.el][test cases]] for more examples.
 
 ** Supported Platforms
 
-Linux, macOS (incl. Apple silicon), and Windows are supported.
+Linux, macOS (including Apple silicon), FreeBSD, and Windows are supported.
+The package bundles native modules for x86-64 Linux, FreeBSD, and Windows, and
+for x86-64 and arm64 macOS.  Other architectures can build from source with
+=M-x fzf-native-load-own-build-dyn=.  The bundled Linux module is built on an
+older glibc baseline so it also loads on current distributions.
 Pre-built shared libraries are in the [[bin][bin/]] directory.
 
 ** Installation

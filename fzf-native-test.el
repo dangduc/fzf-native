@@ -1319,3 +1319,25 @@ the uninitialised scratch."
   (let ((fzf-native-batch-highlight 25))
     ;; Empty query → routes through highlight-all internally.
     (should (vectorp (fzf-native-score-all (vector "alpha" "beta") "")))))
+
+(ert-deftest fzf-native-bundled-module-path-is-architecture-aware-test ()
+  "Bundled paths must distinguish supported architectures explicitly."
+  (let ((system-type 'darwin)
+        (system-configuration "x86_64-apple-darwin"))
+    (should (equal (fzf-native--bundled-module-relative-path)
+                   "Darwin/fzf-native-module.so")))
+  (let ((system-type 'darwin)
+        (system-configuration "arm64-apple-darwin"))
+    (should (equal (fzf-native--bundled-module-relative-path)
+                   "Darwin/arm64/fzf-native-module.so")))
+  (let ((system-type 'gnu/linux)
+        (system-configuration "x86_64-pc-linux-gnu"))
+    (should (equal (fzf-native--bundled-module-relative-path)
+                   "Linux/fzf-native-module.so"))))
+
+(ert-deftest fzf-native-bundled-module-path-rejects-unsupported-arch-test ()
+  "A wrong-architecture artifact must not reach `module-load'."
+  (let ((system-type 'gnu/linux)
+        (system-configuration "aarch64-unknown-linux-gnu"))
+    (should-error (fzf-native--bundled-module-relative-path)
+                  :type 'user-error)))

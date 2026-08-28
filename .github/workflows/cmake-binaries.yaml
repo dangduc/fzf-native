@@ -2,9 +2,27 @@ name: Build And Publish Binaries
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Commit binaries and bump the package version
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+    paths:
+      - "**.c"
+      - "**.h"
+      - "fzf-native.el"
+      - "CMakeLists.txt"
+      - ".github/workflows/cmake-binaries.yaml"
   push:
-    branches: ["develop"]
-    paths: ["**.c", "**.h"]
+    branches: ["main"]
+    paths:
+      - "**.c"
+      - "**.h"
+      - "fzf-native.el"
+      - "CMakeLists.txt"
+      - ".github/workflows/cmake-binaries.yaml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -19,10 +37,42 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: macos-15
+            artifact: macos-arm64
+          - os: macos-15-intel
+            artifact: macos-x86_64
+          - os: windows-latest
+            artifact: windows-x86_64
 
     steps:
     - uses: actions/checkout@v4
+
+    # nix-emacs-ci's current Nixpkgs no longer evaluates x86_64 Darwin.
+    # Install Nix with an immutable action, then select the last locked
+    # nix-emacs-ci revision that provides Emacs 30.2 on both Darwin arches.
+    - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+      if: runner.os != 'Windows'
+
+    - name: Install Emacs 30.2 on POSIX
+      if: runner.os != 'Windows'
+      shell: bash
+      run: >-
+        nix profile install --accept-flake-config
+        github:purcell/nix-emacs-ci/b12b5b31e40df750478c9fc68c1e81c91ed079ec#emacs-30-2
+
+    - uses: jcs090218/setup-emacs-windows@3ad415b5f6575fe0bb8218cb35c199a93b1fb833
+      if: runner.os == 'Windows'
+      with:
+        version: 30.2
+
+    - name: Smoke tracked artifact before rebuilding
+      if: github.event_name != 'workflow_dispatch' || inputs.publish != true
+      shell: bash
+      run: |
+        emacs -Q --batch -L . -l fzf-native \
+          -f fzf-native-load-dyn \
+          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" \"K\")) 0) (error \"tracked UTF-8 artifact is stale\")))"
 
     - name: Clean stale binaries
       shell: bash
@@ -34,13 +84,115 @@ jobs:
     - name: Build
       run: cmake --build ${{github.workspace}}/build --verbose --config ${{env.BUILD_TYPE}}
 
+    - name: Smoke fresh artifact
+      shell: bash
+      run: |
+        emacs -Q --batch -L . -l fzf-native \
+          -f fzf-native-load-dyn \
+          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" \"K\")) 0) (error \"fresh UTF-8 artifact failed\")))"
+
+    - name: Check Darwin export surface
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        module=$(find bin -type f -name 'fzf-native-module.so' -print -quit)
+        actual=$(nm -gU "$module" | awk '{print $3}' | sort)
+        expected=$(printf '%s\n' _emacs_module_init _plugin_is_GPL_compatible | sort)
+        test "$actual" = "$expected"
+
+    - name: Check Windows export surface
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        exports=$(dumpbin //nologo //exports bin/Windows/Release/fzf-native-module.dll)
+        printf '%s\n' "$exports" | grep -Eq '[[:space:]]emacs_module_init$'
+        printf '%s\n' "$exports" | grep -Eq '[[:space:]]plugin_is_GPL_compatible$'
+        if printf '%s\n' "$exports" | grep -Eq '[[:space:]](fzf_|utf8proc_)'; then
+          printf '%s\n' "$exports"
+          exit 1
+        fi
+
     - name: Upload binaries
       uses: actions/upload-artifact@v4
       with:
-        name: bin-${{ matrix.os }}
+        name: bin-${{ matrix.artifact }}
         path: bin/
         if-no-files-found: error
         retention-days: 1
+
+  build-linux:
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
+
+    steps:
+    - name: Install build tools
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        apt-get update
+        apt-get install -y build-essential ca-certificates git python3-pip
+        pip3 install --no-cache-dir cmake==3.31.6
+
+    - uses: actions/checkout@v4
+
+    - name: Clean stale binaries
+      run: rm -rf bin
+
+    - name: Configure and build on glibc 2.31
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+        cmake --build build --verbose --config ${BUILD_TYPE}
+
+    - name: Check Linux compatibility and export surface
+      shell: bash
+      run: |
+        module=bin/Linux/fzf-native-module.so
+        max_glibc=$(objdump -T "$module" | sed -n 's/.*(GLIBC_\([0-9.]*\)).*/\1/p' | sort -V | tail -1)
+        test -n "$max_glibc"
+        test "$(printf '%s\n' "$max_glibc" 2.31 | sort -V | tail -1)" = 2.31
+        actual=$(nm -D --defined-only "$module" | awk '{print $3}' | sort)
+        expected=$(printf '%s\n' emacs_module_init plugin_is_GPL_compatible | sort)
+        test "$actual" = "$expected"
+
+    - name: Upload binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: bin-ubuntu-x86_64
+        path: bin/
+        if-no-files-found: error
+        retention-days: 1
+
+  smoke-linux:
+    needs: build-linux
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+
+    - name: Install Emacs 30.2
+      run: >-
+        nix profile install --accept-flake-config
+        github:purcell/nix-emacs-ci/b12b5b31e40df750478c9fc68c1e81c91ed079ec#emacs-30-2
+
+    - name: Smoke tracked Linux artifact
+      if: github.event_name != 'workflow_dispatch' || inputs.publish != true
+      run: |
+        emacs -Q --batch -L . -l fzf-native \
+          -f fzf-native-load-dyn \
+          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" \"K\")) 0) (error \"tracked UTF-8 artifact is stale\")))"
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: bin-ubuntu-x86_64
+        path: fresh-bin
+
+    - name: Smoke fresh Linux artifact
+      run: |
+        FZF_NATIVE_TEST_MODULE=${{github.workspace}}/fresh-bin/Linux/fzf-native-module.so \
+          emacs -Q --batch -L . -l ert -l fzf-native-utf8-test.el \
+          --eval '(ert-run-tests-batch-and-exit "^fzf-native-utf8-case-ignore-length-changing-fold-test$")'
 
   build-freebsd:
     runs-on: ubuntu-latest
@@ -48,29 +200,39 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Clean stale binaries
-      run: rm -rf bin
-
-    - name: Build in FreeBSD VM
+    - name: Build and smoke in FreeBSD VM
       uses: vmactions/freebsd-vm@v1
       with:
         usesh: true
         prepare: |
-          pkg install -y cmake
+          pkg install -y cmake emacs-nox
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
-          cmake --build build --verbose --config ${{env.BUILD_TYPE}}
+          if [ "${{ github.event_name }}" != workflow_dispatch ] || [ "${{ inputs.publish }}" != true ]; then
+            emacs -Q --batch -L . -l fzf-native \
+              -f fzf-native-load-dyn \
+              --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" \"K\")) 0) (error \"tracked UTF-8 artifact is stale\")))"
+          fi
+          rm -rf bin
+          cmake -B build -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
+          cmake --build build --verbose --config ${BUILD_TYPE}
+          emacs -Q --batch -L . -l fzf-native \
+            -f fzf-native-load-dyn \
+            --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" \"K\")) 0) (error \"fresh UTF-8 artifact failed\")))"
+          actual=$(nm -D --defined-only bin/FreeBSD/fzf-native-module.so | awk '{print $3}' | sort)
+          expected=$(printf '%s\n' emacs_module_init plugin_is_GPL_compatible | sort)
+          test "$actual" = "$expected"
 
     - name: Upload binaries
       uses: actions/upload-artifact@v4
       with:
-        name: bin-freebsd
+        name: bin-freebsd-x86_64
         path: bin/
         if-no-files-found: error
         retention-days: 1
 
   commit:
-    needs: [build, build-freebsd]
+    if: github.event_name == 'push' || inputs.publish == true
+    needs: [build, build-linux, smoke-linux, build-freebsd]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -89,14 +251,25 @@ jobs:
 
     - name: Stage binaries
       run: |
+        rm -rf bin
         mkdir -p bin
         cp -R bin-artifacts/. bin/
         rm -rf bin-artifacts
+        test -f bin/Linux/fzf-native-module.so
+        test -f bin/FreeBSD/fzf-native-module.so
+        test -f bin/Darwin/fzf-native-module.so
+        test -f bin/Darwin/arm64/fzf-native-module.so
+        test -f bin/Windows/Release/fzf-native-module.dll
 
     - name: Bump version
       id: bump
       run: |
         current=$(grep -E '^;; Version: ' fzf-native.el | sed -E 's/^;; Version: //')
+        eask_current=$(sed -n -E 's/^[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' Eask | head -1)
+        if [ -z "$current" ] || [ "$current" != "$eask_current" ]; then
+          echo "Version mismatch before bump: fzf-native.el=$current Eask=$eask_current" >&2
+          exit 1
+        fi
         major=$(echo "$current" | cut -d. -f1)
         minor=$(echo "$current" | cut -d. -f2)
         minor=$((minor + 1))
