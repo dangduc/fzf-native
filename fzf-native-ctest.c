@@ -2916,6 +2916,7 @@ static int32_t lossy_score_of(const char *text, const char *pattern_str) {
   int32_t score = fzf_get_score(text, p, slab);
   fzf_free_pattern(p);
   fzf_free_slab(slab);
+  free(dup);
   return score;
 }
 
@@ -2956,6 +2957,7 @@ static void test_invalid_utf8_highlight_positions(void) {
     if (pos) fzf_free_positions(pos);
     fzf_free_pattern(p);
     fzf_free_slab(slab);
+    free(dup);
   }
 }
 
