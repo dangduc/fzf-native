@@ -743,10 +743,17 @@ The arena is the key invariant: every char* exposed in =s->cands= or
 
 ** Stop / cleanup — =fzf_native_async_stop=
 
-1. Set =score_abort=, =score_req_stop=, and =stop=.  Then signal the scorer.
-2. Stop the producer so that the reader gets EOF.
-3. Join the scorer after the active worker epoch stops.
-4. Join the reader before destruction of =score_req_mu= and =score_req_cond=.
+1. Set =score_abort= and wake the worker pool.  Publish =stop= under =s->mu=
+   so candidate publication is ordered before or after stop, never across it.
+2. Write the private cancellation pipe and signal the scorer.  The pipe wakes
+   =poll= even when a producer descendant escaped the process group and still
+   holds stdout open.
+3. Send =SIGKILL= to the producer process group as independent best-effort
+   cleanup.  Teardown can signal the producer after the reader owns =waitpid=.
+   Exactly one owner reaps the child.
+4. A detached teardown thread joins the scorer after the active worker epoch
+   stops, then joins the reader before closing its stream and cancellation
+   descriptors.
 5. Free the cache, candidate arena, result data, locks, and session.  The
    process-wide worker pool remains available to other sessions.
 

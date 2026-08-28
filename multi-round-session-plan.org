@@ -48,10 +48,10 @@ belongs to that ID, keeps the prior display while a new request runs, and
 reports producer failure even when partial output exists.  This integration is
 tracked as a separate atomic change.
 
-Native implementation and focused verification are complete.  Companion fzfa
-verification, committed-module smoke tests, and release artifact rebuilds are
-still required before merge.  Optional progressive top-K publication remains a
-separate follow-up.
+Native implementation, teardown hardening, and focused verification are
+complete.  The companion fzfa changes and portable module artifacts remain in
+separate atomic pull requests that must pass their integration gates before
+merge.  Optional progressive top-K publication remains a separate follow-up.
 
 * Current fzf-native state
 
@@ -443,7 +443,14 @@ stable-batch cache, growth retry, cancellation, publication, and synchronous
 teardown paths.  At quiescent pool boundaries it compares the exact ordered
 top-K snapshot, including scores and duplicate identity, with an independent
 batch calculation.  Permanent seeds cover active cancellation, growth during a
-request, 2048-candidate batch boundaries, repeated cache rounds, and UTF-8.
+request, 2,048-candidate batch boundaries, repeated cache rounds, filter-only
+limits, concurrent pattern parsing, and UTF-8.
+
+The target also starts the real reader on a pipe.  Normal seeds cover newline
+assembly, ANSI stripping, raw bytes, CR trimming, EOF, and a final unterminated
+line.  Cancellation seeds keep the producer descriptor open, wait until the
+reader enters =poll= again, then stop the session.  This reaches the private
+cancellation channel rather than substituting an in-memory reader model.
 
 Keep the existing upstream fzf match-set oracle.  Run ASan, UBSan, TSan, the C
 tests, direct Emacs 30.2 tests, and upstream match-set tests.
@@ -552,20 +559,25 @@ and synchronization cost.
 
 * Verification record
 
-The following commands passed on 2026-08-20 against the current worktree:
+The following gates passed on 2026-08-28 against the review-fix worktree:
 
-- The direct Emacs 30.2 run passed all 113 native and UTF-8 ERT tests.
+- The direct Emacs 30.2 run passed all 140 native and UTF-8 ERT tests.
 - =make ctest= passed all module and matcher tests.
-- =make ctest-asan= passed with AddressSanitizer and UndefinedBehaviorSanitizer.
-- =make ctest-tsan= passed the C tests and five interactive trace seeds with
-  ThreadSanitizer.
-- =make fuzz-replay= passed all 27 matcher and five interactive-session corpus
-  inputs with AddressSanitizer and UndefinedBehaviorSanitizer.
-- The interactive libFuzzer target completed a clean 20,000-run mutation smoke
-  test and the combined =make fuzz= entry point completed a clean bounded run.
-- =make fuzz-elisp= passed 500 module cases and 40 request-aware session runs.
-- =make fuzz-upstream= passed 500 cases against fzf 0.74.3.
-- The fzfa =make test= run passed strict compilation and all 226 ERT tests.
+- The full C suite passed with AddressSanitizer and UndefinedBehaviorSanitizer.
+- The full C suite passed with ThreadSanitizer.
+- Standalone session-fuzzer replay passed all eight permanent seeds with leak
+  detection, AddressSanitizer, and UndefinedBehaviorSanitizer.
+- ThreadSanitizer replay passed all eight permanent session seeds.
+- The interactive libFuzzer target completed a clean 1,000-run mutation smoke
+  test.  It reached 4,041 instrumented edges and 15,827 features with no target
+  crash, sanitizer finding, or invariant failure.
+- LLVM source coverage recorded eight reader invocations, 16 entries into
+  =poll=, six cancellation-channel exits, two normal EOF exits, and eight stop
+  publications.  Thus the fuzzer reaches the real reader cancellation branch.
+
+The broader matcher corpus, upstream fzf oracle, committed-module smoke tests,
+and companion fzfa suite remain required again after the atomic branches are
+rebased together.
 
 The worker-pool test compares the thread IDs across request rounds.  The IDs do
 not change.
