@@ -46,7 +46,8 @@ Linux, macOS (including Apple silicon), FreeBSD, and Windows are supported.
 The package bundles native modules for x86-64 Linux, FreeBSD, and Windows, and
 for x86-64 and arm64 macOS.  Other architectures can build from source with
 =M-x fzf-native-load-own-build-dyn=.  The bundled Linux module is built on an
-older glibc baseline so it also loads on current distributions.
+older glibc baseline and requires glibc 2.14 or later.  The macOS modules
+require macOS 11 or later.  The FreeBSD module requires FreeBSD 14.4 or later.
 Pre-built shared libraries are in the [[bin][bin/]] directory.
 
 ** Installation

@@ -44,10 +44,13 @@ jobs:
         include:
           - os: macos-15
             artifact: macos-arm64
+            cmake_args: -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
           - os: macos-15-intel
             artifact: macos-x86_64
+            cmake_args: -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
           - os: windows-latest
             artifact: windows-x86_64
+            cmake_args: ""
 
     steps:
     - uses: actions/checkout@v4
@@ -83,7 +86,10 @@ jobs:
       run: rm -rf bin
 
     - name: Configure CMake
-      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
+      run: >-
+        cmake -B ${{github.workspace}}/build
+        -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
+        ${{matrix.cmake_args}}
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --verbose --config ${{env.BUILD_TYPE}}
@@ -206,6 +212,7 @@ jobs:
     - name: Build and smoke in FreeBSD VM
       uses: vmactions/freebsd-vm@v1
       with:
+        release: "14.4"
         usesh: true
         prepare: |
           pkg install -y cmake emacs-nox
