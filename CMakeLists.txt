@@ -64,6 +64,7 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 add_library(utf8proc STATIC ${UTF8PROC_DIR}/utf8proc.c)
 set_target_properties(utf8proc PROPERTIES C_STANDARD 11
                                          POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(utf8proc PUBLIC UTF8PROC_STATIC)
 target_include_directories(utf8proc PUBLIC ${UTF8PROC_INCLUDE_DIR})
 
 if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
