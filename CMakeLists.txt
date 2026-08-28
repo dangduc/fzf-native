@@ -77,6 +77,20 @@ endif()
 target_include_directories(fzf-native-module PRIVATE ${UTF8PROC_INCLUDE_DIR})
 target_link_libraries(fzf-native-module PRIVATE utf8proc)
 
+# ELF startup objects can add globally visible _init and _fini symbols even when
+# the target uses hidden visibility.  Restrict the dynamic ABI to the two
+# symbols that Emacs modules require.  Darwin uses source visibility, and the
+# Windows target uses fzf-native-module.def.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+  set(FZF_NATIVE_EXPORT_MAP "${CMAKE_CURRENT_SOURCE_DIR}/fzf-native-module.map")
+  target_link_options(fzf-native-module PRIVATE
+                      "LINKER:--version-script=${FZF_NATIVE_EXPORT_MAP}")
+  set_property(
+    TARGET fzf-native-module
+    APPEND
+    PROPERTY LINK_DEPENDS "${FZF_NATIVE_EXPORT_MAP}")
+endif()
+
 if(IS_ABSOLUTE "${FZF_NATIVE_MODULE_OUTPUT_DIR}")
   set(OUTPUT_DIR "${FZF_NATIVE_MODULE_OUTPUT_DIR}")
 else()
