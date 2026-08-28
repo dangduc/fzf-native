@@ -43,6 +43,8 @@ static inline void fzf_block_all_signals(void) {}
 
 #ifdef _WIN32
 #  define EXPORT __declspec(dllexport)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define EXPORT __attribute__((visibility("default")))
 #else
 #  define EXPORT
 #endif
@@ -2852,6 +2854,7 @@ fzf_native_filter_only_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
          ? Qt : Qnil;
 }
 
+EXPORT
 int emacs_module_init(struct emacs_runtime *rt) {
   // Verify compatability with Emacs executable loading this module
   if ((size_t) rt->size < sizeof *rt)

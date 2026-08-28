@@ -9,7 +9,7 @@ set(UTF8PROC_INCLUDE_DIR "${UTF8PROC_DIR}")
 
 # Check compilers
 message(STATUS ">>>>>>>> ${CMAKE_CXX_COMPILER_ID}")
-message(STATUS ">>>>>>>> ${CMAKE_HOST_SYSTEM_PROCESSOR}")
+message(STATUS ">>>>>>>> ${CMAKE_SYSTEM_PROCESSOR}")
 message(STATUS ">>>>>>>> UTF8PROC_DIR: ${UTF8PROC_DIR}")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -40,11 +40,11 @@ endif()
 
 # See
 # https://gitlab.kitware.com/cmake/community/-/wikis/doc/tutorials/How-To-Write-Platform-Checks
-set(PLATFORM_DIR ${CMAKE_HOST_SYSTEM_NAME})
+set(PLATFORM_DIR ${CMAKE_SYSTEM_NAME})
 
 if(NOT DEFINED FZF_NATIVE_MODULE_OUTPUT_DIR)
-  if((CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin") AND (CMAKE_HOST_SYSTEM_PROCESSOR
-                                                     STREQUAL "arm64"))
+  if((CMAKE_SYSTEM_NAME STREQUAL "Darwin") AND (CMAKE_SYSTEM_PROCESSOR STREQUAL
+                                                "arm64"))
     # Assume Apple Silicon.
     set(FZF_NATIVE_MODULE_OUTPUT_DIR bin/${PLATFORM_DIR}/arm64)
   else()
@@ -52,22 +52,18 @@ if(NOT DEFINED FZF_NATIVE_MODULE_OUTPUT_DIR)
   endif()
 endif()
 
-# To build shared libraries in Windows, we set CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS
-# to TRUE. See
-# https://cmake.org/cmake/help/v3.4/variable/CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS.html
-# See
-# https://blog.kitware.com/create-dlls-on-windows-without-declspec-using-new-cmake-export-all-feature/
-set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
-
 # Build the minimal vendored runtime directly so the project does not depend on
 # utf8proc's upstream build system or carry its tests and generated binaries.
 add_library(utf8proc STATIC ${UTF8PROC_DIR}/utf8proc.c)
-set_target_properties(utf8proc PROPERTIES C_STANDARD 11
-                                          POSITION_INDEPENDENT_CODE ON)
+set_target_properties(
+  utf8proc
+  PROPERTIES C_STANDARD 11
+             POSITION_INDEPENDENT_CODE ON
+             C_VISIBILITY_PRESET hidden)
 target_compile_definitions(utf8proc PUBLIC UTF8PROC_STATIC)
 target_include_directories(utf8proc PUBLIC ${UTF8PROC_INCLUDE_DIR})
 
-if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   # Assume compiler MSVC.
   add_library(fzf-native-module SHARED fzf-native-module.c fzf.c fzf.h
                                        fzf-additions.c fzf-additions.h)
@@ -85,6 +81,7 @@ set_target_properties(
   fzf-native-module
   PROPERTIES C_STANDARD 11
              POSITION_INDEPENDENT_CODE ON
+             C_VISIBILITY_PRESET hidden
              PREFIX ""
              LIBRARY_OUTPUT_DIRECTORY ${OUTPUT_DIR})
 target_include_directories(fzf-native-module PUBLIC ${EMACS_INCLUDE_DIR})
@@ -97,16 +94,16 @@ set_target_properties(
              LIBRARY_OUTPUT_DIRECTORY ${OUTPUT_DIR}
              RUNTIME_OUTPUT_DIRECTORY ${OUTPUT_DIR})
 
-# Compile-time logging gate. fzf_log() is compiled out of the module by
-# default. Enable with: FZF_NATIVE_DEBUG=1 cmake -B build
-# When toggling, run `make clean` first so CMake reconfigures cleanly.
+# Compile-time logging gate. fzf_log() is compiled out of the module by default.
+# Enable with: FZF_NATIVE_DEBUG=1 cmake -B build When toggling, run `make clean`
+# first so CMake reconfigures cleanly.
 if(DEFINED ENV{FZF_NATIVE_DEBUG})
   target_compile_definitions(fzf-native-module PRIVATE FZF_NATIVE_DEBUG)
   message(STATUS "FZF_NATIVE_DEBUG enabled — file logging compiled in")
 endif()
 
 # --- Debug / Sanitizer flags (Linux/GCC/Clang only) ---
-if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
   # Full debug info: -g3 includes macro definitions, -fno-omit-frame-pointer
   # keeps stack frames intact for better backtraces, -O0 disables optimizations
@@ -143,9 +140,3 @@ if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
 
 endif()
 # --- End debug / sanitizer flags ---
-
-# See
-# https://gernotklingler.com/blog/creating-using-shared-libraries-different-compilers-different-operating-systems/
-include(GenerateExportHeader)
-# generates the export header fzf-native-module_EXPORTS.h automatically.
-generate_export_header(fzf-native-module)
