@@ -41,6 +41,9 @@ jobs:
       - name: Replay the permanent ASan/UBSan corpus
         run: make FUZZ_CC=clang fuzz-replay
 
+      - name: Replay interactive sessions with ThreadSanitizer
+        run: make FUZZ_CC=clang fuzz-session-tsan
+
       - name: Run a bounded coverage-guided campaign
         run: make FUZZ_CC=clang FUZZ_SECONDS=60 fuzz
 
@@ -60,5 +63,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fzf-native-fuzz-artifacts
-          path: build/fuzz-artifacts/
+          path: |
+            build/fuzz-artifacts/
+            build/fuzz-session-artifacts/
           if-no-files-found: ignore

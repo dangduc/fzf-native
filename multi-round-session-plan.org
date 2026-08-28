@@ -452,6 +452,9 @@ line.  Cancellation seeds keep the producer descriptor open, wait until the
 reader enters =poll= again, then stop the session.  This reaches the private
 cancellation channel rather than substituting an in-memory reader model.
 
+The =fuzz= and =fuzz-replay= targets run both matcher targets and session
+targets.  CI also runs =fuzz-session-tsan= and uploads session crash artifacts.
+
 Keep the existing upstream fzf match-set oracle.  Run ASan, UBSan, TSan, the C
 tests, direct Emacs 30.2 tests, and upstream match-set tests.
 
@@ -565,9 +568,11 @@ The following gates passed on 2026-08-28 against the review-fix worktree:
 - =make ctest= passed all module and matcher tests.
 - The full C suite passed with AddressSanitizer and UndefinedBehaviorSanitizer.
 - The full C suite passed with ThreadSanitizer.
-- Standalone session-fuzzer replay passed all eight permanent seeds with leak
-  detection, AddressSanitizer, and UndefinedBehaviorSanitizer.
-- ThreadSanitizer replay passed all eight permanent session seeds.
+- =make fuzz-replay= passed nine matcher seeds and all eight permanent session
+  seeds with AddressSanitizer and UndefinedBehaviorSanitizer.
+- =make fuzz-session-tsan= passed all eight permanent session seeds.
+- A one-second =make fuzz-session= integration run completed 2,221 executions.
+  Peak RSS was 113 MiB, and no sanitizer or invariant failure occurred.
 - The interactive libFuzzer target completed a clean 1,000-run mutation smoke
   test.  It reached 4,041 instrumented edges and 15,827 features with no target
   crash, sanitizer finding, or invariant failure.
@@ -575,9 +580,8 @@ The following gates passed on 2026-08-28 against the review-fix worktree:
   =poll=, six cancellation-channel exits, two normal EOF exits, and eight stop
   publications.  Thus the fuzzer reaches the real reader cancellation branch.
 
-The broader matcher corpus, upstream fzf oracle, committed-module smoke tests,
-and companion fzfa suite remain required again after the atomic branches are
-rebased together.
+The upstream fzf oracle, committed-module smoke tests, and companion fzfa suite
+remain required after the final artifact commit.
 
 The worker-pool test compares the thread IDs across request rounds.  The IDs do
 not change.
