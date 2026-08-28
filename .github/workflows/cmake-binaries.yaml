@@ -379,6 +379,14 @@ jobs:
         cp bin-artifacts/bin-windows-x86_64/Windows/Release/fzf-native-module.dll bin/Windows/Release/
         cp bin-artifacts/bin-windows-x86_64/Windows/Release/fzf-native-module.exp bin/Windows/Release/
         cp bin-artifacts/bin-windows-x86_64/Windows/Release/fzf-native-module.lib bin/Windows/Release/
+        chmod 0644 \
+          bin/Darwin/fzf-native-module.so \
+          bin/Darwin/arm64/fzf-native-module.so \
+          bin/FreeBSD/fzf-native-module.so \
+          bin/Linux/fzf-native-module.so \
+          bin/Windows/Release/fzf-native-module.dll \
+          bin/Windows/Release/fzf-native-module.exp \
+          bin/Windows/Release/fzf-native-module.lib
         rm -rf bin-artifacts
         test -f bin/Linux/fzf-native-module.so
         test -f bin/FreeBSD/fzf-native-module.so
