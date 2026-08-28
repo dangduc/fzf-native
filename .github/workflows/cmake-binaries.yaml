@@ -109,6 +109,9 @@ jobs:
         actual=$(nm -gU "$module" | awk '{print $3}' | sort)
         expected=$(printf '%s\n' _emacs_module_init _plugin_is_GPL_compatible | sort)
         test "$actual" = "$expected"
+        minos=$(otool -l "$module" | awk '$1 == "minos" {print $2; exit}')
+        printf 'minimum macOS version: %s\n' "$minos"
+        test "$minos" = 11.0
 
     - name: Check Windows export surface
       if: runner.os == 'Windows'
@@ -217,6 +220,7 @@ jobs:
         prepare: |
           pkg install -y cmake emacs-nox
         run: |
+          freebsd-version -u | grep -q '^14\.4'
           if [ "${{ github.event_name }}" != workflow_dispatch ] || [ "${{ inputs.publish }}" != true ]; then
             emacs -Q --batch -L . -l fzf-native \
               -f fzf-native-load-dyn \
