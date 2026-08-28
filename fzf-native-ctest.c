@@ -199,6 +199,34 @@ static void test_startup_posix_errors_are_descriptive(void) {
   CHECK(strstr(ctest_signalled_message, strerror(EMFILE)) != NULL);
 }
 
+static size_t ctest_make_user_ptr_calls;
+
+static emacs_value ctest_fail_make_user_ptr(emacs_env *env,
+                                            emacs_finalizer finalizer,
+                                            void *pointer) {
+  (void)env;
+  (void)finalizer;
+  CHECK(pointer == NULL);
+  ctest_make_user_ptr_calls++;
+  ctest_string_pending_exit = emacs_funcall_exit_signal;
+  return NULL;
+}
+
+static void test_async_start_publishes_inert_handle_before_resources(void) {
+  emacs_env env = {0};
+  env.make_user_ptr = ctest_fail_make_user_ptr;
+  env.non_local_exit_check = ctest_non_local_exit_check;
+  ctest_make_user_ptr_calls = 0;
+  ctest_string_pending_exit = emacs_funcall_exit_return;
+  emacs_value args[] = {(emacs_value)(uintptr_t)0x44};
+
+  emacs_value result = fzf_native_async_start(&env, 1, args, NULL);
+
+  CHECK(result == Qnil);
+  CHECK(ctest_make_user_ptr_calls == 1);
+  CHECK(ctest_string_pending_exit == emacs_funcall_exit_signal);
+}
+
 static void test_status_metadata_does_not_copy_results(void) {
   AsyncSession s;
   memset(&s, 0, sizeof s);
@@ -791,6 +819,25 @@ static void test_async_reader_long_line(void) {
   /* Sanity: first/last bytes match what we wrote, no I/O-boundary garbage. */
   CHECK(cand[0]            == 'x');
   CHECK(cand[LINE_LEN - 1] == 'x');
+  free_async_session(s);
+}
+
+static void test_async_reader_final_unterminated_line(void) {
+  int pfd[2];
+  CHECK(pipe(pfd) == 0);
+  CHECK(write(pfd[1], "alpha\nomega", 11) == 11);
+  close(pfd[1]);
+
+  FILE *rfp = fdopen(pfd[0], "r");
+  CHECK(rfp != NULL);
+  AsyncSession *s = make_async_session(rfp, 8);
+  CHECK(s != NULL);
+
+  async_reader((void *)s);
+
+  CHECK(s->count == 2);
+  CHECK(strcmp(cands_at(s, 0), "alpha") == 0);
+  CHECK(strcmp(cands_at(s, 1), "omega") == 0);
   free_async_session(s);
 }
 
@@ -2469,6 +2516,92 @@ static void test_destroy_signals_reader_owned_child(void) {
   CHECK(errno == ECHILD);
 }
 
+/* A descendant can escape the producer process group with setsid() and retain
+   stdout forever.  Teardown must wake the reader through its own cancellation
+   pipe rather than waiting for process-tree cleanup to close that descriptor. */
+static void test_destroy_wakes_reader_with_escaped_descendant(void) {
+  int output[2], escaped_pid_pipe[2], ready_pipe[2];
+  CHECK(pipe(output) == 0);
+  CHECK(pipe(escaped_pid_pipe) == 0);
+  CHECK(pipe(ready_pipe) == 0);
+
+  pid_t producer = fork();
+  CHECK(producer >= 0);
+  if (producer == 0) {
+    (void)setpgid(0, 0);
+    close(output[0]);
+    close(escaped_pid_pipe[0]);
+    close(ready_pipe[0]);
+    pid_t escaped = fork();
+    if (escaped < 0) _exit(100);
+    if (escaped == 0) {
+      if (setsid() < 0) _exit(101);
+      pid_t self = getpid();
+      if (write(escaped_pid_pipe[1], &self, sizeof self) != sizeof self)
+        _exit(102);
+      if (write(output[1], "alpha\nomega", 11) != 11) _exit(103);
+      if (write(ready_pipe[1], "R", 1) != 1) _exit(104);
+      close(escaped_pid_pipe[1]);
+      close(ready_pipe[1]);
+      for (;;) pause();
+    }
+    close(output[1]);
+    close(escaped_pid_pipe[1]);
+    close(ready_pipe[1]);
+    _exit(0);
+  }
+
+  (void)setpgid(producer, producer);
+  close(output[1]);
+  close(escaped_pid_pipe[1]);
+  close(ready_pipe[1]);
+  pid_t escaped = -1;
+  char ready = 0;
+  CHECK(read(escaped_pid_pipe[0], &escaped, sizeof escaped) == sizeof escaped);
+  CHECK(read(ready_pipe[0], &ready, 1) == 1 && ready == 'R');
+  close(escaped_pid_pipe[0]);
+  close(ready_pipe[0]);
+
+  AsyncSession *s = calloc(1, sizeof *s);
+  CHECK(s != NULL);
+  s->pid = producer;
+  s->fp = fdopen(output[0], "r");
+  CHECK(s->fp != NULL);
+  pthread_mutex_init(&s->mu, NULL);
+  pthread_mutex_init(&s->child_mu, NULL);
+  pthread_mutex_init(&s->score_req_mu, NULL);
+  pthread_mutex_init(&s->score_res_mu, NULL);
+  pthread_cond_init(&s->score_req_cond, NULL);
+  cache_init(&s->cache, 4);
+  batch_cache_init(&s->batch_cache, 0);
+  s->child_alive = true;
+  atomic_store_explicit(&s->child_owner, AsyncChildUnclaimed,
+                        memory_order_relaxed);
+  CHECK(async_make_cancel_pipe(s));
+  CHECK(pthread_create(&s->reader, NULL, async_reader, s) == 0);
+  s->reader_started = true;
+
+  double deadline = monotonic_ms() + 1000.0;
+  while (async_observe_pool(s).count < 1 && monotonic_ms() < deadline)
+    test_sleep_ms(1);
+  CHECK(async_observe_pool(s).count == 1);
+  CHECK(strcmp(cands_at(s, 0), "alpha") == 0);
+  CHECK(kill(escaped, 0) == 0);
+
+  double t0 = monotonic_ms();
+  async_session_destroy(s);
+  CHECK(monotonic_ms() - t0 < 1000.0);
+  CHECK(kill(escaped, 0) == 0);
+
+  CHECK(kill(escaped, SIGKILL) == 0);
+  deadline = monotonic_ms() + 5000.0;
+  while (kill(escaped, 0) == 0 && monotonic_ms() < deadline)
+    test_sleep_ms(5);
+  errno = 0;
+  CHECK(kill(escaped, 0) == -1);
+  CHECK(errno == ESRCH);
+}
+
 static double monotonic_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -2723,6 +2856,7 @@ int main(void) {
   RUN(test_async_reader_ansi_stripping);
   RUN(test_async_reader_many_lines);
   RUN(test_async_reader_long_line);
+  RUN(test_async_reader_final_unterminated_line);
 
   printf("--- chunked cands_top ---\n");
   RUN(test_cands_top_index_split);
@@ -2773,6 +2907,7 @@ int main(void) {
   RUN(test_session_abi_is_versioned);
   RUN(test_lossless_string_conversion_preserves_runtime_errors);
   RUN(test_startup_posix_errors_are_descriptive);
+  RUN(test_async_start_publishes_inert_handle_before_resources);
   RUN(test_status_metadata_does_not_copy_results);
   RUN(test_snapshot_copy_oom_is_not_authoritative_empty);
   RUN(test_growth_retry_query_oom_is_terminal);
@@ -2797,6 +2932,7 @@ int main(void) {
   RUN(test_destroy_async_many_in_flight);
   RUN(test_startup_cleanup_kills_term_resistant_child);
   RUN(test_destroy_signals_reader_owned_child);
+  RUN(test_destroy_wakes_reader_with_escaped_descendant);
 
   RUN(test_invalid_utf8_candidates_stay_matchable);
   RUN(test_invalid_utf8_highlight_positions);

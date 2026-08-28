@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <poll.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
@@ -1442,16 +1443,32 @@ static emacs_value signal_slab_allocation_error(emacs_env *env) {
   return Qnil;
 }
 
+/* make_user_ptr allocates both a Lisp_User_Ptr and an emacs_value slot.  If
+   the second allocation fails, the Lisp object can still be finalized even
+   though C receives no handle.  Publish a NULL payload first so every failure
+   is inert, then attach native ownership with non-allocating set_user_ptr. */
+static bool fzf_native_make_inert_user_ptr(emacs_env *env,
+                                           emacs_finalizer finalizer,
+                                           emacs_value *handle) {
+  *handle = env->make_user_ptr(env, finalizer, NULL);
+  return *handle != NULL &&
+         env->non_local_exit_check(env) == emacs_funcall_exit_return;
+}
+
 emacs_value fzf_native_make_default_slab(emacs_env *env,
                                          ptrdiff_t UNUSED(nargs),
                                          emacs_value UNUSED(args[]),
                                          void UNUSED(*data_ptr)) {
+  emacs_value handle;
+  if (!fzf_native_make_inert_user_ptr(env, slab_finalize, &handle))
+    return Qnil;
   fzf_slab_t *slab = fzf_make_default_slab();
 
   if (!slab)
     return signal_slab_allocation_error(env);
 
-  return env->make_user_ptr(env, slab_finalize, slab);
+  env->set_user_ptr(env, handle, slab);
+  return handle;
 }
 
 emacs_value fzf_native_make_slab(emacs_env *env,
@@ -1468,12 +1485,17 @@ emacs_value fzf_native_make_slab(emacs_env *env,
       (uintmax_t)slab16 > SIZE_MAX || (uintmax_t)slab32 > SIZE_MAX)
     return signal_slab_allocation_error(env);
 
+  emacs_value handle;
+  if (!fzf_native_make_inert_user_ptr(env, slab_finalize, &handle))
+    return Qnil;
+
   fzf_slab_t *slab = fzf_make_slab(
       (fzf_slab_config_t){(size_t)slab16, (size_t)slab32});
   if (!slab)
     return signal_slab_allocation_error(env);
 
-  return env->make_user_ptr(env, slab_finalize, slab);
+  env->set_user_ptr(env, handle, slab);
+  return handle;
 }
 
 /* ================================================================
@@ -2647,6 +2669,9 @@ typedef struct {
   _Atomic uint64_t producer_error;
   _Atomic int   producer_exit_status;
   FILE         *fp;
+  int           cancel_read_fd;
+  int           cancel_write_fd;
+  bool          cancel_pipe_ready;
   _Atomic bool stop;
   /* Set by the reader thread immediately before it exits — either
      because the child producer closed its stdout (EOF) or because
@@ -2925,6 +2950,54 @@ static void async_notify_candidate_growth(AsyncSession *s) {
   pthread_mutex_unlock(&s->score_req_mu);
 }
 
+/* A producer descendant can leave the producer's process group with setsid()
+   while retaining stdout.  Process signalling is therefore best-effort
+   cleanup, not a reader wakeup mechanism.  Give every session an independent
+   close-on-exec cancellation channel that teardown owns. */
+static bool async_make_cancel_pipe(AsyncSession *s) {
+  int fds[2];
+  if (pipe(fds) != 0) return false;
+
+  int read_fd_flags = fcntl(fds[0], F_GETFD);
+  int write_fd_flags = fcntl(fds[1], F_GETFD);
+  int write_status_flags = fcntl(fds[1], F_GETFL);
+  if (read_fd_flags < 0 || write_fd_flags < 0 || write_status_flags < 0 ||
+      fcntl(fds[0], F_SETFD, read_fd_flags | FD_CLOEXEC) < 0 ||
+      fcntl(fds[1], F_SETFD, write_fd_flags | FD_CLOEXEC) < 0 ||
+      fcntl(fds[1], F_SETFL, write_status_flags | O_NONBLOCK) < 0) {
+    int saved_errno = errno;
+    close(fds[0]);
+    close(fds[1]);
+    errno = saved_errno;
+    return false;
+  }
+
+  s->cancel_read_fd = fds[0];
+  s->cancel_write_fd = fds[1];
+  s->cancel_pipe_ready = true;
+  return true;
+}
+
+static void async_wake_reader(AsyncSession *s) {
+  if (!s->cancel_pipe_ready) return;
+  const unsigned char wake = 1;
+  ssize_t written;
+  do {
+    written = write(s->cancel_write_fd, &wake, sizeof wake);
+  } while (written < 0 && errno == EINTR);
+  /* EAGAIN means an earlier wake byte is already pending. */
+}
+
+/* Serialize the stop publication with candidate publication under MU.  A
+   candidate that acquires MU first is ordered before stop; one that acquires
+   it afterwards observes STOP and cannot become visible. */
+static void async_publish_stop(AsyncSession *s) {
+  pthread_mutex_lock(&s->mu);
+  atomic_store_explicit(&s->stop, true, memory_order_release);
+  pthread_mutex_unlock(&s->mu);
+  async_wake_reader(s);
+}
+
 /* Append one immutable candidate to the session arena and publish it to the
    scorer.  The producer is the sole caller, so reading COUNT and the current
    top-level block pointer before taking MU is safe.  Keeping this operation
@@ -2932,6 +3005,7 @@ static void async_notify_candidate_growth(AsyncSession *s) {
    growth path without an Emacs process or a shell child. */
 static bool async_append_candidate(AsyncSession *s, const char *line,
                                    size_t len) {
+  if (atomic_load_explicit(&s->stop, memory_order_acquire)) return false;
   size_t i  = s->count;
   size_t hi = i >> CANDS_BLOCK_SHIFT;
   size_t lo = i & CANDS_BLOCK_MASK;
@@ -2969,6 +3043,11 @@ static bool async_append_candidate(AsyncSession *s, const char *line,
   }
 
   pthread_mutex_lock(&s->mu);
+  if (atomic_load_explicit(&s->stop, memory_order_acquire)) {
+    pthread_mutex_unlock(&s->mu);
+    if (need_publish) free(block);
+    return false;
+  }
   if (need_publish) s->cands_top[hi] = block;
   s->cands_top[hi][lo] = dup;
   s->count++;
@@ -2978,57 +3057,164 @@ static bool async_append_candidate(AsyncSession *s, const char *line,
   return true;
 }
 
+static bool async_extend_line(AsyncSession *s, char **line, size_t *used,
+                              size_t *capacity, const char *bytes,
+                              size_t amount) {
+  if (amount > SIZE_MAX - *used - 1) {
+    async_record_producer_failure(
+        s, AsyncProducerErrorAllocation, ENOMEM);
+    return false;
+  }
+  size_t needed = *used + amount + 1;
+  if (needed > *capacity) {
+    size_t next = *capacity ? *capacity : 4096;
+    while (next < needed) {
+      if (next > SIZE_MAX / 2) {
+        next = needed;
+        break;
+      }
+      next *= 2;
+    }
+    char *grown = realloc(*line, next);
+    if (!grown) {
+      async_record_producer_failure(
+          s, AsyncProducerErrorAllocation, ENOMEM);
+      return false;
+    }
+    *line = grown;
+    *capacity = next;
+  }
+  if (amount) memcpy(*line + *used, bytes, amount);
+  *used += amount;
+  (*line)[*used] = '\0';
+  return true;
+}
+
+static bool async_process_candidate_line(AsyncSession *s, char *line,
+                                         size_t len) {
+  while (len && line[len - 1] == '\r') line[--len] = '\0';
+  if (!len) return true;
+
+  len = async_strip_ansi(line, len);
+  if (!len) return true;
+
+  ptrdiff_t mll = s->max_line_length;
+  if (mll != 0) {
+    size_t cap = mll > 0
+                     ? (size_t)mll
+                     : (size_t)(-(mll + 1)) + 1;
+    size_t char_len = utf8_character_count(line, len);
+    if (char_len > cap) {
+      if (mll > 0) return true;   /* exclude */
+      len = utf8_prefix_byte_length(line, len, cap); /* truncate */
+      line[len] = '\0';
+    }
+  }
+
+  return async_append_candidate(s, line, len);
+}
+
 static void *async_reader(void *arg) {
   fzf_block_all_signals();
   AsyncSession *s = arg;
   fzf_log("async_reader START: pid=%d\n", (int)s->pid);
-  /* getline manages a growable buffer that delivers whole logical
-     lines regardless of length.  Pre-getline, the reader used fgets
-     with a fixed 8 KB stack buffer and fragmented long lines at
-     arbitrary I/O boundaries.
 
-     No internal hard ceiling — matches the semantics of fzf, ripgrep,
-     and GNU grep, which all let the reader buffer grow until either
-     the line ends or the OS denies allocation.  The user-facing knob
-     `fzf-native-max-line-length' is checked *after* getline returns
-     (analogous to ripgrep's `--max-columns'), so pathological lines
-     are filtered from the candidate stream but the read itself still
-     happens.  Users who need to truncate before reading can set the
-     producer's output up-front (e.g. `awk 'length<256'`). */
-  char  *line   = NULL;
-  size_t bufcap = 0;
-  ssize_t glen;
-  while (!atomic_load_explicit(&s->stop, memory_order_relaxed) && s->fp &&
-         (glen = getline(&line, &bufcap, s->fp)) != -1) {
-    size_t len = (size_t)glen;
-    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
-      line[--len] = '\0';
-    len = async_strip_ansi(line, len);
-    if (!len) continue;
+  /* Use fd-level poll/read instead of getline.  getline can block forever on
+     an unterminated line held open by a descendant outside the producer's
+     process group.  The cancellation pipe gives teardown an owned wakeup;
+     raw reads retain getline's unbounded-line and final-unterminated-line
+     semantics without ever blocking while a partial line is buffered. */
+  char *line = NULL;
+  size_t used = 0;
+  size_t capacity = 0;
+  bool eof = false;
+  bool read_failed = false;
+  int output_fd = s->fp ? fileno(s->fp) : -1;
 
-    ptrdiff_t mll = s->max_line_length;
-    if (mll != 0) {
-      size_t cap = mll > 0
-                     ? (size_t)mll
-                     : (size_t)(-(mll + 1)) + 1;
-      size_t char_len = utf8_character_count(line, len);
-      if (char_len > cap) {
-        if (mll > 0) continue;   /* exclude */
-        len = utf8_prefix_byte_length(line, len, cap); /* truncate */
-        line[len] = '\0';
-      }
+  if (output_fd < 0) {
+    async_record_producer_failure(
+        s, AsyncProducerErrorRead, errno ? errno : EBADF);
+    read_failed = true;
+  }
+
+  while (!read_failed &&
+         !atomic_load_explicit(&s->stop, memory_order_acquire)) {
+    struct pollfd wait_fds[2] = {
+      {.fd = output_fd, .events = POLLIN},
+      {.fd = s->cancel_read_fd, .events = POLLIN},
+    };
+    nfds_t wait_count = s->cancel_pipe_ready ? 2 : 1;
+    int ready;
+    do {
+      ready = poll(wait_fds, wait_count, -1);
+    } while (ready < 0 && errno == EINTR &&
+             !atomic_load_explicit(&s->stop, memory_order_acquire));
+
+    /* Cancellation wins when producer data and the wake byte arrive in the
+       same poll cycle. */
+    if (atomic_load_explicit(&s->stop, memory_order_acquire) ||
+        (s->cancel_pipe_ready &&
+         (wait_fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))))
+      break;
+    if (ready < 0) {
+      async_record_producer_failure(
+          s, AsyncProducerErrorRead, errno ? errno : EIO);
+      read_failed = true;
+      break;
+    }
+    if (wait_fds[0].revents & POLLNVAL) {
+      async_record_producer_failure(s, AsyncProducerErrorRead, EBADF);
+      read_failed = true;
+      break;
+    }
+    if (!(wait_fds[0].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+
+    char chunk[8192];
+    ssize_t amount;
+    do {
+      amount = read(output_fd, chunk, sizeof chunk);
+    } while (amount < 0 && errno == EINTR &&
+             !atomic_load_explicit(&s->stop, memory_order_acquire));
+    if (atomic_load_explicit(&s->stop, memory_order_acquire)) break;
+    if (amount < 0) {
+      async_record_producer_failure(
+          s, AsyncProducerErrorRead, errno ? errno : EIO);
+      read_failed = true;
+      break;
+    }
+    if (amount == 0) {
+      eof = true;
+      break;
     }
 
-    if (!async_append_candidate(s, line, len)) break;
+    size_t segment = 0;
+    bool keep_reading = true;
+    for (size_t i = 0; i < (size_t)amount; i++) {
+      if (chunk[i] != '\n') continue;
+      if (!async_extend_line(
+              s, &line, &used, &capacity, chunk + segment, i - segment) ||
+          !async_process_candidate_line(s, line, used)) {
+        keep_reading = false;
+        break;
+      }
+      used = 0;
+      line[0] = '\0';
+      segment = i + 1;
+    }
+    if (!keep_reading) break;
+    if (!async_extend_line(s, &line, &used, &capacity, chunk + segment,
+                           (size_t)amount - segment))
+      break;
   }
-  bool stopping = atomic_load_explicit(&s->stop, memory_order_relaxed);
-  if (!stopping && s->fp && !feof(s->fp) &&
-      atomic_load_explicit(&s->producer_error,
-                           memory_order_acquire) == 0)
-    async_record_producer_failure(
-        s, AsyncProducerErrorRead, errno ? errno : EIO);
+
+  /* Match getline on ordinary EOF, but never publish a partial line after a
+     cancellation request. */
+  if (eof && used &&
+      !atomic_load_explicit(&s->stop, memory_order_acquire))
+    (void)async_process_candidate_line(s, line, used);
 
   free(line);
+  bool stopping = atomic_load_explicit(&s->stop, memory_order_acquire);
   if (s->pid > 0 && async_claim_child(s, AsyncChildReader)) {
     uint64_t producer_error = atomic_load_explicit(
         &s->producer_error, memory_order_acquire);
@@ -3040,7 +3226,7 @@ static void *async_reader(void *arg) {
     int wait_status = 0;
     pid_t waited = async_wait_child(s, &wait_status);
     int wait_errno = errno;
-    stopping = atomic_load_explicit(&s->stop, memory_order_relaxed);
+    stopping = atomic_load_explicit(&s->stop, memory_order_acquire);
 
     int exit_status = waited == s->pid
                           ? async_normalize_wait_status(wait_status)
@@ -3105,7 +3291,7 @@ static void async_session_destroy(void *ptr) {
   atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
   async_worker_pool_wake(atomic_load_explicit(
       &s->worker_pool, memory_order_acquire));
-  atomic_store_explicit(&s->stop, true, memory_order_relaxed);
+  async_publish_stop(s);
   bool teardown_owns_child =
       s->pid > 0 && async_claim_child(s, AsyncChildTeardown);
   /* Synchronous startup unwind and the detached-worker fallback must also be
@@ -3148,6 +3334,11 @@ static void async_session_destroy(void *ptr) {
   pthread_cond_destroy(&s->score_req_cond);
 
   if (s->fp)      { fclose(s->fp); s->fp = NULL; }
+  if (s->cancel_pipe_ready) {
+    close(s->cancel_read_fd);
+    close(s->cancel_write_fd);
+    s->cancel_pipe_ready = false;
+  }
   if (teardown_owns_child) {
     int status = 0;
     async_wait_child(s, &status);
@@ -3193,7 +3384,7 @@ static void async_session_destroy_async(void *ptr) {
   atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
   async_worker_pool_wake(atomic_load_explicit(
       &s->worker_pool, memory_order_acquire));
-  atomic_store_explicit(&s->stop, true, memory_order_relaxed);
+  async_publish_stop(s);
   async_signal_child(s, SIGKILL);
   atomic_store_explicit(&s->producer_state, AsyncProducerStopped,
                         memory_order_release);
@@ -3384,6 +3575,16 @@ static bool async_build_child_environment(
 static emacs_value
 fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
                        emacs_value args[], void *UNUSED(data)) {
+  /* Establish Lisp ownership while it is still inert.  make_user_ptr has two
+     allocation stages inside Emacs; publishing a live session first can leak
+     it on the first failure or double-finalize it on the second.  A NULL
+     payload makes either failure harmless, and set_user_ptr performs the
+     non-allocating ownership transfer only after startup is complete. */
+  emacs_value handle;
+  if (!fzf_native_make_inert_user_ptr(
+          env, async_session_destroy_async, &handle))
+    return Qnil;
+
   char *cmd = async_copy_lisp_c_string(env, args[0], "producer command");
   if (!cmd) return Qnil;
 
@@ -3621,6 +3822,8 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   atomic_store(&s->producer_error, 0);
   atomic_store(&s->producer_exit_status, -1);
 
+  bool cancel_ready = async_make_cancel_pipe(s);
+
   {
     /* Canonical name; fzf-async bridges `fzf-async-max-line-length'
        onto this via :around advice on `fzf-native-async-start'.
@@ -3691,9 +3894,10 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   /* Worker threads are allocated lazily by the first scoring request through
      one process-wide pool.  Starting many idle sessions therefore adds only
      their reader/scorer coordinators, not N × CPU persistent workers. */
-  bool start_ok = s->fp != NULL;
-  const char *start_error = start_ok
-      ? NULL : "fzf-native: could not open producer output";
+  bool start_ok = s->fp != NULL && cancel_ready;
+  const char *start_error = s->fp == NULL
+      ? "fzf-native: could not open producer output"
+      : cancel_ready ? NULL : "fzf-native: could not create reader wakeup";
   if (start_ok) {
     start_ok = pthread_create(&s->reader, NULL, async_reader, s) == 0;
     s->reader_started = start_ok;
@@ -3716,7 +3920,8 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   /* The user_ptr finalizer (GC sweep on Emacs main thread) routes through
      the async path too: signaling + pthread_create are O(µs), so GC stays
      fast and the blocking pthread_join runs off-main. */
-  return env->make_user_ptr(env, async_session_destroy_async, s);
+  env->set_user_ptr(env, handle, s);
+  return handle;
 
 start_allocation_failure:
   if (env->non_local_exit_check(env) == emacs_funcall_exit_return)
