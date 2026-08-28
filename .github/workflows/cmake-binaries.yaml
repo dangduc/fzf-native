@@ -122,6 +122,14 @@ jobs:
         printf 'defined DLL exports:\n%s\n' "$actual"
         test "$actual" = "$expected"
 
+    - name: Smoke interactive session ABI
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        emacs -Q --batch -L . -l fzf-native \
+          -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+          --eval '(ert-run-tests-batch-and-exit "^fzf-native-async-submit-snapshot-lifecycle-test$")'
+
     - name: Upload binaries
       uses: actions/upload-artifact@v4
       with:
@@ -236,6 +244,9 @@ jobs:
           expected=$(printf '%s\n' emacs_module_init plugin_is_GPL_compatible | sort)
           printf 'defined dynamic symbols:\n%s\n' "$actual"
           test "$actual" = "$expected"
+          emacs -Q --batch -L . -l fzf-native \
+            -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+            --eval '(ert-run-tests-batch-and-exit "^fzf-native-async-submit-snapshot-lifecycle-test$")'
 
     # The VM action can leave the checkout's other tracked binaries in bin/.
     # Publish only the file that this job built.

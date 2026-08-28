@@ -62,12 +62,9 @@
     (should (equal result '(0)))))
 
 (ert-deftest fzf-native-score-empty-str-inverse-query-test ()
-  "Scalar and batch scoring both accept empty text for inverse-only queries."
-  (let ((fzf-native-fuzzy t)
-        (fzf-native-case-mode 'smart)
-        (fzf-native-batch-highlight nil))
-    (should (equal (fzf-native-score "" "!x") '(1)))
-    (should (equal (fzf-native-score-all '("") "!x") '("")))))
+  "An empty candidate can match a non-empty inverse query."
+  (should (> (car (fzf-native-score "" "!acef")) 0))
+  (should (equal (fzf-native-score-all '("") "!acef") '(""))))
 
 (ert-deftest fzf-native-score-str-wrong-type-int-test ()
   (should-error (fzf-native-score 1 "1")
@@ -555,11 +552,191 @@ size.  Times out after TIMEOUT seconds (default 5)."
       (sleep-for 0.05)))
   (fzf-native-async-result-fresh-p handle filter))
 
+(defun fzf-native-test--wait-for-request (handle request-id &optional timeout)
+  "Wait for REQUEST-ID on HANDLE and return its terminal snapshot."
+  (let ((deadline (+ (float-time) (or timeout 5.0)))
+        snapshot)
+    (while (and (< (float-time) deadline)
+                (progn
+                  (setq snapshot
+                        (fzf-native-async-snapshot handle request-id))
+                  (memq (plist-get snapshot :state) '(queued running))))
+      (sleep-for 0.01))
+    snapshot))
+
+(defun fzf-native-test--wait-for-producer (handle &optional timeout)
+  "Wait for HANDLE's producer to finish and return its status."
+  (let ((deadline (+ (float-time) (or timeout 5.0)))
+        status)
+    (while (and (< (float-time) deadline)
+                (progn
+                  (setq status (fzf-native-async-status handle))
+                  (not (plist-get status :reader-done))))
+      (sleep-for 0.01))
+    status))
+
 (ert-deftest fzf-native-async-lifecycle-test ()
   "Start → wait for data → generation advances → stop."
   (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz")))
     (unwind-protect
         (should (fzf-native-test--wait-for-data handle))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-session-abi-handshake-test ()
+  "The loaded module and Elisp session contracts must agree exactly."
+  (skip-unless (fboundp 'fzf-native-session-abi-version))
+  (should (= (fzf-native-session-abi-version)
+             fzf-native-session-abi-required))
+  (should (fzf-native--verify-session-abi)))
+
+(ert-deftest fzf-native-native-handles-are-kind-checked-test ()
+  "Slab and async-session user pointers must never be cross-cast.
+Every public async entry point rejects a slab without mutating it, and the
+batch scorer rejects a live session in its optional slab position."
+  (skip-unless (fboundp 'fzf-native-async-status))
+  (let ((slab (fzf-native-make-default-slab))
+        (handle (fzf-native-async-start "printf '%s\\n' alpha")))
+    (unwind-protect
+        (progn
+          (dolist (call (list
+                         (lambda () (fzf-native-async-stop slab))
+                         (lambda () (fzf-native-async-generation slab))
+                         (lambda () (fzf-native-async-submit slab "a" 10))
+                         (lambda () (fzf-native-async-snapshot slab))
+                         (lambda () (fzf-native-async-status slab))
+                         (lambda () (fzf-native-async-candidates slab "a" 10))
+                         (lambda () (fzf-native-async-stats slab))
+                         (lambda () (fzf-native-async-result-fresh-p slab "a"))))
+            (should-error (funcall call)))
+          ;; Rejected calls must leave both objects usable as their real kind.
+          (should (numberp (car (fzf-native-score "alpha" "a" slab))))
+          (should-error (fzf-native-score "alpha" "a" handle))
+          (should (listp (fzf-native-async-status handle))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-producer-clean-completion-test ()
+  "A zero producer exit is visible as a clean terminal state."
+  (skip-unless (fboundp 'fzf-native-async-status))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo")))
+    (unwind-protect
+        (let ((status (fzf-native-test--wait-for-producer handle)))
+          (should (plist-get status :reader-done))
+          (should (eq (plist-get status :producer-state) 'complete))
+          (should (= (plist-get status :producer-exit-status) 0))
+          (should-not (plist-get status :producer-error)))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-producer-honors-working-directory-test ()
+  "The child runs in DIR, rather than silently inheriting Emacs's cwd."
+  (skip-unless (memq system-type '(darwin gnu/linux berkeley-unix)))
+  (let* ((dir (make-temp-file "fzf-native-producer-dir-" t))
+         (handle (fzf-native-async-start "pwd" dir)))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle)
+                             :reader-done))
+          (let* ((request-id (fzf-native-async-submit handle "" 10))
+                 (snapshot (fzf-native-test--wait-for-request
+                            handle request-id))
+                 (candidate (car (plist-get snapshot :candidates))))
+            (should (stringp candidate))
+            (should (equal (file-truename candidate)
+                           (file-truename dir)))))
+      (when handle (fzf-native-async-stop handle))
+      (delete-directory dir))))
+
+(ert-deftest fzf-native-async-producer-rejects-missing-directory-test ()
+  "A failed child chdir is reported synchronously and creates no session."
+  (skip-unless (memq system-type '(darwin gnu/linux berkeley-unix)))
+  (let ((missing (make-temp-name
+                  (expand-file-name "fzf-native-missing-dir-"
+                                    temporary-file-directory))))
+    (should-not (file-exists-p missing))
+    (should-error (fzf-native-async-start "pwd" missing)
+                  :type 'error)))
+
+(ert-deftest fzf-native-async-producer-rejects-missing-shell-test ()
+  "An exec failure is reported before a session handle can escape."
+  (skip-unless (memq system-type '(darwin gnu/linux berkeley-unix)))
+  (let ((shell-file-name
+         (make-temp-name
+          (expand-file-name "fzf-native-missing-shell-"
+                            temporary-file-directory)))
+        (shell-command-switch "-c"))
+    (should-error (fzf-native-async-start "printf unreachable")
+                  :type 'error)))
+
+(ert-deftest fzf-native-async-producer-resolves-shell-through-exec-path-test ()
+  "A bare `shell-file-name' is resolved like Emacs subprocess commands."
+  (skip-unless (memq system-type '(darwin gnu/linux berkeley-unix)))
+  (let ((shell-file-name "sh")
+        (shell-command-switch "-c")
+        (exec-path '("/bin" "/usr/bin")))
+    (let ((handle (fzf-native-async-start "printf '%s\\n' shell-ok")))
+      (unwind-protect
+          (progn
+            (should (plist-get (fzf-native-test--wait-for-producer handle)
+                               :reader-done))
+            (let* ((request-id (fzf-native-async-submit handle "shell" 10))
+                   (snapshot (fzf-native-test--wait-for-request
+                              handle request-id)))
+              (should (equal (plist-get snapshot :candidates)
+                             '("shell-ok")))))
+        (fzf-native-async-stop handle)))))
+
+(ert-deftest fzf-native-async-producer-rejects-embedded-nul-inputs-test ()
+  "Producer strings cannot be silently truncated at an embedded NUL."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (should-error (fzf-native-async-start (concat "printf before" "\0" "after"))
+                :type 'error)
+  (should-error (fzf-native-async-start "pwd" (concat "/tmp" "\0" "/missing"))
+                :type 'error)
+  (let ((shell-command-switch (concat "-c" "\0" "ignored")))
+    (should-error (fzf-native-async-start "printf unreachable")
+                  :type 'error))
+  (let ((exec-path (list (concat "/bin" "\0" "/ignored"))))
+    (should-error (fzf-native-async-start "printf unreachable")
+                  :type 'error)))
+
+(ert-deftest fzf-native-async-producer-nonzero-exit-test ()
+  "A nonzero producer exit reports an error without losing its candidates."
+  (skip-unless (fboundp 'fzf-native-async-status))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' foo; exit 7")))
+    (unwind-protect
+        (let ((status (fzf-native-test--wait-for-producer handle)))
+          (should (plist-get status :reader-done))
+          (should (eq (plist-get status :producer-state) 'failed))
+          (should (= (plist-get status :producer-exit-status) 7))
+          (should (equal (plist-get status :producer-error)
+                         "producer exited with status 7"))
+          (let* ((request-id (fzf-native-async-submit handle "foo" 10))
+                 (snapshot (fzf-native-test--wait-for-request
+                            handle request-id)))
+            (should (eq (plist-get snapshot :state) 'complete))
+            (should (equal (plist-get snapshot :candidates) '("foo")))
+            (should (equal (plist-get snapshot :producer-error)
+                           "producer exited with status 7"))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-delayed-producer-failure-bumps-generation-test ()
+  "A failure after stdout EOF is a new poll-visible session event."
+  (skip-unless (fboundp 'fzf-native-async-status))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' partial; exec 1>&-; sleep 0.3; exit 7")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((before (fzf-native-async-status handle))
+                 (before-generation
+                  (plist-get before :snapshot-generation))
+                 (final (fzf-native-test--wait-for-producer handle)))
+            (should-not (plist-get before :reader-done))
+            (should (eq (plist-get final :producer-state) 'failed))
+            (should (equal (plist-get final :producer-error)
+                           "producer exited with status 7"))
+            (should (> (plist-get final :snapshot-generation)
+                       before-generation))))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-stop-invalidates-handle-test ()
@@ -568,6 +745,287 @@ size.  Times out after TIMEOUT seconds (default 5)."
     (fzf-native-test--wait-for-data handle)
     (fzf-native-async-stop handle)
     (should (null (fzf-native-async-generation handle)))))
+
+(ert-deftest fzf-native-async-submit-snapshot-lifecycle-test ()
+  "Submit once, poll snapshots, and receive an owned completed result."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' foo bar baz foobaz"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((request-id (fzf-native-async-submit handle "foo" 10))
+                 (initial (fzf-native-async-snapshot handle request-id))
+                 (final (fzf-native-test--wait-for-request
+                         handle request-id)))
+            (should (integerp request-id))
+            (should (> request-id 0))
+            (should (= (plist-get initial :request-id) request-id))
+            (should (memq (plist-get initial :state)
+                          '(queued running complete)))
+            (should (eq (plist-get final :state) 'complete))
+            (should (= (plist-get final :result-request-id) request-id))
+            (should-not (plist-get final :stale))
+            (should (equal (plist-get final :query) "foo"))
+            (should (member "foo" (plist-get final :candidates)))
+            (should (member "foobaz" (plist-get final :candidates)))
+            (should-not (member "bar" (plist-get final :candidates)))
+            (should (= (plist-get final :pool-generation)
+                       (plist-get final :result-pool-generation)))
+            (should (> (plist-get final :progress-total) 0))
+            (should (= (plist-get final :progress-completed)
+                       (plist-get final :progress-total)))
+            (let ((status (fzf-native-async-status handle)))
+              (should (eq (plist-get status :state) 'complete))
+              (should (= (plist-get status :request-id) request-id)))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-snapshot-retains-prior-result-while-running-test ()
+  "Keep the prior completed list while a new request scans the pool."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "seq 1 500000"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (let ((producer (fzf-native-test--wait-for-producer handle 15.0)))
+            (should (plist-get producer :reader-done))
+            (should (= (plist-get producer :pool-generation) 500000)))
+          (let* ((old-id (fzf-native-async-submit handle "1" 100))
+                 (old (fzf-native-test--wait-for-request handle old-id 10.0))
+                 (old-candidates (plist-get old :candidates))
+                 (new-id (fzf-native-async-submit handle "999999" 100))
+                 (pending (fzf-native-async-snapshot handle new-id)))
+            (should (eq (plist-get old :state) 'complete))
+            (should (= (length old-candidates) 100))
+            (should (memq (plist-get pending :state) '(queued running)))
+            (should (= (plist-get pending :request-id) new-id))
+            (should (= (plist-get pending :result-request-id) old-id))
+            (should (plist-get pending :stale))
+            (should (equal (plist-get pending :query) "1"))
+            (should (equal (plist-get pending :candidates) old-candidates))
+            (let ((final
+                   (fzf-native-test--wait-for-request handle new-id 10.0)))
+              (should (eq (plist-get final :state) 'complete))
+              (should (= (plist-get final :result-request-id) new-id))
+              (should-not (plist-get final :stale)))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-snapshot-preserves-request-query-test ()
+  "Pattern parsing must not mutate the query recorded in a snapshot."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' foo foobar"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((query "foo ")
+                 (request-id (fzf-native-async-submit handle query 10))
+                 (snapshot (fzf-native-test--wait-for-request
+                            handle request-id)))
+            (should (eq (plist-get snapshot :state) 'complete))
+            (should (equal (plist-get snapshot :query) query))
+            (should (= (plist-get snapshot :result-request-id)
+                       request-id))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-submit-supersedes-queued-request-test ()
+  "A new query supersedes queued obsolete work and owns the final snapshot."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "seq 1 100000"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle 10.0))
+          (let* ((old-id (fzf-native-async-submit handle "11111" 20))
+                 (new-id (fzf-native-async-submit handle "99999" 20))
+                 (final (fzf-native-test--wait-for-request
+                         handle new-id 10.0)))
+            (should (> new-id old-id))
+            (should (eq (plist-get final :state) 'complete))
+            (should (= (plist-get final :result-request-id) new-id))
+            (should (member "99999" (plist-get final :candidates)))
+            (should (eq (plist-get
+                         (fzf-native-async-snapshot handle old-id)
+                         :state)
+                        'superseded))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-submit-retries-after-input-growth-test ()
+  "Candidate growth retries the latest request without another submission."
+  (skip-unless (and (fboundp 'fzf-native-async-submit)
+                    (executable-find "python3")))
+  (let* ((gate (make-temp-file "fzf-native-growth-gate-"))
+         (handle (fzf-native-async-start
+                  (format "python3 -u -c 'import os, sys, time
+gate = sys.argv[1]
+for i in range(3): print(f\"a{i}\", flush=True)
+while os.path.exists(gate): time.sleep(0.01)
+print(\"a-late\", flush=True)
+for i in range(40): print(f\"b{i}\", flush=True)
+' %s" (shell-quote-argument gate))))
+         (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((request-id (fzf-native-async-submit handle "a" 100))
+                 (first (fzf-native-test--wait-for-request
+                         handle request-id)))
+            (should (eq (plist-get first :state) 'complete))
+            (should (> (plist-get first :snapshot-generation) 0))
+            (should-not (member "a-late" (plist-get first :candidates)))
+
+            ;; Release the producer.  From here onward, poll only snapshots.
+            ;; A second submit or compatibility candidates call would hide a
+            ;; missing native growth retry.
+            (delete-file gate)
+            (let ((deadline (+ (float-time) 10.0))
+                  snapshot)
+              (while (and (< (float-time) deadline)
+                          (progn
+                            (setq snapshot
+                                  (fzf-native-async-snapshot
+                                   handle request-id))
+                            (not (and
+                                  (eq (plist-get snapshot :state) 'complete)
+                                  (not (plist-get snapshot :stale))
+                                  (member "a-late"
+                                          (plist-get snapshot :candidates))))))
+                (sleep-for 0.01))
+              (should (eq (plist-get snapshot :state) 'complete))
+              (should-not (plist-get snapshot :stale))
+              (should (= (plist-get snapshot :request-id) request-id))
+              (should (= (plist-get snapshot :result-request-id)
+                         request-id))
+              (should (> (plist-get snapshot :snapshot-generation)
+                         (plist-get first :snapshot-generation)))
+              (should (member "a-late"
+                              (plist-get snapshot :candidates)))
+              (should (> (plist-get snapshot :progress-total) 0))
+              (should (= (plist-get snapshot :progress-completed)
+                         (plist-get snapshot :progress-total)))
+              (should (= (plist-get snapshot :pool-generation)
+                         (plist-get snapshot :result-pool-generation))))))
+      (when (file-exists-p gate) (delete-file gate))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-cache-expands-result-capacity-test ()
+  "A cached limit-1 result does not satisfy a later limit-3 request."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' alpha alpine alps beta"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((small-id (fzf-native-async-submit handle "al" 1))
+                 (small (fzf-native-test--wait-for-request handle small-id))
+                 (large-id (fzf-native-async-submit handle "al" 3))
+                 (large (fzf-native-test--wait-for-request handle large-id)))
+            (should (eq (plist-get small :state) 'complete))
+            (should (= (length (plist-get small :candidates)) 1))
+            (should (> large-id small-id))
+            (should (eq (plist-get large :state) 'complete))
+            (should (= (length (plist-get large :candidates)) 3))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-cache-narrows-result-capacity-test ()
+  "A cached unlimited result is capped for a later limit-1 request."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' alpha alpine alps beta"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((all-id (fzf-native-async-submit handle "al" 0))
+                 (all (fzf-native-test--wait-for-request handle all-id))
+                 (small-id (fzf-native-async-submit handle "al" 1))
+                 (small (fzf-native-test--wait-for-request handle small-id)))
+            (should (eq (plist-get all :state) 'complete))
+            (should (= (length (plist-get all :candidates)) 3))
+            (should (> small-id all-id))
+            (should (eq (plist-get small :state) 'complete))
+            (should (= (plist-get small :limit) 1))
+            (should (= (length (plist-get small :candidates)) 1))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-cache-rescores-filter-only-limit-window-test ()
+  "A larger filter-only window is not authoritative for a smaller limit."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let* ((fzf-native-filter-only-min-pool 1)
+         (fzf-native-filter-only-length nil)
+         (fzf-native-filter-only-logic 'or)
+         (fzf-native-async-highlight nil)
+         (handle (fzf-native-async-start
+                  "printf '%s\\n' zzza alpha beta")))
+    (unwind-protect
+        (progn
+          (let ((producer (fzf-native-test--wait-for-producer handle)))
+            (should (plist-get producer :reader-done))
+            (should (= (plist-get producer :pool-generation) 3)))
+          (let* ((all-id (fzf-native-async-submit handle "a" 0))
+                 (all (fzf-native-test--wait-for-request handle all-id))
+                 (small-id (fzf-native-async-submit handle "a" 1))
+                 (small (fzf-native-test--wait-for-request handle small-id)))
+            ;; Ranking the unlimited window puts the stronger later match
+            ;; first.  Limit 1 selects its window in input order, so it must
+            ;; rescore and return the first match instead of truncating ALL.
+            (should (equal (car (plist-get all :candidates)) "alpha"))
+            (should (> small-id all-id))
+            (should (eq (plist-get small :state) 'complete))
+            (should (equal (plist-get small :candidates) '("zzza")))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-cache-separates-case-mode-test ()
+  "Changing case mode for one query cannot reuse an incompatible result."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' foo FOO Food bar"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((fzf-native-case-mode 'ignore)
+                 (ignore-id (fzf-native-async-submit handle "FOO" 10))
+                 (ignore (fzf-native-test--wait-for-request
+                          handle ignore-id)))
+            (should (> (length (plist-get ignore :candidates)) 1)))
+          (let* ((fzf-native-case-mode 'respect)
+                 (respect-id (fzf-native-async-submit handle "FOO" 10))
+                 (respect (fzf-native-test--wait-for-request
+                           handle respect-id)))
+            (should (eq (plist-get respect :state) 'complete))
+            (should (eq (plist-get respect :case-mode) 'respect))
+            (should (equal (plist-get respect :candidates) '("FOO")))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-bounded-top-k-crosses-coordinator-window-test ()
+  "A positive limit returns exact stable top-K across multiple windows.
+The corpus exceeds 64 native batches, so this exercises the second
+coordinator window and verifies that dense matches are counted separately
+from the bounded ranked result."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let* ((fzf-native-filter-only-min-pool nil)
+         (fzf-native-filter-only-length nil)
+         (fzf-native-async-highlight nil)
+         (handle (fzf-native-async-start
+                  (concat "awk 'BEGIN { for (i = 0; i < 140000; i++) "
+                          "printf \"item%06d\\n\", i }'"))))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle 20.0)
+                             :reader-done))
+          (let* ((request-id (fzf-native-async-submit handle "item" 100))
+                 (snapshot (fzf-native-test--wait-for-request
+                            handle request-id 20.0))
+                 (expected (cl-loop for i below 100
+                                    collect (format "item%06d" i))))
+            (should (eq (plist-get snapshot :state) 'complete))
+            (should (= (plist-get snapshot :filtered) 140000))
+            (should (= (plist-get snapshot :total) 140000))
+            (should (equal (plist-get snapshot :candidates) expected))))
+      (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-candidates-empty-filter-test ()
   "Empty filter returns all candidates."
@@ -718,6 +1176,136 @@ in fzf and the cache should treat them so via term-set subsumption
             (should (equal r1 r2))))
       (fzf-native-async-stop handle))))
 
+(ert-deftest fzf-native-async-cache-inverse-extension-broadens-test ()
+  "Extending an inverse term must not refine from the narrower old set."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' foo foobar bar"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((first-id (fzf-native-async-submit handle "!foo" 10))
+                 (first (fzf-native-test--wait-for-request handle first-id))
+                 (second-id (fzf-native-async-submit handle "!foobar" 10))
+                 (second (fzf-native-test--wait-for-request
+                          handle second-id)))
+            (should (equal (plist-get first :candidates) '("bar")))
+            (should (equal (sort (copy-sequence
+                                  (plist-get second :candidates))
+                                 #'string<)
+                           '("bar" "foo")))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-stable-batch-cache-narrowing-test ()
+  "A narrower request consumes whole-result membership before batch evidence."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "seq 1 8192"))
+        (fzf-native-async-highlight nil)
+        (fzf-native-batch-highlight nil))
+    (unwind-protect
+        (let ((deadline (+ (float-time) 10.0)) first)
+          (should (fzf-native-test--wait-for-data handle 10.0))
+          (let ((request-id (fzf-native-async-submit handle "9" 200)))
+            (while (and (< (float-time) deadline)
+                        (progn
+                          (setq first
+                                (fzf-native-async-snapshot handle request-id))
+                          (not (and (eq (plist-get first :state) 'complete)
+                                    (plist-get first :reader-done)
+                                    (not (plist-get first :stale))))))
+              (sleep-for 0.01)))
+          (should (eq (plist-get first :state) 'complete))
+          (should (plist-get first :reader-done))
+          (should (> (plist-get first :batch-cache-entries) 0))
+          (let* ((request-id (fzf-native-async-submit handle "99" 200))
+                 (final (fzf-native-test--wait-for-request
+                         handle request-id 10.0))
+                 (expected-all
+                  (fzf-native-score-all
+                   (mapcar #'number-to-string
+                           (number-sequence 1 8192))
+                   "99"))
+                 (expected
+                  (mapcar #'substring-no-properties
+                          (cl-subseq expected-all 0
+                                     (min 200 (length expected-all))))))
+            (should (eq (plist-get final :state) 'complete))
+            ;; The full matched-index set retained for "9" is smaller and
+            ;; more precise than per-batch evidence, so only those prior
+            ;; matches are scanned for the narrower "99" query.
+            (should (= (plist-get final :progress-total)
+                       (plist-get first :filtered)))
+            (should (< (plist-get final :progress-total)
+                       (plist-get final :pool-generation)))
+            (should (equal (plist-get final :candidates) expected))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-batch-cache-progress-has-fixed-logical-total-test ()
+  "Cached omissions advance completion without changing the progress total."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let* ((fzf-native-async-cache-size 0)
+         (fzf-native-async-cache-bytes 0)
+         (fzf-native-async-batch-cache-bytes (* 1024 1024))
+         (fzf-native-async-highlight nil)
+         (handle (fzf-native-async-start "seq 1 8192")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-producer handle 10.0))
+          (let* ((first-id (fzf-native-async-submit handle "9" 200))
+                 (first (fzf-native-test--wait-for-request
+                         handle first-id 10.0)))
+            (should (eq (plist-get first :state) 'complete))
+            (should (> (plist-get first :batch-cache-entries) 0)))
+          (let* ((second-id (fzf-native-async-submit handle "99" 200))
+                 (second (fzf-native-test--wait-for-request
+                          handle second-id 10.0)))
+            (should (eq (plist-get second :state) 'complete))
+            (should (> (plist-get second :batch-cache-hits) 0))
+            (should (= (plist-get second :progress-total)
+                       (plist-get second :pool-generation)))
+            (should (= (plist-get second :progress-completed)
+                       (plist-get second :progress-total)))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-dense-growth-scores-only-delta-test ()
+  "Exact dense streaming growth does not repeatedly rescan the old pool."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let* ((gate (make-temp-file "fzf-native-dense-growth-"))
+         (handle (fzf-native-async-start
+                  (format (concat "seq 1 5000; while [ -e %s ]; do "
+                                  "sleep 0.01; done; seq 5001 10000")
+                          (shell-quote-argument gate))))
+         (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle 10.0))
+          (let* ((request-id (fzf-native-async-submit handle "" 100))
+                 (first (fzf-native-test--wait-for-request
+                         handle request-id 10.0)))
+            (should (eq (plist-get first :state) 'complete))
+            (should (= (plist-get first :pool-generation) 5000))
+            (delete-file gate)
+            (let ((deadline (+ (float-time) 10.0)) final)
+              (while (and (< (float-time) deadline)
+                          (progn
+                            (setq final
+                                  (fzf-native-async-snapshot
+                                   handle request-id))
+                            (not (and (plist-get final :reader-done)
+                                      (eq (plist-get final :state) 'complete)
+                                      (not (plist-get final :stale))
+                                      (= (plist-get final :pool-generation)
+                                         10000)))))
+                (sleep-for 0.01))
+              (should (= (plist-get final :filtered) 10000))
+              (should (<= (plist-get final :progress-total) 5000))
+              (should (< (plist-get final :progress-total)
+                         (plist-get final :pool-generation)))
+              (should (= (length (plist-get final :candidates)) 100)))))
+      (when (file-exists-p gate) (delete-file gate))
+      (fzf-native-async-stop handle))))
+
 (ert-deftest fzf-native-async-result-fresh-p-before-scoring-test ()
   "`result-fresh-p' is nil for any query before scoring runs."
   (skip-unless (fboundp 'fzf-native-async-start))
@@ -767,16 +1355,10 @@ distinguishing \"no matches\" from \"scoring in flight\"."
           (should (fzf-native-async-result-fresh-p handle "zzz")))
       (fzf-native-async-stop handle))))
 
-(ert-deftest fzf-native-async-result-fresh-p-pool-grew-stale-test ()
-  "After scoring at pool size N, the arrival of more candidates makes
-the cache entry stale: `pool_gen' lags `s->count' and `fresh-p' flips
-to nil.  Uses a two-phase Python producer gated on a tempfile so phase
-2 provably runs *after* scoring has settled against the phase-1 pool,
-regardless of CI runner speed.  Phase 1 emits 3 items, then the
-producer polls until elisp deletes the gate, then phase 2 streams more
-items.  Between `wait-for-fresh' and the gate release, no
-`async-candidates' call dispatches, so the cache entry for \"a\" keeps
-its phase-1 `pool_gen' even as the pool grows."
+(ert-deftest fzf-native-async-result-fresh-p-pool-growth-auto-refresh-test ()
+  "Input growth automatically refreshes the latest compatibility query.
+The second phase starts after the first result is fresh.  Snapshot and
+freshness polling do not submit more scoring work."
   (skip-unless (and (fboundp 'fzf-native-async-start)
                     (executable-find "python3")))
   (let* ((gate (make-temp-file "fzf-native-gate-"))
@@ -791,17 +1373,37 @@ for i in range(40): print(f\"b{i}\", flush=True)
         (progn
           (fzf-native-test--wait-for-data handle)
           (should (fzf-native-test--wait-for-fresh handle "a"))
-          (let ((g0 (fzf-native-async-generation handle))
-                (deadline (+ (float-time) 5.0)))
+          (let* ((request-id (plist-get (fzf-native-async-status handle)
+                                        :request-id))
+                 (initial (fzf-native-async-snapshot handle request-id))
+                 (initial-pool
+                  (plist-get initial :result-pool-generation))
+                 (deadline (+ (float-time) 5.0))
+                 snapshot)
             ;; Release phase 2 now that scoring for "a" is settled.
             (delete-file gate)
-            ;; Wait for at least one phase-2 batch to land so the reader
-            ;; has advanced `s->count' past the phase-1 pool.
-            (while (and (= (fzf-native-async-generation handle) g0)
-                        (< (float-time) deadline))
-              (sleep-for 0.05)))
-          ;; Pool grew → cache entry's `pool_gen' < `s->count' → stale.
-          (should-not (fzf-native-async-result-fresh-p handle "a")))
+            ;; Poll only ownership and freshness.  Neither function submits
+            ;; the query, so the native reader/coordinator path must retry it.
+            (while (and (< (float-time) deadline)
+                        (progn
+                          (setq snapshot
+                                (fzf-native-async-snapshot
+                                 handle request-id))
+                          (not (and
+                                (> (plist-get snapshot :pool-generation)
+                                   initial-pool)
+                                (= (plist-get snapshot :pool-generation)
+                                   (plist-get
+                                    snapshot :result-pool-generation))
+                                (fzf-native-async-result-fresh-p
+                                 handle "a")))))
+              (sleep-for 0.05))
+            (should (> (plist-get snapshot :pool-generation)
+                       initial-pool))
+            (should (= (plist-get snapshot :pool-generation)
+                       (plist-get snapshot :result-pool-generation)))
+            (should-not (plist-get snapshot :stale))
+            (should (fzf-native-async-result-fresh-p handle "a"))))
       (when (file-exists-p gate) (delete-file gate))
       (fzf-native-async-stop handle))))
 
@@ -844,6 +1446,88 @@ sys.stdout.buffer.write(b\"another_valid\\n\")
             ;; byte-junk line should be either coerced or silently dropped.
             (should (cl-some (lambda (s) (string-match-p "valid" s)) result))))
       (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-raw-bytes-round-trip-losslessly-test ()
+  "Raw producer bytes and a raw query survive submit and snapshot exactly."
+  (skip-unless (and (fboundp 'fzf-native-async-submit)
+                    (executable-find "python3")))
+  (let* ((expected (unibyte-string ?c ?a ?f #xe9 ?- ?m ?a ?i ?n))
+         (query (unibyte-string #xe9))
+         (fzf-native-fuzzy nil)
+         (fzf-native-case-mode 'respect)
+         (fzf-native-async-highlight nil)
+         (handle (fzf-native-async-start
+                  "python3 -u -c 'import sys
+sys.stdout.buffer.write(b\"caf\\xe9-main\\nplain\\n\")
+'")))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle)
+                             :reader-done))
+          (let* ((request-id (fzf-native-async-submit handle query 10))
+                 (snapshot (fzf-native-test--wait-for-request
+                            handle request-id))
+                 (candidates (plist-get snapshot :candidates)))
+            (should (eq (plist-get snapshot :state) 'complete))
+            (should (equal (plist-get snapshot :query) query))
+            (should-not (multibyte-string-p (plist-get snapshot :query)))
+            (should (equal candidates (list expected)))
+            (should-not (multibyte-string-p (car candidates)))
+            (should (= (plist-get snapshot :filtered)
+                       (length candidates)))
+            (should (= (plist-get snapshot :total) 2))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-raw-byte-highlight-uses-unibyte-offsets-test ()
+  "A match after mixed valid UTF-8 and raw bytes highlights its byte index."
+  (skip-unless (and (fboundp 'fzf-native-async-submit)
+                    (executable-find "python3")))
+  (let* ((fzf-native-async-highlight 10)
+         (handle (fzf-native-async-start
+                  "python3 -u -c 'import sys
+sys.stdout.buffer.write(b\"\\xe4\\xbd\\xa0\\xe9x\\n\")
+'")))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle)
+                             :reader-done))
+          (let* ((request-id (fzf-native-async-submit handle "x" 10))
+                 (snapshot (fzf-native-test--wait-for-request
+                            handle request-id))
+                 (candidate (car (plist-get snapshot :candidates))))
+            (should candidate)
+            (should-not (multibyte-string-p candidate))
+            (should-not (get-text-property 2 'face candidate))
+            (let ((face (get-text-property 4 'face candidate)))
+              (should (or (eq face 'completions-common-part)
+                          (and (listp face)
+                               (memq 'completions-common-part face)))))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-two-sessions-share-workers-safely-test ()
+  "Two scoring coordinators may overlap on the process-wide worker pool."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((a (fzf-native-async-start "seq 1 200000"))
+        (b (fzf-native-async-start "seq 1 200000"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer a 15.0)
+                             :reader-done))
+          (should (plist-get (fzf-native-test--wait-for-producer b 15.0)
+                             :reader-done))
+          (let* ((a-id (fzf-native-async-submit a "not-present-alpha" 100))
+                 (b-id (fzf-native-async-submit b "not-present-beta" 100))
+                 (a-final (fzf-native-test--wait-for-request a a-id 15.0))
+                 (b-final (fzf-native-test--wait-for-request b b-id 15.0)))
+            (should (eq (plist-get a-final :state) 'complete))
+            (should (eq (plist-get b-final :state) 'complete))
+            (should (= (plist-get a-final :progress-completed)
+                       (plist-get a-final :progress-total)))
+            (should (= (plist-get b-final :progress-completed)
+                       (plist-get b-final :progress-total)))))
+      (fzf-native-async-stop a)
+      (fzf-native-async-stop b))))
 
 (ert-deftest fzf-native-async-multibyte-candidates-test ()
   "Async path scores multibyte candidates (CJK)."
@@ -1250,6 +1934,18 @@ matched position; caller's original is unmutated."
                   (and (listp face)
                        (memq 'completions-common-part face)))))))
 
+(ert-deftest fzf-native-highlight-one-raw-byte-offset-test ()
+  "Mixed valid UTF-8/raw input maps logical match positions to unibyte bytes."
+  (skip-unless (fboundp 'fzf-native-highlight-one))
+  (let* ((orig (unibyte-string #xe4 #xbd #xa0 #xe9 ?x))
+         (ret (fzf-native-highlight-one orig "x")))
+    (should-not (multibyte-string-p ret))
+    (should-not (get-text-property 2 'face ret))
+    (let ((face (get-text-property 4 'face ret)))
+      (should (or (eq face 'completions-common-part)
+                  (and (listp face)
+                       (memq 'completions-common-part face)))))))
+
 (ert-deftest fzf-native-highlight-one-empty-query-test ()
   "Empty query returns a face-stripped copy without crashing."
   (skip-unless (fboundp 'fzf-native-highlight-one))
@@ -1341,3 +2037,175 @@ the uninitialised scratch."
         (system-configuration "aarch64-unknown-linux-gnu"))
     (should-error (fzf-native--bundled-module-relative-path)
                   :type 'user-error)))
+
+;;; Review regression gates (PR #39 multi-agent review)
+
+(ert-deftest fzf-native-async-empty-pool-result-not-final-test ()
+  "A result completed over a still-empty pool is not authoritative.
+Gate for review JO2-1/DL2-1: with the warmup clause removed from the
+snapshot's :stale rule, the first submit at picker-open reports a
+final empty result while the producer is still starting up."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start
+                 "sleep 0.5; printf '%s\\n' alpha beta"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (let ((request-id (fzf-native-async-submit handle "al" 10)))
+          ;; The producer sleeps 0.5s before emitting anything; during
+          ;; the first 0.25s finality must never hold.
+          (let ((deadline (+ (float-time) 0.25)))
+            (while (< (float-time) deadline)
+              (let ((status (fzf-native-async-status handle request-id)))
+                (when (and (eq (plist-get status :state) 'complete)
+                           (not (plist-get status :stale)))
+                  (ert-fail (format "empty-pool result reported final: %S"
+                                    status))))
+              (sleep-for 0.01)))
+          ;; Once the producer finishes, the same request becomes final
+          ;; and non-empty through growth retries alone.
+          (let ((deadline (+ (float-time) 10.0)) snapshot)
+            (while (and (< (float-time) deadline)
+                        (progn
+                          (setq snapshot (fzf-native-async-snapshot
+                                          handle request-id))
+                          (not (and (eq (plist-get snapshot :state) 'complete)
+                                    (not (plist-get snapshot :stale))
+                                    (plist-get snapshot :candidates)))))
+              (sleep-for 0.01))
+            (should (equal (mapcar #'substring-no-properties
+                                   (plist-get snapshot :candidates))
+                           '("alpha")))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-stale-covers-pool-growth-test ()
+  "A completed result at an older pool boundary must report :stale.
+Gate for review DL2-4: with the pool-generation clause removed from
+the snapshot's :stale rule, this observation reports :stale nil."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let* ((gate (make-temp-file "fzf-native-stale-gate-"))
+         (handle (fzf-native-async-start
+                  (format "printf 'a-first\\n'; while [ -e %s ]; do sleep 0.01; done; seq 1 150000"
+                          (shell-quote-argument gate))))
+         (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((request-id (fzf-native-async-submit handle "a" 50))
+                 (first (fzf-native-test--wait-for-request handle request-id)))
+            (should (eq (plist-get first :state) 'complete))
+            (should-not (plist-get first :stale))
+            ;; Release the 150k-line tail and catch the first status where
+            ;; the retained result lags the live pool.  At that instant the
+            ;; same plist must say :stale.
+            (delete-file gate)
+            (let ((deadline (+ (float-time) 10.0))
+                  (observed nil)
+                  snapshot)
+              (while (and (< (float-time) deadline) (not observed))
+                (setq snapshot (fzf-native-async-status handle request-id))
+                (if (< (plist-get snapshot :result-pool-generation)
+                       (plist-get snapshot :pool-generation))
+                    (setq observed t)
+                  (sleep-for 0.001)))
+              (should observed)
+              (should (plist-get snapshot :stale)))))
+      (when (file-exists-p gate) (delete-file gate))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-idempotent-resubmit-quiesces-test ()
+  "Identical resubmits on a settled session reuse the request id.
+Gate for review KK-4: no fresh request id and no :snapshot-generation
+bump, so generation-driven pollers go quiet on an idle session."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' alpha beta"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-producer handle)
+          (let* ((request-id (fzf-native-async-submit handle "al" 10))
+                 (final (fzf-native-test--wait-for-request handle request-id)))
+            (should (eq (plist-get final :state) 'complete))
+            (should-not (plist-get final :stale))
+            (let ((gen0 (plist-get (fzf-native-async-status handle)
+                                   :snapshot-generation)))
+              (dotimes (_ 20)
+                (should (= (fzf-native-async-submit handle "al" 10)
+                           request-id)))
+              (should (= (plist-get (fzf-native-async-status handle)
+                                    :snapshot-generation)
+                         gen0)))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-status-request-aware-test ()
+  "`fzf-native-async-status' answers about a specific request id.
+Gate for review JO-1/DL-3: the metadata-only call takes the same
+optional REQUEST-ID as snapshot and never carries :candidates."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' alpha beta"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-producer handle)
+          (let* ((old-id (fzf-native-async-submit handle "al" 10)))
+            (fzf-native-test--wait-for-request handle old-id)
+            (let* ((new-id (fzf-native-async-submit handle "be" 10))
+                   (old-status (fzf-native-async-status handle old-id))
+                   (new-status (fzf-native-async-status handle new-id)))
+              (should (= (plist-get old-status :request-id) old-id))
+              (should (= (plist-get new-status :request-id) new-id))
+              (should-not (plist-member old-status :candidates))
+              (should-not (plist-member new-status :candidates))
+              (should (memq (plist-get new-status :state)
+                            '(queued running complete))))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-submit-signals-on-failure-test ()
+  "`fzf-native-async-submit' signals instead of returning nil.
+Gate for review JO-2/JO2-3: a failed submit must never produce a nil
+that snapshot would silently read as \"latest\"."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' alpha")))
+    (unwind-protect
+        (progn
+          (should (eq (car (should-error
+                            (fzf-native-async-submit handle "a" -1)))
+                      'wrong-type-argument))
+          (should (eq (car (should-error
+                            (fzf-native-async-snapshot handle -1)))
+                      'wrong-type-argument)))
+      (fzf-native-async-stop handle))
+    ;; After stop, submit is loud; read-only calls stay soft.
+    (should (should-error (fzf-native-async-submit handle "a")))
+    (should-not (fzf-native-async-snapshot handle))))
+
+(ert-deftest fzf-native-score-all-raw-byte-candidate-test ()
+  "Invalid bytes no longer blind the matcher past them.
+Gate for review LT-1/KK2-3 at the Emacs module boundary: a unibyte
+candidate with a raw 0xE9 byte still matches a query that lands after
+the bad byte."
+  (skip-unless (fboundp 'fzf-native-score-all))
+  (let* ((cand (unibyte-string ?s ?r ?c ?/ ?c ?a ?f #xe9 ?/ ?m ?a ?i ?n))
+         (fzf-native-async-highlight nil)
+         (results (fzf-native-score-all (list cand) "main")))
+    (should (= (length results) 1))))
+
+(ert-deftest fzf-native-rejects-embedded-nul-query-test ()
+  "NUL-containing queries cannot alias at the C-string matcher boundary."
+  (let ((query (concat "a" (string 0) "x")))
+    (should-error (fzf-native-score "alpha" query))
+    (should-error (fzf-native-score-all '("alpha") query))
+    (should-error (fzf-native-highlight-one "alpha" query))
+    (let ((handle (fzf-native-async-start "printf '%s\\n' alpha")))
+      (unwind-protect
+          (progn
+            (should-error (fzf-native-async-submit handle query 10))
+            ;; Rejection publishes no request and does not poison a later one.
+            (should (= (fzf-native-async-submit handle "a" 10) 1)))
+        (fzf-native-async-stop handle)))))
+
+(ert-deftest fzf-native-rejects-embedded-nul-candidate-test ()
+  "Synchronous candidate APIs reject strings the C scorer would truncate."
+  (let ((candidate (concat "a" (string 0) "x")))
+    (should-error (fzf-native-score candidate "a"))
+    (should-error (fzf-native-score-all (list candidate) "a"))
+    (should-error (fzf-native-highlight-one candidate "a"))))
