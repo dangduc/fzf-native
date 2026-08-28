@@ -75,6 +75,19 @@ static void test_session_abi_is_versioned(void) {
   CHECK(FZF_NATIVE_SESSION_ABI == 1);
 }
 
+static void test_async_snapshot_staleness_covers_pool_growth(void) {
+  /* A completed result is stale whenever it describes an older append-only
+     pool boundary.  This pure predicate is deterministic; an Emacs poller
+     cannot reliably catch the short interval before the automatic growth
+     retry publishes its replacement. */
+  CHECK(async_snapshot_is_stale(7, 7, 1, 2, false));
+  CHECK(async_snapshot_is_stale(7, 7, 1, 2, true));
+  CHECK(!async_snapshot_is_stale(7, 7, 2, 2, false));
+  CHECK(async_snapshot_is_stale(7, 6, 2, 2, true));
+  CHECK(async_snapshot_is_stale(7, 7, 0, 0, false));
+  CHECK(!async_snapshot_is_stale(7, 7, 0, 0, true));
+}
+
 static void test_batch_worker_stops_on_any_shared_failure(void) {
   struct Shared embedded = {
     .pattern = NULL,
@@ -3068,6 +3081,7 @@ int main(void) {
 
   printf("--- interactive request identity ---\n");
   RUN(test_session_abi_is_versioned);
+  RUN(test_async_snapshot_staleness_covers_pool_growth);
   RUN(test_batch_worker_stops_on_any_shared_failure);
   RUN(test_copy_emacs_string_fallback_is_bounded);
   RUN(test_lossless_string_conversion_preserves_runtime_errors);

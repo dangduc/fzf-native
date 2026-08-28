@@ -2150,41 +2150,6 @@ final empty result while the producer is still starting up."
                            '("alpha")))))
       (fzf-native-async-stop handle))))
 
-(ert-deftest fzf-native-async-stale-covers-pool-growth-test ()
-  "A completed result at an older pool boundary must report :stale.
-Gate for review DL2-4: with the pool-generation clause removed from
-the snapshot's :stale rule, this observation reports :stale nil."
-  (skip-unless (fboundp 'fzf-native-async-submit))
-  (let* ((gate (make-temp-file "fzf-native-stale-gate-"))
-         (handle (fzf-native-async-start
-                  (format "printf 'a-first\\n'; while [ -e %s ]; do sleep 0.01; done; seq 1 150000"
-                          (shell-quote-argument gate))))
-         (fzf-native-async-highlight nil))
-    (unwind-protect
-        (progn
-          (should (fzf-native-test--wait-for-data handle))
-          (let* ((request-id (fzf-native-async-submit handle "a" 50))
-                 (first (fzf-native-test--wait-for-request handle request-id)))
-            (should (eq (plist-get first :state) 'complete))
-            (should-not (plist-get first :stale))
-            ;; Release the 150k-line tail and catch the first status where
-            ;; the retained result lags the live pool.  At that instant the
-            ;; same plist must say :stale.
-            (delete-file gate)
-            (let ((deadline (+ (float-time) 10.0))
-                  (observed nil)
-                  snapshot)
-              (while (and (< (float-time) deadline) (not observed))
-                (setq snapshot (fzf-native-async-status handle request-id))
-                (if (< (plist-get snapshot :result-pool-generation)
-                       (plist-get snapshot :pool-generation))
-                    (setq observed t)
-                  (sleep-for 0.001)))
-              (should observed)
-              (should (plist-get snapshot :stale)))))
-      (when (file-exists-p gate) (delete-file gate))
-      (fzf-native-async-stop handle))))
-
 (ert-deftest fzf-native-async-idempotent-resubmit-quiesces-test ()
   "Identical resubmits on a settled session reuse the request id.
 Gate for review KK-4: no fresh request id and no :snapshot-generation
