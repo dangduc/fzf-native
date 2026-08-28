@@ -107,6 +107,31 @@ static void test_batch_worker_stops_on_shared_allocation_failure(void) {
   CHECK(shared_worker_should_stop(&allocation));
 }
 
+static void test_candidate_analysis_fuses_nul_and_ascii_checks(void) {
+  unsigned char bytes[33];
+  bool ascii = false;
+  memset(bytes, 'a', 32);
+  bytes[32] = 0;
+
+  CHECK(str_analyze_candidate(
+      (struct Str){(char *)bytes, 32}, &ascii));
+  CHECK(ascii);
+  for (size_t i = 0; i < 32; i++) {
+    unsigned char saved = bytes[i];
+    bytes[i] = 0;
+    CHECK(!str_analyze_candidate(
+        (struct Str){(char *)bytes, 32}, &ascii));
+    bytes[i] = saved;
+  }
+  bytes[7] = 0xc3;
+  bytes[8] = 0xa9;
+  CHECK(str_analyze_candidate(
+      (struct Str){(char *)bytes, 32}, &ascii));
+  CHECK(!ascii);
+  CHECK(str_analyze_candidate((struct Str){(char *)bytes, 0}, &ascii));
+  CHECK(ascii);
+}
+
 static enum emacs_funcall_exit ctest_copy_pending_exit;
 static emacs_value ctest_copy_original;
 static emacs_value ctest_copy_encoded;
@@ -3268,6 +3293,7 @@ int main(void) {
   RUN(test_session_abi_is_versioned);
   RUN(test_async_snapshot_staleness_covers_pool_growth);
   RUN(test_batch_worker_stops_on_shared_allocation_failure);
+  RUN(test_candidate_analysis_fuses_nul_and_ascii_checks);
   RUN(test_copy_emacs_string_fallback_is_bounded);
   RUN(test_lossless_string_conversion_preserves_runtime_errors);
   RUN(test_startup_posix_errors_are_descriptive);

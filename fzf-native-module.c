@@ -245,6 +245,37 @@ static bool str_has_embedded_nul(struct Str value) {
   return value.b && memchr(value.b, '\0', value.len) != NULL;
 }
 
+/* Validate the bounded candidate and classify it in one pass.  The matcher
+   otherwise scans the same immutable bytes once for strlen and once for
+   ASCII classification after this module has already scanned them for NUL. */
+static bool str_analyze_candidate(struct Str value, bool *input_is_ascii) {
+  const unsigned char *ptr = (const unsigned char *)value.b;
+  size_t len = value.len;
+  bool ascii = true;
+  const uint64_t ones = UINT64_C(0x0101010101010101);
+  const uint64_t highs = UINT64_C(0x8080808080808080);
+
+  if (!ptr) {
+    *input_is_ascii = true;
+    return len == 0;
+  }
+  while (len >= sizeof(uint64_t)) {
+    uint64_t word;
+    memcpy(&word, ptr, sizeof word);
+    if ((word - ones) & ~word & highs) return false;
+    if (word & highs) ascii = false;
+    ptr += sizeof word;
+    len -= sizeof word;
+  }
+  while (len-- > 0) {
+    unsigned char byte = *ptr++;
+    if (byte == 0) return false;
+    if (byte & 0x80) ascii = false;
+  }
+  *input_is_ascii = ascii;
+  return true;
+}
+
 static bool reject_embedded_nul(emacs_env *env, struct Str value,
                                 const char *what) {
   if (!str_has_embedded_nul(value)) return false;
@@ -574,19 +605,22 @@ static void *worker_routine(void *ptr) {
     if (pattern) {
       for (unsigned i = 0; i < batch->len; ++i) {
         struct Candidate x = batch->xs[i];
+        bool input_is_ascii;
         /* Validate candidate bytes on the worker that already owns this
            batch.  NUL is an invalid-input exception: publish it with a
            write-only relaxed flag and stop only this worker.  Other workers
            may finish, but ordinary candidates pay no shared-state read. */
-        if (str_has_embedded_nul(x.s)) {
+        if (!str_analyze_candidate(x.s, &input_is_ascii)) {
           shared_set_embedded_nul(shared);
           invalid_candidate = true;
           break;
         }
         /* You can get the score/position for as many items as you want */
         int score = filter_only
-          ? (fzf_has_match(x.s.b, pattern, slab) ? 1 : 0)
-          : fzf_get_score(x.s.b, pattern, slab);
+          ? (fzf_has_match_bytes(x.s.b, x.s.len, input_is_ascii,
+                                 pattern, slab) ? 1 : 0)
+          : fzf_get_score_bytes(x.s.b, x.s.len, input_is_ascii,
+                                pattern, slab);
         if (fzf_allocation_failed()) {
           shared_set_allocation_failed(shared);
           break;

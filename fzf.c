@@ -2656,8 +2656,9 @@ void fzf_free_pattern(fzf_pattern_t *pattern) {
   SFREE(pattern);
 }
 
-int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
-                      fzf_slab_t *slab) {
+int32_t fzf_get_score_bytes(const char *text, size_t text_len,
+                            bool input_is_ascii,
+                            fzf_pattern_t *pattern, fzf_slab_t *slab) {
   fzf_clear_allocation_failure();
   // If the pattern is an empty string then pattern->ptr will be NULL and we
   // basically don't want to filter. Return 1 for telescope
@@ -2665,10 +2666,7 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
     return 1;
   }
 
-  fzf_string_t input = {.data = text, .size = strlen(text)};
-  /* Every term is evaluated against the same immutable candidate.  Determine
-     its encoding once instead of rescanning all bytes for every AND/OR term. */
-  bool input_is_ascii = is_ascii_utf8proc(input.data, input.size);
+  fzf_string_t input = {.data = text, .size = text_len};
   if (pattern->only_inv) {
     for (size_t i = 0; i < pattern->size; i++) {
       fzf_term_set_t *term_set = pattern->ptr[i];
@@ -2728,6 +2726,14 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
   }
 
   return total_score > 0 ? total_score : 1;
+}
+
+int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
+                      fzf_slab_t *slab) {
+  size_t text_len = strlen(text);
+  return fzf_get_score_bytes(text, text_len,
+                             is_ascii_utf8proc(text, text_len),
+                             pattern, slab);
 }
 
 fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
