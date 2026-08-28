@@ -72,7 +72,7 @@ jobs:
       run: |
         emacs -Q --batch -L . -l fzf-native \
           -f fzf-native-load-dyn \
-          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" \"K\")) 0) (error \"tracked UTF-8 artifact is stale\")))"
+          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"tracked UTF-8 artifact is stale\")))"
 
     - name: Clean stale binaries
       shell: bash
@@ -89,7 +89,7 @@ jobs:
       run: |
         emacs -Q --batch -L . -l fzf-native \
           -f fzf-native-load-dyn \
-          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" \"K\")) 0) (error \"fresh UTF-8 artifact failed\")))"
+          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"fresh UTF-8 artifact failed\")))"
 
     - name: Check Darwin export surface
       if: runner.os == 'macOS'
@@ -104,13 +104,10 @@ jobs:
       if: runner.os == 'Windows'
       shell: bash
       run: |
-        exports=$(dumpbin //nologo //exports bin/Windows/Release/fzf-native-module.dll)
-        printf '%s\n' "$exports" | grep -Eq '[[:space:]]emacs_module_init$'
-        printf '%s\n' "$exports" | grep -Eq '[[:space:]]plugin_is_GPL_compatible$'
-        if printf '%s\n' "$exports" | grep -Eq '[[:space:]](fzf_|utf8proc_)'; then
-          printf '%s\n' "$exports"
-          exit 1
-        fi
+        actual=$(llvm-readobj --coff-exports bin/Windows/Release/fzf-native-module.dll | awk '$1 == "Name:" {print $2}' | sort)
+        expected=$(printf '%s\n' emacs_module_init plugin_is_GPL_compatible | sort)
+        printf 'defined DLL exports:\n%s\n' "$actual"
+        test "$actual" = "$expected"
 
     - name: Upload binaries
       uses: actions/upload-artifact@v4
@@ -183,7 +180,7 @@ jobs:
       run: |
         emacs -Q --batch -L . -l fzf-native \
           -f fzf-native-load-dyn \
-          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" \"K\")) 0) (error \"tracked UTF-8 artifact is stale\")))"
+          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"tracked UTF-8 artifact is stale\")))"
 
     - uses: actions/download-artifact@v4
       with:
@@ -212,16 +209,17 @@ jobs:
           if [ "${{ github.event_name }}" != workflow_dispatch ] || [ "${{ inputs.publish }}" != true ]; then
             emacs -Q --batch -L . -l fzf-native \
               -f fzf-native-load-dyn \
-              --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" \"K\")) 0) (error \"tracked UTF-8 artifact is stale\")))"
+              --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"tracked UTF-8 artifact is stale\")))"
           fi
           rm -rf bin
           cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
           cmake --build build --verbose --config ${{ env.BUILD_TYPE }}
           emacs -Q --batch -L . -l fzf-native \
             -f fzf-native-load-dyn \
-            --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" \"K\")) 0) (error \"fresh UTF-8 artifact failed\")))"
-          actual=$(nm -D --defined-only bin/FreeBSD/fzf-native-module.so | awk '{print $3}' | sort)
+            --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"fresh UTF-8 artifact failed\")))"
+          actual=$(nm -D --defined-only -P bin/FreeBSD/fzf-native-module.so | awk '{print $1}' | sort)
           expected=$(printf '%s\n' emacs_module_init plugin_is_GPL_compatible | sort)
+          printf 'defined dynamic symbols:\n%s\n' "$actual"
           test "$actual" = "$expected"
 
     - name: Upload binaries
