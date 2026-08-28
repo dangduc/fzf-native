@@ -13,6 +13,8 @@ on:
       - "**.c"
       - "**.h"
       - "fzf-native.el"
+      - "fzf-native-module.def"
+      - "fzf-native-module.map"
       - "CMakeLists.txt"
       - ".github/workflows/cmake-binaries.yaml"
   push:
@@ -21,6 +23,8 @@ on:
       - "**.c"
       - "**.h"
       - "fzf-native.el"
+      - "fzf-native-module.def"
+      - "fzf-native-module.map"
       - "CMakeLists.txt"
       - ".github/workflows/cmake-binaries.yaml"
 
@@ -222,11 +226,19 @@ jobs:
           printf 'defined dynamic symbols:\n%s\n' "$actual"
           test "$actual" = "$expected"
 
+    # The VM action can leave the checkout's other tracked binaries in bin/.
+    # Publish only the file that this job built.
+    - name: Stage FreeBSD binary
+      run: |
+        rm -rf artifact-bin
+        mkdir -p artifact-bin/FreeBSD
+        cp bin/FreeBSD/fzf-native-module.so artifact-bin/FreeBSD/
+
     - name: Upload binaries
       uses: actions/upload-artifact@v4
       with:
         name: bin-freebsd-x86_64
-        path: bin/
+        path: artifact-bin/
         if-no-files-found: error
         retention-days: 1
 
@@ -247,13 +259,18 @@ jobs:
       with:
         path: bin-artifacts
         pattern: bin-*
-        merge-multiple: true
 
     - name: Stage binaries
       run: |
         rm -rf bin
-        mkdir -p bin
-        cp -R bin-artifacts/. bin/
+        mkdir -p bin/Darwin/arm64 bin/FreeBSD bin/Linux bin/Windows/Release
+        cp bin-artifacts/bin-macos-x86_64/Darwin/fzf-native-module.so bin/Darwin/
+        cp bin-artifacts/bin-macos-arm64/Darwin/arm64/fzf-native-module.so bin/Darwin/arm64/
+        cp bin-artifacts/bin-freebsd-x86_64/FreeBSD/fzf-native-module.so bin/FreeBSD/
+        cp bin-artifacts/bin-ubuntu-x86_64/Linux/fzf-native-module.so bin/Linux/
+        cp bin-artifacts/bin-windows-x86_64/Windows/Release/fzf-native-module.dll bin/Windows/Release/
+        cp bin-artifacts/bin-windows-x86_64/Windows/Release/fzf-native-module.exp bin/Windows/Release/
+        cp bin-artifacts/bin-windows-x86_64/Windows/Release/fzf-native-module.lib bin/Windows/Release/
         rm -rf bin-artifacts
         test -f bin/Linux/fzf-native-module.so
         test -f bin/FreeBSD/fzf-native-module.so
@@ -282,6 +299,11 @@ jobs:
         sed -i -E "s/^([[:space:]]+)\"${current}\"$/\1\"${new}\"/" Eask
         echo "version=${new}" >> "$GITHUB_OUTPUT"
         echo "Bumped $current -> $new"
+
+    - name: Stage generated release
+      run: |
+        git add --all -- bin fzf-native.el Eask
+        git diff --cached --name-status
 
     - name: Commit changes
       uses: EndBug/add-and-commit@v9
