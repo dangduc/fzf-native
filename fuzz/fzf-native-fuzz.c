@@ -69,6 +69,7 @@ static bool pattern_has_inverse(const fzf_pattern_t *pattern) {
   return false;
 }
 
+#ifndef FZF_NATIVE_UTF8_MATCHING
 static bool pattern_has_end_anchor(const fzf_pattern_t *pattern) {
   for (size_t i = 0; i < pattern->size; i++) {
     const fzf_term_set_t *set = pattern->ptr[i];
@@ -88,6 +89,7 @@ static bool ascii_bytes(const uint8_t *bytes, size_t size) {
   }
   return true;
 }
+#endif
 
 static void check_term(const char *candidate, const fzf_term_t *term,
                        fzf_slab_t *slab) {
@@ -219,14 +221,17 @@ static void run_one(const uint8_t *data, size_t size) {
   candidate[candidate_size] = '\0';
 
   /* This first, behavior-preserving layer covers the baseline ASCII API.
-     Non-ASCII and malformed-byte behavior is enabled by the stacked UTF-8
-     change, where those semantics are defined and tested explicitly. */
+     The stacked UTF-8 matcher advertises its byte semantics through a public
+     feature macro, which removes this guard without changing this commit's
+     standalone behavior. */
+#ifndef FZF_NATIVE_UTF8_MATCHING
   if (!ascii_bytes(payload, query_size) ||
       !ascii_bytes(payload + candidate_offset, candidate_size)) {
     free(candidate);
     free(query);
     return;
   }
+#endif
 
   fzf_case_types case_mode = (fzf_case_types)(options % 3);
   bool fuzzy = (options & 4) != 0;
@@ -234,14 +239,16 @@ static void run_one(const uint8_t *data, size_t size) {
       fzf_parse_pattern(case_mode, false, query, fuzzy);
   /* main currently underflows in suffix_match when a mutated suffix pattern
      is longer than its candidate.  The additive fuzz layer records but does
-     not alter that pre-existing behavior; the stacked matcher fix removes
-     this exclusion and promotes the reproducer into the permanent corpus. */
+     not alter that pre-existing behavior; the stacked matcher fix advertises
+     the safe implementation and removes this exclusion. */
+#ifndef FZF_NATIVE_UTF8_MATCHING
   if (pattern && (candidate[0] == '\0' || pattern_has_end_anchor(pattern))) {
     fzf_free_pattern(pattern);
     free(candidate);
     free(query);
     return;
   }
+#endif
   fzf_slab_t *default_slab = fzf_make_default_slab();
   fzf_slab_t *selected_slab = make_selected_slab(options);
   if (!pattern || !default_slab || !selected_slab)
@@ -260,7 +267,11 @@ static void run_one(const uint8_t *data, size_t size) {
      baseline implementation intentionally has historical whitespace/anchor
      differences from the scorer; this test-only layer must not redefine
      those semantics. */
+#ifdef FZF_NATIVE_HAS_MATCH_SLAB
+  (void)fzf_has_match(candidate, pattern, default_slab);
+#else
   (void)fzf_has_match(candidate, pattern);
+#endif
 
   /* Exercise the documented small-slab fallback under sanitizers.  The base
      implementation has historical score differences between algorithms, so

@@ -21,12 +21,21 @@ FUZZ_MODULE := $(abspath $(FUZZ_MODULE_DIR)/fzf-native-module.so)
 FZF_REFERENCE ?= fzf
 FZF_REFERENCE_VERSION ?=
 
+# The baseline matcher has no external runtime.  The stacked UTF-8 matcher
+# vendors utf8proc, so discover and link that source when it is present.  This
+# keeps the fuzz-infrastructure commit independently buildable while making
+# the exact PR40+PR41 composition build without branch-specific Makefile edits.
+FUZZ_UTF8PROC_SOURCE := $(firstword $(wildcard utf8proc-*/utf8proc.c))
+FUZZ_UTF8PROC_FLAGS := $(if $(FUZZ_UTF8PROC_SOURCE),-DUTF8PROC_STATIC,)
+
 .PHONY: fuzz-build
 fuzz-build:
 	mkdir -p $(BUILD_DIR)
 	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
 		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
-		-I. -o $(FUZZ_BINARY) fuzz/fzf-native-fuzz.c fzf.c fzf-additions.c
+		-I. $(FUZZ_UTF8PROC_FLAGS) -o $(FUZZ_BINARY) \
+		fuzz/fzf-native-fuzz.c fzf.c fzf-additions.c \
+		$(FUZZ_UTF8PROC_SOURCE)
 
 .PHONY: fuzz
 fuzz: fuzz-build
@@ -43,8 +52,9 @@ fuzz-replay-build:
 	mkdir -p $(BUILD_DIR)
 	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
 		-DFZF_FUZZ_STANDALONE -fsanitize=address,undefined \
-		-fno-omit-frame-pointer -I. -o $(FUZZ_REPLAY_BINARY) \
-		fuzz/fzf-native-fuzz.c fzf.c fzf-additions.c
+		-fno-omit-frame-pointer -I. $(FUZZ_UTF8PROC_FLAGS) \
+		-o $(FUZZ_REPLAY_BINARY) fuzz/fzf-native-fuzz.c fzf.c \
+		fzf-additions.c $(FUZZ_UTF8PROC_SOURCE)
 
 .PHONY: fuzz-replay
 fuzz-replay: fuzz-replay-build
