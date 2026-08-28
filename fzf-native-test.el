@@ -698,6 +698,32 @@ batch scorer rejects a live session in its optional slab position."
     (should-error (fzf-native-async-start "printf unreachable")
                   :type 'error)))
 
+(ert-deftest fzf-native-async-producer-rejects-nul-output-test ()
+  "A producer NUL byte is a visible failure, never a truncated candidate."
+  (skip-unless (and (fboundp 'fzf-native-async-submit)
+                    (executable-find "python3")))
+  (let ((handle
+         (fzf-native-async-start
+          "python3 -u -c 'import os
+os.write(1, b\"valid\\nab\\x00cd\\nlate\\n\")
+'")))
+    (unwind-protect
+        (let ((status (fzf-native-test--wait-for-producer handle)))
+          (should (plist-get status :reader-done))
+          (should (eq (plist-get status :producer-state) 'failed))
+          (should (equal (plist-get status :producer-error)
+                         "producer output contains a NUL byte"))
+          ;; Lines published before the malformed one remain available, but
+          ;; neither its truncated prefix nor any later bytes may escape.
+          (let* ((request-id (fzf-native-async-submit handle "" 10))
+                 (snapshot (fzf-native-test--wait-for-request
+                            handle request-id)))
+            (should (eq (plist-get snapshot :state) 'complete))
+            (should (equal (plist-get snapshot :candidates) '("valid")))
+            (should (equal (plist-get snapshot :producer-error)
+                           "producer output contains a NUL byte"))))
+      (fzf-native-async-stop handle))))
+
 (ert-deftest fzf-native-async-producer-nonzero-exit-test ()
   "A nonzero producer exit reports an error without losing its candidates."
   (skip-unless (fboundp 'fzf-native-async-status))

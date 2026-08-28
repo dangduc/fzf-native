@@ -453,10 +453,12 @@ struct Shared {
   bool filter_only;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
   _Atomic bool allocation_failed;
+  _Atomic bool embedded_nul;
 #else
   /* Windows executes this worker synchronously on the calling thread.  MSVC's
      C11 mode does not implement `_Atomic', so no synchronization is needed. */
   bool allocation_failed;
+  bool embedded_nul;
 #endif
 };
 
@@ -475,6 +477,22 @@ static void shared_set_allocation_failed(struct Shared *shared) {
                         memory_order_relaxed);
 #else
   shared->allocation_failed = true;
+#endif
+}
+
+static bool shared_embedded_nul(struct Shared *shared) {
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+  return atomic_load_explicit(&shared->embedded_nul, memory_order_relaxed);
+#else
+  return shared->embedded_nul;
+#endif
+}
+
+static void shared_set_embedded_nul(struct Shared *shared) {
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+  atomic_store_explicit(&shared->embedded_nul, true, memory_order_relaxed);
+#else
+  shared->embedded_nul = true;
 #endif
 }
 
@@ -510,6 +528,10 @@ static void *worker_routine(void *ptr) {
         if (shared_allocation_failed(shared))
           break;
         struct Candidate x = batch->xs[i];
+        if (str_has_embedded_nul(x.s)) {
+          shared_set_embedded_nul(shared);
+          break;
+        }
         /* You can get the score/position for as many items as you want */
         int score = filter_only
           ? (fzf_has_match(x.s.b, pattern, slab) ? 1 : 0)
@@ -886,7 +908,6 @@ emacs_value fzf_native_score_all(emacs_env *env,
        occupy a batch slot. In practice this is rarely reached on
        Emacs 30+: the coercion path accepts almost any input. */
     if (!s.b) continue;
-    if (reject_embedded_nul(env, s, "candidate")) goto err;
 
     if (!batches || (batches[batch_idx].len >= BATCH_SIZE && ++batch_idx >= capacity)) {
       capacity = batches ? 2 * capacity : 1;
@@ -934,6 +955,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
     .remaining = batch_idx + 1,
     .filter_only = filter_only_mode,
     .allocation_failed = false,
+    .embedded_nul = false,
   };
 
 #ifdef _WIN32
@@ -967,7 +989,11 @@ err_join_threads:
   for (unsigned i = 0; i < num_workers; ++i) pthread_join(data->threads[i], NULL);
 #endif
   if (pattern) fzf_free_pattern(pattern);
-  if (shared_allocation_failed(&shared)) {
+  if (shared_embedded_nul(&shared)) {
+    success = false;
+    async_signal_error(
+        env, "fzf-native: embedded NUL in candidate is not supported");
+  } else if (shared_allocation_failed(&shared)) {
     success = false;
     async_signal_error(
         env, "fzf-native: matcher could not allocate scoring scratch");
@@ -2645,6 +2671,7 @@ enum AsyncProducerErrorKind {
   AsyncProducerErrorExit,
   AsyncProducerErrorSignal,
   AsyncProducerErrorRead,
+  AsyncProducerErrorInvalidData,
   AsyncProducerErrorAllocation,
   AsyncProducerErrorCapacity,
   AsyncProducerErrorWait,
@@ -3097,6 +3124,14 @@ static bool async_extend_line(AsyncSession *s, char **line, size_t *used,
 
 static bool async_process_candidate_line(AsyncSession *s, char *line,
                                          size_t len) {
+  /* Every matcher and snapshot consumer currently uses NUL-terminated
+     candidate strings.  Reject an embedded NUL at the reader boundary so a
+     producer can never publish a silently shortened candidate. */
+  if (len && memchr(line, '\0', len) != NULL) {
+    async_record_producer_failure(s, AsyncProducerErrorInvalidData, 0);
+    return false;
+  }
+
   while (len && line[len - 1] == '\r') line[--len] = '\0';
   if (!len) return true;
 
@@ -5998,6 +6033,9 @@ static bool async_producer_error_message(AsyncSession *s,
       snprintf(buffer, capacity, "producer output read failed: %s",
                strerror(number));
       break;
+    case AsyncProducerErrorInvalidData:
+      snprintf(buffer, capacity, "producer output contains a NUL byte");
+      break;
     case AsyncProducerErrorAllocation:
       snprintf(buffer, capacity,
                "producer reader could not allocate candidate storage");
@@ -6547,6 +6585,8 @@ int emacs_module_init(struct emacs_runtime *rt) {
       env->make_function(env, 1, 2, fzf_native_async_start,
                          "Start async shell COMMAND; return a session handle.\n"
                          "Optional DIR sets the working directory (default: Emacs cwd).\n\n"
+                         "Each stdout line is one candidate.  A line with a NUL byte\n"
+                         "fails the producer session.\n\n"
                          "\\(fn COMMAND &optional DIR)", NULL),
     });
   env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
