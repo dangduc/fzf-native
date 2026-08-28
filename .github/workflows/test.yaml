@@ -20,8 +20,25 @@ jobs:
       - uses: actions/checkout@v2
 
       - uses: jcs090218/setup-emacs@master
+        if: matrix.os != 'macos-15-intel'
         with:
           version: ${{ matrix.emacs-version }}
+
+      # Current nix-emacs-ci follows Nixpkgs 26.11, which dropped x86_64
+      # Darwin.  Keep Intel CI on the immutable 30.2-era lock instead of
+      # silently removing that architecture from the matrix.
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        if: matrix.os == 'macos-15-intel'
+
+      - name: Install Emacs on Intel macOS
+        if: matrix.os == 'macos-15-intel'
+        shell: bash
+        env:
+          EMACS_VERSION: ${{ matrix.emacs-version }}
+        run: |
+          package="emacs-${EMACS_VERSION//./-}"
+          nix profile install --accept-flake-config \
+            "github:purcell/nix-emacs-ci/b12b5b31e40df750478c9fc68c1e81c91ed079ec#${package}"
 
       - uses: actions/setup-node@v2
         with:
