@@ -6109,6 +6109,16 @@ static emacs_value async_plist_put(emacs_env *env, emacs_value plist,
                       (emacs_value[]){ env->intern(env, key), plist });
 }
 
+static bool async_snapshot_is_stale(uint64_t requested_id,
+                                    uint64_t result_id,
+                                    size_t result_pool_gen,
+                                    size_t current_pool,
+                                    bool reader_done) {
+  return requested_id != result_id ||
+         (result_id != 0 && result_pool_gen != current_pool) ||
+         (current_pool == 0 && !reader_done);
+}
+
 static emacs_value async_snapshot_value(emacs_env *env, AsyncSession *s,
                                         uint64_t requested_id,
                                         bool include_candidates) {
@@ -6274,9 +6284,8 @@ static emacs_value async_snapshot_value(emacs_env *env, AsyncSession *s,
      still emit candidates that change the answer.  Mirror the guard in
      `fzf-native-async-result-fresh-p': an empty-pool result is not
      authoritative until the reader has observed EOF (or stop). */
-  bool stale = requested_id != result_id ||
-               (result_id != 0 && result_pool_gen != current_pool) ||
-               (current_pool == 0 && !reader_done);
+  bool stale = async_snapshot_is_stale(
+      requested_id, result_id, result_pool_gen, current_pool, reader_done);
   plist = async_plist_put(env, plist, ":stale", stale ? Qt : Qnil);
   plist = async_plist_put(env, plist, ":result-pool-generation",
                           env->make_integer(env,
