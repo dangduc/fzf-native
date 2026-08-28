@@ -147,11 +147,13 @@ jobs:
       shell: bash
       run: |
         module=bin/Linux/fzf-native-module.so
-        max_glibc=$(objdump -T "$module" | sed -n 's/.*(GLIBC_\([0-9.]*\)).*/\1/p' | sort -V | tail -1)
+        max_glibc=$(objdump -T "$module" | grep -o 'GLIBC_[0-9.]*' | cut -d_ -f2 | sort -V | tail -1)
         test -n "$max_glibc"
+        echo "maximum required glibc version: $max_glibc"
         test "$(printf '%s\n' "$max_glibc" 2.31 | sort -V | tail -1)" = 2.31
         actual=$(nm -D --defined-only "$module" | awk '{print $3}' | sort)
         expected=$(printf '%s\n' emacs_module_init plugin_is_GPL_compatible | sort)
+        printf 'defined dynamic symbols:\n%s\n' "$actual"
         test "$actual" = "$expected"
 
     - name: Upload binaries
@@ -213,8 +215,8 @@ jobs:
               --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" \"K\")) 0) (error \"tracked UTF-8 artifact is stale\")))"
           fi
           rm -rf bin
-          cmake -B build -DCMAKE_BUILD_TYPE=${BUILD_TYPE}
-          cmake --build build --verbose --config ${BUILD_TYPE}
+          cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          cmake --build build --verbose --config ${{ env.BUILD_TYPE }}
           emacs -Q --batch -L . -l fzf-native \
             -f fzf-native-load-dyn \
             --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" \"K\")) 0) (error \"fresh UTF-8 artifact failed\")))"

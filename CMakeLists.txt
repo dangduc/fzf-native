@@ -65,8 +65,9 @@ target_include_directories(utf8proc PUBLIC ${UTF8PROC_INCLUDE_DIR})
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   # Assume compiler MSVC.
-  add_library(fzf-native-module SHARED fzf-native-module.c fzf.c fzf.h
-                                       fzf-additions.c fzf-additions.h)
+  add_library(
+    fzf-native-module SHARED fzf-native-module.c fzf.c fzf.h fzf-additions.c
+                             fzf-additions.h fzf-native-module.def)
 else()
   add_library(fzf-native-module MODULE fzf-native-module.c fzf.c fzf.h
                                        fzf-additions.c fzf-additions.h)

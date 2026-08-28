@@ -42,7 +42,11 @@ static inline void fzf_block_all_signals(void) {}
 #endif
 
 #ifdef _WIN32
-#  define EXPORT __declspec(dllexport)
+/* emacs-module.h declares emacs_module_init before this translation unit can
+   add __declspec(dllexport), and MSVC rejects a differently decorated
+   definition.  The Windows target exports the two ABI symbols with the module
+   definition file instead. */
+#  define EXPORT
 #elif defined(__GNUC__) || defined(__clang__)
 #  define EXPORT __attribute__((visibility("default")))
 #else
