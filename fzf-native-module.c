@@ -2672,6 +2672,11 @@ typedef struct {
   int           cancel_read_fd;
   int           cancel_write_fd;
   bool          cancel_pipe_ready;
+#ifdef FZF_NATIVE_CTEST
+  /* Deterministic coverage seam: native tests and the session fuzzer wait for
+     the reader to enter a specific poll epoch before publishing stop. */
+  _Atomic unsigned test_reader_poll_epoch;
+#endif
   _Atomic bool stop;
   /* Set by the reader thread immediately before it exits — either
      because the child producer closed its stdout (EOF) or because
@@ -3145,6 +3150,10 @@ static void *async_reader(void *arg) {
     };
     nfds_t wait_count = s->cancel_pipe_ready ? 2 : 1;
     int ready;
+#ifdef FZF_NATIVE_CTEST
+    atomic_fetch_add_explicit(
+        &s->test_reader_poll_epoch, 1, memory_order_release);
+#endif
     do {
       ready = poll(wait_fds, wait_count, -1);
     } while (ready < 0 && errno == EINTR &&
@@ -3367,11 +3376,12 @@ static void *async_destroy_worker(void *arg) {
    cache_free to a detached pthread.  Returns within microseconds even
    for sessions with tens of millions of candidates.
 
-   `kill(pid, SIGKILL)` (vs SIGTERM in async_session_destroy) makes the
-   subprocess die immediately rather than running its own shutdown path.
-   The reader thread sees pipe EOF and exits; the scoring thread
-   short-circuits on score_abort.  The detached worker then joins both
-   without holding up the Emacs main thread on minibuffer dismissal.
+   The private cancellation pipe wakes the reader even when an escaped
+   descendant keeps stdout open.  `kill(-pid, SIGKILL)` is independent
+   best-effort process-group cleanup, including when the reader already owns
+   waitpid.  The scoring thread short-circuits on score_abort.  The detached
+   worker then joins both threads without holding up the Emacs main thread on
+   minibuffer dismissal.
 
    Falls back to a synchronous destroy if pthread_create fails — the
    join cost is preferable to a leak. */
