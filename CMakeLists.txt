@@ -121,8 +121,11 @@ if(DEFINED ENV{FZF_NATIVE_DEBUG})
   message(STATUS "FZF_NATIVE_DEBUG enabled — file logging compiled in")
 endif()
 
-# --- Debug / Sanitizer flags (Linux/GCC/Clang only) ---
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# --- Debug / Sanitizer flags (GCC and Clang-family compilers) ---
+# Keep these options compiler-based instead of Linux-only.  The interactive
+# Emacs ABI is exercised on Darwin too, and silently producing an
+# uninstrumented module for -DENABLE_ASAN=ON defeats the option's contract.
+if(CMAKE_C_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
 
   # Full debug info: -g3 includes macro definitions, -fno-omit-frame-pointer
   # keeps stack frames intact for better backtraces, -O0 disables optimizations
@@ -157,5 +160,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(STATUS "UndefinedBehaviorSanitizer enabled")
   endif()
 
+elseif(ENABLE_ASAN OR ENABLE_UBSAN)
+  message(FATAL_ERROR
+          "ENABLE_ASAN/ENABLE_UBSAN requires GCC, Clang, or AppleClang")
 endif()
 # --- End debug / sanitizer flags ---

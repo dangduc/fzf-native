@@ -2203,6 +2203,59 @@ the uninitialised scratch."
               (should (equal actual batch)))))
       (fzf-native-async-stop handle))))
 
+(defun fzf-native-test--new-complete-session ()
+  "Return (HANDLE REQUEST-ID) for a small completed async request."
+  (let* ((handle
+          (fzf-native-async-start "printf '%s\\n' alpha beta gamma"))
+         (request-id (fzf-native-async-submit handle "a" 10))
+         (snapshot (fzf-native-test--wait-for-request handle request-id)))
+    (unless (eq (plist-get snapshot :state) 'complete)
+      (fzf-native-async-stop handle)
+      (error "fzf-native test session did not complete: %S" snapshot))
+    (list handle request-id)))
+
+(defun fzf-native-test--call-with-symbol-value-stop (handle function)
+  "Call FUNCTION while the first `symbol-value' call stops HANDLE.
+
+Return (FIRED RESULT ERROR-DATA)."
+  (let ((original (symbol-function 'symbol-value))
+        fired result error-data)
+    (unwind-protect
+        (progn
+          (fset 'symbol-value
+                (lambda (symbol)
+                  (unless fired
+                    (setq fired t)
+                    (fzf-native-async-stop handle)
+                    (sleep-for 0.05))
+                  (funcall original symbol)))
+          (condition-case error
+              (setq result (funcall function))
+            (error (setq error-data error))))
+      (fset 'symbol-value original))
+    (list fired result error-data)))
+
+(defun fzf-native-test--call-with-cons-stop (handle function)
+  "Call FUNCTION while the first `cons' call stops HANDLE.
+
+Return (FIRED RESULT ERROR-DATA)."
+  (let ((original (symbol-function 'cons))
+        fired result error-data)
+    (unwind-protect
+        (progn
+          (fset 'cons
+                (lambda (car cdr)
+                  (unless fired
+                    (setq fired t)
+                    (fzf-native-async-stop handle)
+                    (sleep-for 0.05))
+                  (funcall original car cdr)))
+          (condition-case error
+              (setq result (funcall function))
+            (error (setq error-data error))))
+      (fset 'cons original))
+    (list fired result error-data)))
+
 (ert-deftest fzf-native-async-public-results-own-strings-across-reentry-test ()
   "Stopping from reentrant Lisp cannot invalidate a public result copy.
 
@@ -2260,6 +2313,111 @@ candidate pointer a deterministic heap-use-after-free."
                                  result))
                        20000)))
         (ignore-errors (fzf-native-async-stop handle))))))
+
+(ert-deftest fzf-native-async-submit-pins-session-across-lisp-reentry-test ()
+  "Stopping during defcustom lookup cannot free an in-flight submit call.
+
+`fzf-native-async-submit' resolves matching options through the mutable Lisp
+function `symbol-value'.  This replacement stops the same handle during that
+call and waits long enough for detached teardown to expose a borrowed session
+pointer.  An ASan module made the old code fail with a heap-use-after-free."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let* ((handle (fzf-native-async-start "printf '%s\\n' alpha"))
+         (original-symbol-value (symbol-function 'symbol-value))
+         fired submit-error)
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle)
+                             :reader-done))
+          (unwind-protect
+              (progn
+                (fset 'symbol-value
+                      (lambda (symbol)
+                        (unless fired
+                          (setq fired t)
+                          (fzf-native-async-stop handle)
+                          (sleep-for 0.3))
+                        (funcall original-symbol-value symbol)))
+                (setq submit-error
+                      (condition-case error-data
+                          (progn
+                            (fzf-native-async-submit handle "a" 10)
+                            nil)
+                        (error error-data))))
+            (fset 'symbol-value original-symbol-value))
+          (should fired)
+          (should submit-error)
+          (should (string-match-p
+                   "fzf-native-async-submit failed"
+                   (error-message-string submit-error)))
+          (should-not (fzf-native-async-generation handle)))
+      (fset 'symbol-value original-symbol-value)
+      (ignore-errors (fzf-native-async-stop handle)))))
+
+(ert-deftest fzf-native-async-candidates-pins-session-across-lisp-reentry-test ()
+  "Candidate scoring must survive stop during matching-option lookup."
+  (pcase-let* ((`(,handle ,_) (fzf-native-test--new-complete-session))
+               (`(,fired ,_result ,_error)
+                (fzf-native-test--call-with-symbol-value-stop
+                 handle
+                 (lambda ()
+                   (fzf-native-async-candidates handle "a" 10)))))
+    (should fired)
+    (should-not (fzf-native-async-generation handle))))
+
+(ert-deftest fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test ()
+  "Freshness checks must survive stop during matching-option lookup."
+  (pcase-let* ((`(,handle ,_) (fzf-native-test--new-complete-session))
+               (`(,fired ,result ,error-data)
+                (fzf-native-test--call-with-symbol-value-stop
+                 handle
+                 (lambda ()
+                   (fzf-native-async-result-fresh-p handle "a")))))
+    (should fired)
+    (should-not error-data)
+    (should-not result)
+    (should-not (fzf-native-async-generation handle))))
+
+(ert-deftest fzf-native-async-snapshot-pins-session-across-lisp-reentry-test ()
+  "Snapshot highlighting must survive a hook that stops its session."
+  (pcase-let ((`(,handle ,request-id)
+               (fzf-native-test--new-complete-session)))
+    (let ((fzf-native-async-highlight t)
+          fired)
+      (let ((fzf-native-highlight-fn
+             (lambda (_candidate _positions)
+               (unless fired
+                 (setq fired t)
+                 (fzf-native-async-stop handle)
+                 (sleep-for 0.05)))))
+        (should (plistp (fzf-native-async-snapshot handle request-id)))
+        (should fired)
+        (should-not (fzf-native-async-generation handle))))))
+
+(ert-deftest fzf-native-async-status-pins-session-across-lisp-reentry-test ()
+  "Status plist construction must survive a reentrant stop."
+  (pcase-let* ((`(,handle ,request-id)
+                (fzf-native-test--new-complete-session))
+               (`(,fired ,result ,error-data)
+                (fzf-native-test--call-with-cons-stop
+                 handle
+                 (lambda () (fzf-native-async-status handle request-id)))))
+    (should fired)
+    (should-not error-data)
+    (should (plistp result))
+    (should-not (fzf-native-async-generation handle))))
+
+(ert-deftest fzf-native-async-stats-pins-session-across-lisp-reentry-test ()
+  "Stats cons construction must survive a reentrant stop."
+  (pcase-let* ((`(,handle ,_) (fzf-native-test--new-complete-session))
+               (`(,fired ,result ,error-data)
+                (fzf-native-test--call-with-cons-stop
+                 handle
+                 (lambda () (fzf-native-async-stats handle)))))
+    (should fired)
+    (should-not error-data)
+    (should (consp result))
+    (should-not (fzf-native-async-generation handle))))
 
 (ert-deftest fzf-native-async-empty-pool-result-not-final-test ()
   "A result completed over a still-empty pool is not authoritative.

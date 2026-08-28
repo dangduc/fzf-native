@@ -93,6 +93,12 @@ jobs:
             '(or fzf-native-session-abi-handshake-test \
                  fzf-native-async-preserves-empty-line-candidates-test \
                  fzf-native-async-public-results-own-strings-across-reentry-test \
+                 fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-stats-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-status-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-submit-pins-session-across-lisp-reentry-test \
                  fzf-native-score-all-empty-string-candidate-test \
                  fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
@@ -119,6 +125,12 @@ jobs:
             '(or fzf-native-session-abi-handshake-test \
                  fzf-native-async-preserves-empty-line-candidates-test \
                  fzf-native-async-public-results-own-strings-across-reentry-test \
+                 fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-stats-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-status-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-submit-pins-session-across-lisp-reentry-test \
                  fzf-native-score-all-empty-string-candidate-test \
                  fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
@@ -229,6 +241,12 @@ jobs:
             '(or fzf-native-session-abi-handshake-test \
                  fzf-native-async-preserves-empty-line-candidates-test \
                  fzf-native-async-public-results-own-strings-across-reentry-test \
+                 fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-stats-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-status-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-submit-pins-session-across-lisp-reentry-test \
                  fzf-native-score-all-empty-string-candidate-test \
                  fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
@@ -246,6 +264,12 @@ jobs:
             '(or fzf-native-session-abi-handshake-test \
                  fzf-native-async-preserves-empty-line-candidates-test \
                  fzf-native-async-public-results-own-strings-across-reentry-test \
+                 fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-stats-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-status-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-submit-pins-session-across-lisp-reentry-test \
                  fzf-native-score-all-empty-string-candidate-test \
                  fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
@@ -273,6 +297,12 @@ jobs:
                 '(or fzf-native-session-abi-handshake-test \
                      fzf-native-async-preserves-empty-line-candidates-test \
                      fzf-native-async-public-results-own-strings-across-reentry-test \
+                     fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
+                     fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
+                     fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
+                     fzf-native-async-stats-pins-session-across-lisp-reentry-test \
+                     fzf-native-async-status-pins-session-across-lisp-reentry-test \
+                     fzf-native-async-submit-pins-session-across-lisp-reentry-test \
                      fzf-native-score-all-empty-string-candidate-test \
                      fzf-native-utf8-case-ignore-length-changing-fold-test))"
           fi
@@ -286,6 +316,12 @@ jobs:
               '(or fzf-native-session-abi-handshake-test \
                    fzf-native-async-preserves-empty-line-candidates-test \
                    fzf-native-async-public-results-own-strings-across-reentry-test \
+                   fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
+                   fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
+                   fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
+                   fzf-native-async-stats-pins-session-across-lisp-reentry-test \
+                   fzf-native-async-status-pins-session-across-lisp-reentry-test \
+                   fzf-native-async-submit-pins-session-across-lisp-reentry-test \
                    fzf-native-score-all-empty-string-candidate-test \
                    fzf-native-utf8-case-ignore-length-changing-fold-test))"
           actual=$(nm -D --defined-only -P bin/FreeBSD/fzf-native-module.so | awk '{print $1}' | sort)

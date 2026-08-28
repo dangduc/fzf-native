@@ -3,6 +3,7 @@
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L
 #endif
+#include <assert.h>
 #include <ctype.h>
 #include <stdalign.h>
 #include <stdbool.h>
@@ -191,6 +192,7 @@ emacs_value Qstringp, Qwrong_type_argument, Qerror;
 typedef void (*fzf_native_finalizer_fn)(void *);
 
 static void slab_finalize(void *object);
+static void async_session_finalize(void *object);
 
 static void async_signal_error(emacs_env *env, const char *message) {
   emacs_value msg = env->make_string(env, message,
@@ -2728,6 +2730,14 @@ enum AsyncProducerErrorKind {
 };
 
 typedef struct {
+  /* The Lisp user pointer owns one reference.  Public module calls pin an
+     additional reference before they invoke any mutable Lisp function.  A
+     reentrant `fzf-native-async-stop' can therefore detach and cancel the
+     handle immediately without freeing the session underneath the outer C
+     call. */
+  _Atomic size_t lifetime_refs;
+  _Atomic bool   handle_owner_released;
+
   pthread_t     reader;
   bool          reader_started;
   pid_t         pid;
@@ -3479,11 +3489,8 @@ static void *async_destroy_worker(void *arg) {
 
    Falls back to a synchronous destroy if pthread_create fails — the
    join cost is preferable to a leak. */
-static void async_session_destroy_async(void *ptr) {
-  AsyncSession *s = ptr;
+static void async_session_request_stop(AsyncSession *s) {
   if (!s) return;
-  fzf_log("async_session_destroy_async: pid=%d\n", (int)s->pid);
-
   atomic_store_explicit(&s->score_abort, true, memory_order_seq_cst);
   async_worker_pool_wake(atomic_load_explicit(
       &s->worker_pool, memory_order_acquire));
@@ -3496,6 +3503,14 @@ static void async_session_destroy_async(void *ptr) {
   s->score_req_stop = true;
   pthread_cond_signal(&s->score_req_cond);
   pthread_mutex_unlock(&s->score_req_mu);
+}
+
+static void async_session_destroy_async(void *ptr) {
+  AsyncSession *s = ptr;
+  if (!s) return;
+  fzf_log("async_session_destroy_async: pid=%d\n", (int)s->pid);
+
+  async_session_request_stop(s);
 
   pthread_t t;
   if (pthread_create(&t, NULL, async_destroy_worker, s) == 0) {
@@ -3505,6 +3520,52 @@ static void async_session_destroy_async(void *ptr) {
             "falling back to synchronous destroy\n");
     async_session_destroy(s);
   }
+}
+
+/* A handle starts with one owner reference.  Module entry points add a pin
+   before any call through a mutable Lisp symbol and drop it only after all
+   session access is complete.  Stop/finalization cancels immediately, but
+   the detached destroy starts only after the last in-flight entry point
+   returns. */
+static void async_session_retain(AsyncSession *s) {
+  size_t old = atomic_fetch_add_explicit(
+      &s->lifetime_refs, 1, memory_order_relaxed);
+  assert(old > 0 && old < SIZE_MAX);
+}
+
+static void async_session_release(AsyncSession *s) {
+  size_t old = atomic_fetch_sub_explicit(
+      &s->lifetime_refs, 1, memory_order_acq_rel);
+  assert(old > 0);
+  if (old == 1) async_session_destroy_async(s);
+}
+
+static void async_session_release_handle_owner(AsyncSession *s) {
+  if (!s) return;
+  if (atomic_exchange_explicit(
+          &s->handle_owner_released, true, memory_order_acq_rel))
+    return;
+  async_session_request_stop(s);
+  async_session_release(s);
+}
+
+static void async_session_finalize(void *object) {
+  async_session_release_handle_owner(object);
+}
+
+static AsyncSession *async_session_pin_handle(emacs_env *env,
+                                              emacs_value handle) {
+  AsyncSession *s = fzf_native_typed_user_ptr(
+      env, handle, async_session_finalize,
+      "an fzf-native async session handle");
+  if (s) async_session_retain(s);
+  return s;
+}
+
+static emacs_value async_session_unpin_return(AsyncSession *s,
+                                              emacs_value value) {
+  async_session_release(s);
+  return value;
 }
 
 enum AsyncSpawnStage {
@@ -3699,7 +3760,7 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
      non-allocating ownership transfer only after startup is complete. */
   emacs_value handle;
   if (!fzf_native_make_inert_user_ptr(
-          env, async_session_destroy_async, &handle))
+          env, async_session_finalize, &handle))
     return Qnil;
 
   char *cmd = async_copy_lisp_c_string(env, args[0], "producer command");
@@ -3913,6 +3974,8 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     free(dir);
     return Qnil;
   }
+  atomic_init(&s->lifetime_refs, 1);
+  atomic_init(&s->handle_owner_released, false);
 
   fzf_log("async_start: cmd='%s' dir='%s' pid=%d\n",
           cmd, dir ? dir : ".", (int)pid);
@@ -4058,12 +4121,12 @@ fzf_native_async_stop(emacs_env *env, ptrdiff_t nargs,
                       emacs_value args[], void *UNUSED(data)) {
   (void)nargs;
   AsyncSession *s = fzf_native_typed_user_ptr(
-      env, args[0], async_session_destroy_async,
+      env, args[0], async_session_finalize,
       "an fzf-native async session handle");
   if (s) {
     fzf_log("async_stop: pid=%d\n", (int)s->pid);
     env->set_user_ptr(env, args[0], NULL);
-    async_session_destroy_async(s);
+    async_session_release_handle_owner(s);
   }
   return Qnil;
 }
@@ -4073,12 +4136,11 @@ static emacs_value
 fzf_native_async_generation(emacs_env *env, ptrdiff_t nargs,
                              emacs_value args[], void *UNUSED(data)) {
   (void)nargs;
-  AsyncSession *s = fzf_native_typed_user_ptr(
-      env, args[0], async_session_destroy_async,
-      "an fzf-native async session handle");
+  AsyncSession *s = async_session_pin_handle(env, args[0]);
   if (!s) return Qnil;
-  return env->make_integer(env,
-    atomic_load_explicit(&s->gen, memory_order_relaxed));
+  emacs_value result = env->make_integer(
+      env, atomic_load_explicit(&s->gen, memory_order_relaxed));
+  return async_session_unpin_return(s, result);
 }
 
 static int cmp_scored_desc(const void *a, const void *b) {
@@ -5758,6 +5820,13 @@ static uint64_t async_submit_request(emacs_env *env, AsyncSession *s,
   bool fo_logic_and = resolve_filter_only_settings(
       env, &fo_unused_min, &fo_max_len);
   (void)fo_unused_min;
+  /* A mutable `symbol-value' implementation can stop this same handle while
+     the matching defcustoms are resolved.  The caller pins S, so it is still
+     alive, but a stopped session must not accept new work. */
+  if (atomic_load_explicit(&s->stop, memory_order_acquire)) {
+    free(filter);
+    return 0;
+  }
   return async_submit_request_resolved(
       s, filter, filter_byte_len, limit, case_mode, fuzzy, fo_max_len,
       fo_logic_and);
@@ -5978,25 +6047,24 @@ static emacs_value async_build_candidate_list(emacs_env *env,
 static emacs_value
 fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
                              emacs_value args[], void *UNUSED(data)) {
-  AsyncSession *s = fzf_native_typed_user_ptr(
-      env, args[0], async_session_destroy_async,
-      "an fzf-native async session handle");
+  AsyncSession *s = async_session_pin_handle(env, args[0]);
   if (!s) return Qnil;
 
   struct Str filter;
-  if (!async_copy_lisp_string(env, args[1], "query", &filter)) return Qnil;
+  if (!async_copy_lisp_string(env, args[1], "query", &filter))
+    return async_session_unpin_return(s, Qnil);
 
   size_t limit = 0;
   if (nargs > 2 && !env->eq(env, args[2], Qnil)) {
     intmax_t extracted = env->extract_integer(env, args[2]);
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
       free(filter.b);
-      return Qnil;
+      return async_session_unpin_return(s, Qnil);
     }
     if (extracted < 0) {
       free(filter.b);
       async_signal_not_natnum(env, args[2]);
-      return Qnil;
+      return async_session_unpin_return(s, Qnil);
     }
     limit = (size_t)extracted;
   }
@@ -6006,7 +6074,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
   if (!request_id) {
     if (env->non_local_exit_check(env) == emacs_funcall_exit_return)
       async_signal_error(env, "fzf-native-async-candidates failed");
-    return Qnil;
+    return async_session_unpin_return(s, Qnil);
   }
 
   size_t rcount = 0, result_limit = 0;
@@ -6041,7 +6109,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
     async_free_public_result(snap, rcount);
     async_signal_error(
         env, "fzf-native: could not copy asynchronous results");
-    return Qnil;
+    return async_session_unpin_return(s, Qnil);
   }
 
   emacs_value result = async_build_candidate_list(
@@ -6049,7 +6117,7 @@ fzf_native_async_candidates(emacs_env *env, ptrdiff_t nargs,
   free(result_filter);
   free(score_error);
   async_free_public_result(snap, rcount);
-  return result;
+  return async_session_unpin_return(s, result);
 }
 
 enum AsyncRequestState {
@@ -6374,9 +6442,7 @@ static emacs_value async_snapshot_value(emacs_env *env, AsyncSession *s,
 static emacs_value
 fzf_native_async_submit(emacs_env *env, ptrdiff_t nargs,
                         emacs_value args[], void *UNUSED(data)) {
-  AsyncSession *s = fzf_native_typed_user_ptr(
-      env, args[0], async_session_destroy_async,
-      "an fzf-native async session handle");
+  AsyncSession *s = async_session_pin_handle(env, args[0]);
   if (!s) {
     if (env->non_local_exit_check(env) == emacs_funcall_exit_return)
       async_signal_error(env, "fzf-native: session is stopped");
@@ -6384,19 +6450,20 @@ fzf_native_async_submit(emacs_env *env, ptrdiff_t nargs,
   }
 
   struct Str query;
-  if (!async_copy_lisp_string(env, args[1], "query", &query)) return Qnil;
+  if (!async_copy_lisp_string(env, args[1], "query", &query))
+    return async_session_unpin_return(s, Qnil);
 
   size_t limit = 0;
   if (nargs > 2 && !env->eq(env, args[2], Qnil)) {
     intmax_t extracted = env->extract_integer(env, args[2]);
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
       free(query.b);
-      return Qnil;
+      return async_session_unpin_return(s, Qnil);
     }
     if (extracted < 0) {
       free(query.b);
       async_signal_not_natnum(env, args[2]);
-      return Qnil;
+      return async_session_unpin_return(s, Qnil);
     }
     limit = (size_t)extracted;
   }
@@ -6406,71 +6473,69 @@ fzf_native_async_submit(emacs_env *env, ptrdiff_t nargs,
   if (!request_id) {
     if (env->non_local_exit_check(env) == emacs_funcall_exit_return)
       async_signal_error(env, "fzf-native-async-submit failed");
-    return Qnil;
+    return async_session_unpin_return(s, Qnil);
   }
-  return env->make_integer(env, (intmax_t)request_id);
+  emacs_value result = env->make_integer(env, (intmax_t)request_id);
+  return async_session_unpin_return(s, result);
 }
 
 /* fzf-native-async-snapshot HANDLE &optional REQUEST-ID -> plist */
 static emacs_value
 fzf_native_async_snapshot(emacs_env *env, ptrdiff_t nargs,
                           emacs_value args[], void *UNUSED(data)) {
-  AsyncSession *s = fzf_native_typed_user_ptr(
-      env, args[0], async_session_destroy_async,
-      "an fzf-native async session handle");
+  AsyncSession *s = async_session_pin_handle(env, args[0]);
   if (!s) return Qnil;
   uint64_t request_id = 0;
   if (nargs > 1 && !env->eq(env, args[1], Qnil)) {
     intmax_t extracted = env->extract_integer(env, args[1]);
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
-      return Qnil;
+      return async_session_unpin_return(s, Qnil);
     if (extracted < 0) {
       async_signal_not_natnum(env, args[1]);
-      return Qnil;
+      return async_session_unpin_return(s, Qnil);
     }
     request_id = (uint64_t)extracted;
   }
-  return async_snapshot_value(env, s, request_id, true);
+  emacs_value result = async_snapshot_value(env, s, request_id, true);
+  return async_session_unpin_return(s, result);
 }
 
 /* fzf-native-async-status HANDLE &optional REQUEST-ID -> plist */
 static emacs_value
 fzf_native_async_status(emacs_env *env, ptrdiff_t nargs,
                         emacs_value args[], void *UNUSED(data)) {
-  AsyncSession *s = fzf_native_typed_user_ptr(
-      env, args[0], async_session_destroy_async,
-      "an fzf-native async session handle");
+  AsyncSession *s = async_session_pin_handle(env, args[0]);
   if (!s) return Qnil;
   uint64_t request_id = 0;
   if (nargs > 1 && !env->eq(env, args[1], Qnil)) {
     intmax_t extracted = env->extract_integer(env, args[1]);
     if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
-      return Qnil;
+      return async_session_unpin_return(s, Qnil);
     if (extracted < 0) {
       async_signal_not_natnum(env, args[1]);
-      return Qnil;
+      return async_session_unpin_return(s, Qnil);
     }
     request_id = (uint64_t)extracted;
   }
-  return async_snapshot_value(env, s, request_id, false);
+  emacs_value result = async_snapshot_value(env, s, request_id, false);
+  return async_session_unpin_return(s, result);
 }
 
 /* fzf-native-async-stats HANDLE -> (filtered . total) */
 static emacs_value
 fzf_native_async_stats(emacs_env *env, ptrdiff_t UNUSED(nargs),
                        emacs_value args[], void *UNUSED(data)) {
-  AsyncSession *s = fzf_native_typed_user_ptr(
-      env, args[0], async_session_destroy_async,
-      "an fzf-native async session handle");
+  AsyncSession *s = async_session_pin_handle(env, args[0]);
   if (!s) return Qnil;
   pthread_mutex_lock(&s->score_res_mu);
   size_t filtered = s->last_filtered;
   size_t total    = s->last_total;
   pthread_mutex_unlock(&s->score_res_mu);
-  return env->funcall(env, Fcons, 2, (emacs_value[]){
+  emacs_value result = env->funcall(env, Fcons, 2, (emacs_value[]){
     env->make_integer(env, (intmax_t)filtered),
     env->make_integer(env, (intmax_t)total),
   });
+  return async_session_unpin_return(s, result);
 }
 
 /* fzf-native-async-result-fresh-p HANDLE QUERY -> t / nil
@@ -6496,13 +6561,12 @@ fzf_native_async_stats(emacs_env *env, ptrdiff_t UNUSED(nargs),
 static emacs_value
 fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
                                  emacs_value args[], void *UNUSED(data)) {
-  AsyncSession *s = fzf_native_typed_user_ptr(
-      env, args[0], async_session_destroy_async,
-      "an fzf-native async session handle");
+  AsyncSession *s = async_session_pin_handle(env, args[0]);
   if (!s) return Qnil;
 
   struct Str query;
-  if (!async_copy_lisp_string(env, args[1], "query", &query)) return Qnil;
+  if (!async_copy_lisp_string(env, args[1], "query", &query))
+    return async_session_unpin_return(s, Qnil);
 
   AsyncPoolObservation pool = async_observe_pool(s);
   size_t cur_pool = pool.count;
@@ -6513,6 +6577,10 @@ fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
   bool fo_logic_and = resolve_filter_only_settings(
       env, &fo_unused_min, &fo_max_len);
   (void)fo_unused_min;
+  if (atomic_load_explicit(&s->stop, memory_order_acquire)) {
+    free(query.b);
+    return async_session_unpin_return(s, Qnil);
+  }
   size_t query_char_len = utf8_character_count(query.b, query.len);
   bool filter_only = decide_filter_only(
       s->filter_only_min_pool, fo_max_len, fo_logic_and,
@@ -6547,7 +6615,7 @@ fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
   }
 
   free(query.b);
-  return fresh ? Qt : Qnil;
+  return async_session_unpin_return(s, fresh ? Qt : Qnil);
 }
 
 #endif /* APPLE || linux || FreeBSD */

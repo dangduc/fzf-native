@@ -62,6 +62,37 @@ jobs:
         run: make ctest-asan
         if: runner.os != 'Windows'
 
+      # The C model test proves the refcount transition, but only a real Emacs
+      # call can prove every public wrapper pins its session before mutable
+      # Lisp reentry.  Keep one instrumented module outside bin/ so the normal
+      # portable-artifact build below remains unchanged.
+      - name: Configure ASan/UBSan Emacs module
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          cmake -S . -B build-emacs-sanitized \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_ASAN=ON \
+            -DENABLE_UBSAN=ON \
+            -DFZF_NATIVE_MODULE_OUTPUT_DIR="$PWD/build-emacs-sanitized/module"
+
+      - name: Build ASan/UBSan Emacs module
+        if: matrix.os == 'ubuntu-latest'
+        run: cmake --build build-emacs-sanitized
+
+      - name: ASan/UBSan public-session reentry tests
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          asan_runtime="$(cc -print-file-name=libasan.so)"
+          env \
+            LD_PRELOAD="$asan_runtime" \
+            ASAN_OPTIONS=detect_leaks=0:halt_on_error=1:abort_on_error=1 \
+            UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            FZF_NATIVE_TEST_MODULE="$PWD/build-emacs-sanitized/module/fzf-native-module.so" \
+            emacs -Q --batch -L . -l ert -l ./fzf-native-test.el \
+            --eval '(ert-run-tests-batch-and-exit "fzf-native-async-.*pins-session-across-lisp-reentry-test")'
+
       - name: Clean stale binaries
         shell: bash
         run: rm -rf bin

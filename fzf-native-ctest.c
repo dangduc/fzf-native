@@ -2720,6 +2720,8 @@ static void *test_destroy_score_stub(void *arg) {
 static AsyncSession *make_destroy_test_session(void) {
   AsyncSession *s = calloc(1, sizeof *s);
   if (!s) return NULL;
+  atomic_init(&s->lifetime_refs, 1);
+  atomic_init(&s->handle_owner_released, false);
   pthread_mutex_init(&s->mu, NULL);
   pthread_mutex_init(&s->child_mu, NULL);
   pthread_mutex_init(&s->score_req_mu, NULL);
@@ -2963,6 +2965,40 @@ static void test_destroy_async_handles_null(void) {
   async_session_destroy_async(NULL);
   CHECK(atomic_load_explicit(&async_destroy_completions,
                              memory_order_relaxed) == base);
+}
+
+static void test_handle_release_waits_for_inflight_api_pin(void) {
+  AsyncSession *s = make_destroy_test_session();
+  CHECK(s != NULL);
+  uint64_t base = atomic_load_explicit(&async_destroy_completions,
+                                       memory_order_relaxed);
+
+  /* Model an outer module call that has obtained the user pointer and can
+     now invoke reentrant Lisp.  Stop detaches the handle and wakes all native
+     work immediately, but it must not free S until the outer call unpins. */
+  async_session_retain(s);
+  async_session_release_handle_owner(s);
+  CHECK(atomic_load_explicit(&s->stop, memory_order_acquire));
+  CHECK(atomic_load_explicit(&s->handle_owner_released,
+                             memory_order_acquire));
+  test_sleep_ms(25);
+  CHECK(atomic_load_explicit(&async_destroy_completions,
+                             memory_order_relaxed) == base);
+
+  /* Finalizer-after-explicit-stop is harmless even if an embedding invokes
+     it with the old payload rather than the handle's new NULL payload. */
+  async_session_release_handle_owner(s);
+  CHECK(atomic_load_explicit(&async_destroy_completions,
+                             memory_order_relaxed) == base);
+
+  async_session_release(s);
+  double deadline = monotonic_ms() + 5000.0;
+  while (atomic_load_explicit(&async_destroy_completions,
+                              memory_order_relaxed) == base &&
+         monotonic_ms() < deadline)
+    test_sleep_ms(5);
+  CHECK(atomic_load_explicit(&async_destroy_completions,
+                             memory_order_relaxed) == base + 1);
 }
 
 static void test_destroy_async_many_in_flight(void) {
@@ -3259,6 +3295,7 @@ int main(void) {
 
   printf("--- async_session_destroy_async ---\n");
   RUN(test_destroy_async_handles_null);
+  RUN(test_handle_release_waits_for_inflight_api_pin);
   RUN(test_destroy_async_returns_fast);
   RUN(test_destroy_async_many_in_flight);
   RUN(test_startup_cleanup_kills_term_resistant_child);
