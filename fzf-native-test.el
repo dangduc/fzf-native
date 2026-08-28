@@ -552,15 +552,23 @@ size.  Times out after TIMEOUT seconds (default 5)."
       (sleep-for 0.05)))
   (fzf-native-async-result-fresh-p handle filter))
 
-(defun fzf-native-test--wait-for-request (handle request-id &optional timeout)
-  "Wait for REQUEST-ID on HANDLE and return its terminal snapshot."
+(defun fzf-native-test--wait-for-request
+    (handle request-id &optional timeout require-candidates)
+  "Wait for REQUEST-ID on HANDLE and return its terminal snapshot.
+
+When REQUIRE-CANDIDATES is non-nil, skip stale or empty warm-up completions.
+Reentry tests use this option because their callback needs one candidate."
   (let ((deadline (+ (float-time) (or timeout 5.0)))
         snapshot)
     (while (and (< (float-time) deadline)
                 (progn
                   (setq snapshot
                         (fzf-native-async-snapshot handle request-id))
-                  (memq (plist-get snapshot :state) '(queued running))))
+                  (or (memq (plist-get snapshot :state) '(queued running))
+                      (and require-candidates
+                           (eq (plist-get snapshot :state) 'complete)
+                           (or (plist-get snapshot :stale)
+                               (null (plist-get snapshot :candidates)))))))
       (sleep-for 0.01))
     snapshot))
 
@@ -2208,7 +2216,8 @@ the uninitialised scratch."
   (let* ((handle
           (fzf-native-async-start "printf '%s\\n' alpha beta gamma"))
          (request-id (fzf-native-async-submit handle "a" 10))
-         (snapshot (fzf-native-test--wait-for-request handle request-id)))
+         (snapshot (fzf-native-test--wait-for-request
+                    handle request-id nil t)))
     (unless (eq (plist-get snapshot :state) 'complete)
       (fzf-native-async-stop handle)
       (error "fzf-native test session did not complete: %S" snapshot))

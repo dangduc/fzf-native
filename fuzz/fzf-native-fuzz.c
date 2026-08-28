@@ -10,6 +10,7 @@
 
 #include "fzf-additions.h"
 #include "fzf.h"
+#include "fzf-private.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -257,6 +258,29 @@ static void run_one(const uint8_t *data, size_t size) {
   int32_t score = fzf_get_score(candidate, pattern, default_slab);
   if (score != fzf_get_score(candidate, pattern, default_slab))
     fuzz_fail("repeated scoring is not deterministic");
+
+  /* The safe bounded APIs must derive candidate classification.  The private
+     preclassified paths must agree when given the classification produced by
+     the same byte range.  Embedded NUL makes the legacy C-string range shorter
+     than CANDIDATE_SIZE, so compare only NUL-free inputs. */
+  if (strlen(candidate) == candidate_size) {
+    bool input_is_ascii = is_ascii_utf8proc(candidate, candidate_size);
+    int32_t bounded_score = fzf_get_score_bytes(
+        candidate, candidate_size, pattern, default_slab);
+    int32_t preclassified_score = fzf_get_score_bytes_preclassified(
+        candidate, candidate_size, input_is_ascii, pattern, default_slab);
+    if (bounded_score != score || preclassified_score != score)
+      fuzz_fail("bounded and legacy scorer entry points disagree");
+
+    bool legacy_match = fzf_has_match(candidate, pattern, default_slab);
+    bool bounded_match = fzf_has_match_bytes(
+        candidate, candidate_size, pattern, default_slab);
+    bool preclassified_match = fzf_has_match_bytes_preclassified(
+        candidate, candidate_size, input_is_ascii, pattern, default_slab);
+    if (bounded_match != legacy_match ||
+        preclassified_match != legacy_match)
+      fuzz_fail("bounded and legacy membership entry points disagree");
+  }
 
   fzf_position_t *positions =
       fzf_get_positions(candidate, pattern, default_slab);

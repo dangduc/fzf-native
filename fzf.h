@@ -122,12 +122,10 @@ void fzf_free_pattern(fzf_pattern_t *pattern);
 
 int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
                       fzf_slab_t *slab);
-/* Length/classification-aware entry point for callers that already own a
-   bounded byte string.  INPUT_IS_ASCII must describe TEXT[0..TEXT_LEN).
-   Semantics and allocation-failure reporting are otherwise identical to
-   fzf_get_score. */
+/* Safe entry point for callers that own a bounded byte string.  The function
+   derives the byte range's ASCII classification.  Semantics and
+   allocation-failure reporting are otherwise identical to fzf_get_score. */
 int32_t fzf_get_score_bytes(const char *text, size_t text_len,
-                            bool input_is_ascii,
                             fzf_pattern_t *pattern, fzf_slab_t *slab);
 
 fzf_position_t *fzf_pos_array(size_t len);

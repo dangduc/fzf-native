@@ -13,10 +13,9 @@
    when PATTERN contains a non-ASCII (UTF-8) or otherwise unrecognized term;
    pure-ASCII patterns never touch it. */
 bool fzf_has_match(const char *text, fzf_pattern_t *pattern, fzf_slab_t *slab);
-/* Low-level counterpart for a bounded string whose ASCII classification is
-   already known.  INPUT_IS_ASCII must describe TEXT[0..TEXT_LEN). */
+/* Safe counterpart for a bounded byte string.  The function derives the byte
+   range's ASCII classification before it selects a matcher. */
 bool fzf_has_match_bytes(const char *text, size_t text_len,
-                         bool input_is_ascii,
                          fzf_pattern_t *pattern, fzf_slab_t *slab);
 
 #endif /* FZF_ADDITIONS_H_ */

@@ -14,6 +14,7 @@
 #include "emacs-module.h"
 #include "fzf.h"
 #include "fzf-additions.h"
+#include "fzf-private.h"
 #include "utf8proc-2.10.0/utf8proc.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -617,10 +618,10 @@ static void *worker_routine(void *ptr) {
         }
         /* You can get the score/position for as many items as you want */
         int score = filter_only
-          ? (fzf_has_match_bytes(x.s.b, x.s.len, input_is_ascii,
-                                 pattern, slab) ? 1 : 0)
-          : fzf_get_score_bytes(x.s.b, x.s.len, input_is_ascii,
-                                pattern, slab);
+          ? (fzf_has_match_bytes_preclassified(
+                 x.s.b, x.s.len, input_is_ascii, pattern, slab) ? 1 : 0)
+          : fzf_get_score_bytes_preclassified(
+                x.s.b, x.s.len, input_is_ascii, pattern, slab);
         if (fzf_allocation_failed()) {
           shared_set_allocation_failed(shared);
           break;

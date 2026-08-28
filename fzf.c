@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-#include "fzf.h"
+#include "fzf-private.h"
 
 #include <string.h>
 #include <ctype.h>
@@ -2656,9 +2656,8 @@ void fzf_free_pattern(fzf_pattern_t *pattern) {
   SFREE(pattern);
 }
 
-int32_t fzf_get_score_bytes(const char *text, size_t text_len,
-                            bool input_is_ascii,
-                            fzf_pattern_t *pattern, fzf_slab_t *slab) {
+int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
+                      fzf_slab_t *slab) {
   fzf_clear_allocation_failure();
   // If the pattern is an empty string then pattern->ptr will be NULL and we
   // basically don't want to filter. Return 1 for telescope
@@ -2666,74 +2665,29 @@ int32_t fzf_get_score_bytes(const char *text, size_t text_len,
     return 1;
   }
 
-  fzf_string_t input = {.data = text, .size = text_len};
-  if (pattern->only_inv) {
-    for (size_t i = 0; i < pattern->size; i++) {
-      fzf_term_set_t *term_set = pattern->ptr[i];
-      fzf_term_t *term = &term_set->ptr[0];
-      /* Negation is a membership decision, not a ranking decision.  The v1
-         fallback can return a valid match with a non-positive raw score when
-         the matching characters have a long gap.  Testing SCORE here made a
-         small slab accept candidates that the default slab rejected. */
-      fzf_result_t res = CALL_ALG(
-          term, false, input, input_is_ascii, NULL, slab);
-      if (fzf_allocation_failed()) return 0;
-      if (res.start >= 0)
-        return 0;
-    }
-    return 1;
-  }
-
-  int32_t total_score = 0;
-  for (size_t i = 0; i < pattern->size; i++) {
-    fzf_term_set_t *term_set = pattern->ptr[i];
-    int32_t current_score = 0;
-    bool matched = false;
-    for (size_t j = 0; j < term_set->size; j++) {
-      fzf_term_t *term = &term_set->ptr[j];
-      fzf_result_t res = CALL_ALG(
-          term, false, input, input_is_ascii, NULL, slab);
-      if (fzf_allocation_failed()) return 0;
-      if (res.start >= 0) {
-        if (term->inv) {
-          continue;
-        }
-        /* Score zero is the public no-match sentinel.  Some valid v1
-           matches with long gaps can accumulate a non-positive raw score,
-           especially when v2 falls back because a slab is small.  Preserve
-           match membership and use the lowest rankable score instead of
-           silently dropping the candidate. */
-        current_score = res.score > 0 ? res.score : 1;
-        matched = true;
-        break;
-      }
-
-      if (term->inv) {
-        /* A term-set can be satisfied solely by an inverse term, including an
-           OR group such as `!foo | bar'.  Keep inverse terms score-neutral
-           here so `foo !bar' retains foo's historical score.  If every
-           successful set is score-neutral, the final return below converts
-           the otherwise-ambiguous zero to the public minimum match score. */
-        current_score = 0;
-        matched = true;
-      }
-    }
-    if (matched) {
-      total_score += current_score;
-    } else {
-      return 0;
-    }
-  }
-
-  return total_score > 0 ? total_score : 1;
+  fzf_string_t input = {.data = text, .size = strlen(text)};
+  bool input_is_ascii = is_ascii_utf8proc(input.data, input.size);
+#include "fzf-score-input.inc"
 }
 
-int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
-                      fzf_slab_t *slab) {
-  size_t text_len = strlen(text);
-  return fzf_get_score_bytes(text, text_len,
-                             is_ascii_utf8proc(text, text_len),
-                             pattern, slab);
+int32_t fzf_get_score_bytes(const char *text, size_t text_len,
+                            fzf_pattern_t *pattern, fzf_slab_t *slab) {
+  fzf_clear_allocation_failure();
+  if (pattern->ptr == NULL) return 1;
+
+  fzf_string_t input = {.data = text, .size = text_len};
+  bool input_is_ascii = is_ascii_utf8proc(text, text_len);
+#include "fzf-score-input.inc"
+}
+
+int32_t fzf_get_score_bytes_preclassified(
+    const char *text, size_t text_len, bool input_is_ascii,
+    fzf_pattern_t *pattern, fzf_slab_t *slab) {
+  fzf_clear_allocation_failure();
+  if (pattern->ptr == NULL) return 1;
+
+  fzf_string_t input = {.data = text, .size = text_len};
+#include "fzf-score-input.inc"
 }
 
 fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,

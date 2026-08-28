@@ -40,6 +40,25 @@ static void session_fuzz_fail(const FuzzSession *fuzz, const char *property) {
   abort();
 }
 
+static void session_fuzz_check_candidate_analyzer(
+    const uint8_t *data, size_t size) {
+  bool actual_ascii = false;
+  bool actual_valid = str_analyze_candidate(
+      (struct Str){.b = (char *)data, .len = size}, &actual_ascii);
+  bool expected_valid = data != NULL || size == 0;
+  bool expected_ascii = true;
+  if (data) {
+    for (size_t i = 0; i < size; i++) {
+      if (data[i] == 0) expected_valid = false;
+      if (data[i] & 0x80) expected_ascii = false;
+    }
+  }
+  if (actual_valid != expected_valid)
+    session_fuzz_fail(NULL, "candidate validation disagrees with scalar oracle");
+  if (actual_valid && actual_ascii != expected_ascii)
+    session_fuzz_fail(NULL, "candidate classification disagrees with scalar oracle");
+}
+
 static uint8_t fuzz_take(FuzzInput *input) {
   return input->offset < input->size ? input->data[input->offset++] : 0;
 }
@@ -611,6 +630,7 @@ static void session_fuzz_run(const uint8_t *data, size_t size) {
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  session_fuzz_check_candidate_analyzer(data, size);
   if (size <= SESSION_FUZZ_MAX_INPUT)
     session_fuzz_reader_probe(data, size);
   session_fuzz_run(data, size);

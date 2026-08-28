@@ -66,10 +66,12 @@ target_include_directories(utf8proc PUBLIC ${UTF8PROC_INCLUDE_DIR})
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   # Assume compiler MSVC.
   add_library(
-    fzf-native-module SHARED fzf-native-module.c fzf.c fzf.h fzf-additions.c
+    fzf-native-module SHARED fzf-native-module.c fzf.c fzf.h fzf-private.h
+                             fzf-score-input.inc fzf-additions.c
                              fzf-additions.h fzf-native-module.def)
 else()
   add_library(fzf-native-module MODULE fzf-native-module.c fzf.c fzf.h
+                                       fzf-private.h fzf-score-input.inc
                                        fzf-additions.c fzf-additions.h)
 endif()
 
@@ -146,6 +148,8 @@ if(CMAKE_C_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
   if(ENABLE_ASAN)
     target_compile_options(fzf-native-module PRIVATE -fsanitize=address
                                                      -fno-omit-frame-pointer -g)
+    target_compile_options(utf8proc PRIVATE -fsanitize=address
+                                            -fno-omit-frame-pointer -g)
     target_link_options(fzf-native-module PRIVATE -fsanitize=address)
     message(STATUS "AddressSanitizer enabled")
   endif()
@@ -156,6 +160,8 @@ if(CMAKE_C_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
   if(ENABLE_UBSAN)
     target_compile_options(fzf-native-module PRIVATE -fsanitize=undefined
                                                      -fno-omit-frame-pointer -g)
+    target_compile_options(utf8proc PRIVATE -fsanitize=undefined
+                                            -fno-omit-frame-pointer -g)
     target_link_options(fzf-native-module PRIVATE -fsanitize=undefined)
     message(STATUS "UndefinedBehaviorSanitizer enabled")
   endif()

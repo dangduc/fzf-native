@@ -22,7 +22,8 @@
  *     term-sets, OR within a term-set, `inv' negation) mirrors fzf's logic.
  */
 
-#include "fzf.h"
+#include "fzf-additions.h"
+#include "fzf-private.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -165,8 +166,9 @@ static bool fzf_addn_is_ascii_algo(fzf_algo_t fn) {
          fn == fzf_suffix_match || fn == fzf_equal_match;
 }
 
-bool fzf_has_match_bytes(const char *text, size_t tn, bool input_is_ascii,
-                         fzf_pattern_t *pattern, fzf_slab_t *slab) {
+bool fzf_has_match_bytes_preclassified(
+    const char *text, size_t tn, bool input_is_ascii,
+    fzf_pattern_t *pattern, fzf_slab_t *slab) {
   fzf_clear_allocation_failure();
   if (!pattern || pattern->size == 0) return true;
   /* The cheap matchers below are byte-wise ASCII only (no Unicode case
@@ -177,13 +179,14 @@ bool fzf_has_match_bytes(const char *text, size_t tn, bool input_is_ascii,
      unrecognized algorithm.  The full scorer is authoritative for Unicode
      case folding and `inv' negation. */
   if (!input_is_ascii)
-    return fzf_get_score_bytes(text, tn, false, pattern, slab) > 0;
+    return fzf_get_score_bytes_preclassified(
+               text, tn, false, pattern, slab) > 0;
   for (size_t i = 0; i < pattern->size; i++) {
     fzf_term_set_t *set = pattern->ptr[i];
     for (size_t j = 0; j < set->size; j++)
       if (!fzf_addn_is_ascii_algo(set->ptr[j].fn))
-        return fzf_get_score_bytes(text, tn, input_is_ascii,
-                                   pattern, slab) > 0;
+        return fzf_get_score_bytes_preclassified(
+                   text, tn, input_is_ascii, pattern, slab) > 0;
   }
   /* AND across term-sets, OR within each term-set — same composition as
      fzf_get_score, just collapsed to bool. */
@@ -198,9 +201,22 @@ bool fzf_has_match_bytes(const char *text, size_t tn, bool input_is_ascii,
   return true;
 }
 
+bool fzf_has_match_bytes(const char *text, size_t text_len,
+                         fzf_pattern_t *pattern, fzf_slab_t *slab) {
+  if (!pattern || pattern->size == 0) {
+    fzf_clear_allocation_failure();
+    return true;
+  }
+  return fzf_has_match_bytes_preclassified(
+      text, text_len, is_ascii_utf8proc(text, text_len), pattern, slab);
+}
+
 bool fzf_has_match(const char *text, fzf_pattern_t *pattern, fzf_slab_t *slab) {
+  if (!pattern || pattern->size == 0) {
+    fzf_clear_allocation_failure();
+    return true;
+  }
   size_t text_len = strlen(text);
-  return fzf_has_match_bytes(text, text_len,
-                             is_ascii_utf8proc(text, text_len),
-                             pattern, slab);
+  return fzf_has_match_bytes_preclassified(
+      text, text_len, is_ascii_utf8proc(text, text_len), pattern, slab);
 }

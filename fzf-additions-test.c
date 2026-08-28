@@ -16,6 +16,7 @@
 
 #include "fzf.h"
 #include "fzf-additions.h"
+#include "fzf-private.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -293,6 +294,40 @@ static void test_utf8_terms(void) {
   check_agreement("utf8 inverted keeps",    "xyz", "!α", CaseIgnore, true, true);
 }
 
+static void check_bounded_entry_points(const char *text,
+                                       const char *pattern_text) {
+  char *query = strdup(pattern_text);
+  fzf_pattern_t *pattern = fzf_parse_pattern(
+      CaseIgnore, false, query, true);
+  fzf_slab_t *slab = fzf_make_default_slab();
+  CHECK(pattern != NULL);
+  CHECK(slab != NULL);
+  if (pattern && slab) {
+    size_t text_len = strlen(text);
+    bool input_is_ascii = is_ascii_utf8proc(text, text_len);
+    int32_t legacy_score = fzf_get_score(text, pattern, slab);
+    CHECK(fzf_get_score_bytes(text, text_len, pattern, slab) == legacy_score);
+    CHECK(fzf_get_score_bytes_preclassified(
+              text, text_len, input_is_ascii, pattern, slab) == legacy_score);
+    bool legacy_match = fzf_has_match(text, pattern, slab);
+    CHECK(fzf_has_match_bytes(text, text_len, pattern, slab) == legacy_match);
+    CHECK(fzf_has_match_bytes_preclassified(
+              text, text_len, input_is_ascii, pattern, slab) == legacy_match);
+  }
+  fzf_free_slab(slab);
+  fzf_free_pattern(pattern);
+  free(query);
+}
+
+static void test_bounded_entry_points_derive_unicode_classification(void) {
+  /* These folds cross the ASCII boundary or change UTF-8 byte length.  The
+     public bounded APIs must classify the candidate rather than trust a
+     caller-supplied flag. */
+  check_bounded_entry_points("Kelvin", "k");
+  check_bounded_entry_points("Ⱥtail", "^ⱥ");
+  check_bounded_entry_points("路径/组件-123", "组件");
+}
+
 static void test_invalid_utf8_exact_is_lossless(void) {
   /* Invalid bytes are individual lossy-decoder units.  An exact match must
      consume each unit; it must not declare success after only the valid
@@ -434,6 +469,7 @@ int main(void) {
   RUN(test_smart_case_uppercase_query_respects_case);
   RUN(test_compound_pattern);
   RUN(test_utf8_terms);
+  RUN(test_bounded_entry_points_derive_unicode_classification);
   RUN(test_invalid_utf8_exact_is_lossless);
   RUN(test_invalid_utf8_fuzzy_fallback_returns_positions);
   RUN(test_slab_allocation_failure_is_reported);
