@@ -2,7 +2,14 @@
 (require 'ert)
 (require 'fzf-native)
 
-(fzf-native-load-dyn)
+(unless (fboundp 'fzf-native-score)
+  (if-let* ((module (getenv "FZF_NATIVE_TEST_MODULE")))
+      (progn
+        (module-load module)
+        (setq fzf-native-loaded t))
+    (fzf-native-load-dyn)))
+(when (fboundp 'fzf-native--verify-session-abi)
+  (fzf-native--verify-session-abi))
 
 
 
@@ -40,6 +47,12 @@
      (equal (fzf-native-score "sfsjoc" "jo" slab)
             '(36)))))
 
+(ert-deftest fzf-native-make-slab-rejects-invalid-size-test ()
+  "Invalid public slab sizes signal an error instead of aborting Emacs."
+  (should-error (fzf-native-make-slab -1 1))
+  (should-error (fzf-native-make-slab most-positive-fixnum
+                                      most-positive-fixnum)))
+
 (ert-deftest fzf-native-score-empty-query-test ()
   (let ((result (fzf-native-score "abcdefghi" "")))
     (should (equal result '(0)))))
@@ -47,6 +60,14 @@
 (ert-deftest fzf-native-score-empty-str-test ()
   (let ((result (fzf-native-score "" "acef")))
     (should (equal result '(0)))))
+
+(ert-deftest fzf-native-score-empty-str-inverse-query-test ()
+  "Scalar and batch scoring both accept empty text for inverse-only queries."
+  (let ((fzf-native-fuzzy t)
+        (fzf-native-case-mode 'smart)
+        (fzf-native-batch-highlight nil))
+    (should (equal (fzf-native-score "" "!x") '(1)))
+    (should (equal (fzf-native-score-all '("") "!x") '("")))))
 
 (ert-deftest fzf-native-score-str-wrong-type-int-test ()
   (should-error (fzf-native-score 1 "1")
@@ -126,6 +147,98 @@ case-insensitive, query with any uppercase becomes case-sensitive."
     (should (equal (fzf-native-score "src/foo.c" "!xyz foo") '(80)))
     ;; Space-separated AND: both substrings must match.
     (should (equal (fzf-native-score "src/foo.c" "src foo") '(160)))))
+
+;;
+;; Exact-value oracle tests for the operators that the rest of the
+;; CI-run main suite only exercises as booleans: suffix ($), equal
+;; (^...$), and OR (|).  Every expected number is derived BY HAND from
+;; the fzf scoring constants below; the binary merely confirms it.
+;;
+;; Constants (fzf.c:52-59):
+;;   ScoreMatch=16  ScoreGapStart=-3  ScoreGapExtention=-1
+;;   BonusBoundary=8  BonusNonWord=8  BonusCamel123=7
+;;   BonusConsecutive=4  BonusFirstCharMultiplier=2
+;; char_class_of (ASCII): a-z=Lower, A-Z=Upper, 0-9=Number, else=NonWord
+;;   ('.', '/', ' ' are all NonWord).
+;; bonus_for(prev,cur): NonWord->word = BonusBoundary(8); else 0 between
+;;   two word letters.  In a run, char k>0 takes
+;;   max(bonus, first_bonus, BonusConsecutive); first_bonus carries the
+;;   run's opening boundary bonus.  The first matched char's bonus is
+;;   doubled (BonusFirstCharMultiplier).
+;;
+;; Two closed forms used repeatedly:
+;;   * contiguous run of M chars whose first char sits at a word boundary:
+;;       (ScoreMatch + 2*BonusBoundary) + (M-1)*(ScoreMatch + BonusBoundary)
+;;       = 32 + 24*(M-1) = 24*M + 8.
+;;   * equal match (^X$): hardcoded (ScoreMatch+BonusBoundary)*M +
+;;       (BonusFirstCharMultiplier-1)*BonusBoundary = 24*M + 8 (fzf.c:1280).
+
+(ert-deftest fzf-native-score-suffix-operator-test ()
+  "Suffix ($) exact scores; boundary vs non-boundary first char.
+
+\"foobar\" \"bar$\": suffix \"bar\" sits at byte range [3,6).  The char
+before it is 'o' (Lower), so the run opens with NO boundary bonus.
+  b: ScoreMatch + 0*2          = 16
+  a: ScoreMatch + max(0,0,4)=4 = 20
+  r: ScoreMatch + 4            = 20   -> total 56.
+General form (no opening boundary): 16*M + 4*(M-1) = 16*3 + 4*2 = 56.
+
+\"foo.bar\" \"bar$\": suffix \"bar\" at [4,7); the char before it is '.'
+\(NonWord), so the run opens at a word boundary.
+  b: ScoreMatch + 2*BonusBoundary = 32
+  a: ScoreMatch + 8               = 24
+  r: ScoreMatch + 8               = 24   -> total 80 = 24*3 + 8."
+  (should (equal (fzf-native-score "foobar"  "bar$") '(56)))
+  (should (equal (fzf-native-score "foo.bar" "bar$") '(80)))
+  ;; A suffix that isn't actually at the end does not match.
+  (should (equal (fzf-native-score "barfoo"  "bar$") '(0))))
+
+(ert-deftest fzf-native-score-equal-operator-test ()
+  "Equal (^...$) exact scores: closed form 24*M + 8, length-exact.
+
+equal_match returns (ScoreMatch+BonusBoundary)*M +
+\(BonusFirstCharMultiplier-1)*BonusBoundary = 24*M + 8 (fzf.c:1280).
+  M=3 \"^abc$\"  -> 24*3 + 8 = 80
+  M=4 \"^abcd$\" -> 24*4 + 8 = 104
+The candidate length must equal the pattern length exactly, so a
+shorter pattern against a longer candidate scores 0."
+  (should (equal (fzf-native-score "abc"  "^abc$")  '(80)))
+  (should (equal (fzf-native-score "abcd" "^abcd$") '(104)))
+  ;; Length mismatch -> no equal match.
+  (should (equal (fzf-native-score "foobar" "^foo$")    '(0)))
+  (should (equal (fzf-native-score "abc"    "^abcd$")  '(0))))
+
+(ert-deftest fzf-native-score-or-operator-test ()
+  "OR (|) takes the FIRST matching term's score within the term-set.
+
+In a term-set the evaluator breaks on the first term that matches and
+uses that term's score (fzf.c:2410-2419); it is NOT the max.  Proof:
+the same two terms reordered give different totals.
+
+text \"abcdef\":
+  \"^abc | ^abcdef$\": term 1 is prefix \"abc\" -> contiguous run of 3 at
+     the start boundary = 24*3 + 8 = 80.  Matches first, so total 80
+     even though equal \"^abcdef$\" (24*6+8=152) would score higher.
+  \"^abcdef$ | ^abc\": term 1 is equal \"abcdef\" = 24*6 + 8 = 152.
+     Matches first -> total 152.
+  \"zzz | ^abc\": term 1 \"zzz\" does not match; falls through to prefix
+     \"abc\" = 80.
+  \"zzz | qqq\": neither term matches -> 0."
+  (should (equal (fzf-native-score "abcdef" "^abc | ^abcdef$") '(80)))
+  (should (equal (fzf-native-score "abcdef" "^abcdef$ | ^abc") '(152)))
+  (should (equal (fzf-native-score "abcdef" "zzz | ^abc")      '(80)))
+  (should (equal (fzf-native-score "abcdef" "zzz | qqq")       '(0))))
+
+(ert-deftest fzf-native-score-and-sum-of-operators-test ()
+  "AND (space) sums the per-term-set scores; combine new operators.
+
+text \"foo.bar\", query \"^foo bar$\" = two term-sets ANDed:
+  prefix \"foo\" : contiguous run of 3 at start boundary = 24*3 + 8 = 80.
+  suffix \"bar\" : opens after '.' (boundary)            = 24*3 + 8 = 80.
+Sum = 160."
+  (should (equal (fzf-native-score "foo.bar" "^foo bar$") '(160)))
+  ;; If either ANDed term fails, the whole pattern scores 0.
+  (should (equal (fzf-native-score "foo.bar" "^foo zzz$") '(0))))
 
 (ert-deftest fzf-native-score-with-default-slab-benchmark-test ()
   "Test scoring with slab is faster."
@@ -292,6 +405,105 @@ calls.  `completion-score' still rides on the returned copy."
   (let* ((coll ["a" "b" "c"])
          (result (fzf-native-score-all coll "")))
     (should (equal result coll))))
+
+;;
+;; Filter-only fast path (sync) — end-to-end guard.
+;;
+;; `fzf-native-score-all' switches to the cheap `fzf_has_match' path when
+;; `fzf-native-filter-only-p' fires (see the defcustoms
+;; `fzf-native-filter-only-min-pool' / `-length' / `-logic').  The fast
+;; path skips scoring and top-K sorting, so the *order* of results and the
+;; `completion-score' property differ from full scoring — but the matched
+;; candidate SET must be identical.
+;;
+;; This guards a real regression where the filter-only path used the
+;; byte-wise ASCII matcher for every term: it dropped ALL UTF-8 matches
+;; and let inverted UTF-8 terms (`!café') through.  The fix defers any
+;; non-ASCII / inverted term-set to the full scorer inside
+;; `fzf_has_match'.  We assert the active-vs-disabled sets are `equal'
+;; for ASCII, case-folded UTF-8, Greek, CJK, and inverted-non-ASCII
+;; queries.
+
+(defun fzf-native-test--score-all-set (coll query)
+  "Sorted, property-stripped match set for `fzf-native-score-all'.
+Neutralises the order / `completion-score' differences between the
+filter-only and full paths so only set membership is compared."
+  (sort (mapcar #'substring-no-properties
+                (fzf-native-score-all coll query))
+        #'string<))
+
+(ert-deftest fzf-native-score-all-filter-only-matches-full-test ()
+  "Filter-only active vs disabled return the SAME matched set.
+
+With `fzf-native-filter-only-min-pool' = 1 and OR logic, the predicate
+fires for any non-empty pool, so the fast path is genuinely exercised;
+with min-pool = 10000000 (default-ish) it never fires on this tiny
+collection.  Both settings must agree on the match set for every query,
+including the UTF-8 / inverted cases that the regression broke."
+  (skip-unless (fboundp 'fzf-native-filter-only-p))
+  (let ((coll '("café" "CAFÉ" "résumé" "naïve"
+                "中文" "测试中文" "中文测试"
+                "Θεσσαλονίκη" "θεωρία"
+                "hello" "HELLO" "world" "test")))
+    (dolist (query '("hello"     ; ASCII, case-fold (matches hello + HELLO)
+                     "café"      ; UTF-8, case-fold (matches café + CAFÉ)
+                     "θε"        ; Greek, case-fold (matches both Greek words)
+                     "中文"      ; CJK (matches all three 中文* candidates)
+                     "!café"     ; inverted non-ASCII term
+                     "résumé"    ; UTF-8 exact-ish
+                     "zzz"))     ; matches nothing
+      ;; Sanity: the predicate really does flip between the two settings,
+      ;; so a green assertion can't be vacuous (path never engaged).
+      (let ((fzf-native-filter-only-min-pool 1)
+            (fzf-native-filter-only-length nil)
+            (fzf-native-filter-only-logic 'or))
+        (should (fzf-native-filter-only-p (length query) (length coll))))
+      (let ((fzf-native-filter-only-min-pool 10000000)
+            (fzf-native-filter-only-length nil)
+            (fzf-native-filter-only-logic 'or))
+        (should-not (fzf-native-filter-only-p (length query) (length coll))))
+      ;; Same matched set under both settings.
+      (let ((active
+             (let ((fzf-native-filter-only-min-pool 1)
+                   (fzf-native-filter-only-length nil)
+                   (fzf-native-filter-only-logic 'or))
+               (fzf-native-test--score-all-set coll query)))
+            (disabled
+             (let ((fzf-native-filter-only-min-pool 10000000)
+                   (fzf-native-filter-only-length nil)
+                   (fzf-native-filter-only-logic 'or))
+               (fzf-native-test--score-all-set coll query))))
+        (should (equal active disabled))
+        ;; Spot-check the load-bearing cases actually carry content / are
+        ;; correctly empty, so "equal but both wrong" can't pass silently.
+        (cond
+         ((equal query "café")
+          (should (equal active '("CAFÉ" "café"))))
+         ((equal query "中文")
+          (should (equal active '("中文" "中文测试" "测试中文"))))
+         ((equal query "!café")
+          ;; Everything EXCEPT the two café candidates.
+          (should-not (member "café" active))
+          (should-not (member "CAFÉ" active))
+          (should (member "résumé" active))
+          (should (member "中文" active)))
+         ((equal query "zzz")
+          (should (null active))))))))
+
+(ert-deftest fzf-native-score-all-filter-only-length-counts-characters-test ()
+  "Filter-only query thresholds count characters, not UTF-8 bytes."
+  (let ((fzf-native-filter-only-min-pool nil)
+        (fzf-native-filter-only-length 1)
+        (fzf-native-filter-only-logic 'or)
+        (fzf-native-batch-highlight nil))
+    (let ((ascii (car (fzf-native-score-all (vector "abc") "a")))
+          (utf8 (car (fzf-native-score-all (vector "你好") "你"))))
+      ;; Filter-only deliberately omits `completion-score'.  Both one-character
+      ;; queries must therefore take that path despite differing byte lengths.
+      (should ascii)
+      (should utf8)
+      (should-not (get-text-property 0 'completion-score ascii))
+      (should-not (get-text-property 0 'completion-score utf8)))))
 
 ;;
 ;; Async path (fzf-native-async-*)
@@ -646,6 +858,61 @@ sys.stdout.buffer.write(b\"another_valid\\n\")
             (should (member "你好世界" result))
             (should (member "你是" result))
             (should-not (member "Hello" result))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-max-line-length-counts-characters-test ()
+  "Async line limits count characters and truncate at UTF-8 boundaries."
+  (skip-unless (and (fboundp 'fzf-native-async-start)
+                    (executable-find "python3")))
+  ;; Positive cap: keep the two-character line and exclude the three-character
+  ;; line, regardless of their six- and nine-byte UTF-8 encodings.
+  (let* ((fzf-native-max-line-length 2)
+         (handle (fzf-native-async-start
+                  "python3 -u -c 'print(\"你好\"); print(\"你好吗\")'")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (should (fzf-native-test--wait-for-fresh handle ""))
+          (should (equal (fzf-native-async-candidates handle "") '("你好"))))
+      (fzf-native-async-stop handle)))
+  ;; Negative cap: retain two complete characters instead of two raw bytes.
+  (let* ((fzf-native-max-line-length -2)
+         (handle (fzf-native-async-start
+                  "python3 -u -c 'print(\"你好吗\")'")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (should (fzf-native-test--wait-for-fresh handle ""))
+          (should (equal (fzf-native-async-candidates handle "") '("你好"))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-filter-only-length-counts-characters-test ()
+  "Async filter-only thresholds count characters, not UTF-8 bytes."
+  (skip-unless (and (fboundp 'fzf-native-async-start)
+                    (executable-find "python3")))
+  (let* ((fzf-native-filter-only-min-pool nil)
+         (fzf-native-filter-only-length 1)
+         (fzf-native-filter-only-logic 'or)
+         (fzf-native-max-line-length nil)
+         (fzf-native-async-highlight nil)
+         (handle (fzf-native-async-start
+                  "python3 -u -c 'print(\"zzz你\"); print(\"zz你\"); print(\"你\")'")))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          ;; Drive the first request with LIMIT=2.  Filter-only evaluates all
+          ;; three memberships but ranks only the producer-order emit window;
+          ;; full scoring would select the later, higher-scoring exact
+          ;; candidate "你".  Excluding it proves the one-character threshold
+          ;; fired without relying on the display order within that window.
+          (let ((deadline (+ (float-time) 5.0)))
+            (while (and (not (fzf-native-async-result-fresh-p handle "你"))
+                        (< (float-time) deadline))
+              (fzf-native-async-candidates handle "你" 2)
+              (sleep-for 0.05)))
+          (should (fzf-native-async-result-fresh-p handle "你"))
+          (should (equal (fzf-native-async-candidates handle "你" 2)
+                         '("zzz你" "zz你"))))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-long-line-whole-test ()
@@ -1052,3 +1319,25 @@ the uninitialised scratch."
   (let ((fzf-native-batch-highlight 25))
     ;; Empty query → routes through highlight-all internally.
     (should (vectorp (fzf-native-score-all (vector "alpha" "beta") "")))))
+
+(ert-deftest fzf-native-bundled-module-path-is-architecture-aware-test ()
+  "Bundled paths must distinguish supported architectures explicitly."
+  (let ((system-type 'darwin)
+        (system-configuration "x86_64-apple-darwin"))
+    (should (equal (fzf-native--bundled-module-relative-path)
+                   "Darwin/fzf-native-module.so")))
+  (let ((system-type 'darwin)
+        (system-configuration "arm64-apple-darwin"))
+    (should (equal (fzf-native--bundled-module-relative-path)
+                   "Darwin/arm64/fzf-native-module.so")))
+  (let ((system-type 'gnu/linux)
+        (system-configuration "x86_64-pc-linux-gnu"))
+    (should (equal (fzf-native--bundled-module-relative-path)
+                   "Linux/fzf-native-module.so"))))
+
+(ert-deftest fzf-native-bundled-module-path-rejects-unsupported-arch-test ()
+  "A wrong-architecture artifact must not reach `module-load'."
+  (let ((system-type 'gnu/linux)
+        (system-configuration "aarch64-unknown-linux-gnu"))
+    (should-error (fzf-native--bundled-module-relative-path)
+                  :type 'user-error)))

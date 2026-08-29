@@ -2,6 +2,11 @@ export EMACS ?= $(shell which emacs)
 
 BUILD_DIR ?= build
 
+# Vendored utf8proc, linked into the C tests because fzf.c's UTF-8 matching
+# variants (via utf8_char_index.h -> utf8proc.h) depend on it.
+UTF8PROC_DIR ?= utf8proc-2.10.0
+UTF8PROC_SRC := $(UTF8PROC_DIR)/utf8proc.c
+
 PACKAGE := fzf-native
 AUTOLOADS := $(PACKAGE)-autoloads.el
 
@@ -22,11 +27,20 @@ compile: autoloads
 .PHONY: test
 test:
 	eask install-deps --dev
-	eask test ert ./fzf-native-test.el
+	eask test ert ./fzf-native-test.el ./fzf-native-utf8-test.el
 
 .PHONY: lint
 lint:
 	eask lint package
+
+.PHONY: check-version
+check-version:
+	@elisp_version=$$(sed -n 's/^;; Version: //p' fzf-native.el); \
+	eask_version=$$(sed -n 's/^[[:space:]]*"\([^"]*\)"[[:space:]]*$$/\1/p' Eask | head -1); \
+	if test -z "$$elisp_version" || test "$$elisp_version" != "$$eask_version"; then \
+	  echo "Version mismatch: fzf-native.el=$$elisp_version Eask=$$eask_version" >&2; \
+	  exit 1; \
+	fi
 
 .PHONY: format
 format:
@@ -84,7 +98,7 @@ emacs-asan:
 # Includes fzf-native-module.c directly so static functions are visible.
 # No Emacs runtime needed; runs as a plain executable.
 .PHONY: ctest
-ctest: ctest-module ctest-additions
+ctest: ctest-module ctest-additions ctest-parser-oom ctest-scorer-oom
 
 # Module-internal tests (counting sort, cache, async_reader, etc.).
 # Links fzf-additions.c because fzf-native-module.c now references
@@ -92,18 +106,62 @@ ctest: ctest-module ctest-additions
 .PHONY: ctest-module
 ctest-module:
 	mkdir -p $(BUILD_DIR)
-	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. -pthread \
-		-o $(BUILD_DIR)/fzf-native-ctest fzf-native-ctest.c fzf.c fzf-additions.c
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/fzf-native-ctest fzf-native-ctest.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-native-ctest
 
 # fzf-additions tests (fzf_has_match agreement with fzf_get_score).
-# Linked against fzf.c + fzf-additions.c — pure-C, no module deps.
+# Linked against fzf.c + fzf-additions.c + utf8proc — pure-C, no module deps.
 .PHONY: ctest-additions
 ctest-additions:
 	mkdir -p $(BUILD_DIR)
-	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. \
-		-o $(BUILD_DIR)/fzf-additions-test fzf-additions-test.c fzf.c fzf-additions.c
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/fzf-additions-test fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-additions-test
+
+# Allocation-failure injection for every parser allocation.  fzf.c is
+# included by the test so malloc/calloc/realloc can be replaced locally.
+.PHONY: ctest-parser-oom
+ctest-parser-oom:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/fzf-parser-oom-ctest fzf-parser-oom-ctest.c fzf-additions.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-parser-oom-ctest
+
+# Allocation-failure injection for scoring scratch and position arrays.
+.PHONY: ctest-scorer-oom
+ctest-scorer-oom:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/fzf-scorer-oom-ctest fzf-scorer-oom-ctest.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-scorer-oom-ctest
+
+# AddressSanitizer + UndefinedBehaviorSanitizer run of the C unit tests.
+# Builds both suites with the sanitizers enabled into distinctly-named
+# binaries (-asan suffix) so they never clobber the plain `ctest` ones,
+# then runs them. A clean run prints the normal test output and exits 0.
+# ASan aborts on error by default; UBSAN_OPTIONS=halt_on_error=1 makes a
+# UBSan diagnostic abort too, so any finding fails the target (and CI).
+.PHONY: ctest-asan
+ctest-asan: export UBSAN_OPTIONS = halt_on_error=1:print_stacktrace=1
+ctest-asan:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -g \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/fzf-native-ctest-asan fzf-native-ctest.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-native-ctest-asan
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -g \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/fzf-additions-test-asan fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-additions-test-asan
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -g \
+		-I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/fzf-parser-oom-ctest-asan fzf-parser-oom-ctest.c fzf-additions.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-parser-oom-ctest-asan
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -g \
+		-I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/fzf-scorer-oom-ctest-asan fzf-scorer-oom-ctest.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-scorer-oom-ctest-asan
 
 .PHONY: clean
 clean:

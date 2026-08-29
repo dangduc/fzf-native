@@ -58,8 +58,8 @@ static void test_n_one(void) {
   CHECK(xs[0].score == 42);
 }
 
-static void test_small_n_qsort_fallback(void) {
-  /* n=8 hits the n < 64 qsort fallback. Verify it still sorts descending. */
+static void test_small_n_insertion_sort(void) {
+  /* n=8 hits the n < 64 insertion-sort path. */
   struct Candidate xs[8] = {
     make_candidate(5, 0), make_candidate(3, 1), make_candidate(9, 2),
     make_candidate(1, 3), make_candidate(7, 4), make_candidate(0, 5),
@@ -69,6 +69,17 @@ static void test_small_n_qsort_fallback(void) {
   CHECK(is_descending_by_score(xs, 8));
   CHECK(xs[0].score == 9);
   CHECK(xs[7].score == 0);
+}
+
+static void test_small_n_stability(void) {
+  struct Candidate xs[8];
+  for (size_t i = 0; i < 8; i++)
+    xs[i] = make_candidate(7, i);
+  counting_sort_candidates(xs, 8);
+  for (size_t i = 0; i < 8; i++) {
+    CHECK(xs[i].score == 7);
+    CHECK(xs[i].s.len == i);
+  }
 }
 
 static void test_large_n_correctness(void) {
@@ -951,7 +962,8 @@ int main(void) {
   printf("--- counting_sort_candidates ---\n");
   RUN(test_n_zero);
   RUN(test_n_one);
-  RUN(test_small_n_qsort_fallback);
+  RUN(test_small_n_insertion_sort);
+  RUN(test_small_n_stability);
   RUN(test_large_n_correctness);
   RUN(test_stability_with_ties);
   RUN(test_all_same_score);

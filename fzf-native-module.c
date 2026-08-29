@@ -12,6 +12,7 @@
 #include "emacs-module.h"
 #include "fzf.h"
 #include "fzf-additions.h"
+#include "utf8proc-2.10.0/utf8proc.h"
 #include <stdio.h>
 #include <stdarg.h>
 
@@ -41,7 +42,13 @@ static inline void fzf_block_all_signals(void) {}
 #endif
 
 #ifdef _WIN32
-#  define EXPORT __declspec(dllexport)
+/* emacs-module.h declares emacs_module_init before this translation unit can
+   add __declspec(dllexport), and MSVC rejects a differently decorated
+   definition.  The Windows target exports the two ABI symbols with the module
+   definition file instead. */
+#  define EXPORT
+#elif defined(__GNUC__) || defined(__clang__)
+#  define EXPORT __attribute__((visibility("default")))
 #else
 #  define EXPORT
 #endif
@@ -129,6 +136,42 @@ emacs_value Qstringp, Qwrong_type_argument, Qerror;
 
 /** An Emacs string made accessible by copying. */
 struct Str { char *b; size_t len; };
+
+/* Count Emacs-style characters (Unicode codepoints) in UTF-8 data.  Invalid
+   bytes count as one character each so byte-junk inputs always make progress
+   and retain the module's existing best-effort behavior. */
+static size_t utf8_character_count(const char *str, size_t byte_len) {
+  size_t byte_pos = 0;
+  size_t char_count = 0;
+
+  while (byte_pos < byte_len) {
+    utf8proc_int32_t codepoint;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)(str + byte_pos),
+        (utf8proc_ssize_t)(byte_len - byte_pos), &codepoint);
+    byte_pos += width > 0 ? (size_t)width : 1;
+    char_count++;
+  }
+  return char_count;
+}
+
+/* Return the byte length of the first CHAR_LIMIT codepoints without splitting
+   a valid UTF-8 sequence.  Invalid bytes count as one codepoint. */
+static size_t utf8_prefix_byte_length(const char *str, size_t byte_len,
+                                      size_t char_limit) {
+  size_t byte_pos = 0;
+  size_t char_count = 0;
+
+  while (byte_pos < byte_len && char_count < char_limit) {
+    utf8proc_int32_t codepoint;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)(str + byte_pos),
+        (utf8proc_ssize_t)(byte_len - byte_pos), &codepoint);
+    byte_pos += width > 0 ? (size_t)width : 1;
+    char_count++;
+  }
+  return byte_pos;
+}
 
 /** Module userdata that gets allocated once at initialization. */
 struct Data {
@@ -248,17 +291,29 @@ static int cmp_candidate(const void *a, const void *b) {
   /* return ((struct Candidate *) a)->score - ((struct Candidate *) b)->score; */
 }
 
+static void insertion_sort_candidates(struct Candidate *xs, size_t n) {
+  for (size_t i = 1; i < n; i++) {
+    struct Candidate candidate = xs[i];
+    size_t j = i;
+    while (j > 0 && xs[j - 1].score < candidate.score) {
+      xs[j] = xs[j - 1];
+      j--;
+    }
+    xs[j] = candidate;
+  }
+}
+
 /* Counting sort of xs[0..n-1] by score, descending.
    O(n + max_score). Falls back to qsort if allocations fail.
-   Stable: same-score candidates keep input order.
+   The normal insertion/counting-sort paths are stable; the emergency qsort
+   fallback after an allocation failure may lose same-score input order.
    Caller must ensure every xs[i].score >= 0; negative scores would
    index count[] out of bounds (undefined behavior). */
 static void counting_sort_candidates(struct Candidate *xs, size_t n) {
   if (n <= 1) return;
-  /* For tiny inputs, qsort beats counting sort because the malloc/calloc
-     round-trip dominates. Threshold chosen empirically; below ~64 the two
-     are within noise on M-series and recent x86. */
-  if (n < 64) { qsort(xs, n, sizeof *xs, cmp_candidate); return; }
+  /* Avoid the counting-sort allocations for tiny inputs, but retain the
+     stable input-order tie-break promised by the large-input path. */
+  if (n < 64) { insertion_sort_candidates(xs, n); return; }
   int max_score = 0;
   for (size_t i = 0; i < n; i++)
     if (xs[i].score > max_score) max_score = xs[i].score;
@@ -332,7 +387,7 @@ static void *worker_routine(void *ptr) {
         struct Candidate x = batch->xs[i];
         /* You can get the score/position for as many items as you want */
         int score = filter_only
-          ? (fzf_has_match(x.s.b, pattern) ? 1 : 0)
+          ? (fzf_has_match(x.s.b, pattern, slab) ? 1 : 0)
           : fzf_get_score(x.s.b, pattern, slab);
         if (score > 0) {
           /* printf("Str: %s # = %d | i = %d, batch->len = %d, batch_idx = %zd\n", */
@@ -390,43 +445,11 @@ static void hl_scratch_free(HlScratch *s) {
   s->capacity = 0;
 }
 
-/* Convert ascending byte-offset runs to char offsets in place via one
-   UTF-8 walk over CSTR.  Continuation bytes (0x80-0xBF) do not advance
-   the character count.  Runs must be non-overlapping and ascending.
-
-   Fast path: scan the byte prefix `[0, ends[n_runs-1])' for the high
-   bit; if no byte is >= 0x80 the string is ASCII at every position we
-   care about, byte offsets equal character offsets, and we return
-   without the per-byte char-counting walk.  Common case for completion
-   workloads dominated by ASCII identifiers / paths / buffer names. */
-static void runs_byte_to_char(const char *cstr,
-                              size_t *starts, size_t *ends,
-                              size_t n_runs) {
-  if (n_runs == 0) return;
-  size_t scan_end = ends[n_runs - 1];
-  for (size_t i = 0; i < scan_end; ++i) {
-    if ((unsigned char)cstr[i] >= 0x80) goto multibyte;
-    if (cstr[i] == '\0') return;  /* runs are within bounds anyway */
-  }
-  return;  /* all ASCII: byte offsets already equal char offsets */
-
- multibyte:;
-  size_t byte_idx = 0;
-  size_t char_idx = 0;
-  for (size_t i = 0; i < n_runs; ++i) {
-    while (byte_idx < starts[i] && cstr[byte_idx] != '\0') {
-      unsigned char b = (unsigned char)cstr[byte_idx++];
-      if ((b & 0xc0) != 0x80) char_idx++;
-    }
-    size_t cs = char_idx;
-    while (byte_idx < ends[i] && cstr[byte_idx] != '\0') {
-      unsigned char b = (unsigned char)cstr[byte_idx++];
-      if ((b & 0xc0) != 0x80) char_idx++;
-    }
-    starts[i] = cs;
-    ends[i]   = char_idx;
-  }
-}
+/* NOTE: upstream main carried a `runs_byte_to_char' helper here that converted
+   fzf's byte-offset positions to character offsets, because upstream fzf.c
+   returns byte positions.  This fork's UTF-8 fzf.c instead returns character
+   offsets directly (see `dispatch_highlight_runs'), so that conversion was
+   removed to avoid double-converting multibyte candidates. */
 
 /* Dispatch fzf positions on CSTR to HOOK as character-offset runs against
    STR.  POS->data[] is fzf's descending byte-offset list; consolidated
@@ -479,7 +502,12 @@ static void dispatch_highlight_runs(emacs_env *env, const char *cstr,
   starts[n_runs] = cs;
   ends[n_runs++] = ce + 1;
 
-  runs_byte_to_char(cstr, starts, ends, n_runs);
+  /* This fork's fzf.c (UTF-8 build) already emits *character* offsets, not
+     byte offsets: its `_utf8' matching variants convert via `utf8_byte_to_char'
+     before returning, and the ASCII path's byte offsets equal char offsets.
+     So consume `pos->data' directly; running module.c's own byte->char pass
+     here would double-convert and mis-highlight multibyte candidates. */
+  (void)cstr;
 
   for (size_t i = 0; i < n_runs; ++i) {
     vargs[2 * i]     = env->make_integer(env, (intmax_t)starts[i]);
@@ -733,12 +761,13 @@ emacs_value fzf_native_score_all(emacs_env *env,
      Pool size for the decision is the candidate count we just batched. */
   size_t fo_min_pool = 0, fo_max_len = 0;
   bool   fo_logic_and = resolve_filter_only_settings(env, &fo_min_pool, &fo_max_len);
+  size_t query_char_len = utf8_character_count(query.b, query.len);
   bool   filter_only_mode = decide_filter_only(fo_min_pool, fo_max_len,
                                                fo_logic_and,
-                                               query.len, (size_t)n);
+                                               query_char_len, (size_t)n);
   fzf_log("fzf_native_score_all: filter_only=%d (min_pool=%zu max_len=%zu logic=%s qlen=%zu pool=%td)\n",
           (int)filter_only_mode, fo_min_pool, fo_max_len,
-          fo_logic_and ? "and" : "or", query.len, n);
+          fo_logic_and ? "and" : "or", query_char_len, n);
 
   fzf_pattern_t *pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
   struct Shared shared = {
@@ -1124,18 +1153,9 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
     return Qlistofzero;
   }
 
-  // Short-circuit if STR is empty.
-  ptrdiff_t str_len;
-  if (!env->copy_string_contents(env, args[0], NULL, &str_len)) {
-    env->non_local_exit_clear(env);
-    str_len = 0;
-  } else if (str_len == /* solely null byte */ 1) {
-    return Qlistofzero;
-  }
-
   struct Bump *bump = NULL;
   /* Default result on coercion failure: `(0)' - same shape as the
-     empty-string short-circuit, meaning "no match". A string that
+     empty-query short-circuit, meaning "no match". A string that
      cannot be coerced through `encode-coding-string' is treated as
      equivalent to a string with no matchable content. (In practice
      this path is rarely reached on Emacs 30+: encode-coding-string
@@ -1200,8 +1220,9 @@ err:
   bump_free(bump);
   /* On coercion failure we return Qlistofzero (no match) rather than
      signaling, so a single un-coerceable input doesn't blow up a
-     larger completion batch. Empty STR/QUERY short-circuit to the
-     same value above. */
+     larger completion batch.  An empty query short-circuits to the same
+     value above; an empty candidate must reach the matcher because an
+     inverse-only query can legitimately accept it. */
   return result;
 }
 
@@ -1210,11 +1231,23 @@ void slab_finalize(void *object) {
   fzf_free_slab(slab);
 }
 
+static emacs_value signal_slab_allocation_error(emacs_env *env) {
+  static const char message[] = "fzf-native: invalid or unavailable slab size";
+  emacs_value string =
+      env->make_string(env, message, (ptrdiff_t)(sizeof(message) - 1));
+  emacs_value data = env->funcall(env, Flist, 1, &string);
+  env->non_local_exit_signal(env, Qerror, data);
+  return Qnil;
+}
+
 emacs_value fzf_native_make_default_slab(emacs_env *env,
                                          ptrdiff_t UNUSED(nargs),
                                          emacs_value UNUSED(args[]),
                                          void UNUSED(*data_ptr)) {
   fzf_slab_t *slab = fzf_make_default_slab();
+
+  if (!slab)
+    return signal_slab_allocation_error(env);
 
   return env->make_user_ptr(env, slab_finalize, slab);
 }
@@ -1223,10 +1256,20 @@ emacs_value fzf_native_make_slab(emacs_env *env,
                                  ptrdiff_t UNUSED(nargs),
                                  emacs_value args[],
                                  void UNUSED(*data_ptr)) {
-  size_t slab16Size = env->extract_integer(env, args[0]);
-  size_t slab32Size = env->extract_integer(env, args[1]);
+  intmax_t slab16 = env->extract_integer(env, args[0]);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+    return Qnil;
+  intmax_t slab32 = env->extract_integer(env, args[1]);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+    return Qnil;
+  if (slab16 < 0 || slab32 < 0 ||
+      (uintmax_t)slab16 > SIZE_MAX || (uintmax_t)slab32 > SIZE_MAX)
+    return signal_slab_allocation_error(env);
 
-  fzf_slab_t *slab = fzf_make_slab((fzf_slab_config_t){slab16Size, slab32Size});
+  fzf_slab_t *slab = fzf_make_slab(
+      (fzf_slab_config_t){(size_t)slab16, (size_t)slab32});
+  if (!slab)
+    return signal_slab_allocation_error(env);
 
   return env->make_user_ptr(env, slab_finalize, slab);
 }
@@ -1769,10 +1812,13 @@ static void *async_reader(void *arg) {
 
     ptrdiff_t mll = s->max_line_length;
     if (mll != 0) {
-      ptrdiff_t cap = mll > 0 ? mll : -mll;
-      if ((ptrdiff_t)len > cap) {
+      size_t cap = mll > 0
+                     ? (size_t)mll
+                     : (size_t)(-(mll + 1)) + 1;
+      size_t char_len = utf8_character_count(line, len);
+      if (char_len > cap) {
         if (mll > 0) continue;   /* exclude */
-        len = (size_t)cap;       /* truncate */
+        len = utf8_prefix_byte_length(line, len, cap); /* truncate */
         line[len] = '\0';
       }
     }
@@ -2209,9 +2255,9 @@ struct AsyncScoringShared {
 static void *async_scoring_worker(void *ptr) {
   fzf_block_all_signals();
   struct AsyncScoringShared *shared = ptr;
-  /* fzf_has_match doesn't need the slab; only the score path does.
-     Allocating either way keeps the worker code uniform — slab create
-     is ~1 µs, dwarfed by the per-batch scoring work. */
+  /* Both paths need the slab: the score path directly, and fzf_has_match for
+     its full-scorer fallback on non-ASCII (UTF-8) terms.  Slab create is
+     ~1 µs, dwarfed by the per-batch scoring work. */
   fzf_slab_t    *slab         = fzf_make_default_slab();
   fzf_pattern_t *pattern      = shared->pattern;
   bool           filter_only  = shared->filter_only;
@@ -2233,7 +2279,7 @@ static void *async_scoring_worker(void *ptr) {
       if (!pattern) {
         sc = 1;                  /* empty filter: keep everything */
       } else if (filter_only) {
-        sc = fzf_has_match(batch->xs[i].str, pattern) ? 1 : 0;
+        sc = fzf_has_match(batch->xs[i].str, pattern, slab) ? 1 : 0;
       } else {
         sc = fzf_get_score(batch->xs[i].str, pattern, slab);
       }
@@ -2361,7 +2407,10 @@ static void *scoring_thread_fn(void *arg) {
        The min-pool arm is cached at session start; the length arm and
        the logic knob were snapshot per dispatch on the main thread and
        carried here via the request slot. */
-    size_t flen_for_decision = filter ? strlen(filter) : 0;
+    size_t filter_byte_len = filter ? strlen(filter) : 0;
+    size_t flen_for_decision = filter
+                                   ? utf8_character_count(filter, filter_byte_len)
+                                   : 0;
     bool   filter_only_mode  = decide_filter_only(
         s->filter_only_min_pool, fo_max_len, fo_logic_and,
         flen_for_decision, count);
@@ -2809,6 +2858,7 @@ fzf_native_filter_only_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
          ? Qt : Qnil;
 }
 
+EXPORT
 int emacs_module_init(struct emacs_runtime *rt) {
   // Verify compatability with Emacs executable loading this module
   if ((size_t) rt->size < sizeof *rt)
