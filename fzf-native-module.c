@@ -141,6 +141,9 @@ typedef long ssize_t;
 #endif
 #define ASYNC_WORKER_LIMIT 64
 #define BATCH_CACHE_BUCKETS 4096
+#define BATCH_CACHE_QUERY_BUCKETS 4096
+#define BATCH_CACHE_MAX_QUERIES 4096
+#define BATCH_CACHE_SOURCE_SCAN_LIMIT 256
 #define BATCH_CACHE_SPARSE_LIMIT 128
 
 /* Turn the fallible POSIX CPU-count probe into a bounded worker count.
@@ -2363,11 +2366,16 @@ typedef struct BatchQuery BatchQuery;
 typedef struct BatchCacheEntry BatchCacheEntry;
 
 struct BatchQuery {
-  BatchQuery     *next;
+  BatchQuery     *hash_next;
+  BatchQuery     *lru_prev;
+  BatchQuery     *lru_next;
   char           *query;
   fzf_pattern_t  *parsed;
   fzf_case_types  case_mode;
   bool            fuzzy;
+  uint64_t         hash;
+  BatchCacheEntry *entry_head;
+  BatchCacheEntry *entry_tail;
   size_t          entry_count;
   size_t          external_refs;
   size_t          bytes;
@@ -2382,6 +2390,8 @@ struct BatchCacheEntry {
   BatchCacheEntry *hash_next;
   BatchCacheEntry *lru_prev;
   BatchCacheEntry *lru_next;
+  BatchCacheEntry *owner_prev;
+  BatchCacheEntry *owner_next;
   BatchQuery      *owner;
   size_t           batch_id;
   size_t           match_count;
@@ -2395,7 +2405,13 @@ struct BatchCacheEntry {
 
 typedef struct {
   pthread_mutex_t  mu;
-  BatchQuery      *queries;
+  BatchQuery      *query_head;
+  BatchQuery      *query_tail;
+  BatchQuery      **query_buckets;
+  size_t           query_bucket_count;
+  size_t           query_count;
+  size_t           max_queries;
+  size_t           source_scan_limit;
   BatchCacheEntry *head;
   BatchCacheEntry *tail;
   BatchCacheEntry **buckets;
@@ -2411,6 +2427,7 @@ typedef struct {
 
 static void batch_cache_remove_entry_locked(
     BatchCache *c, BatchCacheEntry *entry, bool eviction);
+static void batch_cache_trim_queries_locked(BatchCache *c);
 
 static size_t batch_cache_hash(const BatchCache *c, const BatchQuery *query,
                                size_t batch_id) {
@@ -2420,32 +2437,99 @@ static size_t batch_cache_hash(const BatchCache *c, const BatchQuery *query,
   return c->bucket_count ? (size_t)(x % c->bucket_count) : 0;
 }
 
+static uint64_t batch_cache_query_hash(const char *query,
+                                       fzf_case_types case_mode,
+                                       bool fuzzy) {
+  uint64_t hash = UINT64_C(14695981039346656037);
+  for (const unsigned char *p = (const unsigned char *)query; *p; p++) {
+    hash ^= *p;
+    hash *= UINT64_C(1099511628211);
+  }
+  hash ^= (uint64_t)(unsigned)case_mode;
+  hash *= UINT64_C(1099511628211);
+  hash ^= fuzzy ? UINT64_C(1) : UINT64_C(0);
+  hash *= UINT64_C(1099511628211);
+  return hash;
+}
+
+static size_t batch_cache_query_bucket(const BatchCache *c, uint64_t hash) {
+  return c->query_bucket_count
+             ? (size_t)(hash % c->query_bucket_count)
+             : 0;
+}
+
 static void batch_cache_init(BatchCache *c, size_t max_bytes) {
   memset(c, 0, sizeof *c);
   pthread_mutex_init(&c->mu, NULL);
   c->max_bytes = max_bytes;
+  c->max_queries = BATCH_CACHE_MAX_QUERIES;
+  c->source_scan_limit = BATCH_CACHE_SOURCE_SCAN_LIMIT;
+  if (!max_bytes) return;
   c->bucket_count = BATCH_CACHE_BUCKETS;
+  c->query_bucket_count = BATCH_CACHE_QUERY_BUCKETS;
   c->buckets = calloc(c->bucket_count, sizeof *c->buckets);
-  if (!c->buckets) {
+  c->query_buckets = calloc(
+      c->query_bucket_count, sizeof *c->query_buckets);
+  if (!c->buckets || !c->query_buckets) {
+    free(c->buckets);
+    free(c->query_buckets);
+    c->buckets = NULL;
+    c->query_buckets = NULL;
     c->bucket_count = 0;
+    c->query_bucket_count = 0;
     c->max_bytes = 0;
+  }
+}
+
+static void batch_cache_query_lru_unlink_locked(BatchCache *c,
+                                                 BatchQuery *query) {
+  if (query->lru_prev) query->lru_prev->lru_next = query->lru_next;
+  else c->query_head = query->lru_next;
+  if (query->lru_next) query->lru_next->lru_prev = query->lru_prev;
+  else c->query_tail = query->lru_prev;
+  query->lru_prev = query->lru_next = NULL;
+}
+
+static void batch_cache_query_lru_push_locked(BatchCache *c,
+                                               BatchQuery *query) {
+  query->lru_prev = NULL;
+  query->lru_next = c->query_head;
+  if (c->query_head) c->query_head->lru_prev = query;
+  else c->query_tail = query;
+  c->query_head = query;
+}
+
+static void batch_cache_query_lru_touch_locked(BatchCache *c,
+                                                BatchQuery *query) {
+  if (query != c->query_head) {
+    batch_cache_query_lru_unlink_locked(c, query);
+    batch_cache_query_lru_push_locked(c, query);
   }
 }
 
 static BatchQuery *batch_cache_find_query_locked(
     BatchCache *c, const char *query,
-    fzf_case_types case_mode, bool fuzzy) {
-  for (BatchQuery *q = c->queries; q; q = q->next)
-    if (q->case_mode == case_mode && q->fuzzy == fuzzy &&
+    fzf_case_types case_mode, bool fuzzy, uint64_t hash) {
+  if (!c->query_buckets || c->query_bucket_count == 0) return NULL;
+  size_t bucket = batch_cache_query_bucket(c, hash);
+  for (BatchQuery *q = c->query_buckets[bucket]; q; q = q->hash_next)
+    if (q->hash == hash && q->case_mode == case_mode && q->fuzzy == fuzzy &&
         strcmp(q->query, query) == 0)
       return q;
   return NULL;
 }
 
 static void batch_cache_remove_query_locked(BatchCache *c, BatchQuery *query) {
-  BatchQuery **slot = &c->queries;
-  while (*slot && *slot != query) slot = &(*slot)->next;
-  if (*slot == query) *slot = query->next;
+  assert(query->external_refs == 0);
+  assert(query->entry_count == 0);
+  assert(query->entry_head == NULL && query->entry_tail == NULL);
+  size_t bucket = batch_cache_query_bucket(c, query->hash);
+  BatchQuery **slot = &c->query_buckets[bucket];
+  while (*slot && *slot != query) slot = &(*slot)->hash_next;
+  if (*slot == query) *slot = query->hash_next;
+  batch_cache_query_lru_unlink_locked(c, query);
+  assert(c->query_count > 0);
+  c->query_count--;
   if (c->used_bytes >= query->bytes) c->used_bytes -= query->bytes;
   free(query->query);
   if (query->parsed) fzf_free_pattern(query->parsed);
@@ -2455,7 +2539,19 @@ static void batch_cache_remove_query_locked(BatchCache *c, BatchQuery *query) {
 static BatchQuery *batch_cache_acquire_query(
     BatchCache *c, const char *query,
     fzf_case_types case_mode, bool fuzzy) {
-  if (!c->max_bytes || !c->buckets) return NULL;
+  if (!c->max_bytes || !c->buckets || !c->query_buckets) return NULL;
+
+  uint64_t hash = batch_cache_query_hash(query, case_mode, fuzzy);
+  pthread_mutex_lock(&c->mu);
+  BatchQuery *found = batch_cache_find_query_locked(
+      c, query, case_mode, fuzzy, hash);
+  if (found) {
+    found->external_refs++;
+    batch_cache_query_lru_touch_locked(c, found);
+    pthread_mutex_unlock(&c->mu);
+    return found;
+  }
+  pthread_mutex_unlock(&c->mu);
 
   char *query_copy = strdup(query);
   fzf_pattern_t *parsed = parse_query_for_cache(query, case_mode, fuzzy);
@@ -2470,6 +2566,7 @@ static BatchQuery *batch_cache_acquire_query(
   created->parsed = parsed;
   created->case_mode = case_mode;
   created->fuzzy = fuzzy;
+  created->hash = hash;
   size_t query_len = strlen(query_copy);
   size_t parsed_bytes = cache_pattern_bytes(parsed);
   created->bytes = 0;
@@ -2484,10 +2581,11 @@ static BatchQuery *batch_cache_acquire_query(
   }
 
   pthread_mutex_lock(&c->mu);
-  BatchQuery *found = batch_cache_find_query_locked(
-      c, query, case_mode, fuzzy);
+  found = batch_cache_find_query_locked(
+      c, query, case_mode, fuzzy, hash);
   if (found) {
     found->external_refs++;
+    batch_cache_query_lru_touch_locked(c, found);
     pthread_mutex_unlock(&c->mu);
     free(created->query);
     if (created->parsed) fzf_free_pattern(created->parsed);
@@ -2507,9 +2605,13 @@ static BatchQuery *batch_cache_acquire_query(
     return NULL;
   }
   created->external_refs = 1;
-  created->next = c->queries;
-  c->queries = created;
+  size_t bucket = batch_cache_query_bucket(c, created->hash);
+  created->hash_next = c->query_buckets[bucket];
+  c->query_buckets[bucket] = created;
+  batch_cache_query_lru_push_locked(c, created);
+  c->query_count++;
   c->used_bytes += created->bytes;
+  batch_cache_trim_queries_locked(c);
   pthread_mutex_unlock(&c->mu);
   return created;
 }
@@ -2520,31 +2622,40 @@ static void batch_cache_release_query(BatchCache *c, BatchQuery *query) {
   if (query->external_refs > 0) query->external_refs--;
   if (query->external_refs == 0 && query->entry_count == 0)
     batch_cache_remove_query_locked(c, query);
+  batch_cache_trim_queries_locked(c);
   pthread_mutex_unlock(&c->mu);
 }
 
-/* Select the most constrained cached query whose match set is a superset of
-   TARGET.  Exact membership is preferred.  OR queries participate only in
-   exact reuse because adding an OR alternate is not monotonic. */
+/* Select an exact query by hash, or the most constrained safe ancestor in a
+   bounded recent-query window.  OR queries participate only in exact reuse
+   because adding an OR alternate is not monotonic. */
+#ifdef FZF_NATIVE_CTEST
+static size_t batch_cache_test_last_source_scan;
+#endif
 static BatchQuery *batch_cache_select_source(
     BatchCache *c, const char *target,
     fzf_case_types case_mode, bool fuzzy) {
-  if (!c->max_bytes || !c->buckets) return NULL;
+  if (!c->max_bytes || !c->buckets || !c->query_buckets) return NULL;
   fzf_pattern_t *target_pattern = parse_query_for_cache(
       target, case_mode, fuzzy);
   BatchQuery *best = NULL;
   size_t best_terms = 0;
   size_t best_len = 0;
+  size_t inspected = 0;
+  uint64_t hash = batch_cache_query_hash(target, case_mode, fuzzy);
 
   pthread_mutex_lock(&c->mu);
-  for (BatchQuery *q = c->queries; q; q = q->next) {
+  BatchQuery *exact = batch_cache_find_query_locked(
+      c, target, case_mode, fuzzy, hash);
+  if (exact && exact->entry_count > 0) {
+    best = exact;
+  }
+  for (BatchQuery *q = best ? NULL : c->query_head;
+       q && inspected < c->source_scan_limit; q = q->lru_next) {
+    inspected++;
     if (q->entry_count == 0 || q->case_mode != case_mode ||
         q->fuzzy != fuzzy)
       continue;
-    if (strcmp(q->query, target) == 0) {
-      best = q;
-      break;
-    }
     bool safe = subsumes(q->query, target) ||
                 (target_pattern &&
                  subsumes_pattern(q->parsed, target_pattern));
@@ -2558,7 +2669,13 @@ static BatchQuery *batch_cache_select_source(
       best_len = len;
     }
   }
-  if (best) best->external_refs++;
+  if (best) {
+    best->external_refs++;
+    batch_cache_query_lru_touch_locked(c, best);
+  }
+#ifdef FZF_NATIVE_CTEST
+  batch_cache_test_last_source_scan = inspected;
+#endif
   pthread_mutex_unlock(&c->mu);
   if (target_pattern) fzf_free_pattern(target_pattern);
   return best;
@@ -2592,6 +2709,24 @@ static void batch_cache_lru_push_locked(BatchCache *c,
   c->head = entry;
 }
 
+static void batch_cache_owner_unlink_locked(BatchCacheEntry *entry) {
+  BatchQuery *owner = entry->owner;
+  if (entry->owner_prev) entry->owner_prev->owner_next = entry->owner_next;
+  else owner->entry_head = entry->owner_next;
+  if (entry->owner_next) entry->owner_next->owner_prev = entry->owner_prev;
+  else owner->entry_tail = entry->owner_prev;
+  entry->owner_prev = entry->owner_next = NULL;
+}
+
+static void batch_cache_owner_push_locked(BatchQuery *owner,
+                                          BatchCacheEntry *entry) {
+  entry->owner_prev = NULL;
+  entry->owner_next = owner->entry_head;
+  if (owner->entry_head) owner->entry_head->owner_prev = entry;
+  else owner->entry_tail = entry;
+  owner->entry_head = entry;
+}
+
 static void batch_cache_entry_free(BatchCacheEntry *entry) {
   if (!entry) return;
   if (entry->kind == BatchMembershipSparse) free(entry->members.sparse);
@@ -2607,6 +2742,7 @@ static void batch_cache_remove_entry_locked(BatchCache *c,
   while (*slot && *slot != entry) slot = &(*slot)->hash_next;
   if (*slot == entry) *slot = entry->hash_next;
   batch_cache_lru_unlink_locked(c, entry);
+  batch_cache_owner_unlink_locked(entry);
   c->entry_count--;
   if (c->used_bytes >= entry->bytes) c->used_bytes -= entry->bytes;
   BatchQuery *owner = entry->owner;
@@ -2615,6 +2751,30 @@ static void batch_cache_remove_entry_locked(BatchCache *c,
   batch_cache_entry_free(entry);
   if (owner->entry_count == 0 && owner->external_refs == 0)
     batch_cache_remove_query_locked(c, owner);
+}
+
+/* Query objects retain parsed patterns and are also the keys for cached
+   batch memberships.  The byte budget bounds their aggregate storage, but a
+   workload with many short, empty-result queries can otherwise retain enough
+   objects to make ancestor lookup and exact lookup metadata grow without a
+   practical limit.  Evict the least-recently-used inactive query as one unit.
+   Cache evidence is optional, so dropping all of its memberships is always a
+   correct fallback to scoring the original batch. */
+static void batch_cache_trim_queries_locked(BatchCache *c) {
+  while (c->query_count > c->max_queries) {
+    BatchQuery *victim = c->query_tail;
+    while (victim && victim->external_refs > 0)
+      victim = victim->lru_prev;
+    if (!victim) break;
+
+    /* Pin VICTIM while removing its entries so the generic entry-removal
+       path cannot free it underneath this loop. */
+    victim->external_refs++;
+    while (victim->entry_tail)
+      batch_cache_remove_entry_locked(c, victim->entry_tail, true);
+    victim->external_refs--;
+    batch_cache_remove_query_locked(c, victim);
+  }
 }
 
 /* Copy one cached membership set as local indexes in [0, BATCH_SIZE). */
@@ -2721,6 +2881,7 @@ static void batch_cache_insert(BatchCache *c, BatchQuery *query,
   created->hash_next = c->buckets[bucket];
   c->buckets[bucket] = created;
   batch_cache_lru_push_locked(c, created);
+  batch_cache_owner_push_locked(query, created);
   query->entry_count++;
   c->entry_count++;
   c->used_bytes += created->bytes;
@@ -2728,14 +2889,16 @@ static void batch_cache_insert(BatchCache *c, BatchQuery *query,
 
   while (c->tail && c->used_bytes > c->max_bytes)
     batch_cache_remove_entry_locked(c, c->tail, true);
+  batch_cache_trim_queries_locked(c);
   pthread_mutex_unlock(&c->mu);
 }
 
 static void batch_cache_stats(BatchCache *c, size_t *entries,
-                              size_t *bytes, uint64_t *hits,
+                              size_t *queries, size_t *bytes, uint64_t *hits,
                               uint64_t *misses, uint64_t *evictions) {
   pthread_mutex_lock(&c->mu);
   *entries = c->entry_count;
+  *queries = c->query_count;
   *bytes = c->used_bytes;
   *hits = c->hits;
   *misses = c->misses;
@@ -2751,19 +2914,22 @@ static void batch_cache_free(BatchCache *c) {
     batch_cache_entry_free(entry);
     entry = next;
   }
-  BatchQuery *query = c->queries;
+  BatchQuery *query = c->query_head;
   while (query) {
-    BatchQuery *next = query->next;
+    BatchQuery *next = query->lru_next;
     free(query->query);
     if (query->parsed) fzf_free_pattern(query->parsed);
     free(query);
     query = next;
   }
   free(c->buckets);
+  free(c->query_buckets);
   c->buckets = NULL;
-  c->queries = NULL;
+  c->query_buckets = NULL;
+  c->query_head = c->query_tail = NULL;
   c->head = c->tail = NULL;
   c->entry_count = 0;
+  c->query_count = 0;
   pthread_mutex_unlock(&c->mu);
   pthread_mutex_destroy(&c->mu);
 }
@@ -6673,10 +6839,12 @@ static emacs_value async_snapshot_value(emacs_env *env, AsyncSession *s,
     progress_total = 0;
   }
 
-  size_t batch_cache_entries = 0, batch_cache_bytes = 0;
+  size_t batch_cache_entries = 0, batch_cache_queries = 0;
+  size_t batch_cache_bytes = 0;
   uint64_t batch_cache_hits = 0, batch_cache_misses = 0;
   uint64_t batch_cache_evictions = 0;
   batch_cache_stats(&s->batch_cache, &batch_cache_entries,
+                    &batch_cache_queries,
                     &batch_cache_bytes, &batch_cache_hits,
                     &batch_cache_misses, &batch_cache_evictions);
   size_t result_cache_entries = 0, result_cache_bytes = 0;
@@ -6750,6 +6918,9 @@ static emacs_value async_snapshot_value(emacs_env *env, AsyncSession *s,
   plist = async_plist_put(env, plist, ":batch-cache-entries",
                           env->make_integer(
                               env, (intmax_t)batch_cache_entries));
+  plist = async_plist_put(env, plist, ":batch-cache-queries",
+                          env->make_integer(
+                              env, (intmax_t)batch_cache_queries));
   plist = async_plist_put(env, plist, ":reader-done",
                           reader_done ? Qt : Qnil);
   if (include_candidates)
@@ -7194,7 +7365,8 @@ int emacs_module_init(struct emacs_runtime *rt) {
                          "               also completes with :error nil\n"
                          "  :cache-entries :cache-bytes :cache-evictions\n"
                          "               whole-result cache telemetry\n"
-                         "  :batch-cache-entries :batch-cache-bytes :batch-cache-hits\n"
+                         "  :batch-cache-queries :batch-cache-entries\n"
+                         "  :batch-cache-bytes :batch-cache-hits\n"
                          "  :batch-cache-misses :batch-cache-evictions  cache telemetry\n\n"
                          "\\(fn HANDLE &optional REQUEST-ID)", NULL),
     });

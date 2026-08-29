@@ -296,6 +296,10 @@ request cancellation.  A later exact or narrower query can reuse those sets.
 Sparse match sets use local candidate indexes.  Denser sets use bitmaps.
 The scorer does not cache a batch when more than half its candidates match.
 
+The cache retains at most 4,096 query records.  An ancestor lookup scans at
+most 256 recent records.  An exact lookup uses a hash table and does not scan
+this list.  An eviction only removes optional cache evidence.
+
 Set this value to zero to disable stable-batch membership reuse.  The module
 reads the value once in `fzf-native-async-start'."
   :type 'natnum

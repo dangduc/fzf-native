@@ -176,6 +176,17 @@ ctest-asan:
 clean:
 	rm -rf $(BUILD_DIR)
 
+# Long-session scale probe for the stable-batch query index.  This separate
+# output directory does not replace a bundled release artifact.
+.PHONY: benchmark-batch-cache-history
+benchmark-batch-cache-history:
+	cmake -B $(BUILD_DIR)/bench-cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+		-DFZF_NATIVE_MODULE_OUTPUT_DIR=$(abspath $(BUILD_DIR)/bench-module)
+	cmake --build $(BUILD_DIR)/bench-cmake
+	FZF_NATIVE_SOURCE_DIR=$(CURDIR) \
+		FZF_NATIVE_TEST_MODULE=$(abspath $(BUILD_DIR)/bench-module/fzf-native-module.so) \
+		$(EMACS) -Q --batch -l etc/batch-cache-query-history-benchmark.el
+
 # Coverage-guided and differential test targets live in a separate include so
 # they do not alter the release build or the public module ABI.
 include fuzz/fuzz.mk

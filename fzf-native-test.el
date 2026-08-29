@@ -1474,7 +1474,8 @@ plain fuzzy syntax and the leading-quote exact syntax."
                  (first (fzf-native-test--wait-for-request
                          handle first-id 10.0)))
             (should (eq (plist-get first :state) 'complete))
-            (should (> (plist-get first :batch-cache-entries) 0)))
+            (should (> (plist-get first :batch-cache-entries) 0))
+            (should (> (plist-get first :batch-cache-queries) 0)))
           (let* ((second-id (fzf-native-async-submit handle "99" 200))
                  (second (fzf-native-test--wait-for-request
                           handle second-id 10.0)))

@@ -731,12 +731,19 @@ The value is a sparse list when at most 128 of the 2,048 candidates match.  It
 is a bitmap through 50-percent selectivity.  Denser results do not enter the
 cache.  The mutable final partial batch never enters the cache.
 
-The cache uses a byte-budgeted LRU.  Configure the budget with
+The cache uses an LRU and a byte budget.  Configure the budget with
 =fzf-native-async-batch-cache-bytes=.  The default is 64 MiB per session.  A
 value of 0 disables the cache.
 
-Snapshots expose entry, byte, hit, miss, and eviction counters.  These counters
-make narrowing reuse measurable in module-boundary tests.
+An exact-query hash table avoids an LRU scan in normal operation.  The cache
+retains at most 4,096 query records.  This limit also bounds a hash chain.
+An ancestor lookup scans at most 256 recent query records.  The cache removes
+the least-recent inactive query when it reaches the limit.  This operation
+also removes the membership entries of that query.  Cache evidence is
+optional, so an eviction does not change a match result.
+
+Snapshots expose query, entry, byte, hit, miss, and eviction counters.  These
+counters make narrowing reuse measurable in module-boundary tests.
 
 ** Producer and matcher failures
 

@@ -96,6 +96,13 @@ static AsyncSession *session_fuzz_create(uint8_t options) {
   batch_cache_init(
       &s->batch_cache,
       batch_cache_sizes[(options >> 4) & 3]);
+  if (s->batch_cache.max_bytes) {
+    /* Production retains thousands of query records.  Small fuzz-only
+       limits make query eviction and bounded ancestor scans reachable within
+       the 128-operation state-machine budget. */
+    s->batch_cache.max_queries = 1 + ((options >> 1) & 7);
+    s->batch_cache.source_scan_limit = 1 + ((options >> 4) & 7);
+  }
   s->filter_only_min_pool = filter_only_thresholds[(options >> 6) & 3];
   s->max_line_length = session_fuzz_line_limit(options);
   s->worker_pool = async_worker_pool_create(1 + (options & 1));
@@ -475,6 +482,73 @@ static void session_fuzz_check_invariants(FuzzSession *fuzz) {
 
   if (completed > total)
     session_fuzz_fail(fuzz, "request progress exceeds its total");
+
+  pthread_mutex_lock(&s->batch_cache.mu);
+  BatchCache *batch_cache = &s->batch_cache;
+  size_t query_lru_count = 0;
+  size_t active_query_count = 0;
+  BatchQuery *query_previous = NULL;
+  for (BatchQuery *query = batch_cache->query_head; query;
+       query = query->lru_next) {
+    if (query->lru_prev != query_previous)
+      session_fuzz_fail(fuzz, "batch query LRU links disagree");
+    if (batch_cache_find_query_locked(
+            batch_cache, query->query, query->case_mode,
+            query->fuzzy, query->hash) != query)
+      session_fuzz_fail(fuzz, "batch query hash lost an LRU record");
+    size_t owner_entry_count = 0;
+    BatchCacheEntry *owner_previous = NULL;
+    for (BatchCacheEntry *entry = query->entry_head; entry;
+         entry = entry->owner_next) {
+      if (entry->owner != query || entry->owner_prev != owner_previous)
+        session_fuzz_fail(fuzz, "batch entry owner links disagree");
+      owner_previous = entry;
+      owner_entry_count++;
+    }
+    if (owner_previous != query->entry_tail ||
+        owner_entry_count != query->entry_count)
+      session_fuzz_fail(fuzz, "batch query entry count disagrees");
+    if (query->external_refs) active_query_count++;
+    query_previous = query;
+    query_lru_count++;
+  }
+  if (query_previous != batch_cache->query_tail ||
+      query_lru_count != batch_cache->query_count)
+    session_fuzz_fail(fuzz, "batch query LRU count disagrees");
+
+  size_t query_hash_count = 0;
+  for (size_t bucket = 0; bucket < batch_cache->query_bucket_count; bucket++)
+    for (BatchQuery *query = batch_cache->query_buckets[bucket]; query;
+         query = query->hash_next) {
+      if (batch_cache_query_bucket(batch_cache, query->hash) != bucket)
+        session_fuzz_fail(fuzz, "batch query is in the wrong hash bucket");
+      query_hash_count++;
+    }
+  if (query_hash_count != batch_cache->query_count)
+    session_fuzz_fail(fuzz, "batch query hash count disagrees");
+
+  size_t entry_lru_count = 0;
+  BatchCacheEntry *entry_previous = NULL;
+  for (BatchCacheEntry *entry = batch_cache->head; entry;
+       entry = entry->lru_next) {
+    if (entry->lru_prev != entry_previous)
+      session_fuzz_fail(fuzz, "batch entry LRU links disagree");
+    if (batch_cache_find_entry_locked(
+            batch_cache, entry->owner, entry->batch_id) != entry)
+      session_fuzz_fail(fuzz, "batch entry hash lost an LRU record");
+    entry_previous = entry;
+    entry_lru_count++;
+  }
+  if (entry_previous != batch_cache->tail ||
+      entry_lru_count != batch_cache->entry_count)
+    session_fuzz_fail(fuzz, "batch entry LRU count disagrees");
+  if (batch_cache->used_bytes > batch_cache->max_bytes)
+    session_fuzz_fail(fuzz, "batch cache exceeds its byte budget");
+  if (batch_cache->query_count > batch_cache->max_queries &&
+      batch_cache->query_count - batch_cache->max_queries >
+          active_query_count)
+    session_fuzz_fail(fuzz, "inactive batch queries exceed the count cap");
+  pthread_mutex_unlock(&s->batch_cache.mu);
 
   enum AsyncRequestState latest_state = async_request_state(
       latest_id, latest_id, queued_id, current_id, result_id, error_id);

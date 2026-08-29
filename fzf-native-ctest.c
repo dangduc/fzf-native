@@ -2088,15 +2088,16 @@ static void test_batch_cache_sparse_bitmap_and_selectivity_cutoff(void) {
   CHECK(count == 200);
   for (size_t i = 0; i < count; i++) CHECK(local[i] == i * 3);
 
-  size_t stats_entries = 0, stats_bytes = 0;
+  size_t stats_entries = 0, stats_queries = 0, stats_bytes = 0;
   uint64_t stats_hits = 0, stats_misses = 0, stats_evictions = 0;
-  batch_cache_stats(&cache, &stats_entries, &stats_bytes,
+  batch_cache_stats(&cache, &stats_entries, &stats_queries, &stats_bytes,
                     &stats_hits, &stats_misses, &stats_evictions);
   size_t traversed_entries = 0;
   for (BatchCacheEntry *entry = cache.head; entry;
        entry = entry->lru_next)
     traversed_entries++;
   CHECK(stats_entries == 2);
+  CHECK(stats_queries == 1);
   CHECK(stats_entries == traversed_entries);
   CHECK(stats_entries == cache.entry_count);
 
@@ -2196,6 +2197,157 @@ static void test_batch_cache_evicts_to_byte_budget(void) {
   CHECK(query == NULL);
   CHECK(too_small.used_bytes == 0);
   batch_cache_free(&too_small);
+}
+
+static void check_batch_cache_query_indexes(BatchCache *cache) {
+  size_t lru_count = 0;
+  BatchQuery *previous = NULL;
+  for (BatchQuery *query = cache->query_head; query;
+       query = query->lru_next) {
+    CHECK(query->lru_prev == previous);
+    CHECK(batch_cache_find_query_locked(
+              cache, query->query, query->case_mode,
+              query->fuzzy, query->hash) == query);
+    size_t owner_count = 0;
+    BatchCacheEntry *owner_previous = NULL;
+    for (BatchCacheEntry *entry = query->entry_head; entry;
+         entry = entry->owner_next) {
+      CHECK(entry->owner == query);
+      CHECK(entry->owner_prev == owner_previous);
+      owner_previous = entry;
+      owner_count++;
+    }
+    CHECK(owner_previous == query->entry_tail);
+    CHECK(owner_count == query->entry_count);
+    previous = query;
+    lru_count++;
+  }
+  CHECK(previous == cache->query_tail);
+  CHECK(lru_count == cache->query_count);
+
+  size_t hash_count = 0;
+  for (size_t bucket = 0; bucket < cache->query_bucket_count; bucket++)
+    for (BatchQuery *query = cache->query_buckets[bucket]; query;
+         query = query->hash_next) {
+      CHECK(batch_cache_query_bucket(cache, query->hash) == bucket);
+      hash_count++;
+    }
+  CHECK(hash_count == cache->query_count);
+}
+
+static void test_batch_cache_query_cap_evicts_complete_owners(void) {
+  BatchCache cache;
+  batch_cache_init(&cache, 1024 * 1024);
+  cache.max_queries = 4;
+  ScoredStr match = {.idx = 0};
+
+  for (size_t i = 0; i < 32; i++) {
+    char query_text[32];
+    snprintf(query_text, sizeof query_text, "q%02zu", i);
+    BatchQuery *query = batch_cache_acquire_query(
+        &cache, query_text, CaseSmart, true);
+    CHECK(query != NULL);
+    if (!query) continue;
+    batch_cache_insert(&cache, query, 0, &match, 1);
+    batch_cache_release_query(&cache, query);
+    CHECK(cache.query_count <= cache.max_queries);
+    CHECK(cache.entry_count <= cache.max_queries);
+    check_batch_cache_query_indexes(&cache);
+  }
+
+  CHECK(cache.query_count == 4);
+  CHECK(cache.entry_count == 4);
+  CHECK(cache.evictions == 28);
+  CHECK(cache.query_head && strcmp(cache.query_head->query, "q31") == 0);
+  CHECK(cache.query_tail && strcmp(cache.query_tail->query, "q28") == 0);
+  BatchQuery *source = batch_cache_select_source(
+      &cache, "q00", CaseSmart, true);
+  CHECK(source == NULL);
+  source = batch_cache_select_source(&cache, "q31", CaseSmart, true);
+  CHECK(source != NULL);
+  CHECK(source && strcmp(source->query, "q31") == 0);
+  CHECK(batch_cache_test_last_source_scan == 0);
+  batch_cache_release_query(&cache, source);
+  check_batch_cache_query_indexes(&cache);
+  batch_cache_free(&cache);
+}
+
+static void test_batch_cache_source_scan_is_bounded_and_exact_is_hashed(void) {
+  BatchCache cache;
+  batch_cache_init(&cache, 1024 * 1024);
+  cache.source_scan_limit = 3;
+  ScoredStr match = {.idx = 0};
+
+  BatchQuery *anchor = batch_cache_acquire_query(
+      &cache, "anchor", CaseSmart, true);
+  CHECK(anchor != NULL);
+  if (!anchor) {
+    batch_cache_free(&cache);
+    return;
+  }
+  batch_cache_insert(&cache, anchor, 0, &match, 1);
+  batch_cache_release_query(&cache, anchor);
+
+  for (size_t i = 0; i < 8; i++) {
+    char query_text[32];
+    snprintf(query_text, sizeof query_text, "unrelated-%zu", i);
+    BatchQuery *query = batch_cache_acquire_query(
+        &cache, query_text, CaseSmart, true);
+    CHECK(query != NULL);
+    if (!query) continue;
+    batch_cache_insert(&cache, query, 0, &match, 1);
+    batch_cache_release_query(&cache, query);
+  }
+
+  BatchQuery *source = batch_cache_select_source(
+      &cache, "anchor suffix", CaseSmart, true);
+  CHECK(source == NULL);
+  CHECK(batch_cache_test_last_source_scan == 3);
+
+  /* Exact lookup bypasses the ancestor scan even when its query is older
+     than the scan window, then touching it makes it eligible as a recent
+     ancestor. */
+  source = batch_cache_select_source(&cache, "anchor", CaseSmart, true);
+  CHECK(source == anchor);
+  CHECK(batch_cache_test_last_source_scan == 0);
+  batch_cache_release_query(&cache, source);
+  CHECK(cache.query_head == anchor);
+
+  source = batch_cache_select_source(
+      &cache, "anchor suffix", CaseSmart, true);
+  CHECK(source == anchor);
+  CHECK(batch_cache_test_last_source_scan <= 3);
+  batch_cache_release_query(&cache, source);
+  check_batch_cache_query_indexes(&cache);
+  batch_cache_free(&cache);
+}
+
+static void test_batch_cache_query_cap_preserves_active_references(void) {
+  BatchCache cache;
+  batch_cache_init(&cache, 1024 * 1024);
+  cache.max_queries = 1;
+  ScoredStr match = {.idx = 0};
+
+  BatchQuery *first = batch_cache_acquire_query(
+      &cache, "first", CaseSmart, true);
+  CHECK(first != NULL);
+  batch_cache_insert(&cache, first, 0, &match, 1);
+  BatchQuery *second = batch_cache_acquire_query(
+      &cache, "second", CaseSmart, true);
+  CHECK(second != NULL);
+  batch_cache_insert(&cache, second, 0, &match, 1);
+  CHECK(cache.query_count == 2);
+
+  batch_cache_release_query(&cache, first);
+  CHECK(cache.query_count == 1);
+  CHECK(cache.query_head == second && cache.query_tail == second);
+  uint16_t local[BATCH_SIZE];
+  size_t count = 0;
+  CHECK(batch_cache_copy_members(&cache, second, 0, local, &count));
+  CHECK(count == 1 && local[0] == 0);
+  check_batch_cache_query_indexes(&cache);
+  batch_cache_release_query(&cache, second);
+  batch_cache_free(&cache);
 }
 
 static void test_completed_batch_evidence_survives_request_cancellation(void) {
@@ -3486,6 +3638,9 @@ int main(void) {
   RUN(test_batch_cache_sparse_bitmap_and_selectivity_cutoff);
   RUN(test_batch_cache_selects_only_safe_query_ancestors);
   RUN(test_batch_cache_evicts_to_byte_budget);
+  RUN(test_batch_cache_query_cap_evicts_complete_owners);
+  RUN(test_batch_cache_source_scan_is_bounded_and_exact_is_hashed);
+  RUN(test_batch_cache_query_cap_preserves_active_references);
   RUN(test_completed_batch_evidence_survives_request_cancellation);
   RUN(test_mutable_partial_batch_does_not_enter_batch_cache);
 
