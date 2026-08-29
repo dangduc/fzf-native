@@ -350,16 +350,34 @@ to a new submission.
 ** Reader thread — =async_reader=
 
 #+begin_src
-  while (read line from child fp) {
-    strip ANSI escapes (in place)
-    arena_strdup(line)            ← arena owns the bytes
-    allocate a candidate block when necessary
-    publish candidate pointer     ← under s->mu
-    increment the compatibility generation
-    coalesce a growth event when a request exists
-  }
-  on EOF: just return; thread exits naturally.
+  loop:
+    poll the producer fd and the cancellation pipe
+    read at most 8,192 raw bytes
+    feed each newline-free segment to AsyncLineDecoder
+    on newline:
+      finish UTF-8 and ANSI state
+      apply the configured character cap
+      arena_strdup(record)         ← arena owns the retained bytes
+      publish the candidate        ← under s->mu
+      coalesce a growth event when a request exists
+  on ordinary EOF: publish the final unterminated record
+  on cancellation: discard the partial record
 #+end_src
+
+The decoder keeps ANSI, trailing-CR, and partial UTF-8 state across reads. It
+removes trailing CR bytes and ANSI CSI color spans. It counts each invalid
+UTF-8 byte as one character.
+
+The reader rejects every raw NUL byte. This rule also applies after the
+retained prefix and inside a discarded ANSI span.
+
+A positive =fzf-native-max-line-length= excludes a record after its first
+excess visible character. A negative value publishes the first =abs(N)=
+visible characters. A nil or zero value keeps the unbounded behavior.
+
+With a configured cap, the output allocation uses at most =4*abs(N)+1= bytes.
+ANSI payloads, CR runs, and discarded suffixes use fixed decoder state. With
+an unbounded cap, a complete record can grow until its newline arrives.
 
 Why an arena: candidates are written once and freed all at once at
 session end. =arena_strdup= bumps a pointer into a 4 MB chunk;
@@ -659,9 +677,12 @@ holds:
 - *Simple positive byte-prefix* — Q' is one positive term and is a byte-prefix
   of Q.  The term can be operator-free or can have one leading quote followed
   by non-empty text.  This captures positive term extension and later AND
-  terms.  Other operator-bearing sources must use parsed-term proof because an
-  inverse extension can broaden a match set.  Empty, doubled, inverse, anchored,
-  and OR-bearing quoted forms do not use this fast path.
+  terms.  Both byte strings must be valid UTF-8.  An incomplete sequence can
+  become a valid codepoint when extended, which can change its case-folded
+  bytes and invalidate raw-prefix reasoning.  Other operator-bearing sources
+  must use parsed-term proof because an inverse extension can broaden a match
+  set.  Empty, doubled, inverse, anchored, and OR-bearing quoted forms do not
+  use this fast path.
 - *Term-set* — both queries parse to non-OR patterns (no term-set
   with >1 term) and every term-set in Q' has an equivalent term-set
   in Q. Captures: adding an AND term in non-prefix position

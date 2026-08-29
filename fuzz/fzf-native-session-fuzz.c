@@ -33,6 +33,11 @@ typedef struct {
   bool submitted;
 } FuzzSession;
 
+static ptrdiff_t session_fuzz_line_limit(uint8_t options) {
+  static const ptrdiff_t limits[] = {0, 1, -1, 2, -2, 8, -8, 256};
+  return limits[(options >> 1) & 7];
+}
+
 static void session_fuzz_fail(const FuzzSession *fuzz, const char *property) {
   fprintf(stderr,
           "fzf-native interactive fuzz invariant failed at operation %zu: %s\n",
@@ -92,6 +97,7 @@ static AsyncSession *session_fuzz_create(uint8_t options) {
       &s->batch_cache,
       batch_cache_sizes[(options >> 4) & 3]);
   s->filter_only_min_pool = filter_only_thresholds[(options >> 6) & 3];
+  s->max_line_length = session_fuzz_line_limit(options);
   s->worker_pool = async_worker_pool_create(1 + (options & 1));
   if (!s->worker_pool) {
     async_session_destroy(s);
@@ -120,6 +126,87 @@ static bool session_fuzz_write_all(int fd, const uint8_t *data, size_t size) {
   return true;
 }
 
+typedef struct {
+  char **candidates;
+  size_t count;
+  size_t capacity;
+  bool invalid_data;
+} FuzzReaderReference;
+
+static void session_fuzz_reader_reference_free(FuzzReaderReference *ref) {
+  for (size_t i = 0; i < ref->count; i++) free(ref->candidates[i]);
+  free(ref->candidates);
+  memset(ref, 0, sizeof *ref);
+}
+
+static bool session_fuzz_reader_reference_append(FuzzReaderReference *ref,
+                                                 char *candidate) {
+  if (ref->count == ref->capacity) {
+    size_t next = ref->capacity ? ref->capacity * 2 : 8;
+    char **grown = realloc(ref->candidates, next * sizeof *grown);
+    if (!grown) return false;
+    ref->candidates = grown;
+    ref->capacity = next;
+  }
+  ref->candidates[ref->count++] = candidate;
+  return true;
+}
+
+/* Independent one-shot oracle for the incremental reader normalizer.  Fuzz
+   inputs are small enough to retain whole records here; production must not.
+   This checks the streaming CR/ANSI/UTF-8 boundary logic against the prior
+   semantics for every generated record and cap mode. */
+static bool session_fuzz_reader_reference(const uint8_t *data, size_t size,
+                                          ptrdiff_t max_line_length,
+                                          FuzzReaderReference *ref) {
+  size_t start = 0;
+  while (start < size) {
+    size_t end = start;
+    while (end < size && data[end] != '\n') end++;
+    bool terminated = end < size;
+    size_t length = end - start;
+
+    if (length && memchr(data + start, 0, length) != NULL) {
+      ref->invalid_data = true;
+      return true;
+    }
+
+    char *candidate = malloc(length + 1);
+    if (!candidate) return false;
+    if (length) memcpy(candidate, data + start, length);
+    candidate[length] = '\0';
+    while (length && candidate[length - 1] == '\r') length--;
+    candidate[length] = '\0';
+    length = async_strip_ansi(candidate, length);
+
+    bool publish = true;
+    if (max_line_length != 0) {
+      size_t cap = async_line_limit(max_line_length);
+      size_t chars = utf8_character_count(candidate, length);
+      if (chars > cap) {
+        if (max_line_length > 0) {
+          publish = false;
+        } else {
+          length = utf8_prefix_byte_length(candidate, length, cap);
+          candidate[length] = '\0';
+        }
+      }
+    }
+
+    if (publish) {
+      if (!session_fuzz_reader_reference_append(ref, candidate)) {
+        free(candidate);
+        return false;
+      }
+    } else {
+      free(candidate);
+    }
+    if (!terminated) break;
+    start = end + 1;
+  }
+  return true;
+}
+
 /* Exercise the real poll/read producer path as well as the in-process growth
    operations below.  Odd control bytes retain the writer and destroy the
    session with a possibly unterminated line, which forces the cancellation
@@ -128,12 +215,15 @@ static bool session_fuzz_write_all(int fd, const uint8_t *data, size_t size) {
    final unterminated-line publication. */
 static void session_fuzz_reader_probe(const uint8_t *data, size_t size) {
   if (!data || size == 0) return;
-  bool contains_nul = size > 1 && memchr(data + 1, 0, size - 1) != NULL;
   AsyncSession *s = session_fuzz_create(data[0]);
   if (!s) return;
+  FuzzReaderReference reference = {0};
+  bool have_reference = session_fuzz_reader_reference(
+      data + 1, size - 1, s->max_line_length, &reference);
 
   int producer_pipe[2];
   if (pipe(producer_pipe) != 0) {
+    session_fuzz_reader_reference_free(&reference);
     async_session_destroy(s);
     return;
   }
@@ -142,6 +232,7 @@ static void session_fuzz_reader_probe(const uint8_t *data, size_t size) {
       pthread_create(&s->reader, NULL, async_reader, s) != 0) {
     if (!s->fp) close(producer_pipe[0]);
     close(producer_pipe[1]);
+    session_fuzz_reader_reference_free(&reference);
     async_session_destroy(s);
     return;
   }
@@ -164,6 +255,7 @@ static void session_fuzz_reader_probe(const uint8_t *data, size_t size) {
       nanosleep(&pause, NULL);
     async_session_destroy(s);
     close(producer_pipe[1]);
+    session_fuzz_reader_reference_free(&reference);
     return;
   }
 
@@ -178,6 +270,7 @@ static void session_fuzz_reader_probe(const uint8_t *data, size_t size) {
       async_unpack_producer_error_kind(producer_error);
   enum AsyncProducerState producer_state =
       atomic_load_explicit(&s->producer_state, memory_order_acquire);
+  bool contains_nul = size > 1 && memchr(data + 1, 0, size - 1) != NULL;
   if (contains_nul) {
     if (error_kind != AsyncProducerErrorInvalidData ||
         producer_state != AsyncProducerFailed)
@@ -185,6 +278,17 @@ static void session_fuzz_reader_probe(const uint8_t *data, size_t size) {
   } else if (error_kind == AsyncProducerErrorInvalidData) {
     abort();
   }
+  if (have_reference) {
+    if (reference.invalid_data != contains_nul ||
+        s->count != reference.count)
+      abort();
+    for (size_t i = 0; i < reference.count; i++) {
+      char **block = s->cands_top[i >> CANDS_BLOCK_SHIFT];
+      const char *actual = block ? block[i & CANDS_BLOCK_MASK] : NULL;
+      if (!actual || strcmp(actual, reference.candidates[i]) != 0) abort();
+    }
+  }
+  session_fuzz_reader_reference_free(&reference);
   async_session_destroy(s);
 }
 

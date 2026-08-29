@@ -88,7 +88,8 @@ fuzz-session: fuzz-session-build
 	mkdir -p $(FUZZ_SESSION_CORPUS_DIR) $(FUZZ_SESSION_ARTIFACT_DIR)
 	cp $(FUZZ_SESSION_SEED_DIR)/* $(FUZZ_SESSION_CORPUS_DIR)/
 	$(FUZZ_SESSION_BINARY) $(FUZZ_SESSION_CORPUS_DIR) \
-		-max_len=$(FUZZ_SESSION_MAX_LEN) -verbosity=$(FUZZ_VERBOSITY) \
+		-max_len=$(FUZZ_SESSION_MAX_LEN) -dict=$(FUZZ_DICTIONARY) \
+		-verbosity=$(FUZZ_VERBOSITY) \
 		-artifact_prefix=$(FUZZ_SESSION_ARTIFACT_DIR)/ \
 		-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) \
 		-max_total_time=$(FUZZ_SESSION_SECONDS) -print_final_stats=1

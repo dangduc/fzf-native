@@ -251,6 +251,13 @@ negative -N — include but truncate lines to N characters.
 
 Read once at session start by `fzf-native-async-start'.
 
+When this option is non-nil, the reader normalizes each record incrementally.
+It retains at most N decoded candidate characters before the newline arrives.
+ANSI escape payloads and discarded suffix bytes do not increase the partial
+record buffer.  The reader still scans the complete record.  It rejects an
+embedded NUL, including one after a retained prefix.  A nil value permits an
+unbounded record.  A nil value is safe only with trusted producers.
+
 Bridged by fzfa from `fzfa-max-line-length' while fzfa calls
 `fzf-native-async-start'."
   :type '(choice (const   :tag "No limit" nil)

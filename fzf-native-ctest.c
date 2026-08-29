@@ -1178,6 +1178,169 @@ static void test_async_reader_rejects_embedded_nul(void) {
   free_async_session(s);
 }
 
+static bool async_line_reference(const unsigned char *raw, size_t raw_len,
+                                 ptrdiff_t max_line_length, char **output,
+                                 size_t *output_len) {
+  char *copy = malloc(raw_len + 1);
+  CHECK(copy != NULL);
+  if (!copy) return false;
+  if (raw_len) memcpy(copy, raw, raw_len);
+  copy[raw_len] = '\0';
+
+  while (raw_len && copy[raw_len - 1] == '\r') raw_len--;
+  copy[raw_len] = '\0';
+  raw_len = async_strip_ansi(copy, raw_len);
+
+  bool publish = true;
+  if (max_line_length != 0) {
+    size_t cap = async_line_limit(max_line_length);
+    size_t chars = utf8_character_count(copy, raw_len);
+    if (chars > cap) {
+      if (max_line_length > 0) {
+        publish = false;
+      } else {
+        raw_len = utf8_prefix_byte_length(copy, raw_len, cap);
+        copy[raw_len] = '\0';
+      }
+    }
+  }
+  *output = copy;
+  *output_len = raw_len;
+  return publish;
+}
+
+/* The streaming decoder is intentionally more complex than the old
+   whole-record normalizer.  Differentially check their byte-for-byte output
+   across fixed pseudo-random ANSI, CR, valid/invalid UTF-8, and I/O-shaped
+   inputs for every cap mode. */
+static void test_async_line_decoder_matches_one_shot_reference(void) {
+  static const ptrdiff_t limits[] = {0, 1, -1, 2, -2, 17, -17};
+  uint32_t random = UINT32_C(0x9e3779b9);
+
+  for (size_t c = 0; c < sizeof limits / sizeof limits[0]; c++) {
+    AsyncSession *s = make_async_session(NULL, 0);
+    CHECK(s != NULL);
+    if (!s) continue;
+    s->max_line_length = limits[c];
+    AsyncLineDecoder line = {0};
+    size_t expected_count = 0;
+
+    for (size_t trial = 0; trial < 2000; trial++) {
+      unsigned char raw[128];
+      random = random * UINT32_C(1664525) + UINT32_C(1013904223);
+      size_t raw_len = (random >> 24) & 127;
+      for (size_t i = 0; i < raw_len; i++) {
+        random = random * UINT32_C(1664525) + UINT32_C(1013904223);
+        unsigned char byte = (unsigned char)(random >> 24);
+        /* Newline is a record delimiter and NUL is tested separately. */
+        if (byte == 0 || byte == '\n') byte = (unsigned char)(byte + 1);
+        raw[i] = byte;
+      }
+
+      char *reference = NULL;
+      size_t reference_len = 0;
+      bool publish = async_line_reference(
+          raw, raw_len, limits[c], &reference, &reference_len);
+      size_t fed = 0;
+      while (fed < raw_len) {
+        random = random * UINT32_C(1664525) + UINT32_C(1013904223);
+        size_t chunk = 1 + ((random >> 24) & 15);
+        if (chunk > raw_len - fed) chunk = raw_len - fed;
+        CHECK(async_line_feed_bytes(
+            s, &line, (const char *)raw + fed, chunk));
+        fed += chunk;
+      }
+      CHECK(async_line_finish(s, &line));
+
+      if (publish) {
+        CHECK(s->count == expected_count + 1);
+        const char *actual = cands_at(s, expected_count);
+        CHECK(actual != NULL);
+        if (actual) {
+          CHECK(strlen(actual) == reference_len);
+          CHECK(memcmp(actual, reference, reference_len) == 0);
+        }
+        expected_count++;
+      } else {
+        CHECK(s->count == expected_count);
+      }
+      if (limits[c] != 0)
+        CHECK(line.output_capacity <= async_line_output_ceiling(s));
+      free(reference);
+    }
+
+    free(line.output);
+    free_async_session(s);
+  }
+}
+
+static void test_async_line_decoder_bounds_overlong_records(void) {
+  AsyncSession *s = make_async_session(NULL, 0);
+  CHECK(s != NULL);
+  if (!s) return;
+  s->max_line_length = 2;
+  AsyncLineDecoder line = {0};
+
+  /* Two million raw ANSI payload bytes normalize to one two-character
+     candidate.  The decoder must retain only the visible UTF-8 prefix. */
+  CHECK(async_line_feed_byte(s, &line, 0x1b));
+  CHECK(async_line_feed_byte(s, &line, '['));
+  for (size_t i = 0; i < 2000000; i++)
+    CHECK(async_line_feed_byte(s, &line, 'x'));
+  CHECK(async_line_feed_byte(s, &line, 'm'));
+  static const unsigned char nihao[] = {
+      0xe4, 0xbd, 0xa0, 0xe5, 0xa5, 0xbd,
+  };
+  for (size_t i = 0; i < sizeof nihao; i++)
+    CHECK(async_line_feed_byte(s, &line, nihao[i]));
+  CHECK(line.output_capacity <= 9); /* 4 * cap + NUL */
+  CHECK(async_line_finish(s, &line));
+  CHECK(s->count == 1);
+  CHECK(strcmp(cands_at(s, 0), "\xe4\xbd\xa0\xe5\xa5\xbd") == 0);
+
+  /* An ordinary over-limit record is excluded without growing the retained
+     buffer, including when its newline has not arrived yet. */
+  for (size_t i = 0; i < 2000000; i++)
+    CHECK(async_line_feed_byte(s, &line, 'z'));
+  CHECK(line.over_limit);
+  CHECK(line.output_capacity <= 9);
+  CHECK(async_line_finish(s, &line));
+  CHECK(s->count == 1);
+
+  /* NUL remains fatal even after the positive-cap decision is irreversible. */
+  for (size_t i = 0; i < 10000; i++)
+    CHECK(async_line_feed_byte(s, &line, 'q'));
+  CHECK(!async_line_feed_byte(s, &line, 0));
+  uint64_t error = atomic_load_explicit(
+      &s->producer_error, memory_order_acquire);
+  CHECK(async_unpack_producer_error_kind(error) ==
+        AsyncProducerErrorInvalidData);
+
+  free(line.output);
+  free_async_session(s);
+}
+
+static void test_async_line_decoder_truncates_without_splitting_utf8(void) {
+  AsyncSession *s = make_async_session(NULL, 0);
+  CHECK(s != NULL);
+  if (!s) return;
+  s->max_line_length = -2;
+  AsyncLineDecoder line = {0};
+  static const unsigned char input[] = {
+      0xe4, 0xbd, 0xa0, 0xe5, 0xa5, 0xbd, 0xe5, 0x90, 0x97,
+  };
+  CHECK(async_line_feed_bytes(s, &line, (const char *)input, 1));
+  CHECK(async_line_feed_bytes(s, &line, (const char *)input + 1, 4));
+  CHECK(async_line_feed_bytes(
+      s, &line, (const char *)input + 5, sizeof input - 5));
+  CHECK(line.output_capacity <= 9);
+  CHECK(async_line_finish(s, &line));
+  CHECK(s->count == 1);
+  CHECK(strcmp(cands_at(s, 0), "\xe4\xbd\xa0\xe5\xa5\xbd") == 0);
+  free(line.output);
+  free_async_session(s);
+}
+
 /* =====================================================================
  * Chunked candidate storage — index split formula and accessor
  * ===================================================================== */
@@ -1687,6 +1850,16 @@ static void test_byte_prefix_operator_source_safety(void) {
   CHECK(subsumes("'foo$", "'foo$bar") == false);
   CHECK(subsumes("'foo", "'foo | bar") == false);
   CHECK(subsumes("foo bar", "foo bar baz") == false);
+}
+
+static void test_byte_prefix_rejects_invalid_utf8_transition(void) {
+  /* E2 84 is an incomplete prefix of U+212A KELVIN SIGN.  Once complete,
+     case-ignore folds the codepoint to ASCII k, so the raw byte prefix is not
+     a semantic refinement proof.  The same rule applies after a quote. */
+  CHECK(subsumes("\xE2\x84", "\xE2\x84\xAA") == false);
+  CHECK(subsumes("'\xE2\x84", "'\xE2\x84\xAA") == false);
+  CHECK(subsumes("\xE2\x84\xAA", "\xE2\x84\xAA-x") == true);
+  CHECK(subsumes("'\xE2\x84\xAA", "'\xE2\x84\xAA-x") == true);
 }
 
 static void test_subsumes_pattern_adding_term_at_end(void) {
@@ -3265,6 +3438,9 @@ int main(void) {
   RUN(test_async_reader_long_line);
   RUN(test_async_reader_final_unterminated_line);
   RUN(test_async_reader_rejects_embedded_nul);
+  RUN(test_async_line_decoder_matches_one_shot_reference);
+  RUN(test_async_line_decoder_bounds_overlong_records);
+  RUN(test_async_line_decoder_truncates_without_splitting_utf8);
 
   printf("--- chunked cands_top ---\n");
   RUN(test_cands_top_index_split);
@@ -3291,6 +3467,7 @@ int main(void) {
   printf("--- cache (phase 2: term-set subsumption) ---\n");
   RUN(test_subsumes_pattern_extending_term_via_byte_prefix);
   RUN(test_byte_prefix_operator_source_safety);
+  RUN(test_byte_prefix_rejects_invalid_utf8_transition);
   RUN(test_subsumes_pattern_adding_term_at_end);
   RUN(test_subsumes_pattern_adding_term_at_start);
   RUN(test_subsumes_pattern_term_reorder);

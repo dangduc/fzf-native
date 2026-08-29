@@ -287,6 +287,19 @@ static bool reject_embedded_nul(emacs_env *env, struct Str value,
   return true;
 }
 
+static bool bytes_are_valid_utf8(const char *bytes, size_t length) {
+  size_t offset = 0;
+  while (offset < length) {
+    utf8proc_int32_t codepoint = 0;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)bytes + offset,
+        (utf8proc_ssize_t)(length - offset), &codepoint);
+    if (width <= 0) return false;
+    offset += (size_t)width;
+  }
+  return true;
+}
+
 /* Count Emacs-style characters (Unicode codepoints) in UTF-8 data.  Invalid
    bytes count as one character each so byte-junk inputs always make progress
    and retain the module's existing best-effort behavior. */
@@ -1666,7 +1679,11 @@ static void arena_free(Arena *a) {
   a->head = NULL;
 }
 
-/* Strip ANSI CSI escape sequences (ESC [ ... m) in-place. */
+/* Strip ANSI CSI escape sequences (ESC [ ... m) in-place.  Production input
+   is decoded incrementally by AsyncLineDecoder below.  Keep this compact
+   one-shot implementation as an independent oracle for the C and session
+   fuzz tests. */
+#ifdef FZF_NATIVE_CTEST
 static size_t async_strip_ansi(char *s, size_t len) {
   size_t r = 0, w = 0;
   while (r < len) {
@@ -1681,6 +1698,7 @@ static size_t async_strip_ansi(char *s, size_t len) {
   s[w] = '\0';
   return w;
 }
+#endif
 
 typedef struct { char *str; int score; uint32_t idx; } ScoredStr;
 
@@ -1913,13 +1931,20 @@ static bool subsumes(const char *q_prime, const char *q) {
   if (strchr(q_prime, '|') || strchr(q, '|')) return false;
   size_t lp = strlen(q_prime);
   if (lp == 0) return true;
+  size_t lq = strlen(q);
+  /* A byte prefix is a semantic prefix only while both byte strings keep
+     the same valid UTF-8 decoding.  An incomplete source sequence can become
+     a valid codepoint when extended; case folding can then change its bytes
+     and broaden the apparent refinement (for example E2 84 -> Kelvin sign). */
+  if (!bytes_are_valid_utf8(q_prime, lp) ||
+      !bytes_are_valid_utf8(q, lq))
+    return false;
   const char *source_term = q_prime;
   if (*source_term == '\'') {
     source_term++;
     if (*source_term == '\0') return false;
   }
   if (strpbrk(source_term, " \t\r\n!'^$\\")) return false;
-  size_t lq = strlen(q);
   if (lq < lp) return false;
   return memcmp(q, q_prime, lp) == 0;
 }
@@ -3203,66 +3228,386 @@ static bool async_append_candidate(AsyncSession *s, const char *line,
   return true;
 }
 
-static bool async_extend_line(AsyncSession *s, char **line, size_t *used,
-                              size_t *capacity, const char *bytes,
-                              size_t amount) {
-  if (amount > SIZE_MAX - *used - 1) {
+enum AsyncAnsiState {
+  AsyncAnsiNormal,
+  AsyncAnsiEscape,
+  AsyncAnsiCsi,
+};
+
+/* Incremental normalizer for one producer record.  A configured character
+   cap must also be a memory bound: a minified or ANSI-heavy record cannot be
+   allowed to accumulate in Emacs merely because its newline has not arrived.
+
+   The state machine deliberately preserves the old one-shot ordering and its
+   edge cases:
+
+     1. reject NUL anywhere in the raw record;
+     2. remove all raw trailing CR bytes;
+     3. strip ESC [ ... m spans, including an unterminated span at EOL;
+     4. count invalid UTF-8 bytes as individual characters.
+
+   With MAX_LINE_LENGTH nonzero, OUTPUT retains at most |N| UTF-8 characters
+   (four bytes per character), while the reader continues to drain the record
+   so a NUL hidden beyond the display prefix is still an error.  Positive caps
+   exclude after the first excess character; negative caps discard the excess
+   but publish the retained prefix.  A nil/zero cap intentionally preserves
+   the documented unbounded-line behavior. */
+typedef struct {
+  char               *output;
+  size_t              output_len;
+  size_t              output_capacity;
+  size_t              pending_crs;
+  unsigned char       utf8[4];
+  size_t              utf8_used;
+  unsigned            utf8_expected;
+  size_t              char_count;
+  enum AsyncAnsiState ansi_state;
+  bool                over_limit;
+  bool                saw_bytes;
+} AsyncLineDecoder;
+
+static size_t async_line_limit(ptrdiff_t configured) {
+  return configured > 0
+             ? (size_t)configured
+             : (size_t)(-(configured + 1)) + 1;
+}
+
+static size_t async_line_output_ceiling(AsyncSession *s) {
+  if (s->max_line_length == 0) return SIZE_MAX;
+  size_t cap = async_line_limit(s->max_line_length);
+  return cap <= (SIZE_MAX - 1) / 4 ? cap * 4 + 1 : SIZE_MAX;
+}
+
+static bool async_line_reserve(AsyncSession *s, AsyncLineDecoder *line,
+                               size_t amount) {
+  if (amount > SIZE_MAX - line->output_len - 1) {
     async_record_producer_failure(
         s, AsyncProducerErrorAllocation, ENOMEM);
     return false;
   }
-  size_t needed = *used + amount + 1;
-  if (needed > *capacity) {
-    size_t next = *capacity ? *capacity : 4096;
-    while (next < needed) {
-      if (next > SIZE_MAX / 2) {
-        next = needed;
+  size_t needed = line->output_len + amount + 1;
+  if (needed <= line->output_capacity) return true;
+
+  size_t ceiling = async_line_output_ceiling(s);
+  size_t next = line->output_capacity ? line->output_capacity : 64;
+  while (next < needed) {
+    if (next > SIZE_MAX / 2) {
+      next = needed;
+      break;
+    }
+    next *= 2;
+  }
+  if (next > ceiling) next = ceiling;
+  if (next < needed) {
+    async_record_producer_failure(
+        s, AsyncProducerErrorAllocation, ENOMEM);
+    return false;
+  }
+  char *grown = realloc(line->output, next);
+  if (!grown) {
+    async_record_producer_failure(
+        s, AsyncProducerErrorAllocation, ENOMEM);
+    return false;
+  }
+  line->output = grown;
+  line->output_capacity = next;
+  return true;
+}
+
+static bool async_line_append_output(AsyncSession *s, AsyncLineDecoder *line,
+                                     const unsigned char *bytes,
+                                     size_t amount) {
+  if (!async_line_reserve(s, line, amount)) return false;
+  if (amount) memcpy(line->output + line->output_len, bytes, amount);
+  line->output_len += amount;
+  line->output[line->output_len] = '\0';
+  return true;
+}
+
+static bool async_line_commit_character(AsyncSession *s,
+                                        AsyncLineDecoder *line,
+                                        const unsigned char *bytes,
+                                        size_t width) {
+  ptrdiff_t configured = s->max_line_length;
+  if (configured != 0) {
+    size_t cap = async_line_limit(configured);
+    if (line->char_count >= cap) {
+      if (configured > 0) line->over_limit = true;
+      return true;
+    }
+    line->char_count++;
+  }
+  return async_line_append_output(s, line, bytes, width);
+}
+
+static unsigned async_utf8_expected_width(unsigned char byte) {
+  if (byte >= 0xc2 && byte <= 0xdf) return 2;
+  if (byte >= 0xe0 && byte <= 0xef) return 3;
+  if (byte >= 0xf0 && byte <= 0xf4) return 4;
+  return 1;
+}
+
+static bool async_line_emit_visible_byte(AsyncSession *s,
+                                         AsyncLineDecoder *line,
+                                         unsigned char byte) {
+  if (s->max_line_length == 0)
+    return async_line_append_output(s, line, &byte, 1);
+
+  size_t cap = async_line_limit(s->max_line_length);
+  if ((s->max_line_length > 0 && line->over_limit) ||
+      (s->max_line_length < 0 && line->char_count >= cap &&
+       line->utf8_used == 0))
+    return true;
+
+  line->utf8[line->utf8_used++] = byte;
+  if (line->utf8_used == 1)
+    line->utf8_expected = async_utf8_expected_width(byte);
+  if (line->utf8_used < line->utf8_expected) return true;
+
+  utf8proc_int32_t codepoint;
+  utf8proc_ssize_t width = utf8proc_iterate(
+      line->utf8, (utf8proc_ssize_t)line->utf8_used, &codepoint);
+  size_t consumed = width > 0 ? (size_t)width : 1;
+  unsigned char remainder[3];
+  size_t remainder_len = line->utf8_used - consumed;
+  if (remainder_len)
+    memcpy(remainder, line->utf8 + consumed, remainder_len);
+
+  bool ok = async_line_commit_character(s, line, line->utf8, consumed);
+  line->utf8_used = 0;
+  line->utf8_expected = 0;
+  for (size_t i = 0; ok && i < remainder_len; i++)
+    ok = async_line_emit_visible_byte(s, line, remainder[i]);
+  return ok;
+}
+
+static bool async_line_emit_ansi_byte(AsyncSession *s,
+                                      AsyncLineDecoder *line,
+                                      unsigned char byte) {
+  if (line->ansi_state == AsyncAnsiCsi) {
+    if (byte == 'm') line->ansi_state = AsyncAnsiNormal;
+    return true;
+  }
+  if (line->ansi_state == AsyncAnsiEscape) {
+    if (byte == '[') {
+      line->ansi_state = AsyncAnsiCsi;
+      return true;
+    }
+    line->ansi_state = AsyncAnsiNormal;
+    if (!async_line_emit_visible_byte(s, line, 0x1b)) return false;
+  }
+  if (byte == 0x1b) {
+    line->ansi_state = AsyncAnsiEscape;
+    return true;
+  }
+  return async_line_emit_visible_byte(s, line, byte);
+}
+
+static bool async_line_flush_crs(AsyncSession *s, AsyncLineDecoder *line) {
+  while (line->pending_crs) {
+    /* Once the retained prefix is final, ordinary CR bytes can no longer
+       affect UTF-8 or ANSI state.  Avoid a second byte-at-a-time pass over a
+       huge CR run before the next non-CR byte. */
+    if (line->ansi_state == AsyncAnsiCsi) {
+      line->pending_crs = 0;
+      break;
+    }
+    if (line->ansi_state == AsyncAnsiNormal && line->utf8_used == 0 &&
+        s->max_line_length != 0) {
+      size_t cap = async_line_limit(s->max_line_length);
+      if (s->max_line_length > 0 && line->char_count >= cap) {
+        line->over_limit = true;
+        line->pending_crs = 0;
         break;
       }
-      next *= 2;
+      if (s->max_line_length < 0 && line->char_count >= cap) {
+        line->pending_crs = 0;
+        break;
+      }
     }
-    char *grown = realloc(*line, next);
-    if (!grown) {
+    line->pending_crs--;
+    if (!async_line_emit_ansi_byte(s, line, '\r')) return false;
+  }
+  return true;
+}
+
+static bool async_line_feed_byte(AsyncSession *s, AsyncLineDecoder *line,
+                                 unsigned char byte) {
+  /* Every matcher and snapshot consumer currently uses NUL-terminated
+     candidate strings.  Check even discarded ANSI/over-limit bytes so a
+     producer can never publish a silently shortened candidate. */
+  if (byte == '\0') {
+    async_record_producer_failure(s, AsyncProducerErrorInvalidData, 0);
+    return false;
+  }
+  line->saw_bytes = true;
+  if (byte == '\r') {
+    if (line->pending_crs == SIZE_MAX) {
       async_record_producer_failure(
           s, AsyncProducerErrorAllocation, ENOMEM);
       return false;
     }
-    *line = grown;
-    *capacity = next;
+    line->pending_crs++;
+    return true;
   }
-  if (amount) memcpy(*line + *used, bytes, amount);
-  *used += amount;
-  (*line)[*used] = '\0';
+  if (!async_line_flush_crs(s, line)) return false;
+  return async_line_emit_ansi_byte(s, line, byte);
+}
+
+static bool async_line_emit_visible_run(AsyncSession *s,
+                                        AsyncLineDecoder *line,
+                                        const unsigned char *bytes,
+                                        size_t amount) {
+  if (amount == 0) return true;
+  line->saw_bytes = true;
+  if (s->max_line_length == 0)
+    return async_line_append_output(s, line, bytes, amount);
+
+  size_t cap = async_line_limit(s->max_line_length);
+  size_t offset = 0;
+
+  /* Complete at most one codepoint staged across an earlier read/ANSI span. */
+  while (offset < amount && line->utf8_used) {
+    if (!async_line_emit_visible_byte(s, line, bytes[offset++])) return false;
+  }
+  if ((s->max_line_length > 0 && line->over_limit) ||
+      (s->max_line_length < 0 && line->char_count >= cap))
+    return true;
+
+  size_t retained_start = offset;
+  size_t retained_end = offset;
+  while (offset < amount && line->char_count < cap) {
+    if (bytes[offset] < 0x80) {
+      size_t ascii_end = offset + 1;
+      while (ascii_end < amount && bytes[ascii_end] < 0x80) ascii_end++;
+      size_t available = cap - line->char_count;
+      size_t run = ascii_end - offset;
+      size_t take = run < available ? run : available;
+      offset += take;
+      line->char_count += take;
+      retained_end = offset;
+      if (take < run) break;
+      continue;
+    }
+
+    unsigned expected = async_utf8_expected_width(bytes[offset]);
+    if (expected > amount - offset) {
+      line->utf8_used = amount - offset;
+      line->utf8_expected = expected;
+      memcpy(line->utf8, bytes + offset, line->utf8_used);
+      offset = amount;
+      break;
+    }
+    utf8proc_int32_t codepoint;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        bytes + offset, (utf8proc_ssize_t)(amount - offset), &codepoint);
+    offset += width > 0 ? (size_t)width : 1;
+    line->char_count++;
+    retained_end = offset;
+  }
+
+  if (retained_end > retained_start &&
+      !async_line_append_output(s, line, bytes + retained_start,
+                                retained_end - retained_start))
+    return false;
+  if (s->max_line_length > 0 && offset < amount)
+    line->over_limit = true;
   return true;
 }
 
-static bool async_process_candidate_line(AsyncSession *s, char *line,
-                                         size_t len) {
-  /* Every matcher and snapshot consumer currently uses NUL-terminated
-     candidate strings.  Reject an embedded NUL at the reader boundary so a
-     producer can never publish a silently shortened candidate. */
-  if (len && memchr(line, '\0', len) != NULL) {
-    async_record_producer_failure(s, AsyncProducerErrorInvalidData, 0);
-    return false;
-  }
-
-  while (len && line[len - 1] == '\r') line[--len] = '\0';
-  len = async_strip_ansi(line, len);
-
-  ptrdiff_t mll = s->max_line_length;
-  if (mll != 0) {
-    size_t cap = mll > 0
-                     ? (size_t)mll
-                     : (size_t)(-(mll + 1)) + 1;
-    size_t char_len = utf8_character_count(line, len);
-    if (char_len > cap) {
-      if (mll > 0) return true;   /* exclude */
-      len = utf8_prefix_byte_length(line, len, cap); /* truncate */
-      line[len] = '\0';
+/* Feed one newline-free raw segment.  Ordinary candidate sources are mostly
+   ASCII, so avoid a function call and utf8proc_iterate per byte on that hot
+   path.  Non-ASCII, ANSI, CR, and NUL bytes still take the exact state-machine
+   path above. */
+static bool async_line_feed_bytes(AsyncSession *s, AsyncLineDecoder *line,
+                                  const char *bytes, size_t amount) {
+  size_t offset = 0;
+  while (offset < amount) {
+    if (line->ansi_state == AsyncAnsiCsi) {
+      size_t start = offset;
+      while (offset < amount && bytes[offset] != 'm' &&
+             bytes[offset] != '\0')
+        offset++;
+      if (offset > start) line->saw_bytes = true;
+      if (offset == amount) return true;
+      if (!async_line_feed_byte(
+              s, line, (unsigned char)bytes[offset++]))
+        return false;
+      continue;
     }
-  }
 
-  return async_append_candidate(s, line, len);
+    if (line->ansi_state == AsyncAnsiNormal && line->pending_crs == 0) {
+      size_t start = offset;
+      while (offset < amount) {
+        unsigned char byte = (unsigned char)bytes[offset];
+        if (byte == '\0' || byte == '\r' || byte == 0x1b)
+          break;
+        offset++;
+      }
+      if (offset > start &&
+          !async_line_emit_visible_run(
+              s, line, (const unsigned char *)bytes + start,
+              offset - start))
+        return false;
+      if (offset == amount) return true;
+    }
+
+    if (!async_line_feed_byte(
+            s, line, (unsigned char)bytes[offset++]))
+      return false;
+  }
+  return true;
+}
+
+static bool async_line_finish_utf8(AsyncSession *s,
+                                   AsyncLineDecoder *line) {
+  while (line->utf8_used) {
+    utf8proc_int32_t codepoint;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        line->utf8, (utf8proc_ssize_t)line->utf8_used, &codepoint);
+    size_t consumed = width > 0 ? (size_t)width : 1;
+    if (!async_line_commit_character(s, line, line->utf8, consumed))
+      return false;
+    line->utf8_used -= consumed;
+    if (line->utf8_used)
+      memmove(line->utf8, line->utf8 + consumed, line->utf8_used);
+  }
+  line->utf8_expected = 0;
+  return true;
+}
+
+static void async_line_reset(AsyncLineDecoder *line) {
+  line->output_len = 0;
+  line->pending_crs = 0;
+  line->utf8_used = 0;
+  line->utf8_expected = 0;
+  line->char_count = 0;
+  line->ansi_state = AsyncAnsiNormal;
+  line->over_limit = false;
+  line->saw_bytes = false;
+  if (line->output) line->output[0] = '\0';
+}
+
+static bool async_line_finish(AsyncSession *s, AsyncLineDecoder *line) {
+  /* Dropping the deferred run here is exactly the old pre-ANSI trailing-CR
+     trim.  A lone ESC remains visible; an incomplete ESC [ span vanishes. */
+  line->pending_crs = 0;
+  if (line->ansi_state == AsyncAnsiEscape &&
+      !async_line_emit_visible_byte(s, line, 0x1b))
+    return false;
+  line->ansi_state = AsyncAnsiNormal;
+  if (s->max_line_length != 0 && !async_line_finish_utf8(s, line))
+    return false;
+
+  bool publish = !(s->max_line_length > 0 && line->over_limit);
+  bool ok = true;
+  if (publish) {
+    if (!async_line_reserve(s, line, 0)) return false;
+    line->output[line->output_len] = '\0';
+    ok = async_append_candidate(s, line->output, line->output_len);
+  }
+  async_line_reset(line);
+  return ok;
 }
 
 static void *async_reader(void *arg) {
@@ -3272,12 +3617,10 @@ static void *async_reader(void *arg) {
 
   /* Use fd-level poll/read instead of getline.  getline can block forever on
      an unterminated line held open by a descendant outside the producer's
-     process group.  The cancellation pipe gives teardown an owned wakeup;
-     raw reads retain getline's unbounded-line and final-unterminated-line
-     semantics without ever blocking while a partial line is buffered. */
-  char *line = NULL;
-  size_t used = 0;
-  size_t capacity = 0;
+     process group.  The cancellation pipe gives teardown an owned wakeup.
+     AsyncLineDecoder retains whole-line semantics while a configured
+     character cap also bounds the partial-record buffer. */
+  AsyncLineDecoder line = {0};
   bool eof = false;
   bool read_failed = false;
   int output_fd = s->fp ? fileno(s->fp) : -1;
@@ -3342,33 +3685,31 @@ static void *async_reader(void *arg) {
       break;
     }
 
-    size_t segment = 0;
     bool keep_reading = true;
-    for (size_t i = 0; i < (size_t)amount; i++) {
-      if (chunk[i] != '\n') continue;
-      if (!async_extend_line(
-              s, &line, &used, &capacity, chunk + segment, i - segment) ||
-          !async_process_candidate_line(s, line, used)) {
+    size_t segment = 0;
+    while (segment < (size_t)amount) {
+      const char *newline = memchr(
+          chunk + segment, '\n', (size_t)amount - segment);
+      size_t end = newline ? (size_t)(newline - chunk) : (size_t)amount;
+      if (!async_line_feed_bytes(
+              s, &line, chunk + segment, end - segment) ||
+          (newline && !async_line_finish(s, &line))) {
         keep_reading = false;
         break;
       }
-      used = 0;
-      line[0] = '\0';
-      segment = i + 1;
+      if (!newline) break;
+      segment = end + 1;
     }
     if (!keep_reading) break;
-    if (!async_extend_line(s, &line, &used, &capacity, chunk + segment,
-                           (size_t)amount - segment))
-      break;
   }
 
   /* Match getline on ordinary EOF, but never publish a partial line after a
      cancellation request. */
-  if (eof && used &&
+  if (eof && line.saw_bytes &&
       !atomic_load_explicit(&s->stop, memory_order_acquire))
-    (void)async_process_candidate_line(s, line, used);
+    (void)async_line_finish(s, &line);
 
-  free(line);
+  free(line.output);
   bool stopping = atomic_load_explicit(&s->stop, memory_order_acquire);
   if (s->pid > 0 && async_claim_child(s, AsyncChildReader)) {
     uint64_t producer_error = atomic_load_explicit(
@@ -5955,19 +6296,6 @@ static ScoredStr *async_copy_public_result(
   return copy;
 }
 
-static bool async_bytes_are_valid_utf8(const char *bytes, size_t length) {
-  size_t offset = 0;
-  while (offset < length) {
-    utf8proc_int32_t codepoint = 0;
-    utf8proc_ssize_t width = utf8proc_iterate(
-        (const utf8proc_uint8_t *)bytes + offset,
-        (utf8proc_ssize_t)(length - offset), &codepoint);
-    if (width <= 0) return false;
-    offset += (size_t)width;
-  }
-  return true;
-}
-
 /* Prefer an ordinary multibyte Lisp string for valid UTF-8, but retain an
    exact unibyte representation when a producer row or query contains raw
    bytes.  Decide from the bytes before calling Emacs: make_string can also
@@ -5982,7 +6310,7 @@ static emacs_value async_make_lisp_string_lossless(
     async_signal_error(env, "fzf-native: string exceeds Emacs size limit");
     return Qnil;
   }
-  return async_bytes_are_valid_utf8(bytes, length)
+  return bytes_are_valid_utf8(bytes, length)
              ? env->make_string(env, bytes, (ptrdiff_t)length)
              : env->make_unibyte_string(env, bytes, (ptrdiff_t)length);
 }

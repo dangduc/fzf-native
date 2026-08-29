@@ -1359,6 +1359,62 @@ round actually took the refinement path."
                            (plist-get second :pool-generation)))))
           (fzf-native-async-stop handle))))))
 
+(ert-deftest fzf-native-async-cache-invalid-utf8-prefix-rescans-test ()
+  "An incomplete UTF-8 query cannot constrain its completed codepoint.
+
+E2 84 is a byte prefix of U+212A KELVIN SIGN.  In case-ignore mode, the
+completed codepoint folds to ASCII k.  Therefore, caching the invalid prefix's
+empty match set must not make the valid query miss candidate k.  Exercise both
+plain fuzzy syntax and the leading-quote exact syntax."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (dolist (quoted '(nil t))
+    (let* ((fzf-native-case-mode 'ignore)
+           (fzf-native-fuzzy t)
+           (fzf-native-async-cache-size 40)
+           (fzf-native-async-cache-bytes (* 1024 1024))
+           (fzf-native-async-batch-cache-bytes 0)
+           (fzf-native-async-highlight nil)
+           (fzf-native-batch-highlight nil)
+           (invalid-prefix
+            (apply #'unibyte-string
+                   (if quoted '(39 #xe2 #x84) '(#xe2 #x84))))
+           (kelvin-query
+            (apply #'unibyte-string
+                   (if quoted '(39 #xe2 #x84 #xaa)
+                     '(#xe2 #x84 #xaa))))
+           (expected
+            (mapcar #'substring-no-properties
+                    (append (fzf-native-score-all '("k") kelvin-query)
+                            nil)))
+           (handle (fzf-native-async-start "printf 'k\\n'")))
+      (unwind-protect
+          (progn
+            (let ((producer (fzf-native-test--wait-for-producer handle)))
+              (should (plist-get producer :reader-done))
+              (should (= (plist-get producer :pool-generation) 1)))
+            (should (equal expected '("k")))
+            (let* ((first-id
+                    (fzf-native-async-submit handle invalid-prefix 10))
+                   (first
+                    (fzf-native-test--wait-for-request handle first-id))
+                   (second-id
+                    (fzf-native-async-submit handle kelvin-query 10))
+                   (second
+                    (fzf-native-test--wait-for-request handle second-id)))
+              (should (eq (plist-get first :state) 'complete))
+              (should-not (plist-get first :stale))
+              (should-not (plist-get first :candidates))
+              (should (eq (plist-get second :state) 'complete))
+              (should-not (plist-get second :stale))
+              (should
+               (equal (mapcar #'substring-no-properties
+                              (plist-get second :candidates))
+                      expected))
+              (should (= (plist-get second :filtered) 1))
+              (should (= (plist-get second :progress-total)
+                         (plist-get second :pool-generation)))))
+        (fzf-native-async-stop handle)))))
+
 (ert-deftest fzf-native-async-stable-batch-cache-narrowing-test ()
   "A narrower request consumes whole-result membership before batch evidence."
   (skip-unless (fboundp 'fzf-native-async-submit))
@@ -1730,6 +1786,51 @@ sys.stdout.buffer.write(b\"\\xe4\\xbd\\xa0\\xe9x\\n\")
           (should (fzf-native-test--wait-for-data handle))
           (should (fzf-native-test--wait-for-fresh handle ""))
           (should (equal (fzf-native-async-candidates handle "") '("你好"))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-line-cap-streams-ansi-heavy-record-test ()
+  "A character cap bounds raw ANSI-heavy records without changing output."
+  (skip-unless (and (fboundp 'fzf-native-async-start)
+                    (executable-find "python3")))
+  (let* ((fzf-native-max-line-length 2)
+         (fzf-native-async-highlight nil)
+         (handle
+          (fzf-native-async-start
+           (concat
+            "python3 -u -c 'import sys;w=sys.stdout.buffer.write;"
+            "w(b\"\\x1b[\"+b\"x\"*1000000+b\"m\"+"
+            "\"你好\".encode()+b\"\\r\\r\\n\");"
+            "w(\"你好吗\\n\".encode())'"))))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle 10.0)
+                             :reader-done))
+          (let* ((request-id (fzf-native-async-submit handle "" 10))
+                 (snapshot
+                  (fzf-native-test--wait-for-request handle request-id 10.0)))
+            (should (eq (plist-get snapshot :state) 'complete))
+            (should (equal (mapcar #'substring-no-properties
+                                   (plist-get snapshot :candidates))
+                           '("你好")))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test ()
+  "Truncation must not hide a NUL later in a large producer record."
+  (skip-unless (and (fboundp 'fzf-native-async-start)
+                    (executable-find "python3")))
+  (let* ((fzf-native-max-line-length -1)
+         (handle
+          (fzf-native-async-start
+           (concat
+            "python3 -u -c 'import sys;sys.stdout.buffer.write("
+            "b\"a\"+b\"x\"*1000000+b\"\\0\\n\")'"))))
+    (unwind-protect
+        (let ((status (fzf-native-test--wait-for-producer handle 10.0)))
+          (should (plist-get status :reader-done))
+          (should (eq (plist-get status :producer-state) 'failed))
+          (should (equal (plist-get status :producer-error)
+                         "producer output contains a NUL byte"))
+          (should (= (plist-get status :pool-generation) 0)))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-filter-only-length-counts-characters-test ()
