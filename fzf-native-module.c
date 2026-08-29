@@ -7399,225 +7399,15 @@ int emacs_module_init(struct emacs_runtime *rt) {
 #endif
 
   static struct Data data;
+#define FZF_INIT_CHECK_EXIT()                                                \
+  do {                                                                       \
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)         \
+      return 3;                                                              \
+  } while (0)
 
-  // fzf-native-score-all COLLECTION QUERY &optional SLAB
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-score-all"),
-      env->make_function(env, 2, 3, fzf_native_score_all,
-                         "Score COLLECTION matching QUERY.\n"
-                         "\n"
-                         "\\(fn COLLECTION QUERY &optional SLAB)",
-                         &data),
-    });
-
-  // fzf-native-highlight-all COLLECTION QUERY
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-highlight-all"),
-      env->make_function(env, 2, 2, fzf_native_highlight_all,
-                         "Apply fzf match highlights to COLLECTION against QUERY.\n"
-                         "Mutates each candidate string's text properties in place;\n"
-                         "stale `completions-common-part' face from a prior query is\n"
-                         "stripped before new positions are applied.  No scoring or\n"
-                         "sorting is performed.\n"
-                         "\n"
-                         "\\(fn COLLECTION QUERY)",
-                         &data),
-    });
-
-  // fzf-native-highlight-one CAND QUERY
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-highlight-one"),
-      env->make_function(env, 2, 2, fzf_native_highlight_one,
-                         "Return a copy of CAND with fzf match face applied for QUERY.\n"
-                         "Per-candidate counterpart to `fzf-native-highlight-all'.\n"
-                         "Intended for `completion-lazy-hilit-fn' callers.\n"
-                         "\n"
-                         "Empty QUERY returns a face-stripped copy.  No-match returns\n"
-                         "an unfaced copy.  Caller's original CAND is never mutated.\n"
-                         "Ignores `fzf-native-batch-highlight' (the cap is meaningless\n"
-                         "for a single candidate).  Honors `fzf-native-highlight-fn'.\n"
-                         "\n"
-                         "\\(fn CAND QUERY)",
-                         &data),
-    });
-
-  // fzf-native-score STR QUERY &optional SLAB
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-score"),
-      env->make_function(env, 2, 3, fzf_native_score,
-                         "Score STR matching QUERY.\n"
-                         "\n"
-                         "\\(fn STR QUERY &optional SLAB)",
-                         &data),
-    });
-
-  env->funcall(env, env->intern(env, "provide"), 1,
-               (emacs_value[]) { env->intern(env, "fzf-native-module") });
-
-#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-session-abi-version"),
-      env->make_function(env, 0, 0, fzf_native_session_abi_version,
-                         "Return the interactive-session ABI version.\n\n"
-                         "\\(fn)", NULL),
-    });
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-async-start"),
-      env->make_function(env, 1, 2, fzf_native_async_start,
-                         "Start async shell COMMAND; return a session handle.\n"
-                         "Optional DIR sets the working directory (default: Emacs cwd).\n\n"
-                         "Each stdout line is one candidate.  A line with a NUL byte\n"
-                         "fails the producer session.\n\n"
-                         "\\(fn COMMAND &optional DIR)", NULL),
-    });
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-async-stop"),
-      env->make_function(env, 1, 1, fzf_native_async_stop,
-                         "Stop async session HANDLE and free resources.\n\n"
-                         "\\(fn HANDLE)", NULL),
-    });
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-async-generation"),
-      env->make_function(env, 1, 1, fzf_native_async_generation,
-                         "Return candidate-count generation for HANDLE.\n\n"
-                         "\\(fn HANDLE)", NULL),
-    });
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-async-submit"),
-      env->make_function(env, 2, 3, fzf_native_async_submit,
-                         "Submit QUERY to async HANDLE and return its request ID.\n"
-                         "Optional LIMIT caps the completed result.  Identical queued or\n"
-                         "running work reuses its existing request ID.  This call never\n"
-                         "waits for scoring and does not build an Emacs candidate list.\n"
-                         "Signals instead of returning nil on failure: `error' if HANDLE\n"
-                         "is stopped, `wrong-type-argument' if QUERY is not an encodable\n"
-                         "string or LIMIT is not a natural number.\n\n"
-                         "\\(fn HANDLE QUERY &optional LIMIT)", NULL),
-    });
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-async-snapshot"),
-      env->make_function(env, 1, 2, fzf_native_async_snapshot,
-                         "Return a request-aware result plist for async HANDLE.\n"
-                         "Optional REQUEST-ID selects the request to inspect; nil or 0\n"
-                         "means the latest submitted request.  The plist retains the last\n"
-                         "completed candidates while newer work is queued or running.\n"
-                         "nil if HANDLE is stopped.\n"
-                         "\n"
-                         "About the inspected request:\n"
-                         "  :request-id  the id this plist answers about\n"
-                         "  :state       one of the symbols idle, queued, running,\n"
-                         "               complete, failed, superseded, unknown\n"
-                         "  :stale       t unless the retained result belongs to this\n"
-                         "               request AND covers the current pool.  Finality is\n"
-                         "               (and (eq :state 'complete) (not :stale)).\n"
-                         "  :progress-completed :progress-total  scoring progress\n"
-                         "\n"
-                         "About the retained (last published) result:\n"
-                         "  :candidates  matched strings, best first (snapshot only)\n"
-                         "  :filtered :total  match count / pool size for a counts overlay\n"
-                         "  :result-request-id :result-pool-generation  which request\n"
-                         "               produced it, at what pool boundary\n"
-                         "  :query :limit :case-mode :fuzzy :filter-only  the options it\n"
-                         "               was computed with.  These describe the retained\n"
-                         "               result, NOT necessarily REQUEST-ID's options;\n"
-                         "               when :stale, they belong to another request.\n"
-                         "  :error :failed-request-id  scoring error, if any\n"
-                         "\n"
-                         "About the session:\n"
-                         "  :latest-request-id  most recently submitted id\n"
-                         "  :pool-generation    current candidate pool size\n"
-                         "  :snapshot-generation  bumps per result or producer terminal event\n"
-                         "  :reader-done        producer stream fully consumed\n"
-                         "  :producer-state :producer-exit-status :producer-error\n"
-                         "               check these before treating an empty final\n"
-                         "               result as \"no matches\" -- a failed producer\n"
-                         "               also completes with :error nil\n"
-                         "  :cache-entries :cache-bytes :cache-evictions\n"
-                         "               whole-result cache telemetry\n"
-                         "  :batch-cache-queries :batch-cache-entries\n"
-                         "  :batch-cache-bytes :batch-cache-hits\n"
-                         "  :batch-cache-misses :batch-cache-evictions  cache telemetry\n\n"
-                         "\\(fn HANDLE &optional REQUEST-ID)", NULL),
-    });
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-async-status"),
-      env->make_function(env, 1, 2, fzf_native_async_status,
-                         "Return request and producer status for async HANDLE.\n"
-                         "This is the metadata-only counterpart to\n"
-                         "`fzf-native-async-snapshot': the same plist minus\n"
-                         ":candidates, so polling never pays the candidate\n"
-                         "list build.  Optional REQUEST-ID selects the request\n"
-                         "to inspect; without it, inspect the latest one.\n\n"
-                         "\\(fn HANDLE &optional REQUEST-ID)", NULL),
-    });
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-async-candidates"),
-      env->make_function(env, 2, 3, fzf_native_async_candidates,
-                         "Return fzf-scored candidates from HANDLE matching FILTER.\n"
-                         "Optional LIMIT caps the number of candidates returned to Elisp;\n"
-                         "use `fzf-native-async-stats' to get the full filtered count.\n\n"
-                         "\\(fn HANDLE FILTER &optional LIMIT)", NULL),
-    });
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-async-stats"),
-      env->make_function(env, 1, 1, fzf_native_async_stats,
-                         "Return (FILTERED . TOTAL) counts from the last async-candidates call.\n\n"
-                         "\\(fn HANDLE)", NULL),
-    });
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-async-result-fresh-p"),
-      env->make_function(env, 2, 2, fzf_native_async_result_fresh_p,
-                         "Return non-nil when the result cache for QUERY is fresh on HANDLE.\n"
-                         "Fresh means scoring has completed for QUERY at the current pool\n"
-                         "size, so the most recent `fzf-native-async-candidates' return for\n"
-                         "QUERY is authoritative — a nil return in that state means zero\n"
-                         "matches, not in-flight.\n\n"
-                         "\\(fn HANDLE QUERY)", NULL),
-    });
-#endif
-
-  /* fzf-native-filter-only-p — single source of truth for the filter-only
-     decision.  Reads the filter-only defcustoms and applies the OR/AND
-     composition; Elisp callers (fussy etc.) use this to take consistent
-     paths without re-implementing the rule. */
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-filter-only-p"),
-      env->make_function(env, 2, 2, fzf_native_filter_only_p,
-                         "Return non-nil when filter-only mode would fire at QUERY-LENGTH and POOL-SIZE.\n"
-                         "\n"
-                         "Honors `fzf-native-filter-only-min-pool',\n"
-                         "`fzf-native-filter-only-length', and `fzf-native-filter-only-logic'.\n"
-                         "An arm whose defcustom is nil/0 is disabled.\n\n"
-                         "\\(fn QUERY-LENGTH POOL-SIZE)", NULL),
-    });
-
-  // fzf-native-make-default-slab
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-make-default-slab"),
-      env->make_function(env, 0, 0, fzf_native_make_default_slab,
-                         "Instantiate and return a default fzf slab.\n"
-                         "\n"
-                         "\\(fn)",
-                         &data),
-    });
-
-  env->funcall(env, env->intern(env, "provide"), 1,
-               (emacs_value[]) { env->intern(env, "fzf-native-make-default-slab") });
-
-  // fzf-native-make-slab
-  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
-      env->intern(env, "fzf-native-make-slab"),
-      env->make_function(env, 2, 2, fzf_native_make_slab,
-                         "Instantiate and return a fzf slab.\n"
-                         "\n"
-                         "\\(fn SIZE16 SIZE32)",
-                         &data),
-    });
-
-  env->funcall(env, env->intern(env, "provide"), 1,
-               (emacs_value[]) { env->intern(env, "fzf-native-make-slab") });
-
-  // Get a few common lisp functions.
+  /* Establish every shared Lisp root before publishing a callable module
+     function.  `defalias' is an ordinary Lisp call and can run advice, so a
+     callback can invoke an alias before `emacs_module_init' returns. */
   Qt = env->make_global_ref(env, env->intern(env, "t"));
   Qnil = env->make_global_ref(env, env->intern(env, "nil"));
   Fcons = env->make_global_ref(env, env->intern(env, "cons"));
@@ -7676,17 +7466,262 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qface = env->make_global_ref(env, env->intern(env, "face"));
   Qcompletions_common_part = env->make_global_ref(env, env->intern(env, "completions-common-part"));
   Fremove_text_properties = env->make_global_ref(env, env->intern(env, "remove-text-properties"));
-  /* Pre-built (face nil) plist passed to remove-text-properties to strip the
-     `face' property regardless of value.  Built once to avoid allocating a
-     fresh cons cell on every highlight call. */
-  Qface_nil_plist = env->make_global_ref(
-    env, env->funcall(env, Flist, 2, (emacs_value[]){Qface, Qnil}));
   Qutf_8 = env->make_global_ref(env, env->intern(env, "utf-8"));
-  Qlistofzero = env->make_global_ref(
-    env, env->funcall(env, Fcons, 2,
-                      (emacs_value[]){env->make_integer(env, 0), Qnil}));
   Qzero = env->make_global_ref(env, env->make_integer(env, 0));
   Qone = env->make_global_ref(env, env->make_integer(env, 1));
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+    return 3;
 
+  /* Build the two composite roots only after their callees exist. */
+  emacs_value face_nil = env->funcall(
+      env, Flist, 2, (emacs_value[]){Qface, Qnil});
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+    return 3;
+  Qface_nil_plist = env->make_global_ref(env, face_nil);
+  emacs_value list_of_zero = env->funcall(
+      env, Fcons, 2, (emacs_value[]){Qzero, Qnil});
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+    return 3;
+  Qlistofzero = env->make_global_ref(env, list_of_zero);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+    return 3;
+
+  // fzf-native-score-all COLLECTION QUERY &optional SLAB
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-score-all"),
+      env->make_function(env, 2, 3, fzf_native_score_all,
+                         "Score COLLECTION matching QUERY.\n"
+                         "\n"
+                         "\\(fn COLLECTION QUERY &optional SLAB)",
+                         &data),
+    });
+  FZF_INIT_CHECK_EXIT();
+
+  // fzf-native-highlight-all COLLECTION QUERY
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-highlight-all"),
+      env->make_function(env, 2, 2, fzf_native_highlight_all,
+                         "Apply fzf match highlights to COLLECTION against QUERY.\n"
+                         "Mutates each candidate string's text properties in place;\n"
+                         "stale `completions-common-part' face from a prior query is\n"
+                         "stripped before new positions are applied.  No scoring or\n"
+                         "sorting is performed.\n"
+                         "\n"
+                         "\\(fn COLLECTION QUERY)",
+                         &data),
+    });
+  FZF_INIT_CHECK_EXIT();
+
+  // fzf-native-highlight-one CAND QUERY
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-highlight-one"),
+      env->make_function(env, 2, 2, fzf_native_highlight_one,
+                         "Return a copy of CAND with fzf match face applied for QUERY.\n"
+                         "Per-candidate counterpart to `fzf-native-highlight-all'.\n"
+                         "Intended for `completion-lazy-hilit-fn' callers.\n"
+                         "\n"
+                         "Empty QUERY returns a face-stripped copy.  No-match returns\n"
+                         "an unfaced copy.  Caller's original CAND is never mutated.\n"
+                         "Ignores `fzf-native-batch-highlight' (the cap is meaningless\n"
+                         "for a single candidate).  Honors `fzf-native-highlight-fn'.\n"
+                         "\n"
+                         "\\(fn CAND QUERY)",
+                         &data),
+    });
+  FZF_INIT_CHECK_EXIT();
+
+  // fzf-native-score STR QUERY &optional SLAB
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-score"),
+      env->make_function(env, 2, 3, fzf_native_score,
+                         "Score STR matching QUERY.\n"
+                         "\n"
+                         "\\(fn STR QUERY &optional SLAB)",
+                         &data),
+    });
+  FZF_INIT_CHECK_EXIT();
+
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-session-abi-version"),
+      env->make_function(env, 0, 0, fzf_native_session_abi_version,
+                         "Return the interactive-session ABI version.\n\n"
+                         "\\(fn)", NULL),
+    });
+  FZF_INIT_CHECK_EXIT();
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-start"),
+      env->make_function(env, 1, 2, fzf_native_async_start,
+                         "Start async shell COMMAND; return a session handle.\n"
+                         "Optional DIR sets the working directory (default: Emacs cwd).\n\n"
+                         "Each stdout line is one candidate.  A line with a NUL byte\n"
+                         "fails the producer session.\n\n"
+                         "\\(fn COMMAND &optional DIR)", NULL),
+    });
+  FZF_INIT_CHECK_EXIT();
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-stop"),
+      env->make_function(env, 1, 1, fzf_native_async_stop,
+                         "Stop async session HANDLE and free resources.\n\n"
+                         "\\(fn HANDLE)", NULL),
+    });
+  FZF_INIT_CHECK_EXIT();
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-generation"),
+      env->make_function(env, 1, 1, fzf_native_async_generation,
+                         "Return candidate-count generation for HANDLE.\n\n"
+                         "\\(fn HANDLE)", NULL),
+    });
+  FZF_INIT_CHECK_EXIT();
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-submit"),
+      env->make_function(env, 2, 3, fzf_native_async_submit,
+                         "Submit QUERY to async HANDLE and return its request ID.\n"
+                         "Optional LIMIT caps the completed result.  Identical queued or\n"
+                         "running work reuses its existing request ID.  This call never\n"
+                         "waits for scoring and does not build an Emacs candidate list.\n"
+                         "Signals instead of returning nil on failure: `error' if HANDLE\n"
+                         "is stopped, `wrong-type-argument' if QUERY is not an encodable\n"
+                         "string or LIMIT is not a natural number.\n\n"
+                         "\\(fn HANDLE QUERY &optional LIMIT)", NULL),
+    });
+  FZF_INIT_CHECK_EXIT();
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-snapshot"),
+      env->make_function(env, 1, 2, fzf_native_async_snapshot,
+                         "Return a request-aware result plist for async HANDLE.\n"
+                         "Optional REQUEST-ID selects the request to inspect; nil or 0\n"
+                         "means the latest submitted request.  The plist retains the last\n"
+                         "completed candidates while newer work is queued or running.\n"
+                         "nil if HANDLE is stopped.\n"
+                         "\n"
+                         "About the inspected request:\n"
+                         "  :request-id  the id this plist answers about\n"
+                         "  :state       one of the symbols idle, queued, running,\n"
+                         "               complete, failed, superseded, unknown\n"
+                         "  :stale       t unless the retained result belongs to this\n"
+                         "               request AND covers the current pool.  Finality is\n"
+                         "               (and (eq :state 'complete) (not :stale)).\n"
+                         "  :progress-completed :progress-total  scoring progress\n"
+                         "\n"
+                         "About the retained (last published) result:\n"
+                         "  :candidates  matched strings, best first (snapshot only)\n"
+                         "  :filtered :total  match count / pool size for a counts overlay\n"
+                         "  :result-request-id :result-pool-generation  which request\n"
+                         "               produced it, at what pool boundary\n"
+                         "  :query :limit :case-mode :fuzzy :filter-only  the options it\n"
+                         "               was computed with.  These describe the retained\n"
+                         "               result, NOT necessarily REQUEST-ID's options;\n"
+                         "               when :stale, they belong to another request.\n"
+                         "  :error :failed-request-id  scoring error, if any\n"
+                         "\n"
+                         "About the session:\n"
+                         "  :latest-request-id  most recently submitted id\n"
+                         "  :pool-generation    current candidate pool size\n"
+                         "  :snapshot-generation  bumps per result or producer terminal event\n"
+                         "  :reader-done        producer stream fully consumed\n"
+                         "  :producer-state :producer-exit-status :producer-error\n"
+                         "               check these before treating an empty final\n"
+                         "               result as \"no matches\" -- a failed producer\n"
+                         "               also completes with :error nil\n"
+                         "  :cache-entries :cache-bytes :cache-evictions\n"
+                         "               whole-result cache telemetry\n"
+                         "  :batch-cache-queries :batch-cache-entries\n"
+                         "  :batch-cache-bytes :batch-cache-hits\n"
+                         "  :batch-cache-misses :batch-cache-evictions  cache telemetry\n\n"
+                         "\\(fn HANDLE &optional REQUEST-ID)", NULL),
+    });
+  FZF_INIT_CHECK_EXIT();
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-status"),
+      env->make_function(env, 1, 2, fzf_native_async_status,
+                         "Return request and producer status for async HANDLE.\n"
+                         "This is the metadata-only counterpart to\n"
+                         "`fzf-native-async-snapshot': the same plist minus\n"
+                         ":candidates, so polling never pays the candidate\n"
+                         "list build.  Optional REQUEST-ID selects the request\n"
+                         "to inspect; without it, inspect the latest one.\n\n"
+                         "\\(fn HANDLE &optional REQUEST-ID)", NULL),
+    });
+  FZF_INIT_CHECK_EXIT();
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-candidates"),
+      env->make_function(env, 2, 3, fzf_native_async_candidates,
+                         "Return fzf-scored candidates from HANDLE matching FILTER.\n"
+                         "Optional LIMIT caps the number of candidates returned to Elisp;\n"
+                         "use `fzf-native-async-stats' to get the full filtered count.\n\n"
+                         "\\(fn HANDLE FILTER &optional LIMIT)", NULL),
+    });
+  FZF_INIT_CHECK_EXIT();
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-stats"),
+      env->make_function(env, 1, 1, fzf_native_async_stats,
+                         "Return (FILTERED . TOTAL) counts from the last async-candidates call.\n\n"
+                         "\\(fn HANDLE)", NULL),
+    });
+  FZF_INIT_CHECK_EXIT();
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-async-result-fresh-p"),
+      env->make_function(env, 2, 2, fzf_native_async_result_fresh_p,
+                         "Return non-nil when the result cache for QUERY is fresh on HANDLE.\n"
+                         "Fresh means scoring has completed for QUERY at the current pool\n"
+                         "size, so the most recent `fzf-native-async-candidates' return for\n"
+                         "QUERY is authoritative — a nil return in that state means zero\n"
+                         "matches, not in-flight.\n\n"
+                         "\\(fn HANDLE QUERY)", NULL),
+    });
+  FZF_INIT_CHECK_EXIT();
+#endif
+
+  /* fzf-native-filter-only-p — single source of truth for the filter-only
+     decision.  Reads the filter-only defcustoms and applies the OR/AND
+     composition; Elisp callers (fussy etc.) use this to take consistent
+     paths without re-implementing the rule. */
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-filter-only-p"),
+      env->make_function(env, 2, 2, fzf_native_filter_only_p,
+                         "Return non-nil when filter-only mode would fire at QUERY-LENGTH and POOL-SIZE.\n"
+                         "\n"
+                         "Honors `fzf-native-filter-only-min-pool',\n"
+                         "`fzf-native-filter-only-length', and `fzf-native-filter-only-logic'.\n"
+                         "An arm whose defcustom is nil/0 is disabled.\n\n"
+                         "\\(fn QUERY-LENGTH POOL-SIZE)", NULL),
+    });
+  FZF_INIT_CHECK_EXIT();
+
+  // fzf-native-make-default-slab
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-make-default-slab"),
+      env->make_function(env, 0, 0, fzf_native_make_default_slab,
+                         "Instantiate and return a default fzf slab.\n"
+                         "\n"
+                         "\\(fn)",
+                         &data),
+    });
+  FZF_INIT_CHECK_EXIT();
+
+  // fzf-native-make-slab
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-make-slab"),
+      env->make_function(env, 2, 2, fzf_native_make_slab,
+                         "Instantiate and return a fzf slab.\n"
+                         "\n"
+                         "\\(fn SIZE16 SIZE32)",
+                         &data),
+    });
+  FZF_INIT_CHECK_EXIT();
+
+  /* Publish features only after all callable aliases and shared state exist. */
+  env->funcall(env, env->intern(env, "provide"), 1,
+               (emacs_value[]) { env->intern(env, "fzf-native-make-default-slab") });
+  FZF_INIT_CHECK_EXIT();
+  env->funcall(env, env->intern(env, "provide"), 1,
+               (emacs_value[]) { env->intern(env, "fzf-native-make-slab") });
+  FZF_INIT_CHECK_EXIT();
+  env->funcall(env, env->intern(env, "provide"), 1,
+               (emacs_value[]) { env->intern(env, "fzf-native-module") });
+  FZF_INIT_CHECK_EXIT();
+
+#undef FZF_INIT_CHECK_EXIT
   return 0;
 }
