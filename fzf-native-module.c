@@ -354,11 +354,16 @@ struct Bump {
 
 #ifdef FZF_NATIVE_CTEST
 static _Atomic bool copy_test_fail_bump_allocation;
+static _Atomic size_t bump_test_live_blocks;
 #endif
 
 static void bump_free(struct Bump *head) {
   while (head) {
     struct Bump *next = head->next;
+#ifdef FZF_NATIVE_CTEST
+    atomic_fetch_sub_explicit(
+        &bump_test_live_blocks, 1, memory_order_relaxed);
+#endif
     free(head);
     head = next;
   }
@@ -401,6 +406,10 @@ static struct Str copy_valid_emacs_string(emacs_env *env, struct Bump **bump, em
     if (force_allocation_failure ||
         !(new = malloc(sizeof *new + capacity)))
       return (struct Str) { 0 };
+#ifdef FZF_NATIVE_CTEST
+    atomic_fetch_add_explicit(
+        &bump_test_live_blocks, 1, memory_order_relaxed);
+#endif
     *new = (struct Bump) { .next = *bump, .cursor = new->b, .limit = new->b + capacity };
     *bump = new;
     buf = new->cursor;
@@ -1026,7 +1035,8 @@ emacs_value fzf_native_score_all(emacs_env *env,
   }
 
   if (!batches) {
-    return Qnil;
+    success = true;
+    goto err;
   }
 
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
@@ -7502,10 +7512,10 @@ int emacs_module_init(struct emacs_runtime *rt) {
       env->intern(env, "fzf-native-highlight-all"),
       env->make_function(env, 2, 2, fzf_native_highlight_all,
                          "Apply fzf match highlights to COLLECTION against QUERY.\n"
-                         "Mutates each candidate string's text properties in place;\n"
-                         "stale `completions-common-part' face from a prior query is\n"
-                         "stripped before new positions are applied.  No scoring or\n"
-                         "sorting is performed.\n"
+                         "A nonempty query substitutes highlighted string copies into\n"
+                         "COLLECTION and leaves the original strings unchanged.  An\n"
+                         "empty query clears stale `completions-common-part' faces on\n"
+                         "the existing strings.  No scoring or sorting is performed.\n"
                          "\n"
                          "\\(fn COLLECTION QUERY)",
                          &data),

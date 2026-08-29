@@ -100,6 +100,7 @@ jobs:
           -l fzf-native-utf8-test.el \
           --eval "(ert-run-tests-batch-and-exit \
             '(or fzf-native-session-abi-handshake-test \
+                 fzf-native-module-init-publication-is-reentry-safe-test \
                  fzf-native-async-preserves-empty-line-candidates-test \
                  fzf-native-async-public-results-own-strings-across-reentry-test \
                  fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
@@ -142,6 +143,7 @@ jobs:
           -l fzf-native-utf8-test.el \
           --eval "(ert-run-tests-batch-and-exit \
             '(or fzf-native-session-abi-handshake-test \
+                 fzf-native-module-init-publication-is-reentry-safe-test \
                  fzf-native-async-preserves-empty-line-candidates-test \
                  fzf-native-async-public-results-own-strings-across-reentry-test \
                  fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
@@ -268,6 +270,7 @@ jobs:
           -l fzf-native-utf8-test.el \
           --eval "(ert-run-tests-batch-and-exit \
             '(or fzf-native-session-abi-handshake-test \
+                 fzf-native-module-init-publication-is-reentry-safe-test \
                  fzf-native-async-preserves-empty-line-candidates-test \
                  fzf-native-async-public-results-own-strings-across-reentry-test \
                  fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
@@ -301,6 +304,7 @@ jobs:
           -l fzf-native-utf8-test.el \
           --eval "(ert-run-tests-batch-and-exit \
             '(or fzf-native-session-abi-handshake-test \
+                 fzf-native-module-init-publication-is-reentry-safe-test \
                  fzf-native-async-preserves-empty-line-candidates-test \
                  fzf-native-async-public-results-own-strings-across-reentry-test \
                  fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
@@ -344,6 +348,7 @@ jobs:
               -l fzf-native-utf8-test.el \
               --eval "(ert-run-tests-batch-and-exit \
                 '(or fzf-native-session-abi-handshake-test \
+                     fzf-native-module-init-publication-is-reentry-safe-test \
                      fzf-native-async-preserves-empty-line-candidates-test \
                      fzf-native-async-public-results-own-strings-across-reentry-test \
                      fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
@@ -373,6 +378,7 @@ jobs:
             -l fzf-native-utf8-test.el \
             --eval "(ert-run-tests-batch-and-exit \
               '(or fzf-native-session-abi-handshake-test \
+                   fzf-native-module-init-publication-is-reentry-safe-test \
                    fzf-native-async-preserves-empty-line-candidates-test \
                    fzf-native-async-public-results-own-strings-across-reentry-test \
                    fzf-native-async-candidates-pins-session-across-lisp-reentry-test \

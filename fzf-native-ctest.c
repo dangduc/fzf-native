@@ -227,6 +227,47 @@ static void test_copy_emacs_string_fallback_is_bounded(void) {
   CHECK(ctest_copy_pending_exit == emacs_funcall_exit_return);
 }
 
+static bool ctest_score_all_eq(emacs_env *env, emacs_value a,
+                               emacs_value b) {
+  (void)env;
+  return a == b;
+}
+
+static emacs_value ctest_score_all_type_of(emacs_env *env,
+                                           emacs_value value) {
+  (void)env;
+  (void)value;
+  return Qvector;
+}
+
+static ptrdiff_t ctest_score_all_vec_size(emacs_env *env,
+                                          emacs_value vector) {
+  (void)env;
+  (void)vector;
+  return 0;
+}
+
+static void test_score_all_empty_collection_frees_query_bump(void) {
+  emacs_env env = {0};
+  env.copy_string_contents = ctest_copy_string_contents;
+  env.non_local_exit_check = ctest_copy_exit_check;
+  env.non_local_exit_clear = ctest_copy_exit_clear;
+  env.funcall = ctest_encode_string;
+  env.eq = ctest_score_all_eq;
+  env.type_of = ctest_score_all_type_of;
+  env.vec_size = ctest_score_all_vec_size;
+  ctest_reset_copy_env();
+  atomic_store_explicit(&bump_test_live_blocks, 0, memory_order_relaxed);
+
+  emacs_value args[] = {
+      (emacs_value)(uintptr_t)0x41,
+      ctest_copy_original,
+  };
+  CHECK(fzf_native_score_all(&env, 2, args, NULL) == Qnil);
+  CHECK(atomic_load_explicit(
+            &bump_test_live_blocks, memory_order_relaxed) == 0);
+}
+
 static enum emacs_funcall_exit ctest_string_pending_exit;
 static bool ctest_make_string_should_signal;
 static size_t ctest_make_string_calls;
@@ -3682,6 +3723,7 @@ int main(void) {
   RUN(test_batch_worker_stops_on_shared_allocation_failure);
   RUN(test_candidate_analysis_fuses_nul_and_ascii_checks);
   RUN(test_copy_emacs_string_fallback_is_bounded);
+  RUN(test_score_all_empty_collection_frees_query_bump);
   RUN(test_lossless_string_conversion_preserves_runtime_errors);
   RUN(test_startup_posix_errors_are_descriptive);
   RUN(test_async_start_publishes_inert_handle_before_resources);

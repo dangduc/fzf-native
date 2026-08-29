@@ -252,7 +252,7 @@ thread, which polls without ever blocking.
        │
        ▼
   ┌──────────────────────────────────────────────┐
-  │ C: fork + chdir(dir) + execl                 │
+  │ C: snapshot env + fork + chdir + execve      │
   │    spawn reader thread                       │
   │    spawn persistent scoring thread           │
   │    return AsyncSession handle                │

@@ -2,6 +2,10 @@
 (require 'ert)
 (require 'fzf-native)
 
+(defconst fzf-native-test--directory
+  (file-name-directory (or load-file-name buffer-file-name))
+  "Directory that contains the fzf-native test files.")
+
 (unless (fboundp 'fzf-native-score)
   (if-let* ((module (getenv "FZF_NATIVE_TEST_MODULE")))
       (progn
@@ -10,6 +14,33 @@
     (fzf-native-load-dyn)))
 (when (fboundp 'fzf-native--verify-session-abi)
   (fzf-native--verify-session-abi))
+
+(defun fzf-native-test--module-file ()
+  "Return the module file selected for this test process."
+  (or (getenv "FZF_NATIVE_TEST_MODULE")
+      (expand-file-name
+       (fzf-native--bundled-module-relative-path)
+       fzf-native--bin-dir)))
+
+(ert-deftest fzf-native-module-init-publication-is-reentry-safe-test ()
+  "Fresh module initialization survives alias advice and partial failure."
+  (let ((emacs (expand-file-name invocation-name invocation-directory))
+        (probe (expand-file-name "fzf-native-module-init-probe.el"
+                                 fzf-native-test--directory))
+        (module (fzf-native-test--module-file)))
+    (skip-unless (and module-file-suffix (file-executable-p emacs)))
+    (dolist (mode '("reentry" "partial-error"))
+      (with-temp-buffer
+        (let* ((process-environment
+                (cons (concat "FZF_NATIVE_INIT_PROBE=" mode)
+                      (cons (concat "FZF_NATIVE_TEST_MODULE=" module)
+                            process-environment)))
+               (status
+                (call-process emacs nil t nil "-Q" "--batch" "-l" probe)))
+          (unless (zerop status)
+            (ert-fail
+             (format "Module init probe %s exited %s:\n%s"
+                     mode status (buffer-string)))))))))
 
 
 
