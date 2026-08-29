@@ -10,6 +10,7 @@
 
 #include "fzf-additions.h"
 #include "fzf.h"
+#include "fzf-private.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -186,6 +187,47 @@ static void check_whitespace_equivalence(const char *candidate,
   }
 }
 
+static void check_bounded_entry_points(const char *candidate,
+                                       size_t candidate_size,
+                                       fzf_pattern_t *pattern,
+                                       fzf_slab_t *slab,
+                                       int32_t legacy_score) {
+  /* Keep the explicit range separate from the NUL-terminated legacy input.
+     Sanitizers will reject any later strlen use in a bounded entry point. */
+  size_t allocation_size = candidate_size ? candidate_size : 1;
+  char *range = malloc(allocation_size);
+  if (!range)
+    abort();
+  if (candidate_size)
+    memcpy(range, candidate, candidate_size);
+  else
+    range[0] = 'x';
+
+  bool input_is_ascii = is_ascii_utf8proc(range, candidate_size);
+  int32_t bounded_score = fzf_get_score_bytes(
+      range, candidate_size, pattern, slab);
+  int32_t preclassified_score = fzf_get_score_bytes_preclassified(
+      range, candidate_size, input_is_ascii, pattern, slab);
+  if (bounded_score != preclassified_score)
+    fuzz_fail("safe and preclassified bounded scorers disagree");
+
+  bool bounded_match = fzf_has_match_bytes(
+      range, candidate_size, pattern, slab);
+  bool preclassified_match = fzf_has_match_bytes_preclassified(
+      range, candidate_size, input_is_ascii, pattern, slab);
+  if (bounded_match != preclassified_match)
+    fuzz_fail("safe and preclassified bounded membership disagrees");
+
+  /* The C-string wrappers have the same range only without embedded NUL. */
+  if (strlen(candidate) == candidate_size) {
+    if (bounded_score != legacy_score)
+      fuzz_fail("bounded and legacy scorer entry points disagree");
+    if (bounded_match != fzf_has_match(candidate, pattern, slab))
+      fuzz_fail("bounded and legacy membership entry points disagree");
+  }
+  free(range);
+}
+
 static void run_one(const uint8_t *data, size_t size) {
   if (!data || size < 2 || size > FZF_NATIVE_FUZZ_MAX_INPUT)
     return;
@@ -257,6 +299,9 @@ static void run_one(const uint8_t *data, size_t size) {
   int32_t score = fzf_get_score(candidate, pattern, default_slab);
   if (score != fzf_get_score(candidate, pattern, default_slab))
     fuzz_fail("repeated scoring is not deterministic");
+
+  check_bounded_entry_points(candidate, candidate_size, pattern,
+                             default_slab, score);
 
   fzf_position_t *positions =
       fzf_get_positions(candidate, pattern, default_slab);

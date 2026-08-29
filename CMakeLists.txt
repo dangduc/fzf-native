@@ -66,11 +66,25 @@ target_include_directories(utf8proc PUBLIC ${UTF8PROC_INCLUDE_DIR})
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   # Assume compiler MSVC.
   add_library(
-    fzf-native-module SHARED fzf-native-module.c fzf.c fzf.h fzf-additions.c
-                             fzf-additions.h fzf-native-module.def)
+    fzf-native-module SHARED
+    fzf-native-module.c
+    fzf.c
+    fzf.h
+    fzf-private.h
+    fzf-score-input.inc
+    fzf-additions.c
+    fzf-additions.h
+    fzf-native-module.def)
 else()
-  add_library(fzf-native-module MODULE fzf-native-module.c fzf.c fzf.h
-                                       fzf-additions.c fzf-additions.h)
+  add_library(
+    fzf-native-module MODULE
+    fzf-native-module.c
+    fzf.c
+    fzf.h
+    fzf-private.h
+    fzf-score-input.inc
+    fzf-additions.c
+    fzf-additions.h)
 endif()
 
 # Pull in utf8proc headers and link the static runtime.
@@ -121,8 +135,11 @@ if(DEFINED ENV{FZF_NATIVE_DEBUG})
   message(STATUS "FZF_NATIVE_DEBUG enabled — file logging compiled in")
 endif()
 
-# --- Debug / Sanitizer flags (Linux/GCC/Clang only) ---
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# --- Debug / Sanitizer flags (GCC and Clang-family compilers) ---
+# Keep these options compiler-based instead of Linux-only.  The interactive
+# Emacs ABI is exercised on Darwin too, and silently producing an
+# uninstrumented module for -DENABLE_ASAN=ON defeats the option's contract.
+if(CMAKE_C_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
 
   # Full debug info: -g3 includes macro definitions, -fno-omit-frame-pointer
   # keeps stack frames intact for better backtraces, -O0 disables optimizations
@@ -143,6 +160,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   if(ENABLE_ASAN)
     target_compile_options(fzf-native-module PRIVATE -fsanitize=address
                                                      -fno-omit-frame-pointer -g)
+    target_compile_options(utf8proc PRIVATE -fsanitize=address
+                                            -fno-omit-frame-pointer -g)
     target_link_options(fzf-native-module PRIVATE -fsanitize=address)
     message(STATUS "AddressSanitizer enabled")
   endif()
@@ -153,9 +172,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   if(ENABLE_UBSAN)
     target_compile_options(fzf-native-module PRIVATE -fsanitize=undefined
                                                      -fno-omit-frame-pointer -g)
+    target_compile_options(utf8proc PRIVATE -fsanitize=undefined
+                                            -fno-omit-frame-pointer -g)
     target_link_options(fzf-native-module PRIVATE -fsanitize=undefined)
     message(STATUS "UndefinedBehaviorSanitizer enabled")
   endif()
 
+elseif(ENABLE_ASAN OR ENABLE_UBSAN)
+  message(
+    FATAL_ERROR "ENABLE_ASAN/ENABLE_UBSAN requires GCC, Clang, or AppleClang")
 endif()
 # --- End debug / sanitizer flags ---

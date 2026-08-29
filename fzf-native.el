@@ -3,7 +3,7 @@
 ;; Copyright 2021 Duc Dang
 ;; Author: Duc Dang <me@dangduc.com>
 ;; Assisted-by: Claude:claude-opus-4-7
-;; Version: 2.4
+;; Version: 2.6
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: matching
 ;; Homepage: https://github.com/dangduc/fzf-native
@@ -32,10 +32,14 @@
 (declare-function fzf-native-async-start "fzf-native-module" (command &optional dir))
 (declare-function fzf-native-async-stop "fzf-native-module" (handle))
 (declare-function fzf-native-async-generation "fzf-native-module" (handle))
+(declare-function fzf-native-async-submit "fzf-native-module" (handle query &optional limit))
+(declare-function fzf-native-async-snapshot "fzf-native-module" (handle &optional request-id))
+(declare-function fzf-native-async-status "fzf-native-module" (handle &optional request-id))
 (declare-function fzf-native-async-candidates "fzf-native-module" (handle filter &optional limit))
 (declare-function fzf-native-async-stats "fzf-native-module" (handle))
 (declare-function fzf-native-async-result-fresh-p "fzf-native-module" (handle query))
 (declare-function fzf-native-filter-only-p "fzf-native-module" (query-length pool-size))
+(declare-function fzf-native-session-abi-version "fzf-native-module" ())
 
 (defconst fzf-native--dyn-name "fzf-native-module"
   "Dynamic module name.")
@@ -46,6 +50,60 @@ Set by `fzf-native-load-dyn', `fzf-native-load-own-build-dyn', and
 `fzf-native-ensure-loaded'.  Libraries that depend on the C entry
 points can call `fzf-native-ensure-loaded' to guarantee the module
 is available without tracking load state themselves.")
+
+(defconst fzf-native-session-abi-required 1
+  "Interactive-session ABI required by this version of fzf-native.el.")
+
+(defun fzf-native--freebsd-target-p ()
+  "Return non-nil when Emacs targets FreeBSD specifically.
+
+Emacs reports FreeBSD, DragonFly, NetBSD, and OpenBSD as
+`berkeley-unix'.  The configuration triplet is required to distinguish the
+FreeBSD module's libc and kernel ABI from the other BSD targets."
+  (and (eq system-type 'berkeley-unix)
+       (string-match-p
+        "-freebsd\\(?:[0-9.]*\\)?\\(?:-\\|\\'\\)"
+        (downcase system-configuration))))
+
+(defun fzf-native--session-platform-p ()
+  "Return non-nil when this target implements the POSIX session ABI."
+  (or (memq system-type '(darwin gnu/linux))
+      (fzf-native--freebsd-target-p)))
+
+(defun fzf-native--verify-session-abi ()
+  "Fail if the loaded POSIX module has a stale session ABI.
+Windows modules retain batch-only support and do not implement the session
+entry points, so this handshake applies only where the native session API is
+available."
+  (when (fzf-native--session-platform-p)
+    (unless (fboundp 'fzf-native-session-abi-version)
+      (error (concat "Stale fzf-native module: interactive-session ABI "
+                     "entry point is missing (need ABI %d); rebuild or "
+                     "replace the bundled native module")
+             fzf-native-session-abi-required))
+    (let ((actual (fzf-native-session-abi-version)))
+      (unless (equal actual fzf-native-session-abi-required)
+        (error (concat "Incompatible fzf-native interactive-session ABI: "
+                       "module has %S, Elisp requires %d; rebuild or "
+                       "replace the bundled native module")
+               actual fzf-native-session-abi-required))))
+  t)
+
+(defun fzf-native--verify-initialized-module ()
+  "Verify the initialized module, or report the required safe recovery.
+
+Emacs does not unload a dynamic module when its feature is removed.  Loading a
+second ABI over live user pointers and worker callbacks is unsafe.  Therefore,
+after an incompatible initializer has run, recovery requires replacing or
+rebuilding the artifact and restarting Emacs."
+  (condition-case err
+      (fzf-native--verify-session-abi)
+    (error
+     (setq fzf-native-loaded nil)
+     (error (concat "%s.  The incompatible native module is already loaded "
+                    "and cannot be replaced safely in this Emacs process; "
+                    "rebuild or replace it, then restart Emacs")
+            (error-message-string err)))))
 
 (defconst fzf-native--bin-dir
   (concat (file-name-directory load-file-name) "bin/")
@@ -72,7 +130,8 @@ confirmation before compiling."
 ;; Higher-level packages (fzfa, fussy) keep their own user-facing
 ;; defcustoms and bridge their values onto these names — fussy via
 ;; `setq-local' (synchronous, same-buffer call pattern), fzfa via
-;; `:around' advice on the C entry points (timer-driven, cross-buffer).
+;; explicit dynamic bindings at fzfa-owned call sites (timer-driven,
+;; cross-buffer).
 
 (defcustom fzf-native-case-mode 'smart
   "How fzf-native treats letter case when matching queries.
@@ -117,7 +176,7 @@ Bridged by fussy from `fussy-fzf-native-highlight' via `setq-local'."
 Read by `fzf-native-async-candidates' on every call.  Same semantics
 as `fzf-native-batch-highlight' (nil / positive integer).
 
-Bridged by fzfa from `fzfa-highlight' via `:around' advice."
+Bridged by fzfa from `fzfa-highlight' at fzfa-owned native call sites."
   :type '(choice (const   :tag "Disabled" nil)
                  (const   :tag "All candidates" t)
                  (integer :tag "Top N candidates"))
@@ -192,35 +251,70 @@ negative -N — include but truncate lines to N characters.
 
 Read once at session start by `fzf-native-async-start'.
 
-Bridged by fzfa from `fzfa-max-line-length' via `:around'
-advice; the read happens inside `fzf-native-async-start' so the
-advice is in scope for the `symbol-value' lookup."
+When this option is non-nil, the reader normalizes each record incrementally.
+It retains at most N decoded candidate characters before the newline arrives.
+ANSI escape payloads and discarded suffix bytes do not increase the partial
+record buffer.  The reader still scans the complete record.  It rejects an
+embedded NUL, including one after a retained prefix.  A nil value permits an
+unbounded record.  A nil value is safe only with trusted producers.
+
+Bridged by fzfa from `fzfa-max-line-length' while fzfa calls
+`fzf-native-async-start'."
   :type '(choice (const   :tag "No limit" nil)
                  (integer :tag "N (positive = exclude, negative = truncate)"))
   :group 'fzf-native)
 
 (defcustom fzf-native-async-cache-size 40
   "Per-session LRU result cache capacity for the async path.
-Each entry stores top-K results and the full matched-candidate index
-for one query — enables exact-fresh hits (skip scoring) and prefix-
-refinement hits (rescore only previously-matched candidates plus
-deltas) without re-scanning the full pool.
+Each entry stores top-K results and, when the byte budget permits, a
+complete matched-candidate index for one query.  Complete membership
+enables exact-growth and prefix-refinement scans; otherwise the scorer
+uses stable-batch evidence or safely scans the selected pool boundary.
 
 Read once at session start by `fzf-native-async-start'.
 
-Bridged by fzfa from `fzfa-cache-size' via `:around' advice."
+Bridged by fzfa from `fzfa-cache-size' while fzfa starts a session."
   :type 'integer
+  :group 'fzf-native)
+
+(defcustom fzf-native-async-cache-bytes (* 64 1024 1024)
+  "Maximum bytes retained by the whole-result cache for one session.
+The budget includes query keys, parsed patterns, top-K entries, and complete
+matched-candidate index sets.  Set this to 0 to disable the whole-result
+cache.  The entry-count limit in `fzf-native-async-cache-size' also applies.
+
+Read once at session start by `fzf-native-async-start'."
+  :type 'integer
+  :group 'fzf-native)
+
+(defcustom fzf-native-async-batch-cache-bytes (* 64 1024 1024)
+  "Maximum bytes for stable-batch membership data in one async session.
+
+The native scorer stores completed full-batch match sets before it checks
+request cancellation.  A later exact or narrower query can reuse those sets.
+
+Sparse match sets use local candidate indexes.  Denser sets use bitmaps.
+The scorer does not cache a batch when more than half its candidates match.
+
+The cache retains at most 4,096 query records.  An ancestor lookup scans at
+most 256 recent records.  An exact lookup uses a hash table and does not scan
+this list.  An eviction only removes optional cache evidence.
+
+Set this value to zero to disable stable-batch membership reuse.  The module
+reads the value once in `fzf-native-async-start'."
+  :type 'natnum
   :group 'fzf-native)
 
 (defcustom fzf-native-filter-only-min-pool 10000000
   "Pool size at which scoring switches to filter-only mode.
 When the candidate pool reaches at least this size, scoring replaces
 full fzf evaluation with `fzf_has_match' (boolean match-only check
-from fzf-additions) and skips top-K sorting.  The match-set is
-still built exhaustively so the per-session query cache (m_idx) can
-be used to refine subsequent keystrokes — and so the rest of the
-pipeline (cache hits, refinement, downstream Elisp processing)
-behaves identically across the threshold.
+from fzf-additions).  The async scorer retains the first result-limit
+matches, then scores and ranks only that bounded visible window.
+Complete match membership is optional cache evidence: it is retained
+only when it fits half of `fzf-native-async-cache-bytes'.  If it does
+not fit, later refinement safely uses stable-batch evidence or scans
+the selected pool boundary again.
 
 Pool size is sampled per scoring run, so a streaming session that
 crosses the threshold mid-typing switches modes for the keystrokes
@@ -235,17 +329,17 @@ as follows:
                (effectively \"always filter\"; handy for testing).
   10000000   — filter-only only once the pool reaches 10M (default).
 
-Default 10000000 is empirical: below it the full scorer is fast
-enough; above it the per-keystroke latency benefits noticeably from
-the cheap path.
+The default 10000000 is a conservative large-pool trigger.  Actual
+latency depends on candidate length, query shape, match density,
+hardware, and the requested result limit; measure with your workload.
 
 Composes with `fzf-native-filter-only-length' under the rule
 selected by `fzf-native-filter-only-logic' (OR by default).  Async
 reads this once at session start; sync (`fzf-native-score-all')
 reads it on every call.
 
-Bridged by fzfa from `fzfa-filter-only-min-pool' via
-`:around' advice."
+Bridged by fzfa from `fzfa-filter-only-min-pool' at fzfa-owned native
+call sites."
   :type '(choice (const :tag "Disabled" nil)
                  (integer :tag "Minimum pool size"))
   :group 'fzf-native)
@@ -276,8 +370,8 @@ Composes with `fzf-native-filter-only-min-pool' under the rule
 selected by `fzf-native-filter-only-logic' (OR by default — either
 trigger is sufficient).
 
-Bridged by higher-level packages (fzfa, fussy) via the usual
-`:around' advice / `setq-local' patterns."
+Bridged by higher-level packages at their owned call sites (fzfa) or
+through buffer-local bindings (fussy)."
   :type '(choice (const :tag "Disabled" nil)
                  (integer :tag "Maximum query length"))
   :group 'fzf-native)
@@ -383,6 +477,7 @@ before `module-load' reports a misleading bad-CPU-type or loader error."
             (arm64-p (concat "Darwin/arm64/" fzf-native--dyn-name ".so"))))
           (berkeley-unix
            (and x86-64-p
+                (fzf-native--freebsd-target-p)
                 (concat "FreeBSD/" fzf-native--dyn-name ".so")))
           (gnu/linux
            (and x86-64-p
@@ -398,24 +493,37 @@ before `module-load' reports a misleading bad-CPU-type or loader error."
   (interactive)
   (let* ((dyn-name (fzf-native--bundled-module-relative-path))
          (dyn-path (concat fzf-native--bin-dir dyn-name)))
-    (module-load dyn-path)
+    ;; A module initializer may already have run even when the Lisp-side
+    ;; convenience flag is nil.  Verify that live image first: calling a
+    ;; second initializer cannot safely replace its functions or user pointers.
+    (unless (featurep 'fzf-native-module)
+      (module-load dyn-path))
+    (fzf-native--verify-initialized-module)
     (setq fzf-native-loaded t)
     (let ((inhibit-message t))
       (message "[INFO] Successfully load dynamic module, `%s`" dyn-name))))
 
 ;;;###autoload
 (defun fzf-native-load-own-build-dyn ()
-  "Load user-compiled version of module, building it if necessary."
-  (unless (require 'fzf-native-module nil t)
-    (if (or fzf-native-always-compile-module
-            (y-or-n-p "Fzf-Native needs `fzf-native-module' to work.  Compile it now? "))
-        (progn
-          (let ((fzf-native-module-cmake-args (concat "-DFZF_NATIVE_MODULE_OUTPUT_DIR=''"
-                                                      " "
-                                                      fzf-native-module-cmake-args)))
-            (fzf-native-module-compile))
-          (require 'fzf-native-module))
-      (error "Fzf-Native will not work until `fzf-native-module' is compiled!")))
+  "Load a user-compiled module, building it if necessary.
+
+If an incompatible module already initialized in this Emacs process, signal a
+restart-required error.  Replacing a loaded dynamic module in place is unsafe."
+  (if (featurep 'fzf-native-module)
+      (fzf-native--verify-initialized-module)
+    (unless (require 'fzf-native-module nil t)
+      (if (or fzf-native-always-compile-module
+              (y-or-n-p
+               "Fzf-Native needs `fzf-native-module' to work.  Compile it now? "))
+          (progn
+            (let ((fzf-native-module-cmake-args
+                   (concat "-DFZF_NATIVE_MODULE_OUTPUT_DIR='' "
+                           fzf-native-module-cmake-args)))
+              (fzf-native-module-compile))
+            (require 'fzf-native-module))
+        (error
+         "Fzf-Native will not work until `fzf-native-module' is compiled!")))
+    (fzf-native--verify-initialized-module))
   (setq fzf-native-loaded t))
 
 ;;;###autoload

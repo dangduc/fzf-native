@@ -122,6 +122,14 @@ void fzf_free_pattern(fzf_pattern_t *pattern);
 
 int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
                       fzf_slab_t *slab);
+/* Safe entry point for callers that own a bounded byte string.  TEXT must
+   reference at least TEXT_LEN readable bytes.  Every byte in that range is
+   candidate data, including embedded NUL bytes.  The legacy fzf_get_score
+   wrapper stops at the first NUL.  This function derives the exact
+   range's ASCII classification.  Matching and allocation-failure reporting
+   are otherwise identical to fzf_get_score. */
+int32_t fzf_get_score_bytes(const char *text, size_t text_len,
+                            fzf_pattern_t *pattern, fzf_slab_t *slab);
 
 fzf_position_t *fzf_pos_array(size_t len);
 fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,

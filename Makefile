@@ -1,6 +1,15 @@
 export EMACS ?= $(shell which emacs)
 
 BUILD_DIR ?= build
+UNAME_S := $(shell uname -s)
+
+ifeq ($(UNAME_S),Darwin)
+ASAN_PRELOAD_VAR := DYLD_INSERT_LIBRARIES
+ASAN_RUNTIME := $(shell $(CC) -print-file-name=libclang_rt.asan_osx_dynamic.dylib)
+else
+ASAN_PRELOAD_VAR := LD_PRELOAD
+ASAN_RUNTIME := $(shell $(CC) -print-file-name=libasan.so)
+endif
 
 # Vendored utf8proc, linked into the C tests because fzf.c's UTF-8 matching
 # variants (via utf8_char_index.h -> utf8proc.h) depend on it.
@@ -92,7 +101,7 @@ build-san:
 # with -fsanitize=address). Requires build-asan to have been run first.
 .PHONY: emacs-asan
 emacs-asan:
-	LD_PRELOAD=$$($(CC) -print-file-name=libasan.so) $(EMACS)
+	$(ASAN_PRELOAD_VAR)=$(ASAN_RUNTIME) $(EMACS)
 
 # C-level unit tests for module internals (counting_sort_candidates, etc.).
 # Includes fzf-native-module.c directly so static functions are visible.
@@ -166,6 +175,17 @@ ctest-asan:
 .PHONY: clean
 clean:
 	rm -rf $(BUILD_DIR)
+
+# Long-session scale probe for the stable-batch query index.  This separate
+# output directory does not replace a bundled release artifact.
+.PHONY: benchmark-batch-cache-history
+benchmark-batch-cache-history:
+	cmake -B $(BUILD_DIR)/bench-cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+		-DFZF_NATIVE_MODULE_OUTPUT_DIR=$(abspath $(BUILD_DIR)/bench-module)
+	cmake --build $(BUILD_DIR)/bench-cmake
+	FZF_NATIVE_SOURCE_DIR=$(CURDIR) \
+		FZF_NATIVE_TEST_MODULE=$(abspath $(BUILD_DIR)/bench-module/fzf-native-module.so) \
+		$(EMACS) -Q --batch -l etc/batch-cache-query-history-benchmark.el
 
 # Coverage-guided and differential test targets live in a separate include so
 # they do not alter the release build or the public module ABI.

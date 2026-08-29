@@ -16,6 +16,7 @@
 
 #include "fzf.h"
 #include "fzf-additions.h"
+#include "fzf-private.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -293,6 +294,82 @@ static void test_utf8_terms(void) {
   check_agreement("utf8 inverted keeps",    "xyz", "!α", CaseIgnore, true, true);
 }
 
+static void check_bounded_range(const char *text, size_t text_len,
+                                const char *pattern_text,
+                                bool expect_match,
+                                bool compare_legacy) {
+  char *query = strdup(pattern_text);
+  fzf_pattern_t *pattern = fzf_parse_pattern(
+      CaseIgnore, false, query, true);
+  fzf_slab_t *slab = fzf_make_default_slab();
+  CHECK(pattern != NULL);
+  CHECK(slab != NULL);
+  if (pattern && slab) {
+    bool input_is_ascii = is_ascii_utf8proc(text, text_len);
+    int32_t bounded_score =
+        fzf_get_score_bytes(text, text_len, pattern, slab);
+    bool bounded_match =
+        fzf_has_match_bytes(text, text_len, pattern, slab);
+    CHECK((bounded_score > 0) == expect_match);
+    CHECK(bounded_match == expect_match);
+    CHECK(fzf_get_score_bytes_preclassified(
+              text, text_len, input_is_ascii, pattern, slab) == bounded_score);
+    CHECK(fzf_has_match_bytes_preclassified(
+              text, text_len, input_is_ascii, pattern, slab) == bounded_match);
+    if (compare_legacy) {
+      CHECK(fzf_get_score(text, pattern, slab) == bounded_score);
+      CHECK(fzf_has_match(text, pattern, slab) == bounded_match);
+    }
+  }
+  fzf_free_slab(slab);
+  fzf_free_pattern(pattern);
+  free(query);
+}
+
+static void check_bounded_entry_points(const char *text,
+                                       const char *pattern_text) {
+  check_bounded_range(text, strlen(text), pattern_text, true, true);
+}
+
+static void test_bounded_entry_points_derive_unicode_classification(void) {
+  /* These folds cross the ASCII boundary or change UTF-8 byte length.  The
+     public bounded APIs must classify the candidate rather than trust a
+     caller-supplied flag. */
+  check_bounded_entry_points("Kelvin", "k");
+  check_bounded_entry_points("Ⱥtail", "^ⱥ");
+  check_bounded_entry_points("路径/组件-123", "组件");
+}
+
+static void test_bounded_entry_points_preserve_embedded_nul(void) {
+  const char text[] = {'a', '\0', 'b'};
+  check_bounded_range(text, sizeof text, "b", true, false);
+
+  char query[] = "b";
+  fzf_pattern_t *pattern = fzf_parse_pattern(
+      CaseIgnore, false, query, true);
+  fzf_slab_t *slab = fzf_make_default_slab();
+  CHECK(pattern != NULL);
+  CHECK(slab != NULL);
+  if (pattern && slab) {
+    CHECK(fzf_get_score(text, pattern, slab) == 0);
+    CHECK(!fzf_has_match(text, pattern, slab));
+  }
+  fzf_free_slab(slab);
+  fzf_free_pattern(pattern);
+}
+
+static void test_bounded_entry_points_need_no_terminator(void) {
+  char *text = malloc(3);
+  CHECK(text != NULL);
+  if (!text)
+    return;
+  memcpy(text, "abc", 3);
+  /* ASan poisons the byte after this exact allocation.  A strlen-based
+     implementation therefore fails before it can inspect unrelated memory. */
+  check_bounded_range(text, 3, "c", true, false);
+  free(text);
+}
+
 static void test_invalid_utf8_exact_is_lossless(void) {
   /* Invalid bytes are individual lossy-decoder units.  An exact match must
      consume each unit; it must not declare success after only the valid
@@ -434,6 +511,9 @@ int main(void) {
   RUN(test_smart_case_uppercase_query_respects_case);
   RUN(test_compound_pattern);
   RUN(test_utf8_terms);
+  RUN(test_bounded_entry_points_derive_unicode_classification);
+  RUN(test_bounded_entry_points_preserve_embedded_nul);
+  RUN(test_bounded_entry_points_need_no_terminator);
   RUN(test_invalid_utf8_exact_is_lossless);
   RUN(test_invalid_utf8_fuzzy_fallback_returns_positions);
   RUN(test_slab_allocation_failure_is_reported);

@@ -1,0 +1,274 @@
+#+title: fzf-native Emacs ABI fuzzing plan
+
+* Status
+
+This plan is a draft.  The current =make fuzz-elisp= target crosses the real
+Emacs module ABI, but it is deterministic random testing.  The two native
+libFuzzer targets bypass the ABI.
+
+* Goal
+
+Exercise every public module function through a real Emacs process.  Cover
+valid values, invalid values, user-pointer lifecycles, callbacks, and non-local
+exits.
+
+Keep the existing matcher and interactive-session fuzzers.  They give faster
+native coverage and stronger sanitizer coverage than a process-level ABI
+target.
+
+* Non-goals
+
+- Do not replace the native matcher or session fuzzers.
+- Do not use a mock =emacs_env= as the primary ABI oracle.
+- Do not fuzz arbitrary shell commands.
+- Do not treat expected Lisp signals as failures.
+- Do not require a sanitizer build of Emacs for the first release.
+
+* Risk model
+
+The ABI target covers faults that the internal C targets cannot reach:
+
+- conversion between =emacs_value= objects and native strings
+- multibyte strings, unibyte strings, embedded NUL bytes, and text properties
+- proper lists, improper lists, circular lists, vectors, and mixed collections
+- negative integers, large integers, bignums, and wrong argument types
+- session handles, slab pointers, stopped handles, and cross-kind user pointers
+- finalizers during active producer and matcher work
+- highlight hooks that return, signal, quit, collect garbage, or reenter the module
+- dynamic variables that contain unsupported values
+- result lists, vectors, plists, text properties, and request ownership
+- stale non-local exits after the module catches an expected signal
+
+* Test architecture
+
+** Real Emacs runner
+
+Add =fuzz/fzf-native-abi-fuzz.el=.  This file loads an explicit module path and
+decodes one bounded binary trace.  Every operation calls a public module
+function through Lisp.
+
+The runner owns small pools of Lisp objects:
+
+- strings and queries
+- lists and vectors
+- slabs
+- live and stopped session handles
+- callback functions
+- request IDs and snapshots
+
+An input byte selects an operation and its object-pool indexes.  Invalid
+indexes select a generated fallback value.  This rule keeps every byte string
+executable.
+
+Use these initial limits:
+
+- 8 KiB for one input
+- 128 operations for one trace
+- 64 Lisp objects of each kind
+- 4 live sessions
+- 4,097 candidates in one producer
+- 5 seconds for one isolated replay
+
+The producer reads a generated temporary file through a fixed command.  The
+trace cannot supply a command or a file path.
+
+** Operation set
+
+Implement the following structured operations:
+
+1. Create a multibyte, unibyte, propertized, empty, or long string.
+2. Create a list, vector, improper list, circular list, or mixed collection.
+3. Create a slab with boundary and extreme integer values.
+4. Change one fzf-native dynamic variable to a valid or invalid value.
+5. Call =fzf-native-score=.
+6. Call =fzf-native-score-all=.
+7. Call =fzf-native-highlight-one= or =fzf-native-highlight-all=.
+8. Call =fzf-native-filter-only-p=.
+9. Start a session from the fixed producer.
+10. Submit a query and retain its request ID.
+11. Poll candidates, freshness, statistics, status, or a snapshot.
+12. Stop a live or stopped session.
+13. Use a slab as a session handle, or use a session handle as a slab.
+14. Drop selected references and run garbage collection.
+15. Install a highlight hook that returns, signals, quits, collects, or reenters.
+16. Run a known-good scalar call after a caught signal.
+
+Emacs enforces function arity before it enters the module.  Include wrong-arity
+calls to make sure that aliases retain their declared contracts.
+
+** Execution modes
+
+Use one Emacs process for each sanitizer replay.  This mode gives exact crash
+and timeout ownership.
+
+Use one Emacs process for many random traces during fast local campaigns.
+Reset dynamic variables, stop sessions, release objects, and collect garbage
+between traces.
+
+* Oracles
+
+** Process and sanitizer oracles
+
+- Emacs must not crash, abort, or exceed the trace timeout.
+- ASan and UBSan must not report a module fault.
+- A caught Lisp signal must not poison the next ABI call.
+- A trace reset must stop all sessions that the trace created.
+- Repeated reset cycles must stay below a defined RSS-growth limit.
+
+LeakSanitizer can report allocations that the Emacs host retains.  Keep leak
+checks separate until the runner identifies stable module-owned allocations.
+
+** Result-shape oracles
+
+- Scalar calls return the documented score and position shape.
+- Batch calls return strings from the input collection.
+- Snapshot and status plists contain documented keys and value types.
+- Candidate indexes and highlight positions stay within character bounds.
+- Request IDs, pool generations, and snapshot generations never decrease.
+- A stopped handle returns or signals according to its documented contract.
+- An expected type failure uses the documented Lisp signal.
+
+** Differential and metamorphic oracles
+
+- Scalar match membership equals batch match membership.
+- List and vector collections produce the same ordered result.
+- Filter-only and scored modes produce the same match membership.
+- Highlighted and unhighlighted modes produce the same match membership.
+- Highlighting does not change caller-owned strings unless the API documents it.
+- A complete interactive snapshot equals a fresh batch result at its pool boundary.
+- Repeating a query without input growth produces the same completed snapshot.
+- Catching a callback signal and disabling the callback restores normal scoring.
+
+The upstream fzf oracle remains separate.  It applies only when fzf and
+fzf-native use the same query and case semantics.
+
+* Sanitizer lane
+
+Add a separate CMake output for an ASan and UBSan module.  Do not overwrite the
+tracked release module.
+
+Load the sanitizer runtime before Emacs loads the module.  Discover the runtime
+path from the selected Clang compiler.  Stop with a clear error if the runtime
+is unavailable.
+
+Run the checked ABI corpus and bounded random traces in this lane.  Keep the
+existing native TSan lane because TSan inside an unsanitized Emacs host is not
+a reliable configuration.
+
+* Coverage guidance
+
+First, add LLVM source-coverage output for the module wrappers.  Record wrapper
+branches that the checked corpus reaches.
+
+Then prototype AFL++ process-mode fuzzing against the real Emacs runner.  Build
+only the module with AFL instrumentation.  Use =afl-showmap= to prove that
+different traces produce different module edge maps.
+
+Do not call this lane coverage-guided until that proof succeeds.  If process
+startup is too expensive, evaluate a persistent runner as a separate change.
+Do not replace the real Emacs runner with a fake environment for speed.
+
+* Corpus and failure handling
+
+Store permanent inputs in =fuzz/abi-corpus=.  Start with one success and one
+error seed for each exported function.
+
+Add focused seeds for these boundaries:
+
+- empty, embedded-NUL, invalid-unibyte, BMP, supplementary-plane, and long strings
+- zero, negative, fixnum-boundary, and bignum integers
+- empty, mixed, improper, circular, list, and vector collections
+- live, stopped, collected, and cross-kind user pointers
+- normal, signaling, quitting, collecting, and reentrant callbacks
+- queued, running, complete, cancelled, failed, and stale requests
+
+Save each failure as the original binary input and a readable operation trace.
+Record the fzf-native commit, Emacs version, module path, and sanitizer settings.
+
+Use byte-level minimization first.  Then use an operation-aware reducer that
+preserves object definitions and request dependencies.  Promote each confirmed
+module fault to a corpus seed and a focused ERT test.
+
+* Make targets
+
+Add these targets:
+
+- =make fuzz-abi-replay=: replay the checked corpus with the release module
+- =make fuzz-abi-random=: run deterministic random traces through real Emacs
+- =make fuzz-abi-sanitize=: build the sanitizer module and replay the corpus
+- =make fuzz-abi-coverage=: report wrapper and error-path source coverage
+- =make fuzz-abi-afl=: run the optional AFL++ process campaign
+- =make fuzz-all-replay=: replay matcher, session, and ABI corpora
+
+Do not add the process campaign to =make fuzz-continuous=.  That target remains
+the fast native libFuzzer campaign.
+
+* Milestones
+
+** Milestone 0: Public ABI inventory
+
+List every function that =emacs_module_init= exports.  Record its argument,
+return, mutation, signal, and lifecycle contracts.
+
+Status: Not started.
+
+** Milestone 1: Valid trace runner
+
+Implement the byte decoder, object pools, fixed producer, reset logic, and
+valid operations.  Add result-shape and differential oracles.
+
+Status: Not started.
+
+** Milestone 2: Invalid values and user pointers
+
+Add wrong types, extreme integers, malformed collections, cross-kind pointers,
+stopped handles, and garbage-collection transitions.
+
+Status: Not started.
+
+** Milestone 3: Callbacks and non-local exits
+
+Add callback return, signal, quit, garbage-collection, and reentry modes.  Run
+a known-good operation after every caught signal.
+
+Status: Not started.
+
+** Milestone 4: Sanitizer module
+
+Build a separate ASan and UBSan module.  Add isolated replay, timeouts, artifact
+capture, and an RSS-growth guard.
+
+Status: Not started.
+
+** Milestone 5: Coverage and guidance
+
+Add LLVM coverage reports.  Prototype AFL++ process mode and retain it only if
+=afl-showmap= proves useful edge feedback.
+
+Status: Not started.
+
+** Milestone 6: Continuous verification
+
+Add fast corpus replay to normal verification.  Add bounded sanitizer and
+random campaigns to scheduled verification.
+
+Status: Not started.
+
+* Completion criteria
+
+The first ABI-fuzzing release is complete when all conditions are true:
+
+- The ABI inventory includes every exported function.
+- Each argument position has valid and invalid corpus coverage.
+- Every exported function has a success seed and an error seed.
+- Every user-pointer API covers live, stopped, collected, and cross-kind values.
+- Callback tests cover return, signal, quit, garbage collection, and reentry.
+- Result-shape and differential oracles pass through real Emacs 30.2.
+- The sanitizer module replays the full ABI corpus without ASan or UBSan findings.
+- Ten thousand bounded random traces finish without crashes or timeouts.
+- The coverage report shows no untested public wrapper.
+- Each confirmed fault has a minimized seed and a focused regression test.
+- The README documents replay, reduction, and sanitizer commands.
+
+AFL++ integration is optional for the first release.  It becomes required only
+after process-mode edge feedback is reliable on the supported platform.

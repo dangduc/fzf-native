@@ -8,11 +8,19 @@ on:
         required: false
         default: false
         type: boolean
+      rebuild:
+        description: Build replacement binaries without committing them
+        required: false
+        default: false
+        type: boolean
   pull_request:
     paths:
       - "**.c"
       - "**.h"
+      - "**.inc"
       - "fzf-native.el"
+      - "fzf-native-test.el"
+      - "fzf-native-utf8-test.el"
       - "fzf-native-module.def"
       - "fzf-native-module.map"
       - "CMakeLists.txt"
@@ -22,6 +30,7 @@ on:
     paths:
       - "**.c"
       - "**.h"
+      - "**.inc"
       - "fzf-native.el"
       - "fzf-native-module.def"
       - "fzf-native-module.map"
@@ -36,6 +45,13 @@ env:
   BUILD_TYPE: Release
 
 jobs:
+  validate-release:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish == true &&
+       github.ref == 'refs/heads/main')
+    uses: ./.github/workflows/test.yaml
+
   build:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -74,12 +90,37 @@ jobs:
         version: 30.2
 
     - name: Smoke tracked artifact before rebuilding
-      if: github.event_name != 'workflow_dispatch' || inputs.publish != true
+      if: >-
+        github.event_name != 'workflow_dispatch' ||
+        (inputs.publish != true && inputs.rebuild != true)
       shell: bash
       run: |
         emacs -Q --batch -L . -l fzf-native \
-          -f fzf-native-load-dyn \
-          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"tracked UTF-8 artifact is stale\")))"
+          -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+          -l fzf-native-utf8-test.el \
+          --eval "(ert-run-tests-batch-and-exit \
+            '(or fzf-native-session-abi-handshake-test \
+                 fzf-native-module-init-publication-is-reentry-safe-test \
+                 fzf-native-async-preserves-empty-line-candidates-test \
+                 fzf-native-async-public-results-own-strings-across-reentry-test \
+                 fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-stats-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-status-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-submit-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-cache-positive-quote-refinement-test \
+                 fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
+                 fzf-native-async-max-line-length-counts-characters-test \
+                 fzf-native-async-line-cap-streams-ansi-heavy-record-test \
+                 fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
+                 fzf-native-async-producer-uses-dynamic-process-environment-test \
+                 fzf-native-async-producer-honors-environment-removal-test \
+                 fzf-native-async-producer-honors-path-removal-test \
+                 fzf-native-async-producer-corrects-pwd-for-directory-test \
+                 fzf-native-async-producer-honors-pwd-removal-test \
+                 fzf-native-score-all-empty-string-candidate-test \
+                 fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
     - name: Clean stale binaries
       shell: bash
@@ -98,8 +139,31 @@ jobs:
       shell: bash
       run: |
         emacs -Q --batch -L . -l fzf-native \
-          -f fzf-native-load-dyn \
-          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"fresh UTF-8 artifact failed\")))"
+          -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+          -l fzf-native-utf8-test.el \
+          --eval "(ert-run-tests-batch-and-exit \
+            '(or fzf-native-session-abi-handshake-test \
+                 fzf-native-module-init-publication-is-reentry-safe-test \
+                 fzf-native-async-preserves-empty-line-candidates-test \
+                 fzf-native-async-public-results-own-strings-across-reentry-test \
+                 fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-stats-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-status-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-submit-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-cache-positive-quote-refinement-test \
+                 fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
+                 fzf-native-async-max-line-length-counts-characters-test \
+                 fzf-native-async-line-cap-streams-ansi-heavy-record-test \
+                 fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
+                 fzf-native-async-producer-uses-dynamic-process-environment-test \
+                 fzf-native-async-producer-honors-environment-removal-test \
+                 fzf-native-async-producer-honors-path-removal-test \
+                 fzf-native-async-producer-corrects-pwd-for-directory-test \
+                 fzf-native-async-producer-honors-pwd-removal-test \
+                 fzf-native-score-all-empty-string-candidate-test \
+                 fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
     - name: Check Darwin export surface
       if: runner.os == 'macOS'
@@ -121,6 +185,14 @@ jobs:
         expected=$(printf '%s\n' emacs_module_init plugin_is_GPL_compatible | sort)
         printf 'defined DLL exports:\n%s\n' "$actual"
         test "$actual" = "$expected"
+
+    - name: Smoke interactive session ABI
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        emacs -Q --batch -L . -l fzf-native \
+          -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+          --eval '(ert-run-tests-batch-and-exit "^fzf-native-async-submit-snapshot-lifecycle-test$")'
 
     - name: Upload binaries
       uses: actions/upload-artifact@v4
@@ -189,11 +261,36 @@ jobs:
         github:purcell/nix-emacs-ci/b12b5b31e40df750478c9fc68c1e81c91ed079ec#emacs-30-2
 
     - name: Smoke tracked Linux artifact
-      if: github.event_name != 'workflow_dispatch' || inputs.publish != true
+      if: >-
+        github.event_name != 'workflow_dispatch' ||
+        (inputs.publish != true && inputs.rebuild != true)
       run: |
         emacs -Q --batch -L . -l fzf-native \
-          -f fzf-native-load-dyn \
-          --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"tracked UTF-8 artifact is stale\")))"
+          -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+          -l fzf-native-utf8-test.el \
+          --eval "(ert-run-tests-batch-and-exit \
+            '(or fzf-native-session-abi-handshake-test \
+                 fzf-native-module-init-publication-is-reentry-safe-test \
+                 fzf-native-async-preserves-empty-line-candidates-test \
+                 fzf-native-async-public-results-own-strings-across-reentry-test \
+                 fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-stats-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-status-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-submit-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-cache-positive-quote-refinement-test \
+                 fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
+                 fzf-native-async-max-line-length-counts-characters-test \
+                 fzf-native-async-line-cap-streams-ansi-heavy-record-test \
+                 fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
+                 fzf-native-async-producer-uses-dynamic-process-environment-test \
+                 fzf-native-async-producer-honors-environment-removal-test \
+                 fzf-native-async-producer-honors-path-removal-test \
+                 fzf-native-async-producer-corrects-pwd-for-directory-test \
+                 fzf-native-async-producer-honors-pwd-removal-test \
+                 fzf-native-score-all-empty-string-candidate-test \
+                 fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
     - uses: actions/download-artifact@v4
       with:
@@ -203,8 +300,31 @@ jobs:
     - name: Smoke fresh Linux artifact
       run: |
         FZF_NATIVE_TEST_MODULE=${{github.workspace}}/fresh-bin/Linux/fzf-native-module.so \
-          emacs -Q --batch -L . -l ert -l fzf-native-utf8-test.el \
-          --eval '(ert-run-tests-batch-and-exit "^fzf-native-utf8-case-ignore-length-changing-fold-test$")'
+          emacs -Q --batch -L . -l ert -l fzf-native-test.el \
+          -l fzf-native-utf8-test.el \
+          --eval "(ert-run-tests-batch-and-exit \
+            '(or fzf-native-session-abi-handshake-test \
+                 fzf-native-module-init-publication-is-reentry-safe-test \
+                 fzf-native-async-preserves-empty-line-candidates-test \
+                 fzf-native-async-public-results-own-strings-across-reentry-test \
+                 fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-stats-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-status-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-submit-pins-session-across-lisp-reentry-test \
+                 fzf-native-async-cache-positive-quote-refinement-test \
+                 fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
+                 fzf-native-async-max-line-length-counts-characters-test \
+                 fzf-native-async-line-cap-streams-ansi-heavy-record-test \
+                 fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
+                 fzf-native-async-producer-uses-dynamic-process-environment-test \
+                 fzf-native-async-producer-honors-environment-removal-test \
+                 fzf-native-async-producer-honors-path-removal-test \
+                 fzf-native-async-producer-corrects-pwd-for-directory-test \
+                 fzf-native-async-producer-honors-pwd-removal-test \
+                 fzf-native-score-all-empty-string-candidate-test \
+                 fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
   build-freebsd:
     runs-on: ubuntu-latest
@@ -221,21 +341,71 @@ jobs:
           pkg install -y cmake emacs-nox
         run: |
           freebsd-version -u | grep -q '^14\.4'
-          if [ "${{ github.event_name }}" != workflow_dispatch ] || [ "${{ inputs.publish }}" != true ]; then
+          if [ "${{ github.event_name }}" != workflow_dispatch ] || \
+             { [ "${{ inputs.publish }}" != true ] && [ "${{ inputs.rebuild }}" != true ]; }; then
             emacs -Q --batch -L . -l fzf-native \
-              -f fzf-native-load-dyn \
-              --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"tracked UTF-8 artifact is stale\")))"
+              -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+              -l fzf-native-utf8-test.el \
+              --eval "(ert-run-tests-batch-and-exit \
+                '(or fzf-native-session-abi-handshake-test \
+                     fzf-native-module-init-publication-is-reentry-safe-test \
+                     fzf-native-async-preserves-empty-line-candidates-test \
+                     fzf-native-async-public-results-own-strings-across-reentry-test \
+                     fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
+                     fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
+                     fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
+                     fzf-native-async-stats-pins-session-across-lisp-reentry-test \
+                     fzf-native-async-status-pins-session-across-lisp-reentry-test \
+                     fzf-native-async-submit-pins-session-across-lisp-reentry-test \
+                     fzf-native-async-cache-positive-quote-refinement-test \
+                     fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
+                     fzf-native-async-max-line-length-counts-characters-test \
+                     fzf-native-async-line-cap-streams-ansi-heavy-record-test \
+                     fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
+                     fzf-native-async-producer-uses-dynamic-process-environment-test \
+                     fzf-native-async-producer-honors-environment-removal-test \
+                     fzf-native-async-producer-honors-path-removal-test \
+                     fzf-native-async-producer-corrects-pwd-for-directory-test \
+                     fzf-native-async-producer-honors-pwd-removal-test \
+                     fzf-native-score-all-empty-string-candidate-test \
+                     fzf-native-utf8-case-ignore-length-changing-fold-test))"
           fi
           rm -rf bin
           cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
           cmake --build build --verbose --config ${{ env.BUILD_TYPE }}
           emacs -Q --batch -L . -l fzf-native \
-            -f fzf-native-load-dyn \
-            --eval "(let ((fzf-native-case-mode 'ignore)) (unless (> (car (fzf-native-score \"k\" (string #x212A))) 0) (error \"fresh UTF-8 artifact failed\")))"
+            -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+            -l fzf-native-utf8-test.el \
+            --eval "(ert-run-tests-batch-and-exit \
+              '(or fzf-native-session-abi-handshake-test \
+                   fzf-native-module-init-publication-is-reentry-safe-test \
+                   fzf-native-async-preserves-empty-line-candidates-test \
+                   fzf-native-async-public-results-own-strings-across-reentry-test \
+                   fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
+                   fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
+                   fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
+                   fzf-native-async-stats-pins-session-across-lisp-reentry-test \
+                   fzf-native-async-status-pins-session-across-lisp-reentry-test \
+                   fzf-native-async-submit-pins-session-across-lisp-reentry-test \
+                   fzf-native-async-cache-positive-quote-refinement-test \
+                   fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
+                   fzf-native-async-max-line-length-counts-characters-test \
+                   fzf-native-async-line-cap-streams-ansi-heavy-record-test \
+                   fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
+                   fzf-native-async-producer-uses-dynamic-process-environment-test \
+                   fzf-native-async-producer-honors-environment-removal-test \
+                   fzf-native-async-producer-honors-path-removal-test \
+                   fzf-native-async-producer-corrects-pwd-for-directory-test \
+                   fzf-native-async-producer-honors-pwd-removal-test \
+                   fzf-native-score-all-empty-string-candidate-test \
+                   fzf-native-utf8-case-ignore-length-changing-fold-test))"
           actual=$(nm -D --defined-only -P bin/FreeBSD/fzf-native-module.so | awk '{print $1}' | sort)
           expected=$(printf '%s\n' emacs_module_init plugin_is_GPL_compatible | sort)
           printf 'defined dynamic symbols:\n%s\n' "$actual"
           test "$actual" = "$expected"
+          emacs -Q --batch -L . -l fzf-native \
+            -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
+            --eval '(ert-run-tests-batch-and-exit "^fzf-native-async-submit-snapshot-lifecycle-test$")'
 
     # The VM action can leave the checkout's other tracked binaries in bin/.
     # Publish only the file that this job built.
@@ -254,8 +424,11 @@ jobs:
         retention-days: 1
 
   commit:
-    if: github.event_name == 'push' || inputs.publish == true
-    needs: [build, build-linux, smoke-linux, build-freebsd]
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish == true &&
+       github.ref == 'refs/heads/main')
+    needs: [validate-release, build, build-linux, smoke-linux, build-freebsd]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -282,6 +455,14 @@ jobs:
         cp bin-artifacts/bin-windows-x86_64/Windows/Release/fzf-native-module.dll bin/Windows/Release/
         cp bin-artifacts/bin-windows-x86_64/Windows/Release/fzf-native-module.exp bin/Windows/Release/
         cp bin-artifacts/bin-windows-x86_64/Windows/Release/fzf-native-module.lib bin/Windows/Release/
+        chmod 0644 \
+          bin/Darwin/fzf-native-module.so \
+          bin/Darwin/arm64/fzf-native-module.so \
+          bin/FreeBSD/fzf-native-module.so \
+          bin/Linux/fzf-native-module.so \
+          bin/Windows/Release/fzf-native-module.dll \
+          bin/Windows/Release/fzf-native-module.exp \
+          bin/Windows/Release/fzf-native-module.lib
         rm -rf bin-artifacts
         test -f bin/Linux/fzf-native-module.so
         test -f bin/FreeBSD/fzf-native-module.so
@@ -306,6 +487,14 @@ jobs:
           minor=0
         fi
         new="${major}.${minor}"
+        remote_tag=$(git ls-remote --tags origin "refs/tags/${new}") || {
+          echo "Could not check whether release tag ${new} exists" >&2
+          exit 1
+        }
+        if [ -n "$remote_tag" ]; then
+          echo "Release tag ${new} already exists; update the declared version before publishing" >&2
+          exit 1
+        fi
         sed -i "s/^;; Version: ${current}$/;; Version: ${new}/" fzf-native.el
         sed -i -E "s/^([[:space:]]+)\"${current}\"$/\1\"${new}\"/" Eask
         echo "version=${new}" >> "$GITHUB_OUTPUT"
