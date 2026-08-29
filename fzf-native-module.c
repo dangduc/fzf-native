@@ -31,8 +31,6 @@
 #include <errno.h>
 #include <time.h>
 
-extern char **environ;
-
 /* Block all signals on the current thread.  Worker threads call this on
    entry so async signals (SIGCHLD, SIGIO, ...) only ever land on Emacs's
    main thread.  Otherwise Emacs's signal handler forwards via pthread_kill,
@@ -187,6 +185,7 @@ emacs_value Qsym_async_cache_bytes;
 emacs_value Qsym_async_batch_cache_bytes, Qsym_filter_only_min_pool;
 emacs_value Qsym_filter_only_length, Qsym_filter_only_logic;
 emacs_value Qsym_shell_file_name, Qsym_shell_command_switch, Qsym_exec_path;
+emacs_value Qsym_process_environment;
 emacs_value Qsym_highlight_fn;
 /* Cached value symbols for `type-of' comparisons and signal/error names. */
 emacs_value Qvector, Qstring, Qignore, Qrespect;
@@ -2388,6 +2387,7 @@ enum BatchMembershipKind {
 
 struct BatchCacheEntry {
   BatchCacheEntry *hash_next;
+  BatchCacheEntry **hash_prev_next;
   BatchCacheEntry *lru_prev;
   BatchCacheEntry *lru_next;
   BatchCacheEntry *owner_prev;
@@ -2428,6 +2428,9 @@ typedef struct {
 static void batch_cache_remove_entry_locked(
     BatchCache *c, BatchCacheEntry *entry, bool eviction);
 static void batch_cache_trim_queries_locked(BatchCache *c);
+#ifdef FZF_NATIVE_CTEST
+static size_t batch_cache_test_hash_unlinks;
+#endif
 
 static size_t batch_cache_hash(const BatchCache *c, const BatchQuery *query,
                                size_t batch_id) {
@@ -2737,10 +2740,16 @@ static void batch_cache_entry_free(BatchCacheEntry *entry) {
 static void batch_cache_remove_entry_locked(BatchCache *c,
                                             BatchCacheEntry *entry,
                                             bool eviction) {
-  size_t bucket = batch_cache_hash(c, entry->owner, entry->batch_id);
-  BatchCacheEntry **slot = &c->buckets[bucket];
-  while (*slot && *slot != entry) slot = &(*slot)->hash_next;
-  if (*slot == entry) *slot = entry->hash_next;
+  assert(entry->hash_prev_next != NULL);
+  assert(*entry->hash_prev_next == entry);
+  *entry->hash_prev_next = entry->hash_next;
+  if (entry->hash_next)
+    entry->hash_next->hash_prev_next = entry->hash_prev_next;
+  entry->hash_next = NULL;
+  entry->hash_prev_next = NULL;
+#ifdef FZF_NATIVE_CTEST
+  batch_cache_test_hash_unlinks++;
+#endif
   batch_cache_lru_unlink_locked(c, entry);
   batch_cache_owner_unlink_locked(entry);
   c->entry_count--;
@@ -2879,6 +2888,9 @@ static void batch_cache_insert(BatchCache *c, BatchQuery *query,
 
   size_t bucket = batch_cache_hash(c, query, batch_id);
   created->hash_next = c->buckets[bucket];
+  created->hash_prev_next = &c->buckets[bucket];
+  if (created->hash_next)
+    created->hash_next->hash_prev_next = &created->hash_next;
   c->buckets[bucket] = created;
   batch_cache_lru_push_locked(c, created);
   batch_cache_owner_push_locked(query, created);
@@ -4242,61 +4254,218 @@ static char *async_copy_lisp_c_string(emacs_env *env, emacs_value value,
              ? copied.b : NULL;
 }
 
-/* Build an execve environment in the parent.  Only the pointer vector and
-   replacement PATH entry are owned; unchanged entries point into environ and
-   are stable in the fork snapshot. */
-static bool async_build_child_environment(
-    const char *exec_path_prefix, char ***out_environment,
-    char ***out_owned_vector, char **out_owned_path) {
-  *out_environment = environ;
-  *out_owned_vector = NULL;
-  *out_owned_path = NULL;
-  if (!exec_path_prefix) return true;
+struct AsyncChildEnvironment {
+  char **entries;
+  size_t count;
+};
 
-  const char *old_path = getenv("PATH");
-  size_t prefix_len = strlen(exec_path_prefix);
-  size_t old_len = old_path && *old_path ? strlen(old_path) : 0;
-  if (prefix_len > SIZE_MAX - old_len - 7) return false;
-  size_t path_len = 5 + prefix_len + (old_len ? 1 + old_len : 0);
+struct AsyncEnvironmentNameSlot {
+  const char *entry;
+  size_t name_length;
+};
+
+static void async_free_child_environment(
+    struct AsyncChildEnvironment *environment) {
+  if (!environment) return;
+  for (size_t i = 0; i < environment->count; i++)
+    free(environment->entries[i]);
+  free(environment->entries);
+  *environment = (struct AsyncChildEnvironment){0};
+}
+
+static uint64_t async_environment_name_hash(const char *entry,
+                                            size_t name_length) {
+  uint64_t hash = UINT64_C(14695981039346656037);
+  for (size_t i = 0; i < name_length; i++) {
+    hash ^= (unsigned char)entry[i];
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+
+/* process-environment is ordered: the first entry for a variable wins, and a
+   name without '=' removes that variable.  Return true only for the first
+   occurrence of NAME. */
+static bool async_environment_name_insert(
+    struct AsyncEnvironmentNameSlot *slots, size_t slot_count,
+    const char *entry, size_t name_length) {
+  size_t slot = (size_t)(async_environment_name_hash(entry, name_length) %
+                         slot_count);
+  for (;;) {
+    struct AsyncEnvironmentNameSlot *candidate = &slots[slot];
+    if (!candidate->entry) {
+      candidate->entry = entry;
+      candidate->name_length = name_length;
+      return true;
+    }
+    if (candidate->name_length == name_length &&
+        memcmp(candidate->entry, entry, name_length) == 0)
+      return false;
+    slot++;
+    if (slot == slot_count) slot = 0;
+  }
+}
+
+static char *async_build_path_entry(const char *prefix,
+                                    const char *old_path) {
+  size_t prefix_len = strlen(prefix);
+  size_t old_len = old_path ? strlen(old_path) : 0;
+  bool separator = prefix_len > 0 && old_len > 0;
+  size_t separator_len = separator ? 1 : 0;
+  if (prefix_len > SIZE_MAX - 6 ||
+      old_len > SIZE_MAX - 6 - prefix_len ||
+      separator_len > SIZE_MAX - 6 - prefix_len - old_len)
+    return NULL;
+  size_t path_len = 5 + prefix_len + separator_len + old_len;
   char *path_entry = malloc(path_len + 1);
-  if (!path_entry) return false;
+  if (!path_entry) return NULL;
   memcpy(path_entry, "PATH=", 5);
-  memcpy(path_entry + 5, exec_path_prefix, prefix_len);
+  memcpy(path_entry + 5, prefix, prefix_len);
   size_t position = 5 + prefix_len;
+  if (separator) path_entry[position++] = ':';
   if (old_len) {
-    path_entry[position++] = ':';
     memcpy(path_entry + position, old_path, old_len);
     position += old_len;
   }
   path_entry[position] = '\0';
+  return path_entry;
+}
 
-  size_t count = 0;
-  while (environ && environ[count]) count++;
-  if (count > (SIZE_MAX / sizeof(char *)) - 2) {
-    free(path_entry);
+static char *async_build_pwd_entry(const char *directory) {
+  size_t directory_len = strlen(directory);
+  while (directory_len > 2 && directory[directory_len - 1] == '/')
+    directory_len--;
+  if (directory_len > SIZE_MAX - 5) return NULL;
+  char *pwd_entry = malloc(4 + directory_len + 1);
+  if (!pwd_entry) return NULL;
+  memcpy(pwd_entry, "PWD=", 4);
+  memcpy(pwd_entry + 4, directory, directory_len);
+  pwd_entry[4 + directory_len] = '\0';
+  return pwd_entry;
+}
+
+/* Copy Emacs's dynamic process-environment before fork.  libc's environ is
+   only the environment that launched Emacs; setenv and dynamic Lisp bindings
+   do not update it.  Every entry is owned so later Lisp mutation cannot race
+   the child snapshot.
+
+   process-environment is a first-entry-wins association list.  A name-only
+   entry is a removal sentinel.  Deduplicate every name before execve so a
+   shadowed inherited value cannot reappear in the child.
+
+   A dynamic exec-path still augments PATH for GUI Emacs sessions.  Replace
+   the effective PATH with one canonical entry at its first position.  Its
+   suffix comes from process-environment, never from stale libc state.  An
+   explicit PATH removal suppresses this augmentation.  When DIR is explicit,
+   an effective PWD entry receives DIR while a PWD removal stays removed. */
+static bool async_build_child_environment(
+    emacs_env *env, const char *exec_path_prefix,
+    const char *working_directory,
+    struct AsyncChildEnvironment *out) {
+  *out = (struct AsyncChildEnvironment){0};
+  emacs_value process_environment = env->funcall(
+      env, Fsymbol_value, 1, &Qsym_process_environment);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+    return false;
+  emacs_value environment_vector = env->funcall(
+      env, Fvconcat, 1, &process_environment);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+    return false;
+  ptrdiff_t vector_count = env->vec_size(env, environment_vector);
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return ||
+      vector_count < 0)
+    return false;
+  size_t count = (size_t)vector_count;
+  if (count > (SIZE_MAX / sizeof(char *)) - 2 ||
+      count > (SIZE_MAX - 1) / 2)
+    return false;
+
+  char **raw_entries = calloc(count ? count : 1, sizeof *raw_entries);
+  char **entries = calloc(count + 2, sizeof *entries);
+  unsigned char *retained = calloc(count ? count : 1, sizeof *retained);
+  size_t slot_count = count * 2 + 1;
+  struct AsyncEnvironmentNameSlot *slots =
+      calloc(slot_count, sizeof *slots);
+  char *generated_path = NULL;
+  char *generated_pwd = NULL;
+  if (!raw_entries || !entries || !retained || !slots) {
+    free(raw_entries);
+    free(entries);
+    free(retained);
+    free(slots);
     return false;
   }
-  char **environment = calloc(count + 2, sizeof *environment);
-  if (!environment) {
-    free(path_entry);
-    return false;
-  }
-  bool replaced = false;
-  size_t output = 0;
   for (size_t i = 0; i < count; i++) {
-    if (!replaced && strncmp(environ[i], "PATH=", 5) == 0) {
-      environment[output++] = path_entry;
-      replaced = true;
-    } else {
-      environment[output++] = environ[i];
+    emacs_value value = env->vec_get(
+        env, environment_vector, (ptrdiff_t)i);
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+      goto fail;
+    }
+    raw_entries[i] = async_copy_lisp_c_string(
+        env, value, "process-environment entry");
+    if (!raw_entries[i]) goto fail;
+  }
+
+  size_t output = 0;
+  bool path_seen = false;
+  for (size_t i = 0; i < count; i++) {
+    char *entry = raw_entries[i];
+    char *equals = strchr(entry, '=');
+    size_t name_length = equals ? (size_t)(equals - entry) : strlen(entry);
+    if (!async_environment_name_insert(
+            slots, slot_count, entry, name_length))
+      continue;
+
+    bool is_path = name_length == 4 && memcmp(entry, "PATH", 4) == 0;
+    bool is_pwd = name_length == 3 && memcmp(entry, "PWD", 3) == 0;
+    if (is_path) {
+      path_seen = true;
+      if (equals && exec_path_prefix) {
+        generated_path = async_build_path_entry(
+            exec_path_prefix, equals + 1);
+        if (!generated_path) goto fail;
+        entries[output++] = generated_path;
+      } else if (equals) {
+        entries[output++] = entry;
+        retained[i] = 1;
+      }
+    } else if (is_pwd && equals && working_directory) {
+      generated_pwd = async_build_pwd_entry(working_directory);
+      if (!generated_pwd) goto fail;
+      entries[output++] = generated_pwd;
+    } else if (equals) {
+      entries[output++] = entry;
+      retained[i] = 1;
     }
   }
-  if (!replaced) environment[output++] = path_entry;
-  environment[output] = NULL;
-  *out_environment = environment;
-  *out_owned_vector = environment;
-  *out_owned_path = path_entry;
+  if (exec_path_prefix && !path_seen) {
+    generated_path = async_build_path_entry(exec_path_prefix, NULL);
+    if (!generated_path) goto fail;
+    entries[output++] = generated_path;
+  }
+  entries[output] = NULL;
+
+  for (size_t i = 0; i < count; i++)
+    if (!retained[i]) free(raw_entries[i]);
+  free(raw_entries);
+  free(retained);
+  free(slots);
+
+  *out = (struct AsyncChildEnvironment){
+      .entries = entries,
+      .count = output,
+  };
   return true;
+
+fail:
+  for (size_t i = 0; i < count; i++) free(raw_entries[i]);
+  free(raw_entries);
+  free(entries);
+  free(retained);
+  free(slots);
+  free(generated_path);
+  free(generated_pwd);
+  return false;
 }
 
 /* fzf-native-async-start COMMAND &optional DIR -> session handle */
@@ -4318,7 +4487,15 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
 
   char *dir = NULL;
   if (nargs > 1 && !env->eq(env, args[1], Qnil)) {
-    dir = async_copy_lisp_c_string(env, args[1], "producer directory");
+    emacs_value expand_file_name = env->intern(env, "expand-file-name");
+    emacs_value expanded_dir = env->funcall(
+        env, expand_file_name, 1, &args[1]);
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+      free(cmd);
+      return Qnil;
+    }
+    dir = async_copy_lisp_c_string(
+        env, expanded_dir, "producer directory");
     if (!dir) {
       free(cmd);
       return Qnil;
@@ -4381,12 +4558,9 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     }
   }
 
-  char **child_environment = NULL;
-  char **owned_environment = NULL;
-  char *owned_path = NULL;
+  struct AsyncChildEnvironment child_environment = {0};
   if (!async_build_child_environment(
-          exec_path_str, &child_environment,
-          &owned_environment, &owned_path))
+          env, exec_path_str, dir, &child_environment))
     goto start_allocation_failure;
 
   fzf_log("async_start: shell='%s' switch='%s' cmd='%s' dir='%s' PATH='%s'\n",
@@ -4403,8 +4577,7 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     free(shell_prog);
     free(shell_switch);
     free(exec_path_str);
-    free(owned_environment);
-    free(owned_path);
+    async_free_child_environment(&child_environment);
     async_signal_posix_error(
         env, "producer output pipe creation", error_number);
     return Qnil;
@@ -4420,8 +4593,7 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     free(shell_prog);
     free(shell_switch);
     free(exec_path_str);
-    free(owned_environment);
-    free(owned_path);
+    async_free_child_environment(&child_environment);
     async_signal_posix_error(
         env, "producer status pipe creation", error_number);
     return Qnil;
@@ -4439,8 +4611,7 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     free(shell_prog);
     free(shell_switch);
     free(exec_path_str);
-    free(owned_environment);
-    free(owned_path);
+    async_free_child_environment(&child_environment);
     async_signal_posix_error(
         env, "producer status pipe configuration", error_number);
     return Qnil;
@@ -4459,8 +4630,7 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     free(shell_prog);
     free(shell_switch);
     free(exec_path_str);
-    free(owned_environment);
-    free(owned_path);
+    async_free_child_environment(&child_environment);
     async_signal_posix_error(
         env, "producer fork", error_number);
     return Qnil;
@@ -4490,7 +4660,7 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
       async_child_spawn_fail(
           status_fd[1], AsyncSpawnStageDirectory, errno);
     char *const child_argv[] = {shell_prog, shell_switch, cmd, NULL};
-    execve(shell_prog, child_argv, child_environment);
+    execve(shell_prog, child_argv, child_environment.entries);
     async_child_spawn_fail(status_fd[1], AsyncSpawnStageExec, errno);
   }
   (void)setpgid(pid, pid);
@@ -4503,8 +4673,7 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   free(shell_prog);
   free(shell_switch);
   free(exec_path_str);
-  free(owned_environment);
-  free(owned_path);
+  async_free_child_environment(&child_environment);
   if (spawn_failed) {
     close(pfd[0]);
     (void)waitpid(pid, NULL, 0);
@@ -7494,6 +7663,8 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qsym_shell_file_name      = env->make_global_ref(env, env->intern(env, "shell-file-name"));
   Qsym_shell_command_switch = env->make_global_ref(env, env->intern(env, "shell-command-switch"));
   Qsym_exec_path            = env->make_global_ref(env, env->intern(env, "exec-path"));
+  Qsym_process_environment  = env->make_global_ref(
+      env, env->intern(env, "process-environment"));
   Qvector  = env->make_global_ref(env, env->intern(env, "vector"));
   Qstring  = env->make_global_ref(env, env->intern(env, "string"));
   Qignore  = env->make_global_ref(env, env->intern(env, "ignore"));

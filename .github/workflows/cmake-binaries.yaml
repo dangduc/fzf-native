@@ -110,6 +110,14 @@ jobs:
                  fzf-native-async-submit-pins-session-across-lisp-reentry-test \
                  fzf-native-async-cache-positive-quote-refinement-test \
                  fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
+                 fzf-native-async-max-line-length-counts-characters-test \
+                 fzf-native-async-line-cap-streams-ansi-heavy-record-test \
+                 fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
+                 fzf-native-async-producer-uses-dynamic-process-environment-test \
+                 fzf-native-async-producer-honors-environment-removal-test \
+                 fzf-native-async-producer-honors-path-removal-test \
+                 fzf-native-async-producer-corrects-pwd-for-directory-test \
+                 fzf-native-async-producer-honors-pwd-removal-test \
                  fzf-native-score-all-empty-string-candidate-test \
                  fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
@@ -144,6 +152,14 @@ jobs:
                  fzf-native-async-submit-pins-session-across-lisp-reentry-test \
                  fzf-native-async-cache-positive-quote-refinement-test \
                  fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
+                 fzf-native-async-max-line-length-counts-characters-test \
+                 fzf-native-async-line-cap-streams-ansi-heavy-record-test \
+                 fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
+                 fzf-native-async-producer-uses-dynamic-process-environment-test \
+                 fzf-native-async-producer-honors-environment-removal-test \
+                 fzf-native-async-producer-honors-path-removal-test \
+                 fzf-native-async-producer-corrects-pwd-for-directory-test \
+                 fzf-native-async-producer-honors-pwd-removal-test \
                  fzf-native-score-all-empty-string-candidate-test \
                  fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
@@ -262,6 +278,14 @@ jobs:
                  fzf-native-async-submit-pins-session-across-lisp-reentry-test \
                  fzf-native-async-cache-positive-quote-refinement-test \
                  fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
+                 fzf-native-async-max-line-length-counts-characters-test \
+                 fzf-native-async-line-cap-streams-ansi-heavy-record-test \
+                 fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
+                 fzf-native-async-producer-uses-dynamic-process-environment-test \
+                 fzf-native-async-producer-honors-environment-removal-test \
+                 fzf-native-async-producer-honors-path-removal-test \
+                 fzf-native-async-producer-corrects-pwd-for-directory-test \
+                 fzf-native-async-producer-honors-pwd-removal-test \
                  fzf-native-score-all-empty-string-candidate-test \
                  fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
@@ -287,6 +311,14 @@ jobs:
                  fzf-native-async-submit-pins-session-across-lisp-reentry-test \
                  fzf-native-async-cache-positive-quote-refinement-test \
                  fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
+                 fzf-native-async-max-line-length-counts-characters-test \
+                 fzf-native-async-line-cap-streams-ansi-heavy-record-test \
+                 fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
+                 fzf-native-async-producer-uses-dynamic-process-environment-test \
+                 fzf-native-async-producer-honors-environment-removal-test \
+                 fzf-native-async-producer-honors-path-removal-test \
+                 fzf-native-async-producer-corrects-pwd-for-directory-test \
+                 fzf-native-async-producer-honors-pwd-removal-test \
                  fzf-native-score-all-empty-string-candidate-test \
                  fzf-native-utf8-case-ignore-length-changing-fold-test))"
 
@@ -322,6 +354,14 @@ jobs:
                      fzf-native-async-submit-pins-session-across-lisp-reentry-test \
                      fzf-native-async-cache-positive-quote-refinement-test \
                      fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
+                     fzf-native-async-max-line-length-counts-characters-test \
+                     fzf-native-async-line-cap-streams-ansi-heavy-record-test \
+                     fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
+                     fzf-native-async-producer-uses-dynamic-process-environment-test \
+                     fzf-native-async-producer-honors-environment-removal-test \
+                     fzf-native-async-producer-honors-path-removal-test \
+                     fzf-native-async-producer-corrects-pwd-for-directory-test \
+                     fzf-native-async-producer-honors-pwd-removal-test \
                      fzf-native-score-all-empty-string-candidate-test \
                      fzf-native-utf8-case-ignore-length-changing-fold-test))"
           fi
@@ -343,6 +383,14 @@ jobs:
                    fzf-native-async-submit-pins-session-across-lisp-reentry-test \
                    fzf-native-async-cache-positive-quote-refinement-test \
                    fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
+                   fzf-native-async-max-line-length-counts-characters-test \
+                   fzf-native-async-line-cap-streams-ansi-heavy-record-test \
+                   fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
+                   fzf-native-async-producer-uses-dynamic-process-environment-test \
+                   fzf-native-async-producer-honors-environment-removal-test \
+                   fzf-native-async-producer-honors-path-removal-test \
+                   fzf-native-async-producer-corrects-pwd-for-directory-test \
+                   fzf-native-async-producer-honors-pwd-removal-test \
                    fzf-native-score-all-empty-string-candidate-test \
                    fzf-native-utf8-case-ignore-length-changing-fold-test))"
           actual=$(nm -D --defined-only -P bin/FreeBSD/fzf-native-module.so | awk '{print $1}' | sort)

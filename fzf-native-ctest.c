@@ -2350,6 +2350,37 @@ static void test_batch_cache_query_cap_preserves_active_references(void) {
   batch_cache_free(&cache);
 }
 
+static void test_batch_cache_owner_eviction_unlinks_hash_in_linear_work(void) {
+  enum { entry_total = 2048 };
+  BatchCache cache;
+  batch_cache_init(&cache, 4 * 1024 * 1024);
+
+  /* Put every membership in one hash chain.  Query eviction walks the owner
+     list oldest-first, which made a fresh bucket scan quadratic before each
+     entry retained its hash predecessor link. */
+  free(cache.buckets);
+  cache.bucket_count = 1;
+  cache.buckets = calloc(cache.bucket_count, sizeof *cache.buckets);
+  CHECK(cache.buckets != NULL);
+
+  BatchQuery *query = batch_cache_acquire_query(
+      &cache, "linear-owner-eviction", CaseSmart, true);
+  CHECK(query != NULL);
+  for (size_t batch_id = 0; batch_id < entry_total; batch_id++)
+    batch_cache_insert(&cache, query, batch_id, NULL, 0);
+  CHECK(cache.entry_count == entry_total);
+  CHECK(query->entry_count == entry_total);
+
+  batch_cache_test_hash_unlinks = 0;
+  cache.max_queries = 0;
+  batch_cache_release_query(&cache, query);
+  CHECK(batch_cache_test_hash_unlinks == entry_total);
+  CHECK(cache.entry_count == 0);
+  CHECK(cache.query_count == 0);
+  CHECK(cache.used_bytes == 0);
+  batch_cache_free(&cache);
+}
+
 static void test_completed_batch_evidence_survives_request_cancellation(void) {
   BatchCache cache;
   batch_cache_init(&cache, 1024 * 1024);
@@ -3641,6 +3672,7 @@ int main(void) {
   RUN(test_batch_cache_query_cap_evicts_complete_owners);
   RUN(test_batch_cache_source_scan_is_bounded_and_exact_is_hashed);
   RUN(test_batch_cache_query_cap_preserves_active_references);
+  RUN(test_batch_cache_owner_eviction_unlinks_hash_in_linear_work);
   RUN(test_completed_batch_evidence_survives_request_cancellation);
   RUN(test_mutable_partial_batch_does_not_enter_batch_cache);
 

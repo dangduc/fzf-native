@@ -583,6 +583,19 @@ Reentry tests use this option because their callback needs one candidate."
       (sleep-for 0.01))
     status))
 
+(defun fzf-native-test--producer-output (command &optional directory)
+  "Run COMMAND in DIRECTORY and return its async candidate lines."
+  (let ((handle (fzf-native-async-start command directory)))
+    (unwind-protect
+        (progn
+          (fzf-native-test--wait-for-producer handle)
+          (let* ((request-id (fzf-native-async-submit handle "" 10))
+                 (snapshot
+                  (fzf-native-test--wait-for-request handle request-id)))
+            (mapcar #'substring-no-properties
+                    (plist-get snapshot :candidates))))
+      (fzf-native-async-stop handle))))
+
 (ert-deftest fzf-native-async-lifecycle-test ()
   "Start → wait for data → generation advances → stop."
   (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz")))
@@ -633,6 +646,95 @@ batch scorer rejects a live session in its optional slab position."
           (should (= (plist-get status :producer-exit-status) 0))
           (should-not (plist-get status :producer-error)))
       (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-producer-uses-dynamic-process-environment-test ()
+  "A producer receives values from the current Lisp environment."
+  (skip-unless (memq system-type '(darwin gnu/linux berkeley-unix)))
+  (let ((process-environment
+         (cons "FZF_NATIVE_TEST_DYNAMIC_ENV=present" process-environment)))
+    (should
+     (equal
+      (fzf-native-test--producer-output
+       "printf '%s\\n' \"$FZF_NATIVE_TEST_DYNAMIC_ENV\"")
+      '("present")))))
+
+(ert-deftest fzf-native-async-producer-honors-environment-removal-test ()
+  "A name-only entry hides every older value with the same name."
+  (skip-unless (memq system-type '(darwin gnu/linux berkeley-unix)))
+  (let ((process-environment
+         (cons "FZF_NATIVE_TEST_REMOVED_ENV"
+               (cons "FZF_NATIVE_TEST_REMOVED_ENV=shadowed"
+                     process-environment))))
+    (should
+     (equal
+      (fzf-native-test--producer-output
+      "printf '%s\\n' \"$FZF_NATIVE_TEST_REMOVED_ENV\"")
+      '("")))))
+
+(ert-deftest fzf-native-async-producer-honors-path-removal-test ()
+  "A name-only PATH entry overrides `exec-path' augmentation."
+  (skip-unless (and (memq system-type '(darwin gnu/linux berkeley-unix))
+                    (executable-find "python3")))
+  (let* ((python (executable-find "python3"))
+         (process-environment
+          (cons "PATH" (cons "PATH=/shadowed" process-environment)))
+         (exec-path (list (file-name-directory python)))
+         (shell-file-name python)
+         (shell-command-switch "-c"))
+    (should
+     (equal
+      (fzf-native-test--producer-output
+      "import os; print('set' if 'PATH' in os.environ else 'unset')")
+      '("unset")))))
+
+(ert-deftest fzf-native-async-producer-corrects-pwd-for-directory-test ()
+  "An effective PWD value tracks the producer working directory."
+  (skip-unless (and (memq system-type '(darwin gnu/linux berkeley-unix))
+                    (executable-find "python3")))
+  (let* ((python (executable-find "python3"))
+         (directory (make-temp-file "fzf-native-pwd-" t))
+         (process-environment (cons "PWD=/stale" process-environment))
+         (exec-path (list (file-name-directory python)))
+         (shell-file-name python)
+         (shell-command-switch "-c")
+         (default-directory (file-name-as-directory directory)))
+    (unwind-protect
+        (should
+         (equal
+          (fzf-native-test--producer-output
+           "import os; print(os.environ.get('PWD', 'unset'))" ".")
+          (list (directory-file-name directory))))
+      (delete-directory directory))))
+
+(ert-deftest fzf-native-async-producer-honors-pwd-removal-test ()
+  "A name-only PWD entry stays removed when DIR is explicit."
+  (skip-unless (and (memq system-type '(darwin gnu/linux berkeley-unix))
+                    (executable-find "python3")))
+  (let* ((python (executable-find "python3"))
+         (directory (make-temp-file "fzf-native-pwd-" t))
+         (process-environment
+          (cons "PWD" (cons "PWD=/stale" process-environment)))
+         (exec-path (list (file-name-directory python)))
+         (shell-file-name python)
+         (shell-command-switch "-c"))
+    (unwind-protect
+        (should
+         (equal
+          (fzf-native-test--producer-output
+           "import os; print('set' if 'PWD' in os.environ else 'unset')"
+           directory)
+          '("unset")))
+      (delete-directory directory))))
+
+(ert-deftest fzf-native-async-producer-rejects-invalid-environment-test ()
+  "Invalid environment entries fail before a child starts."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (let ((process-environment (cons 42 process-environment)))
+    (should-error (fzf-native-async-start "printf unreachable")))
+  (let ((process-environment
+         (cons (concat "FZF_NATIVE_TEST_NUL=before" "\0" "after")
+               process-environment)))
+    (should-error (fzf-native-async-start "printf unreachable"))))
 
 (ert-deftest fzf-native-async-producer-honors-working-directory-test ()
   "The child runs in DIR, rather than silently inheriting Emacs's cwd."

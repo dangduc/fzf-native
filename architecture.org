@@ -742,8 +742,26 @@ the least-recent inactive query when it reaches the limit.  This operation
 also removes the membership entries of that query.  Cache evidence is
 optional, so an eviction does not change a match result.
 
+Each membership entry keeps a link to its hash predecessor.  Bulk query
+eviction therefore removes its entries in linear work while holding the lock.
+
 Snapshots expose query, entry, byte, hit, miss, and eviction counters.  These
 counters make narrowing reuse measurable in module-boundary tests.
+
+** Producer process environment
+
+=fzf-native-async-start= copies the current Lisp =process-environment= before
+it forks.  The first entry for each variable controls the child environment.
+A name-only entry removes that variable and hides older duplicate values.
+
+The copied environment owns every string until =execve= completes.  Later
+Lisp changes cannot race this snapshot.  A dynamic =exec-path= augments the
+effective =PATH= without reading the stale environment that launched Emacs.
+An explicit name-only =PATH= entry suppresses this augmentation.
+
+When a caller supplies =DIR=, Emacs expands it before the fork.  An effective
+=PWD= entry receives that absolute directory.  A name-only =PWD= entry stays
+removed.
 
 ** Producer and matcher failures
 
