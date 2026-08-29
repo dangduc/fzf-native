@@ -1289,6 +1289,76 @@ in fzf and the cache should treat them so via term-set subsumption
                            '("bar" "foo")))))
       (fzf-native-async-stop handle))))
 
+(ert-deftest fzf-native-async-cache-positive-quote-refinement-test ()
+  "A longer positive quoted term scans only its cached ancestor's matches.
+
+The leading quote toggles a positive term between exact and fuzzy matching.
+Extending either form is monotone, so both global fuzzy modes may safely reuse
+the prior membership set.  Compare both rounds with batch scoring to guard the
+optimization's semantics, and assert `progress-total' to prove that the second
+round actually took the refinement path."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((collection '("alpha" "alphabet" "alphanumeric"
+                      "beta" "gamma" "你好-alpha")))
+    (dolist (fuzzy '(t nil))
+      (let* ((fzf-native-fuzzy fuzzy)
+             (fzf-native-case-mode 'smart)
+             (fzf-native-async-cache-size 40)
+             (fzf-native-async-cache-bytes (* 1024 1024))
+             (fzf-native-async-batch-cache-bytes 0)
+             (fzf-native-async-highlight nil)
+             (fzf-native-batch-highlight nil)
+             (handle
+              (fzf-native-async-start
+               "printf '%s\\n' alpha alphabet alphanumeric beta gamma 你好-alpha")))
+        (unwind-protect
+            (progn
+              (let ((producer (fzf-native-test--wait-for-producer handle)))
+                (should (plist-get producer :reader-done))
+                (should (= (plist-get producer :pool-generation)
+                           (length collection))))
+              (let* ((first-query "'alpha")
+                     (second-query "'alphab")
+                     (first-id
+                      (fzf-native-async-submit handle first-query 20))
+                     (first
+                      (fzf-native-test--wait-for-request handle first-id))
+                     (second-id
+                      (fzf-native-async-submit handle second-query 20))
+                     (second
+                      (fzf-native-test--wait-for-request handle second-id))
+                     (expected-first
+                      (mapcar #'substring-no-properties
+                              (append (fzf-native-score-all
+                                       collection first-query)
+                                      nil)))
+                     (expected-second
+                      (mapcar #'substring-no-properties
+                              (append (fzf-native-score-all
+                                       collection second-query)
+                                      nil))))
+                (should (eq (plist-get first :state) 'complete))
+                (should (eq (plist-get second :state) 'complete))
+                (should-not (plist-get first :stale))
+                (should-not (plist-get second :stale))
+                (should
+                 (equal (mapcar #'substring-no-properties
+                                (plist-get first :candidates))
+                        expected-first))
+                (should
+                 (equal (mapcar #'substring-no-properties
+                                (plist-get second :candidates))
+                        expected-second))
+                (should (= (plist-get first :filtered)
+                           (length expected-first)))
+                (should (= (plist-get second :filtered)
+                           (length expected-second)))
+                (should (= (plist-get second :progress-total)
+                           (plist-get first :filtered)))
+                (should (< (plist-get second :progress-total)
+                           (plist-get second :pool-generation)))))
+          (fzf-native-async-stop handle))))))
+
 (ert-deftest fzf-native-async-stable-batch-cache-narrowing-test ()
   "A narrower request consumes whole-result membership before batch evidence."
   (skip-unless (fboundp 'fzf-native-async-submit))

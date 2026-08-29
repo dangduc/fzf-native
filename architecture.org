@@ -656,10 +656,12 @@ compatibility function performs both operations in one call.
 *Subsumption rule* (cache_lookup_prefix). Q' subsumes Q if either
 holds:
 
-- *Simple positive byte-prefix* — Q' is one operator-free positive term and is
-  a byte-prefix of Q.  This captures term extension and later AND terms.  An
-  operator-bearing source must use parsed-term proof because inverse extension
-  can broaden a match set.
+- *Simple positive byte-prefix* — Q' is one positive term and is a byte-prefix
+  of Q.  The term can be operator-free or can have one leading quote followed
+  by non-empty text.  This captures positive term extension and later AND
+  terms.  Other operator-bearing sources must use parsed-term proof because an
+  inverse extension can broaden a match set.  Empty, doubled, inverse, anchored,
+  and OR-bearing quoted forms do not use this fast path.
 - *Term-set* — both queries parse to non-OR patterns (no term-set
   with >1 term) and every term-set in Q' has an equivalent term-set
   in Q. Captures: adding an AND term in non-prefix position

@@ -1676,11 +1676,16 @@ static void test_subsumes_pattern_extending_term_via_byte_prefix(void) {
   CHECK(subsumes("fo", "foo") == true);
 }
 
-static void test_byte_prefix_rejects_operator_source_terms(void) {
+static void test_byte_prefix_operator_source_safety(void) {
   CHECK(subsumes("!foo", "!foobar") == false);
   CHECK(subsumes("foo$", "foo$bar") == false);
   CHECK(subsumes("^foo", "^foobar") == false);
-  CHECK(subsumes("'foo", "'foobar") == false);
+  CHECK(subsumes("'foo", "'foobar") == true);
+  CHECK(subsumes("'", "'foo") == false);
+  CHECK(subsumes("''foo", "''foobar") == false);
+  CHECK(subsumes("'!foo", "'!foobar") == false);
+  CHECK(subsumes("'foo$", "'foo$bar") == false);
+  CHECK(subsumes("'foo", "'foo | bar") == false);
   CHECK(subsumes("foo bar", "foo bar baz") == false);
 }
 
@@ -1796,6 +1801,23 @@ static void test_cache_lookup_prefix_rejects_inverse_extension(void) {
                              &out, &out_count, &out_sidx, &out_gen));
   CHECK(out == NULL);
   CHECK(out_sidx == NULL);
+  cache_free(&c);
+}
+
+static void test_cache_lookup_prefix_finds_positive_quote_extension(void) {
+  Cache c;
+  cache_init(&c, 20);
+  cache_insert_eligible(&c, "'foo", 100);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0;
+  CHECK(cache_lookup_prefix(&c, "'foobar", CaseSmart, true,
+                            &out, &out_count, &out_sidx, &out_gen));
+  CHECK(out_gen == 100);
+  CHECK(out_sidx != NULL);
+  shared_idx_release(out_sidx);
+  free(out);
   cache_free(&c);
 }
 
@@ -3268,7 +3290,7 @@ int main(void) {
 
   printf("--- cache (phase 2: term-set subsumption) ---\n");
   RUN(test_subsumes_pattern_extending_term_via_byte_prefix);
-  RUN(test_byte_prefix_rejects_operator_source_terms);
+  RUN(test_byte_prefix_operator_source_safety);
   RUN(test_subsumes_pattern_adding_term_at_end);
   RUN(test_subsumes_pattern_adding_term_at_start);
   RUN(test_subsumes_pattern_term_reorder);
@@ -3277,6 +3299,7 @@ int main(void) {
   RUN(test_subsumes_pattern_distinct_terms);
   RUN(test_cache_lookup_prefix_v2_finds_term_subset);
   RUN(test_cache_lookup_prefix_rejects_inverse_extension);
+  RUN(test_cache_lookup_prefix_finds_positive_quote_extension);
   RUN(test_cache_lookup_prefix_v2_finds_reordered);
   RUN(test_cache_lookup_prefix_picks_most_terms);
   RUN(test_cache_lookup_prefix_skips_or_in_query);

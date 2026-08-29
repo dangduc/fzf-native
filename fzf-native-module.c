@@ -1902,15 +1902,23 @@ static void cache_stats(Cache *c, size_t *entries, size_t *bytes,
 }
 
 /* A raw byte-prefix proves subsumption only when Q' is one simple positive
-   term.  Extending that term, or adding later AND terms, can only narrow its
-   match set.  Operator-bearing sources need parsed-term proof: for example,
-   extending !foo to !foobar broadens the inverse match, and treating it as a
-   safe ancestor would silently discard valid candidates. */
+   term.  A single leading quote is also safe when followed by a non-empty
+   term: it toggles that positive term between fuzzy and exact matching, and
+   extending either form can only narrow its match set.  Extending the term,
+   or adding later AND terms, can likewise only narrow its match set.  Other
+   operator-bearing sources need parsed-term proof: for example, extending
+   !foo to !foobar broadens the inverse match, and treating it as a safe
+   ancestor would silently discard valid candidates. */
 static bool subsumes(const char *q_prime, const char *q) {
   if (strchr(q_prime, '|') || strchr(q, '|')) return false;
   size_t lp = strlen(q_prime);
   if (lp == 0) return true;
-  if (strpbrk(q_prime, " \t\r\n!'^$\\")) return false;
+  const char *source_term = q_prime;
+  if (*source_term == '\'') {
+    source_term++;
+    if (*source_term == '\0') return false;
+  }
+  if (strpbrk(source_term, " \t\r\n!'^$\\")) return false;
   size_t lq = strlen(q);
   if (lq < lp) return false;
   return memcmp(q, q_prime, lp) == 0;
