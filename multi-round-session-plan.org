@@ -1,16 +1,22 @@
 #+title: Multi-round fzf-native session plan
-#+status: Native implementation complete; companion integration and release artifacts pending.
+#+status: Historical design record. Native implementation is complete. Stacked integration and release pull requests remain pending.
+
+This file records the session design, its upstream fzf research, and its verification results.
+See [[file:architecture.org][architecture.org]] for the current implementation contract.
+
+Sections that describe planned work preserve the original decision sequence.
+They are not the current implementation reference.
 
 * Goal
 
-Complete the long-lived session support that =AsyncSession= already starts.
+Complete the long-lived session support that the earlier =AsyncSession= started.
 
 A session keeps its producer, candidate pool, matcher state, caches, and worker
 resources between query updates.  Emacs submits new queries without starting a
 new producer process or creating a new set of worker threads.
 
-Keep the current batch and asynchronous APIs.  Add request-aware operations, then
-implement the old combined dispatch-and-read operation as a compatibility layer.
+Keep the batch and compatibility APIs.
+Add request-aware operations and implement combined dispatch-and-read as a compatibility layer.
 
 * Implementation status
 
@@ -28,7 +34,8 @@ The reader now coalesces candidate-growth events after the first request.  The
 coordinator retries that request with the same request ID and a new pool
 boundary.  It keeps the prior completed result visible during the retry.
 
-All sessions now share one lazily-created process-wide pthread worker pool.
+All sessions now share one lazily-created process-wide worker pool.
+The pool uses pthreads.
 Each worker keeps one matcher slab for the process lifetime.  A session adds
 only its producer, reader, and scoring coordinator threads.
 
@@ -44,49 +51,37 @@ request errors.  A matcher failure keeps the prior completed result.
 
 The companion fzfa change stores the native request ID and complete request
 signature for each source.  It accepts only a complete, fresh snapshot that
-belongs to that ID, keeps the prior display while a new request runs, and
-reports producer failure even when partial output exists.  This integration is
-tracked as a separate atomic change.
+belongs to that ID.  It keeps the prior display during a new request.
+It also reports producer failure with partial output.
+A separate atomic change tracks this integration.
 
 Native implementation, teardown hardening, and focused verification are
 complete.  The companion fzfa changes and portable module artifacts remain in
 separate atomic pull requests that must pass their integration gates before
 merge.  Optional progressive top-K publication remains a separate follow-up.
 
-* Current fzf-native state
+* Implemented session state
 
-The current asynchronous handle is already a partial multi-round session.
-=fzf-native-async-start= forks one producer process.  It also starts one reader
-thread and one long-lived scoring coordinator thread.  Repeated calls to
-=fzf-native-async-candidates= on the same handle do not fork another process.
+=fzf-native-async-start= starts one producer, one reader, and one long-lived coordinator.
+Repeated query updates on that handle do not start another producer.
 
-=fzf-native-async-candidates= combines two actions.  It submits a query and
-returns the best result that is available.  On a miss, it returns the last
-completed result while the coordinator scores the new query.  This behavior is
-close to interactive fzf, but the API does not identify which request produced
-the returned list.
+=fzf-native-async-candidates= still combines request submission and result reading.
+The request-aware API separates these operations and identifies the result owner.
 
-The coordinator has one pending-request slot.  A changed query sets an abort
-flag and replaces the queued request.  One lazy process-wide pthread pool runs
-scoring requests for every session.  Each worker reuses one matcher slab.
+The coordinator owns one pending-request slot.
+A changed request sets an abort flag and replaces obsolete queued work.
 
-The result cache stores a literal query, a top-K result, and the full set of
-matching candidate indexes.  It supports exact hits, narrowing refinement, and
-append-only candidate deltas.  A separate stable-batch cache stores safe
-membership after each complete immutable batch.  Cancellation keeps that
-evidence but does not publish a cancelled whole result.
+One lazy process-wide worker pool runs scoring work for all sessions.
+Each worker reuses one matcher slab.
 
-The old cache key omitted case mode, fuzzy mode, filter-only mode, and result
-capacity.  The first implementation slice corrected case mode, fuzzy mode, and
-result-capacity handling.  It reuses membership across filter-only modes, but
-it does not reuse ranked results across those modes.
+The whole-result cache supports exact hits, narrowing refinement, and append-only deltas.
+Its key includes case mode, fuzzy mode, filter-only mode, and result capacity rules.
 
-The current generation counter also mixes two events.  The reader increments it
-for each candidate.  The scorer increments it for a completed result.  A caller
-cannot use this counter to identify a query result.
+The stable-batch cache retains safe membership from complete immutable batches.
+Cancellation keeps this evidence but does not publish an obsolete whole result.
 
-The remaining work is not a new session from zero.  It is a controlled upgrade
-of =AsyncSession= and its Emacs integration.
+The compatibility generation counter mixes candidate and result changes.
+Request IDs and snapshot generations provide exact ownership for new callers.
 
 * Upstream fzf reference
 
@@ -124,8 +119,8 @@ A query update cancels the active scan at a chunk boundary.  Rapid updates
 coalesce to the latest request.  A cancelled scan does not publish a final list.
 
 Candidate growth uses a different policy.  fzf lets the scan of the current
-snapshot finish.  It then retries with the latest candidate snapshot.  Reader
-notifications are coalesced in a 10 to 50 ms window.
+snapshot finish.  It then retries with the latest candidate snapshot.
+fzf coalesces reader notifications in a 10 to 50 ms window.
 
 ** What fzf reuses
 
@@ -138,24 +133,24 @@ narrower query can skip candidates that did not match the broader query.  This
 keeps safe membership evidence without treating old scores or old ordering as
 authoritative.
 
-fzf does not cache a chunk when more than 512 of its 1,024 candidates match.
+If more than 512 of 1,024 candidates match, fzf does not cache the chunk.
 Only full, stable chunks enter this cache.  The mutable last chunk gets copied
 for a snapshot and does not become shared cache state.
 
-fzf also caches exact completed result lists.  It uses this cache only when the
-candidate count is unchanged.  It does not cache a completed result with
+fzf also caches exact completed result lists.  It uses this cache only for an
+unchanged candidate count.  It does not cache a completed result with
 100,000 or more matches.
 
-The exact-result cache is invalidated when the candidate count changes.  Stable
+After the candidate count changes, fzf invalidates the exact-result cache.  Stable
 chunk bitmaps remain useful during append-only input growth.  A source revision
 change clears incompatible chunk data.
 
 ** Deliberate fzf-native differences
 
 fzf assumes that search mode and case mode remain fixed during one process.
-fzf-native exposes these settings per call.  Every fzf-native cache key must
+fzf-native exposes this configuration per call.  Every fzf-native cache key must
 therefore include all matching semantics, or a session must freeze those
-settings.
+configuration values.
 
 fzf accepts a result-wait race because its terminal consumes events internally.
 The Emacs API needs exact request ownership.  Every request and snapshot must
@@ -163,24 +158,24 @@ carry a monotonic request ID.
 
 fzf creates new Go goroutines for a scan but reuses matcher slabs and sort
 buffers.  Native threads have a higher setup cost.  fzf-native uses one
-process-wide persistent pthread worker pool and reuses per-worker memory.
+persistent worker pool for the process and reuses per-worker memory.
 
 ** Design comparison
 
-| Concern | fzf 0.74.3 | Current fzf-native | Planned fzf-native |
-|---------+------------+--------------------+--------------------|
-| Producer lifetime | One reader cycle | One child per async handle | Keep current behavior |
-| Query update | Cancel and coalesce | Abort and replace one slot | Add request IDs and fix cancellation races |
-| Input growth | Finish, then retry | Coalesce growth and retry | Keep implemented behavior |
-| Result display | Keep prior completed list | Return prior or cached list | Keep behavior and label ownership |
-| Partial matches | Progress only | No partial publication | Defer optional top-K publication |
-| Safe reuse | Per-chunk membership bitmap | Per-query match-index array | Add stable per-batch evidence |
-| Exact reuse | Completed merger cache | Literal-query top-K cache | Use complete semantic keys |
-| Scan workers | New Go goroutines | Process-wide persistent pthread pool | Keep implemented behavior |
+| Concern | fzf 0.74.3 | Before this work | Implemented fzf-native |
+|---------+------------+------------------+------------------------|
+| Producer lifetime | One reader cycle | One child per async handle | One child per async handle |
+| Query update | Cancel and coalesce | Abort and replace one slot | Request IDs, cancellation, and replacement |
+| Input growth | Finish, then retry | Manual repeated dispatch | Coalesced retry with the same request ID |
+| Result display | Keep prior completed list | Return an unlabeled prior list | Keep prior list and label its owner |
+| Partial matches | Progress only | No partial publication | Progress only |
+| Safe reuse | Per-chunk membership bitmap | Per-query match-index array | Whole-result and stable-batch membership |
+| Exact reuse | Completed merger cache | Literal-query top-K cache | Complete semantic keys and limit rules |
+| Scan workers | New Go goroutines | Per-session pthread workers | Process-wide worker pool |
 
-* Product behavior
+* Implemented product behavior
 
-Implement fzf-compatible publication first:
+The first session release uses fzf-compatible publication:
 
 1. Keep the last completed result visible while a new request runs.
 2. Publish progress for the active request.
@@ -189,12 +184,12 @@ Implement fzf-compatible publication first:
 5. Publish the replacement result atomically after the active request finishes.
 
 Do not make progressive candidate publication part of the first release.  It is
-not required for fzf parity.  Add it later only if measurements show useful
+not required for fzf parity.  Add it later only after measurements show useful
 latency gains without unstable ordering or excessive Emacs traffic.
 
 * Public Emacs API
 
-Keep these operations:
+The release keeps these compatibility operations:
 
 #+begin_src emacs-lisp
 (fzf-native-async-start command &optional directory)
@@ -205,12 +200,12 @@ Keep these operations:
 (fzf-native-async-result-fresh-p handle query)
 #+end_src
 
-Add separate request and snapshot operations:
+It adds these request-aware operations:
 
 #+begin_src emacs-lisp
 (fzf-native-async-submit handle query &optional limit)
 (fzf-native-async-snapshot handle &optional request-id)
-(fzf-native-async-status handle)
+(fzf-native-async-status handle &optional request-id)
 #+end_src
 
 =fzf-native-async-submit= returns a monotonic request ID.  Submission never
@@ -221,19 +216,18 @@ builds an Emacs list and never waits for scoring.
 - request ID
 - pool generation
 - snapshot generation
-- state: =queued=, =running=, =complete=, =superseded=, or =failed=
+- state: =idle=, =queued=, =running=, =complete=, =failed=, =superseded=, or =unknown=
 - completed-batch candidate count and total scan count
 - last completed result, query, and request ID
-- current result when the requested search is complete
+- current result for a complete requested search
 - total match count
 - producer state and error data
 
-Make =fzf-native-async-candidates= a compatibility wrapper over submit and
-snapshot.  Preserve its immediate return and stale-result behavior.  Use the
-snapshot query for highlighting, not the newly submitted query.
+The combined candidate operation uses the same submission path.
+It preserves immediate return and stale-result behavior for compatibility.
 
-Keep =fzf-native-async-result-fresh-p= as a compatibility predicate.  Make it
-use request state and all matching semantics.
+Highlighting uses the retained result query, not a newly submitted query.
+=fzf-native-async-result-fresh-p= remains a compatibility predicate.
 
 Add collection-backed sessions only after command-backed sessions are stable.
 This addition does not block multi-round query support.
@@ -247,8 +241,8 @@ Each session owns:
 - one pool generation counter
 - one request ID counter
 - one snapshot generation counter
-- one producer process when command input is used
-- access to one process-wide persistent pthread worker pool
+- one producer process for command input
+- access to the process-wide worker pool
 - bounded request and completion queues
 - reusable worker slabs and sort buffers
 - a per-batch membership cache
@@ -256,7 +250,7 @@ Each session owns:
 - the last completed public snapshot
 
 Each request is immutable.  It contains the query, case mode, fuzzy mode,
-filter-only settings, result limit, pool boundary, pool generation, and request
+filter-only configuration, result limit, pool boundary, pool generation, and request
 ID.
 
 Workers never read mutable request fields.  Candidate publication uses a stable
@@ -276,9 +270,9 @@ A membership-cache key contains:
 - normalized query representation
 - case mode
 - fuzzy mode
-- filter-only settings
+- filter-only configuration
 - all other matching semantics
-- source or pool revision when needed
+- source or pool revision, as required
 
 The result limit is not part of membership identity.  It is part of a ranked
 snapshot request and its exact-result capacity.
@@ -287,7 +281,7 @@ Use a hybrid membership value:
 
 - a compact list of =uint32_t= indexes for sparse matches
 - a bitmap for denser matches
-- no entry when selectivity is too low
+- no entry for low selectivity
 
 Start with fzf's 50 percent selectivity cutoff as a reference.  Tune it with
 memory and latency measurements.  Put both cache types under explicit byte
@@ -297,8 +291,8 @@ An exact-result key contains all matching semantics, the pool generation, the
 pool boundary, and the requested result capacity.  In full-scoring mode, a
 larger cached capacity can serve a smaller limit.  A smaller capacity cannot
 serve a larger limit.  In filter-only mode, reuse requires the same effective
-emit-window size because the engine selects the input-order window before it
-ranks that window; truncating a larger ranked window changes semantics.
+emit-window size.  The engine selects the input-order window before it ranks
+that window.  Truncation of a larger ranked window changes semantics.
 
 Fix the current cache correctness defects before session reuse.  In particular,
 a result cached for limit 1 must not serve limit 3.  A case-insensitive result
@@ -317,7 +311,7 @@ On a query change:
 5. Keep membership entries from batches that finished before cancellation.
 6. Keep the last completed public snapshot visible and mark it as stale.
 7. Start the newest request.
-8. Publish its final snapshot only if its request ID is still current.
+8. If its request ID is still current, publish its final snapshot.
 
 Never publish an obsolete request as the current result.
 
@@ -327,7 +321,7 @@ On append-only candidate growth:
 
 1. Coalesce producer notifications.
 2. Let the scan of the current stable snapshot finish.
-3. Publish that completed snapshot if its query is still current.
+3. If its query is still current, publish that completed snapshot.
 4. Retry the current query against the newest stable pool boundary.
 5. Reuse cache entries for unchanged full batches.
 6. Scan the new candidate delta and the current partial batch.
@@ -347,7 +341,7 @@ Classify a transition as one of these types:
 - =NEW_BROADENS_OLD=: every old match remains a new match.
 - =UNKNOWN=: no safe relationship is known.
 
-For =EXACT=, use an exact completed result when the pool boundary also matches.
+For =EXACT= with a matching pool boundary, use an exact completed result.
 
 For =NEW_NARROWS_OLD=, scan only prior matches in cached stable batches.  Add new
 candidates from an append-only delta.
@@ -363,7 +357,7 @@ membership relationship does not imply a safe score relationship.
 
 * Worker execution
 
-Create the process-wide pthread worker pool lazily on the first scoring request.
+Create the process-wide worker pool lazily on the first scoring request.
 Keep it alive for the process lifetime.  Session stop removes only that
 session's work and joins its producer, reader, and coordinator.
 
@@ -371,10 +365,10 @@ Each worker owns reusable matcher slabs and result buffers.  Work items identify
 the session, request, batch, candidate range, and cache-derived input set.
 
 Workers test the cancellation generation at least once per batch.  Keep the
-current mid-batch test if measurements show negligible cost.
+current mid-batch test after measurements show negligible cost.
 
-The coordinator accepts a completion only when its request ID and pool
-generation match the work item.  It can still commit safe membership evidence
+The coordinator accepts only a completion with the request ID and pool
+generation of the work item.  It can still commit safe membership evidence
 for an immutable completed batch from an obsolete request.
 
 Use bounded queues and explicit backpressure.  Session shutdown closes the
@@ -382,11 +376,11 @@ queues, stops the producer, joins all workers, and frees cache and arena memory.
 
 * Ranking and result publication
 
-For the first release, retain the current final counting-sort path if it remains
-correct and fast enough.  Publish only a completed ranked snapshot.
+For the first release, retain the current final counting-sort path after it
+meets correctness and performance requirements.  Publish only a completed ranked snapshot.
 
-Then evaluate fzf's ranking structure.  fzf sorts a local list for each worker
-and performs a lazy k-way merge when the terminal asks for result indexes.  A
+Then evaluate fzf's ranking structure.  fzf sorts a local list for each worker.
+After the terminal asks for result indexes, fzf performs a lazy k-way merge.  A
 fixed top-K merge can fit the Emacs API better than a fully lazy merger.
 
 Do not expose worker completion order as rank order.  Tie-breaking must remain
@@ -432,13 +426,13 @@ Add focused tests for:
 - Emacs garbage collection of live and stopped sessions
 
 Add a state-machine fuzzer.  Its operations include append, replace, submit,
-poll, change settings, stop, and collect.  Compare every completed session
+poll, change configuration, stop, and collect.  Compare every completed session
 snapshot with a fresh batch calculation for the same stable pool boundary.
 
-Implemented: =fuzz/fzf-native-session-fuzz.c= includes the real module core and
-uses structured libFuzzer traces to append candidates, submit replacement
-requests with changing settings and limits, poll, wait, and stop active
-sessions.  It reaches the persistent scoring thread, worker pool, result cache,
+Implemented: =fuzz/fzf-native-session-fuzz.c= includes the real module core.
+Structured libFuzzer traces append candidates and submit replacement requests.
+They change configuration and limits, poll, wait, and stop active sessions.
+The target reaches the persistent coordinator, worker pool, result cache,
 stable-batch cache, growth retry, cancellation, publication, and synchronous
 teardown paths.  At quiescent pool boundaries it compares the exact ordered
 top-K snapshot, including scores and duplicate identity, with an independent
@@ -461,7 +455,7 @@ tests, direct Emacs 30.2 tests, and upstream match-set tests.
 * Benchmarks
 
 Use one session per trial.  Do not restart the producer between query updates
-in a trial; warm the process-wide worker pool before timed rounds.
+in a trial.  Warm the process-wide worker pool before timed rounds.
 
 Measure:
 
@@ -480,7 +474,7 @@ Report cold and warm results.  Include ASCII and UTF-8 corpora.  Compare each
 completed result with the batch API and upstream fzf where their semantics
 match.
 
-If progressive top-K is implemented, also measure time to the first useful
+If the release implements progressive top-K, also measure time to the first useful
 provisional list and reorder count before completion.
 
 * Implementation milestones
@@ -503,8 +497,8 @@ producer, reader, coordinator, and lifecycle management.
 
 ** Milestone 2: fzf-like request policy
 
-Status: Complete.  Query cancellation, queued-request replacement, candidate
-growth retry, and last-completed-result retention are implemented.
+Status: Complete.  The implementation includes query cancellation, queued-request
+replacement, candidate growth retry, and last-completed-result retention.
 
 Add query cancellation, latest-request coalescing, candidate-growth retry, and
 last-completed-result retention.
@@ -557,7 +551,7 @@ Evaluate local sorted lists with a fixed top-K merge.
 
 Status: Not started.
 
-Add provisional snapshots only when the benchmark results justify the added API
+Add provisional snapshots only after the benchmark results justify the added API
 and synchronization cost.
 
 * Verification record
@@ -591,7 +585,7 @@ the completion-table path and the Helm path start one native handle.
 
 The request tests cover cancellation, result ownership, retained results, and
 automatic input-growth retries.  The randomized test changes case and fuzzy
-settings between requests.  Each completed snapshot equals a new batch result.
+configuration between requests.  Each completed snapshot equals a new batch result.
 
 The teardown tests stop active sessions and wait for detached cleanup.  The GC
 test releases live sessions while producer and matcher threads run.

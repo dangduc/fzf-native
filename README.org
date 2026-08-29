@@ -5,23 +5,21 @@
 [[https://github.com/dangduc/fzf-native/actions/workflows/cmake.yaml][https://github.com/dangduc/fzf-native/actions/workflows/cmake.yaml/badge.svg]]
 [[https://github.com/dangduc/fzf-native/actions/workflows/format.yaml][https://github.com/dangduc/fzf-native/actions/workflows/format.yaml/badge.svg]]
 
-This is a package that provides fuzzy match scoring based on the fzf
-algorithm by [[https://github.com/junegunn][junegunn]]. The main
-contribution is a wrapper over the C implementation of fzf from the
-project
-[[https://github.com/nvim-telescope/telescope-fzf-native.nvim][telescope-fzf-native.nvim]].
-Elisp functions for scoring are exported through an Emacs dynamic
-module.
+fzf-native provides fzf matching through an Emacs dynamic module.
+It supports synchronous collections and persistent asynchronous command sessions.
 
-This package /does one thing/ -- For a given STR and QUERY compute
-and return a score and matching indices. If you're looking for a fuzzy
-auto-completion engine, see the Use Cases section for how this package
-can be used in a ~completion-style~.
+The matcher comes from
+[[https://github.com/nvim-telescope/telescope-fzf-native.nvim][telescope-fzf-native.nvim]].
+That project ports the fzf algorithm by [[https://github.com/junegunn][junegunn]] to C.
+
+When you need one score, use the scalar API.
+When Emacs already owns the candidate collection, use the batch API.
+When a command streams candidates during query changes, use the session API.
 
 #+begin_src emacs-lisp
 ;; Example of basic usage
 (fzf-native-score "Hot-Topic" "hp")
-;; (41 0 6)
+;; (41)
 #+end_src
 
 #+begin_src emacs-lisp
@@ -35,20 +33,28 @@ can be used in a ~completion-style~.
 (let ((slab (fzf-native-make-default-slab)))
   (fzf-native-score "Hello World" "er" slab)
   (fzf-native-score "Example of slab re-use" "xu" slab))
-;; (24 1 19)
+;; (24)
 #+end_src
 
-See [[fzf-native-test.el][test cases]] for more examples.
+=fzf-native-score= returns =(SCORE)=.
+The module now sends match positions to =fzf-native-highlight-fn= instead of returning them.
+
+See [[file:fzf-native-test.el][test cases]] for more examples.
 
 ** Supported Platforms
 
-Linux, macOS (including Apple silicon), FreeBSD, and Windows are supported.
-The package bundles native modules for x86-64 Linux, FreeBSD, and Windows, and
-for x86-64 and arm64 macOS.  Other architectures can build from source with
-=M-x fzf-native-load-own-build-dyn=.  The bundled Linux module is built on an
-older glibc baseline and requires glibc 2.31 or later.  The macOS modules
-require macOS 11 or later.  The FreeBSD module requires FreeBSD 14.4 or later.
-Pre-built shared libraries are in the [[bin][bin/]] directory.
+The synchronous API supports Linux, macOS, FreeBSD, and Windows.
+The persistent session API supports macOS, Linux, and FreeBSD.
+
+The package bundles x86-64 modules for Linux, FreeBSD, and Windows.
+It bundles x86-64 and arm64 modules for macOS.
+
+The Linux module requires glibc 2.31 or later.
+The macOS modules require macOS 11 or later.
+The FreeBSD module requires FreeBSD 14.4 or later.
+
+Prebuilt modules are in the [[file:bin][bin/]] directory.
+For another architecture, build from source with =M-x fzf-native-load-own-build-dyn=.
 
 ** Installation
 
@@ -103,23 +109,18 @@ Clone / download this repository and modify your ~load-path~:
 
 ** Use Cases
 
-[[https://github.com/jojojames/fussy][Fussy]]: ~fzf-native~ is used as
-one of several choose-your-own scoring backends in ~fussy~, a package
-that provides a ~completing-style~ for intelligent matching and
-sorting. See [[https://github.com/jojojames/fussy/blob/HEAD/architecture.org][fussy's architecture overview]]
-for how fussy dispatches to ~fzf-native~ during ~all-completions~.
+[[https://github.com/jojojames/fussy][fussy]] uses fzf-native as one of its scoring backends.
+It integrates the synchronous API with Emacs completion styles.
+See the [[https://github.com/jojojames/fussy/blob/HEAD/architecture.org][fussy architecture]].
 
-[[https://github.com/jojojames/fzfa][fzfa]]: an Emacs
-~completing-read~ wrapper that uses ~fzf-native~'s async surface to
-stream candidates from long-running shell commands (~find~, ~rg~,
-~git ls-files~, etc.) without blocking. See
-[[https://github.com/jojojames/fzfa/blob/HEAD/architecture.org][fzfa's architecture overview]]
-for the Elisp-side pipeline.
+[[https://github.com/dangduc/fzfa][fzfa]] uses persistent sessions for command-backed completion.
+One session can stream =find=, =rg=, or =git ls-files= output without blocking Emacs.
+See the [[https://github.com/dangduc/fzfa/blob/HEAD/architecture.org][fzfa architecture]].
 
 ** Request-aware asynchronous API
 
-One asynchronous handle keeps one producer process for its full lifetime.
-Submit each query to the same handle:
+One session handle keeps one producer until stop or producer exit.
+Submit every query update to the same handle.
 
 #+begin_src emacs-lisp
 (let* ((handle (fzf-native-async-start "find . -type f"))
@@ -129,110 +130,95 @@ Submit each query to the same handle:
     (fzf-native-async-stop handle)))
 #+end_src
 
-~fzf-native-async-submit~ returns a monotonic request ID.  An identical queued
-or active request keeps its existing ID.  A changed query replaces obsolete
-queued work and cancels obsolete active work.
+=fzf-native-async-submit= returns a monotonic request ID.
+An identical queued, running, or settled request keeps its existing ID.
 
-~fzf-native-async-snapshot~ returns a plist.  The ~:state~ value is ~queued~,
-~running~, ~complete~, ~failed~, ~superseded~, ~idle~, or ~unknown~.  The plist keeps the
-last completed ~:candidates~ while a newer request runs.  The
-~:result-request-id~ field identifies the owner of that list.  The ~:stale~
-field is non-nil for a different request or a newer candidate pool.
-The ~:snapshot-generation~ field increments for each published result and for
-producer terminal-state changes, including a delayed producer failure.
-While a request runs, ~:progress-completed~ reports the number of candidates
-resolved by fully scanned batches or reusable cache evidence.
-~:progress-total~ is the fixed logical size of that request's scan.
-Both fields describe the requested ID, not the retained older result.
+A different request replaces obsolete queued work.
+It also asks the active matcher to stop.
 
-The ~:producer-state~, ~:producer-exit-status~, and ~:producer-error~ fields
-describe the command reader.  A failed matcher request has state ~failed~ and
-an ~:error~ string.  A failure does not remove the prior completed candidates.
+=fzf-native-async-status= returns request metadata without candidate strings.
+Use it for regular polling.
 
-~fzf-native-async-status~ returns the same request metadata without a candidate
-list.  ~fzf-native-async-candidates~ remains the combined compatibility API.
+=fzf-native-async-snapshot= returns the same metadata and the last completed candidate list.
+Use it after =:snapshot-generation= changes.
 
-On POSIX platforms, ~fzf-native.el~ checks
-~fzf-native-session-abi-version~ before it marks a native module loaded.  A
-stale bundled module therefore fails with a rebuild instruction instead of
-silently omitting or misinterpreting session entry points.
+The =:result-request-id= field owns the retained list.
+The =:stale= field is non-nil for another request or an older pool boundary.
 
-Candidate input can continue after a request completes.  The native session
-coalesces these input events and retries the same request ID automatically.
-The old result remains available until the retry completes.
+The =:state= field is =queued=, =running=, =complete=, =failed=, =superseded=, =idle=, or =unknown=.
+The progress fields describe the inspected request, not the retained result.
 
-All asynchronous sessions share one lazily-created persistent scoring pool.
-Query updates do not start a new process or create new scoring threads, and
-opening many sessions does not multiply the worker count by the CPU count.
+The producer fields report command completion or failure separately.
+A matcher failure keeps the prior completed candidates and adds an =:error= value.
+
+Candidate input can continue after a result completes.
+The session coalesces growth events and retries the same request ID.
+
+All sessions share one lazy process-wide worker pool.
+Query updates do not start a new producer or create new scoring threads.
+
+On POSIX platforms, =fzf-native.el= checks =fzf-native-session-abi-version= during module loading.
+A stale module fails with a rebuild and restart instruction.
+
+=fzf-native-async-candidates= remains the combined compatibility API.
+New integrations need the request-aware API for exact result ownership.
 
 ** Customization
 
-The C module reads the following defcustoms via ~symbol-value~ at call
-time.  Higher-level packages (~fussy~, ~fzfa~) keep their own
-user-facing defcustoms and bridge their values onto these canonical
-names — ~fussy~ via ~setq-local~ (synchronous, same-buffer call
-pattern), and ~fzfa~ with explicit dynamic bindings at its native call
-sites (timer-driven, cross-buffer).  Set these directly only if you call
-~fzf-native-score~ / ~fzf-native-score-all~ / ~fzf-native-async-*~
-yourself; otherwise prefer the package-level knob.
+The C module reads these variables through =symbol-value=.
+Higher-level packages bind them at their native call sites.
 
-| Variable                            | Default    | Read by                            | Behavior                                    |
-|-------------------------------------+------------+------------------------------------+---------------------------------------------|
-| ~fzf-native-case-mode~              | ~smart~    | every scoring call (sync + async)  | ~smart~ (lowercase = ignore, mixed = respect) / ~ignore~ / ~respect~ |
-| ~fzf-native-batch-highlight~        | 25         | ~fzf-native-score~ / ~fzf-native-score-all~ | nil = off; positive N = apply ~completions-common-part~ face to top N candidates via ~fzf_get_positions~ in C. |
-| ~fzf-native-async-highlight~        | 200        | ~fzf-native-async-candidates~      | nil = off; t = all returned candidates; positive N = top N. |
-| ~fzf-native-max-line-length~        | 256        | ~fzf-native-async-start~ (once at session start) | nil = no limit; +N = drop lines longer than N; -N = truncate lines to N characters. |
-| ~fzf-native-async-cache-size~       | 40         | ~fzf-native-async-start~ (once at session start) | LRU result-cache entries.  Each entry stores top-K results and, when it fits the byte budget, complete matched-candidate membership for exact-growth or refinement hits. |
-| ~fzf-native-async-cache-bytes~      | 64 MiB     | ~fzf-native-async-start~ (once at session start) | Byte budget for whole-result keys, parsed patterns, top-K results, and matched-candidate indexes.  Set to 0 to disable. |
-| ~fzf-native-async-batch-cache-bytes~ | 64 MiB    | ~fzf-native-async-start~ (once at session start) | Byte budget for safe membership data from complete stable batches.  The cache retains at most 4,096 query records.  An ancestor lookup scans at most 256 recent records.  Set to 0 to disable. |
-| ~fzf-native-filter-only-min-pool~   | 10 000 000 | ~fzf-native-async-start~ (once at session start), ~fzf-native-score-all~ (per call) | Pool-size threshold for filter-only mode.  When the candidate pool reaches ≥ N, scoring swaps ~fzf_get_score~ for ~fzf_has_match~ (cheap boolean) and skips top-K sorting.  ~nil~/~0~ disables this arm. |
-| ~fzf-native-filter-only-length~     | nil        | every scoring call (sync + async)  | Query-length threshold for filter-only mode.  When set to a positive integer N and the query is at most N characters, take the cheap match path.  ~nil~/~0~ disables this arm. |
-| ~fzf-native-filter-only-logic~      | ~or~       | every scoring call (sync + async)  | How the two filter-only arms compose: ~or~ = either trigger is sufficient; ~and~ = every enabled arm must fire (a disabled arm is trivially satisfied). |
+Set the higher-level package option unless your code calls fzf-native directly.
+
+| Variable | Default | Read point | Purpose |
+|----------+---------+------------+---------|
+| =fzf-native-case-mode= | =smart= | Every scoring request | Select smart, ignored, or respected case. |
+| =fzf-native-fuzzy= | t | Every scoring request | Select fuzzy or exact default matching. |
+| =fzf-native-batch-highlight= | 25 | Every synchronous score call | Limit synchronous highlighting. |
+| =fzf-native-async-highlight= | 200 | Every asynchronous candidate build | Limit session-result highlighting. |
+| =fzf-native-highlight-fn= | default function | Every highlight operation | Apply match ranges to one string. |
+| =fzf-native-max-line-length= | 256 | Session start | Drop or truncate long producer records. |
+| =fzf-native-async-cache-size= | 40 | Session start | Limit whole-result cache entries. |
+| =fzf-native-async-cache-bytes= | 64 MiB | Session start | Limit whole-result cache bytes. |
+| =fzf-native-async-batch-cache-bytes= | 64 MiB | Session start | Limit stable-batch cache bytes. |
+| =fzf-native-filter-only-min-pool= | 10,000,000 | Session start or each batch call | Set the pool-size filter-only trigger. |
+| =fzf-native-filter-only-length= | nil | Every scoring request | Set the query-length filter-only trigger. |
+| =fzf-native-filter-only-logic= | =or= | Every scoring request | Combine enabled filter-only triggers. |
 
 *** Filter-only mode
 
-Filter-only mode replaces the per-candidate fuzzy-DP score (~fzf_get_score~)
-with a cheap boolean match (~fzf_has_match~).  It retains only the first
-limit matches, then scores and ranks that bounded visible window.  Useful when
-full scoring is wasted work: very
-large pools (pool-size arm) or very short queries (length arm) where
-score ranking carries little signal anyway.
+Filter-only mode uses =fzf_has_match= instead of full scoring for the first pass.
+It is useful for a large pool or a short query.
 
-Two independent triggers — pool size and query length — compose via
-~fzf-native-filter-only-logic~.  Set either or both; ~nil~/~0~ on a
-defcustom disables that arm.
+Pool size and query length are independent triggers.
+=fzf-native-filter-only-logic= combines enabled triggers with OR or AND.
 
-Sync (~fzf-native-score-all~): when filter-only fires, candidates are
-returned in input order, no ~completion-score~ text property is
-attached.  Highlights still apply to the top-N entries (top by input
-order in this mode).
+A nil or zero threshold disables that trigger.
+If both thresholds are disabled, full scoring remains active.
 
-Async (~fzf-native-async-candidates~): when filter-only fires, only the
-limit-bound first-match window gets re-scored and sorted so the visible top
-stays ranked.  Complete membership is retained for refinement only when it
-fits half the whole-result cache byte budget.  If it does not fit, membership
-is discarded and a later query safely falls back to stable-batch evidence or a
-full scan.
+The synchronous path returns matches in input order.
+It does not add a =completion-score= property.
 
-For positive limits, full scoring also has bounded result materialization.  It
-ranks each 64-batch window and stable-merges that window into a running top-K
-under the total order (score descending, producer index ascending).  A limit
-of nil/zero requests every result and therefore remains proportional to the
-number of matches.
+For a positive limit, the session path retains the first requested matches in producer order.
+It fully scores and ranks only that bounded visible window.
+
+Complete membership is optional cache evidence.
+If it exceeds its byte limit, later requests use stable-batch evidence or another scan.
+
+Full session scoring also bounds result materialization for a positive limit.
+It reduces each 64-batch window and merges that window into a running top K.
+
+A nil or zero limit requests every result.
+Memory then grows with the number of matches.
 
 **** ~(fzf-native-filter-only-p QUERY-LENGTH POOL-SIZE)~
 
-C-defined predicate that returns non-nil when filter-only mode would
-fire at the given query length and pool size.  Reads the same three
-defcustoms.  Single source of truth for callers that want to take
-consistent code paths — e.g. fussy's metadata adjustment skips its
-score-based sort when this returns non-nil for the current call.
+This C predicate applies the same filter-only rules for Elisp callers.
+Pass the query character count and candidate pool size.
 
-Highlighting runs entirely inside the C module: after scoring,
-~fzf_get_positions~ produces matched byte offsets, which are merged
-into runs and applied to the candidate string with ~put-text-property~
-before strings are handed back to Emacs.  No Elisp regex pass is
-involved.
+Highlighting runs inside the C module.
+=fzf_get_positions= produces character positions, which the module merges into ranges.
+No Elisp regular-expression pass is required.
 
 ** Building the Native Libraries
 
@@ -242,19 +228,20 @@ mkdir build && cmake -B build -DCMAKE_C_FLAGS='-O3 -march=native' && cmake --bui
 
 ** Fuzzing
 
-The fuzzing layer is additive: it links the existing matcher sources into a
-test-only libFuzzer binary and does not change the shipped matcher or module.
+Fuzz builds are test-only.
+They do not change the release module.
 
-- ~make fuzz-replay~ replays the permanent sanitizer corpus.
-- ~make fuzz~ runs a bounded libFuzzer campaign.  Override ~FUZZ_SECONDS~ for
-  longer runs.
-- ~make fuzz-elisp~ checks randomized properties at the Emacs module boundary.
-- ~make fuzz-upstream~ compares randomized ASCII match sets with an installed
-  ~fzf~ executable.  CI pins the reference release.
+- =make fuzz-replay= replays the matcher and session sanitizer corpora.
+- =make fuzz= runs bounded matcher and session libFuzzer campaigns.
+- =make fuzz-session-tsan= replays session seeds with TSan.
+- =make fuzz-elisp= runs randomized properties through a real Emacs module.
+- =make fuzz-upstream= compares compatible match sets with an installed fzf.
 
-Failures print a deterministic seed or produce an artifact under
-~build/fuzz-artifacts/~ so they can be replayed and promoted into the permanent
-corpus.
+Set =FUZZ_SECONDS= to change the bounded campaign duration.
+Failures produce a deterministic seed or an artifact in the related build directory.
+
+The session target reaches the reader, coordinator, worker pool, caches, publication, and teardown.
+See [[file:abi-fuzzing-plan.org][abi-fuzzing-plan.org]] for the planned process-level ABI campaign.
 
 ** Debugging fzf-native with emacs/lldb (EXAMPLE)
 *** Building Emacs
@@ -265,7 +252,7 @@ autoreconf -isvf
 ./autogen.sh
 ./configure CFLAGS="-g -O0" LDFLAGS="-g" --with-ns
 make bootstrap
-#+end_src :tangle yes
+#+end_src
 *** Building fzf-native
 #+begin_src shell :tangle yes
 $ pwd
@@ -330,11 +317,10 @@ $ brew install llvm
 
 ** Architecture
 
-For a deep dive into how ~fzf-native~ works internally — the three
-scoring paths (sync single, sync batch, async streaming), the
-=AsyncSession= threading and lock model, the arena allocator, the
-=score_abort= same-filter rule, and the counting-sort top-K
-extraction — see [[file:architecture.org][architecture.org]].
+See [[file:architecture.org][architecture.org]] for the current implementation.
+It documents the public API, session lifecycle, request ownership, caches, worker scheduling, and failure model.
+
+See [[file:multi-round-session-plan.org][multi-round-session-plan.org]] for the historical design record and verification results.
 
 ** Credit
 All credit for fzf.c goes to the
