@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: GPL-3.0-or-later
+
 LIBRARY fzf-native-module
 EXPORTS
     emacs_module_init

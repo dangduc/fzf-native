@@ -1,3 +1,5 @@
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
 (package "fzf-native"
          "2.7"
          "Fuzzy completion style")

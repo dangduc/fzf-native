@@ -1,6 +1,30 @@
 ;;; fzf-native-upstream-test.el --- Differential checks against fzf -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Duc Dang
+;; Author: Duc Dang <me@dangduc.com>
+;; Assisted-by: Codex:gpt-5
 ;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;; This file is part of fzf-native.
+
+;; fzf-native is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; fzf-native is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with fzf-native.  If not, see <https://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;; Compare randomized native-module results with the upstream fzf executable.
+
+;;; Code:
 
 (require 'cl-lib)
 (require 'ert)
@@ -78,7 +102,7 @@
   (sort (mapcar #'substring-no-properties (append strings nil)) #'string<))
 
 (defun fzf-native-upstream--fzf (fzf collection query case-mode fuzzy)
-  "Return matches produced by FZF for COLLECTION and QUERY."
+  "Return matches from FZF for COLLECTION and QUERY using CASE-MODE and FUZZY."
   (let ((args (append
                (list "--read0" "--print0" "--no-sort" "--no-color"
                      "--no-multi-line" "--literal"

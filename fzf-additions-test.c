@@ -1,4 +1,5 @@
-/* Standalone C unit tests for fzf-additions.c (fzf_has_match).
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Standalone C unit tests for fzf-additions.c (fzf_has_match).
  *
  * Build and run via `make ctest-additions` (or `make ctest`, which runs
  * every C-level test target).  No Emacs runtime; pure C against fzf.h
