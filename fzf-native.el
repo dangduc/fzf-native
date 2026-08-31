@@ -4,7 +4,7 @@
 ;; Author: Duc Dang <me@dangduc.com>
 ;; Assisted-by: Claude:claude-opus-4-7
 ;; Assisted-by: Codex:gpt-5
-;; Version: 2.7
+;; Version: 2.8
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: matching
 ;; Homepage: https://github.com/dangduc/fzf-native
