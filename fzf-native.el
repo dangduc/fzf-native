@@ -1,13 +1,29 @@
 ;;; fzf-native.el --- Fuzzy completion style  -*- lexical-binding: t; -*-
 
-;; Copyright 2021 Duc Dang
+;; Copyright (C) 2021-2026 Duc Dang
 ;; Author: Duc Dang <me@dangduc.com>
 ;; Assisted-by: Claude:claude-opus-4-7
+;; Assisted-by: Codex:gpt-5
 ;; Version: 2.7
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: matching
 ;; Homepage: https://github.com/dangduc/fzf-native
 ;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;; This file is part of fzf-native.
+
+;; fzf-native is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; fzf-native is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with fzf-native.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
 
@@ -456,7 +472,6 @@ on each module load."
           (message "Compilation of `fzf-native' module with logging succeeded")
         (error "Compilation of `fzf-native' module with logging failed!")))))
 
-;;;###autoload
 (defun fzf-native--bundled-module-relative-path ()
   "Return the bundled module path for this target, or signal an error.
 

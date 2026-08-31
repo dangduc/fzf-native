@@ -1,6 +1,63 @@
 ;;; fzf-native-test.el --- `fzf-native' test. -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2022-2026 James Nguyen and Duc Dang
+;; Author: James Nguyen <james@jojojames.com>
+;; Maintainer: Duc Dang <me@dangduc.com>
+;; Assisted-by: Codex:gpt-5
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;; This file is part of fzf-native.
+
+;; fzf-native is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; fzf-native is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with fzf-native.  If not, see <https://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;; Exercise the batch scorer, asynchronous session API, highlighting, module
+;; loading, and regression contracts through Emacs's public module boundary.
+
+;;; Code:
+
 (require 'ert)
 (require 'fzf-native)
+
+(declare-function fzf-native-score-all "fzf-native-module"
+                  (collection query &optional slab))
+(declare-function fzf-native-highlight-all "fzf-native-module"
+                  (collection query))
+(declare-function fzf-native-highlight-one "fzf-native-module" (cand query))
+(declare-function fzf-native-score "fzf-native-module"
+                  (string query &optional slab))
+(declare-function fzf-native-make-default-slab "fzf-native-module" ())
+(declare-function fzf-native-make-slab "fzf-native-module" (size16 size32))
+(declare-function fzf-native-async-start "fzf-native-module"
+                  (command &optional dir))
+(declare-function fzf-native-async-stop "fzf-native-module" (handle))
+(declare-function fzf-native-async-generation "fzf-native-module" (handle))
+(declare-function fzf-native-async-submit "fzf-native-module"
+                  (handle query &optional limit))
+(declare-function fzf-native-async-snapshot "fzf-native-module"
+                  (handle &optional request-id))
+(declare-function fzf-native-async-status "fzf-native-module"
+                  (handle &optional request-id))
+(declare-function fzf-native-async-candidates "fzf-native-module"
+                  (handle filter &optional limit))
+(declare-function fzf-native-async-stats "fzf-native-module" (handle))
+(declare-function fzf-native-async-result-fresh-p "fzf-native-module"
+                  (handle query))
+(declare-function fzf-native-filter-only-p "fzf-native-module"
+                  (query-length pool-size))
+(declare-function fzf-native-session-abi-version "fzf-native-module" ())
 
 (defconst fzf-native-test--directory
   (file-name-directory (or load-file-name buffer-file-name))
@@ -126,8 +183,8 @@
     (should (equal result '(16)))))
 
 (ert-deftest fzf-native-score-case-mode-smart-test ()
-  "Default `fzf-native-case-mode' is smart: lowercase query is
-case-insensitive, query with any uppercase becomes case-sensitive."
+  "Smart case treats a lowercase query as case-insensitive.
+Any uppercase query character makes matching case-sensitive."
   (should (eq fzf-native-case-mode 'smart))
   ;; Lowercase query → insensitive: matches uppercase target.
   (should (equal (fzf-native-score "Foo" "foo") '(80)))
@@ -369,10 +426,11 @@ Sum = 160."
 ;; the same as "did not match" and the candidate is silently dropped.
 
 (defconst fzf-native-test--bad-bytes
-  (string-as-multibyte ";; Copyright 2022 Jo Be�����")
+  (concat (encode-coding-string ";; Copyright 2022 Jo Be" 'us-ascii)
+          (unibyte-string #xff #xfe #xfd #xfc #xfb))
   "Raw-byte string used as a reproducer for the `unicode-string-p' bug.
 Note: on Emacs 30+ this WILL coerce successfully through
-`encode-coding-string', so it scores like any other string. The tests
+`encode-coding-string', so it scores like any other string.  The tests
 below assert the absence of a signal, not any particular score.")
 
 (ert-deftest fzf-native-score-invalid-unibyte-test ()
@@ -420,7 +478,7 @@ Earlier the C scorer returned the input objects so callers could read
 `completion-score' off them directly.  As of the highlight-isolation
 fix, top-N candidates are `copy-sequence'd before face / score
 attachment so the caller's shared strings (obarray symbol-names,
-buffer-name interns, etc.) don't accumulate stale face / score across
+`buffer-name' results, etc.) don't accumulate stale face / score across
 calls.  `completion-score' still rides on the returned copy."
   (let* ((orig (copy-sequence "你好"))
          (result (fzf-native-score-all (list orig) "你")))
@@ -453,7 +511,7 @@ calls.  `completion-score' still rides on the returned copy."
 ;; queries.
 
 (defun fzf-native-test--score-all-set (coll query)
-  "Sorted, property-stripped match set for `fzf-native-score-all'.
+  "Return a sorted, property-stripped match set for COLL and QUERY.
 Neutralises the order / `completion-score' differences between the
 filter-only and full paths so only set membership is compared."
   (sort (mapcar #'substring-no-properties
@@ -556,7 +614,8 @@ reader on small corpora — the first batch may carry just one line."
   (> (fzf-native-async-generation handle) 0))
 
 (defun fzf-native-test--wait-for-scoring (handle filter &optional limit timeout)
-  "Dispatch FILTER and poll until scoring completes; return candidates.
+  "Dispatch FILTER on HANDLE and poll until scoring completes.
+Return candidates, limited to LIMIT when non-nil.
 Scoring is considered done when stats total > 0.  Polls for up to
 TIMEOUT seconds (default 5), calling candidates each iteration."
   (let ((deadline (+ (float-time) (or timeout 5.0))))
@@ -571,7 +630,7 @@ TIMEOUT seconds (default 5), calling candidates each iteration."
     (fzf-native-async-candidates handle filter)))
 
 (defun fzf-native-test--wait-for-fresh (handle filter &optional timeout)
-  "Drive scoring for FILTER and poll `result-fresh-p' until t.
+  "Drive scoring for FILTER on HANDLE and poll until fresh.
 Unlike `wait-for-scoring' (which exits as soon as stats are updated by
 *any* candidates call, racing the actual scoring), this returns only
 once the result cache holds an entry for FILTER at the current pool
@@ -604,7 +663,7 @@ Reentry tests use this option because their callback needs one candidate."
     snapshot))
 
 (defun fzf-native-test--wait-for-producer (handle &optional timeout)
-  "Wait for HANDLE's producer to finish and return its status."
+  "Wait up to TIMEOUT seconds for HANDLE's producer and return its status."
   (let ((deadline (+ (float-time) (or timeout 5.0)))
         status)
     (while (and (< (float-time) deadline)
@@ -703,7 +762,7 @@ batch scorer rejects a live session in its optional slab position."
       '("")))))
 
 (ert-deftest fzf-native-async-producer-honors-path-removal-test ()
-  "A name-only PATH entry overrides `exec-path' augmentation."
+  "A name-only PATH entry overrides augmentation from variable `exec-path'."
   (skip-unless (and (memq system-type '(darwin gnu/linux berkeley-unix))
                     (executable-find "python3")))
   (let* ((python (executable-find "python3"))
@@ -1316,8 +1375,8 @@ Previously score_abort=true was set unconditionally on every call; with
 large candidate sets the pre-work exceeded the 50ms timer interval so
 workers always aborted immediately (livelock: scoring never completed).
 The fix skips setting abort when the incoming filter matches the one
-currently being scored.  Stats are only written on completion, so
-(car (fzf-native-async-stats handle)) > 0 proves scoring finished."
+currently being scored.  Stats are only written on completion, so a
+positive filtered count proves scoring finished."
   (skip-unless (fboundp 'fzf-native-async-start))
   (let ((handle (fzf-native-async-start "seq 1 1000000")))
     (unwind-protect
@@ -1341,8 +1400,8 @@ currently being scored.  Stats are only written on completion, so
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-cache-prefix-refinement-test ()
-  "Cache returns consistent results across a typing progression and on
-backspace.  Setup: a small corpus where 'fo'/'foo'/'food' produce
+  "Cache results stay consistent through typing and backspacing.
+Setup uses a small corpus where 'fo'/'foo'/'food' produce
 predictably-different result sets.  We type the progression, verify
 each query's results, then backspace back to 'fo' and verify it
 returns the same set as the original 'fo' call.
@@ -1382,9 +1441,9 @@ This exercises:
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-cache-term-reorder-test ()
-  "Term reordering: \"foo bar\" and \"bar foo\" are semantically equal
-in fzf and the cache should treat them so via term-set subsumption
-(v2).  Both queries should return the same candidates."
+  "Term reordering preserves the candidate set.
+The queries \"foo bar\" and \"bar foo\" are semantically equal in fzf,
+and the v2 term-set subsumption cache should treat them that way."
   (skip-unless (fboundp 'fzf-native-async-start))
   (let ((handle (fzf-native-async-start
                  "printf '%s\\n' foobar fooXbar bar foo barfoo barXfoo")))
@@ -1694,8 +1753,8 @@ plain fuzzy syntax and the leading-quote exact syntax."
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-result-fresh-p-zero-match-test ()
-  "Authoritative zero: scoring done for a non-matching query — candidates
-returns nil AND fresh-p returns t.  This is the load-bearing case for
+  "A completed zero-match result remains authoritative.
+Candidates returns nil AND fresh-p returns t.  This is the load-bearing case for
 distinguishing \"no matches\" from \"scoring in flight\"."
   (skip-unless (fboundp 'fzf-native-async-start))
   (let ((handle (fzf-native-async-start "printf '%s\\n' foo bar baz")))
@@ -1997,8 +2056,8 @@ sys.stdout.buffer.write(b\"\\xe4\\xbd\\xa0\\xe9x\\n\")
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-long-line-whole-test ()
-  "Lines much larger than the reader's initial buffer must arrive as a
-single whole candidate, not as fragments split at I/O boundaries.
+  "The reader returns an over-buffer line as one candidate.
+It does not split the line into fragments at I/O boundaries.
 
 The reader uses `getline', which grows its buffer to fit each logical
 line.  Pre-getline, the reader used `fgets' with a fixed 8 KB stack
@@ -2027,8 +2086,8 @@ by the user-facing cap before we can observe whole-line delivery."
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-large-pool-finalize-test ()
-  "Ingest ~50k candidates, dispatch a typing progression, then stop
-cleanly.  Smoke-tests the destroy path under realistic load (arena
+  "A large pool finalizes cleanly after a typing progression.
+This smoke-tests the destroy path under realistic load (arena
 chunks, multiple cache entries, scoring thread mid-run)."
   (skip-unless (fboundp 'fzf-native-async-start))
   (let ((handle (fzf-native-async-start "seq 1 50000")))
@@ -2041,9 +2100,9 @@ chunks, multiple cache entries, scoring thread mid-run)."
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-gc-during-active-workers-test ()
-  "Drop the session handle while reader/scoring threads are still
-active, then force GC.  Emacs must not crash and must remain
-responsive.  This is the on-machine 06-06 finalizer-race reproducer:
+  "Garbage collection during active workers does not crash Emacs.
+Drop the session handle while reader/scoring threads are still active,
+then force GC.  This is the on-machine 06-06 finalizer-race reproducer:
 `async_session_destroy' is invoked from `sweep_vectors' during GC,
 calls `pthread_join' on workers that may be mid-malloc, and previously
 deadlocked on the macOS xzone fork-lock.
@@ -2066,8 +2125,8 @@ needed.  No `async-stop' here on purpose — we want the finalizer path."
   (should (equal (fzf-native-score "abcdefghi" "acef") '(78))))
 
 (ert-deftest fzf-native-async-stop-returns-fast-test ()
-  "`fzf-native-async-stop' must return on the calling (Emacs main) thread
-within milliseconds, regardless of how much work the scoring/reader
+  "`fzf-native-async-stop' returns quickly on Emacs's main thread.
+It returns within milliseconds, regardless of how much work the scoring/reader
 threads or arena teardown might cost.  The C side signals stop
 synchronously and offloads `pthread_join' + arena/cache free to a
 detached pthread; this test asserts that contract end-to-end.
@@ -2097,8 +2156,9 @@ single-digit ms."
       (ignore-errors (fzf-native-async-stop handle)))))
 
 (ert-deftest fzf-native-async-stop-many-sessions-fast-test ()
-  "Multi-source teardown: stopping N sessions back-to-back from Emacs
-main returns in roughly N × per-call cost (microseconds each), not the
+  "Back-to-back session stops remain nonblocking.
+Stopping N sessions from Emacs's main thread returns in roughly N × per-call
+cost (microseconds each), not the
 sum of their join times.  Models the `fzfa-find-any' minibuffer-exit
 path where ~10 async sources tear down in one unwind."
   (skip-unless (fboundp 'fzf-native-async-start))
@@ -2129,12 +2189,11 @@ path where ~10 async sources tear down in one unwind."
 
 Builds a list of caller-owned strings, captures the originals by `eq'
 identity before the call, runs `fzf-native-highlight-all', and confirms
-that (a) the originals carry no `face' property after the call, and
-(b) the returned list's top-N slots hold face-bearing copies that are
+that the originals carry no `face' property after the call and that
+the returned list's top-N slots hold face-bearing copies that are
 NOT `eq' to the originals."
   (skip-unless (fboundp 'fzf-native-highlight-all))
-  (let* ((fussy-fzf-native-highlight t)
-         (orig-1 (copy-sequence "alpha"))
+  (let* ((orig-1 (copy-sequence "alpha"))
          (orig-2 (copy-sequence "beta"))
          (orig-3 (copy-sequence "gamma"))
          (coll   (list orig-1 orig-2 orig-3))
@@ -2154,8 +2213,7 @@ NOT `eq' to the originals."
 (ert-deftest fzf-native-highlight-all-preserves-vector-originals-test ()
   "Caller's original strings are not face-mutated by highlight-all (vector)."
   (skip-unless (fboundp 'fzf-native-highlight-all))
-  (let* ((fussy-fzf-native-highlight t)
-         (orig-1 (copy-sequence "alpha"))
+  (let* ((orig-1 (copy-sequence "alpha"))
          (orig-2 (copy-sequence "beta"))
          (coll   (vector orig-1 orig-2))
          (ret    (fzf-native-highlight-all coll "a")))
@@ -2170,8 +2228,7 @@ NOT `eq' to the originals."
 (ert-deftest fzf-native-highlight-all-returns-same-collection-test ()
   "Return value is `eq' to args[0] (substitution-in-place semantics)."
   (skip-unless (fboundp 'fzf-native-highlight-all))
-  (let* ((fussy-fzf-native-highlight t)
-         (lst (list (copy-sequence "alpha") (copy-sequence "beta")))
+  (let* ((lst (list (copy-sequence "alpha") (copy-sequence "beta")))
          (vec (vector (copy-sequence "alpha") (copy-sequence "beta"))))
     (should (eq (fzf-native-highlight-all lst "a") lst))
     (should (eq (fzf-native-highlight-all vec "a") vec))))
@@ -2306,8 +2363,9 @@ character positions 3,4,5 — not bytes 5,6,7."
         (should-not (and (listp face) (memq 'completions-common-part face)))))))
 
 (ert-deftest fzf-native-highlight-all-empty-query-no-crash-test ()
-  "Regression: empty query → clear-only path → `hl_scratch_free' on
-zero-initialised scratch.  Used to abort with libmalloc complaining
+  "An empty query clears highlights without crashing.
+The clear-only path reaches `hl_scratch_free' on zero-initialised scratch.
+It used to abort with libmalloc complaining
 the pointer being freed was not allocated (declaration sat behind
 `goto done')."
   (skip-unless (fboundp 'fzf-native-highlight-all))
@@ -2319,8 +2377,8 @@ the pointer being freed was not allocated (declaration sat behind
       (should (eq (fzf-native-highlight-all vec "") vec)))))
 
 (ert-deftest fzf-native-highlight-one-basic-test ()
-  "Single-char match attaches `completions-common-part' face at the
-matched position; caller's original is unmutated."
+  "A single-character match attaches the completion face.
+The face covers the matched position; the caller's original is unmutated."
   (skip-unless (fboundp 'fzf-native-highlight-one))
   (let* ((orig (copy-sequence "find-file"))
          (ret  (fzf-native-highlight-one orig "f")))
@@ -2390,8 +2448,9 @@ matched position; caller's original is unmutated."
     (should-not (text-property-not-all 0 (length ret) 'face nil ret))))
 
 (ert-deftest fzf-native-highlight-one-ignores-batch-highlight-cap-test ()
-  "`fzf-native-batch-highlight' must NOT gate `highlight-one'.  The cap
-applies to top-N selection in `highlight-all' / `score-all'; for a single
+  "The batch highlight cap does not gate `highlight-one'.
+`fzf-native-batch-highlight' applies to top-N selection in
+`highlight-all' / `score-all'; for a single
 candidate it's meaningless and ignoring it is the design — see Chunk 6
 of the sort-highlight design, where call sites bind it to nil to suppress
 eager passes but lazy highlights must still fire."
@@ -2405,8 +2464,9 @@ eager passes but lazy highlights must still fire."
                      (memq 'completions-common-part face))))))
 
 (ert-deftest fzf-native-score-all-empty-query-no-crash-test ()
-  "Regression: `fzf-native-score-all' with empty query delegates to
-`fzf-native-highlight-all'; the highlight_all path must not crash on
+  "An empty score-all query delegates without crashing.
+`fzf-native-score-all' delegates to `fzf-native-highlight-all'; its path
+must not crash on
 the uninitialised scratch."
   (skip-unless (fboundp 'fzf-native-score-all))
   (let ((fzf-native-batch-highlight 25))
@@ -2480,7 +2540,7 @@ the uninitialised scratch."
                  (eq feature 'fzf-native-module)))
               ((symbol-function 'fzf-native--verify-session-abi)
                (lambda ()
-                 (error "module has ABI 2, Elisp requires ABI 1")))
+                 (error "Module has ABI 2, Elisp requires ABI 1")))
               ((symbol-function 'fzf-native-module-compile)
                (lambda () (cl-incf compile-calls))))
       (let ((message
@@ -2503,7 +2563,7 @@ the uninitialised scratch."
                (lambda (_path) (cl-incf module-loads)))
               ((symbol-function 'fzf-native--verify-session-abi)
                (lambda ()
-                 (error "module has ABI 2, Elisp requires ABI 1"))))
+                 (error "Module has ABI 2, Elisp requires ABI 1"))))
       (let ((message
              (error-message-string (should-error (fzf-native-load-dyn)))))
         (should (= module-loads 1))
@@ -2524,7 +2584,7 @@ the uninitialised scratch."
                (lambda (_path) (cl-incf module-loads)))
               ((symbol-function 'fzf-native--verify-session-abi)
                (lambda ()
-                 (error "module has ABI 2, Elisp requires ABI 1"))))
+                 (error "Module has ABI 2, Elisp requires ABI 1"))))
       (let ((message
              (error-message-string (should-error (fzf-native-load-dyn)))))
         (should (= module-loads 0))
@@ -2569,7 +2629,7 @@ the uninitialised scratch."
                     handle request-id nil t)))
     (unless (eq (plist-get snapshot :state) 'complete)
       (fzf-native-async-stop handle)
-      (error "fzf-native test session did not complete: %S" snapshot))
+      (error "Fzf-native test session did not complete: %S" snapshot))
     (list handle request-id)))
 
 (defun fzf-native-test--call-with-symbol-value-stop (handle function)
@@ -2916,3 +2976,6 @@ the bad byte."
     (should-error (fzf-native-score candidate "a"))
     (should-error (fzf-native-score-all (list candidate) "a"))
     (should-error (fzf-native-highlight-one candidate "a"))))
+
+(provide 'fzf-native-test)
+;;; fzf-native-test.el ends here

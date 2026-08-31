@@ -1,11 +1,42 @@
 ;;; fzf-native-utf8-test.el --- UTF-8 tests for fzf-native -*- lexical-binding: t -*-
 
+;; Copyright (C) 2026 Duc Dang
+;; Author: Duc Dang <me@dangduc.com>
+;; Assisted-by: Codex:gpt-5
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;; This file is part of fzf-native.
+
+;; fzf-native is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; fzf-native is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with fzf-native.  If not, see <https://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
 ;; This file contains all UTF-8 test strings from the C test suite (fzf-test.c)
-;; to ensure the Emacs module handles them correctly
+;; to ensure the Emacs module handles them correctly.
+
+;;; Code:
 
 (require 'ert)
 (require 'benchmark)
 (require 'fzf-native)
+
+(declare-function fzf-native-make-default-slab "fzf-native-module" ())
+(declare-function fzf-native-make-slab "fzf-native-module" (size16 size32))
+(declare-function fzf-native-score "fzf-native-module"
+                  (string query &optional slab))
+(declare-function fzf-native-score-all "fzf-native-module"
+                  (collection query &optional slab))
 
 ;; Load one explicitly selected module, but never redefine native symbols by
 ;; loading a second bundled artifact over an already loaded source build.
@@ -27,37 +58,37 @@
 (defconst fzf-native-utf8-test-strings
   '(;; European languages with diacritics
     "café" "résumé" "naïve" "Åström"
-    "über" "größe" "straße" 
+    "über" "größe" "straße"
     "café_résumé.pdf" "café restaurant"
     "café.txt" "naïve.doc"
-    
+
     ;; CJK characters
     "中文" "测试中文" "中文测试"
     "test中文file.txt" "测试中文text"
     "こんにちは" "世界" "ポケモン"
     "こんにちは世界" "ポケモン.txt"
     "Hello世界café"
-    
+
     ;; Greek
     "Αριστοτέλης" "Θεσσαλονίκη"
-    
+
     ;; Cyrillic
-    "Москва" 
-    
+    "Москва"
+
     ;; Arabic
     "مرحبا" "مرحبا بالعالم"
-    
+
     ;; Hebrew
     "שלום"
-    
+
     ;; Emojis
     "🚀" "😀" "🌍"
     "file🚀rocket.txt" "hello 🚀 world"
     "😀 hello 🌍 world"
-    
+
     ;; Mathematical symbols
     "∫dx" "∂y"
-    
+
     ;; Mixed ASCII/UTF-8
     "hello café" "test_café_file.txt"
     "restaurant café" "ÜBER größe")
@@ -70,15 +101,15 @@
   (should (> (fzf-native-utf8-test--get-score "café" "café") 0))
   (should (> (fzf-native-utf8-test--get-score "café restaurant" "café") 0))
   (should (= (fzf-native-utf8-test--get-score "restaurant" "café") 0))
-  
+
   ;; Test Chinese characters
   (should (> (fzf-native-utf8-test--get-score "中文" "中文") 0))
   (should (> (fzf-native-utf8-test--get-score "测试中文text" "中文") 0))
-  
+
   ;; Test Japanese
   (should (> (fzf-native-utf8-test--get-score "こんにちは世界" "こんにちは") 0))
   (should (> (fzf-native-utf8-test--get-score "ポケモン.txt" "ポケモン") 0))
-  
+
   ;; Test emojis
   (should (> (fzf-native-utf8-test--get-score "🚀" "🚀") 0))
   (should (> (fzf-native-utf8-test--get-score "hello 🚀 world" "🚀") 0)))
@@ -89,7 +120,7 @@
   (should (> (fzf-native-utf8-test--get-score "café.txt" "^café") 0))
   (should (> (fzf-native-utf8-test--get-score "naïve.doc" "^naï") 0))
   (should (= (fzf-native-utf8-test--get-score "résumé" "^café") 0))
-  
+
   ;; CJK prefix
   (should (> (fzf-native-utf8-test--get-score "中文测试" "^中文") 0))
   (should (> (fzf-native-utf8-test--get-score "こんにちは世界" "^こん") 0))
@@ -115,10 +146,10 @@
   ;; Fuzzy match across UTF-8 characters
   (should (> (fzf-native-utf8-test--get-score "café résumé" "cr") 0))
   (should (> (fzf-native-utf8-test--get-score "über größe" "üg") 0))
-  
+
   ;; Mixed scripts
   (should (> (fzf-native-utf8-test--get-score "Hello世界café" "H世c") 0))
-  
+
   ;; Emoji fuzzy match
   (should (> (fzf-native-utf8-test--get-score "😀 hello 🌍 world" "😀🌍") 0)))
 
@@ -131,10 +162,10 @@
   (should (= (fzf-native-utf8-test--get-score "café" "CAFÉ") 0))
   (should (> (fzf-native-utf8-test--get-score "CAFÉ" "CAFÉ") 0))
   (should (> (fzf-native-utf8-test--get-score "ÜBER größe" "über") 0))
-  
+
   ;; Greek case folding
   (should (> (fzf-native-utf8-test--get-score "Θεσσαλονίκη" "θε") 0))
-  
+
   ;; Cyrillic case folding
   (should (> (fzf-native-utf8-test--get-score "Москва" "мос") 0)))
 
@@ -188,7 +219,7 @@
   (dolist (str fzf-native-utf8-test-strings)
     (let ((score (fzf-native-utf8-test--get-score str str)))
       (should (> score 0))))
-  
+
   ;; Test specific patterns from C tests
   (should (> (fzf-native-utf8-test--get-score "café_résumé.pdf" "café") 0))
   (should (> (fzf-native-utf8-test--get-score "test_café_file.txt" "café") 0))
@@ -205,13 +236,13 @@
     ;; Should match café
     (should (= (length results) 1))
     (should (string= (substring-no-properties (car results)) "café")))
-  
+
   ;; Test with CJK
   (let* ((collection '("中文测试" "测试中文" "test中文file"))
          (results (fzf-native-score-all collection "中文")))
     ;; Should match all three
     (should (= (length results) 3)))
-  
+
   ;; Test with emojis
   (let* ((collection '("🚀 rocket" "😀 smile" "🌍 world"))
          (results (fzf-native-score-all collection "🚀")))
@@ -225,12 +256,12 @@
   (should (> (fzf-native-utf8-test--get-score "café.txt" "café") 0))
   (should (> (fzf-native-utf8-test--get-score "naïve.doc" "naï") 0))
   (should (> (fzf-native-utf8-test--get-score "ポケモン.txt" "txt") 0))
-  
+
   ;; Test from test_utf8_fuzzy_match_v1
   (should (> (fzf-native-utf8-test--get-score "café résumé" "cr") 0))
   (should (> (fzf-native-utf8-test--get-score "Über Größe" "üg") 0))
   (should (> (fzf-native-utf8-test--get-score "😀 hello 🌍 world" "😀🌍") 0))
-  
+
   ;; Test from test_utf8_fuzzy_match_v2
   (should (> (fzf-native-utf8-test--get-score "مرحبا بالعالم" "مب") 0))
   (should (> (fzf-native-utf8-test--get-score "Hello世界café" "H世c") 0))
@@ -241,7 +272,7 @@
   "Test UTF-8 strings that might need normalization."
   ;; Note: Current implementation doesn't strip accents, so café != cafe
   (should (> (fzf-native-utf8-test--get-score "café" "café") 0))  ; exact match works
-  
+
   ;; Full-width vs half-width (Japanese)
   (should (> (fzf-native-utf8-test--get-score "ｈｅｌｌｏ" "ｈｅ") 0)))
 
@@ -288,21 +319,21 @@ than returned in the score list."
 ;;   ;; The advice function `fzf-native--fix-score-indices` converts byte to char positions
 ;;   ;; DISABLED because we now return character positions natively
 ;;   (advice-add 'fzf-native-score :around #'fzf-native--fix-score-indices)
-;;   
+;;
 ;;   ;; Test 'hello-世界-world' with search '界'
 ;;   ;; Character position: h=0, e=1, l=2, l=3, o=4, -=5, 世=6, 界=7, -=8, w=9...
 ;;   (let ((result (fzf-native-score "hello-世界-world" "界")))
 ;;     (should (> (car result) 0))  ; Should match
 ;;     ;; With advice, '界' should be at character position 7
 ;;     (should (equal (cadr result) 7)))  ; Character position
-;;   
+;;
 ;;   ;; Test with '世界'
 ;;   (let ((result (fzf-native-score "hello-世界-world" "世界")))
 ;;     (should (> (car result) 0))  ; Should match
 ;;     ;; With advice: '世' at char 6, '界' at char 7
 ;;     (should (member 6 (cdr result)))  ; '世' character position
 ;;     (should (member 7 (cdr result))))  ; '界' character position
-;;   
+;;
 ;;   ;; Clean up: remove advice
 ;;   (advice-remove 'fzf-native-score #'fzf-native--fix-score-indices))
 
@@ -311,16 +342,16 @@ than returned in the score list."
   "Test edge cases with UTF-8 strings."
   ;; Empty pattern should return 0 score
   (should (= (fzf-native-utf8-test--get-score "café" "") 0))
-  
+
   ;; Single UTF-8 character patterns
   (should (> (fzf-native-utf8-test--get-score "café" "é") 0))
   (should (> (fzf-native-utf8-test--get-score "中文" "中") 0))
   (should (> (fzf-native-utf8-test--get-score "🚀" "🚀") 0))
-  
+
   ;; Very long UTF-8 strings
   (let ((long-str "很长的中文字符串包含许多不同的汉字用于测试"))
     (should (> (fzf-native-utf8-test--get-score long-str "中文") 0)))
-  
+
   ;; Mixed direction text (LTR and RTL)
   (should (> (fzf-native-utf8-test--get-score "Hello שלום مرحبا" "שלום") 0)))
 
@@ -330,11 +361,11 @@ than returned in the score list."
   ;; Negation with UTF-8
   (should (= (fzf-native-utf8-test--get-score "café" "!café") 0))
   (should (> (fzf-native-utf8-test--get-score "résumé" "!café") 0))
-  
+
   ;; OR patterns with UTF-8
   (should (> (fzf-native-utf8-test--get-score "café" "café | résumé") 0))
   (should (> (fzf-native-utf8-test--get-score "résumé" "café | résumé") 0))
-  
+
   ;; Complex patterns
   (should (> (fzf-native-utf8-test--get-score "test_ñ.rb" "ñ .rb$") 0)))
 

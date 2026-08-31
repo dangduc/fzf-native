@@ -1,8 +1,39 @@
 ;;; batch-cache-query-history-benchmark.el --- stable-cache scale probe -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Duc Dang
+;; Author: Duc Dang <me@dangduc.com>
+;; Assisted-by: Codex:gpt-5
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;; This file is part of fzf-native.
+
+;; fzf-native is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; fzf-native is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with fzf-native.  If not, see <https://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
 ;; Run `make benchmark-batch-cache-history' from the repository root.
 
+;;; Code:
+
 (require 'cl-lib)
+
+(declare-function fzf-native-async-start "fzf-native-module" (command &optional dir))
+(declare-function fzf-native-async-status "fzf-native-module"
+                  (handle &optional request-id))
+(declare-function fzf-native-async-stop "fzf-native-module" (handle))
+(declare-function fzf-native-async-submit "fzf-native-module"
+                  (handle query &optional limit))
 
 (let* ((script-directory
         (file-name-directory (or load-file-name buffer-file-name)))
@@ -26,6 +57,7 @@
       fzf-native-async-batch-cache-bytes (* 64 1024 1024))
 
 (defun fzf-native-bench--wait-for-producer (handle)
+  "Wait for the producer owned by HANDLE to finish."
   (let ((deadline (+ (float-time) 30.0)) status)
     (while (and (< (float-time) deadline)
                 (not (plist-get
@@ -36,6 +68,7 @@
       (error "The producer did not finish: %S" status))))
 
 (defun fzf-native-bench--run-query (handle index)
+  "Run query INDEX through HANDLE and return elapsed milliseconds."
   (let* ((query (format "never-match-%08d-ZZ" index))
          (started (float-time))
          (request-id (fzf-native-async-submit handle query 20))
@@ -54,6 +87,7 @@
     (* 1000.0 (- (float-time) started))))
 
 (defun fzf-native-bench--report-window (samples start end)
+  "Print timing summary for SAMPLES between START and END."
   (let* ((values (append (cl-subseq samples start end) nil))
          (sorted (sort (copy-sequence values) #'<)))
     (princ

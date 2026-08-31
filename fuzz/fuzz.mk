@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # Test-only fuzzing targets.  Nothing in this file is linked into the release
 # module unless an explicit fuzz target is requested.
 

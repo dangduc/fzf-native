@@ -1,4 +1,5 @@
-/* Standalone C unit tests for fzf-native-module internals.
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Standalone C unit tests for fzf-native-module internals.
  *
  * This file #includes fzf-native-module.c directly so that `static`
  * functions like counting_sort_candidates and cmp_candidate are visible.

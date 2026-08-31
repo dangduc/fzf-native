@@ -1,4 +1,5 @@
-/*
+/* SPDX-License-Identifier: MIT
+ *
  * UTF-8 Character Indexing Utilities for fzf-native
  * Provides efficient byte-to-character position mapping using utf8proc
  */

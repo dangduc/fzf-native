@@ -1,5 +1,36 @@
 ;;; fzf-native-module-init-probe.el --- Fresh-process module init probes -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Duc Dang
+;; Author: Duc Dang <me@dangduc.com>
+;; Assisted-by: Codex:gpt-5
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;; This file is part of fzf-native.
+
+;; fzf-native is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; fzf-native is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with fzf-native.  If not, see <https://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;; Exercise module initialization in a fresh Emacs process.  The test suite
+;; selects a probe with FZF_NATIVE_INIT_PROBE and supplies the module path in
+;; FZF_NATIVE_TEST_MODULE.
+
+;;; Code:
+
+(declare-function fzf-native-score-all "fzf-native-module"
+                  (collection query &optional slab))
+
 (let ((module (getenv "FZF_NATIVE_TEST_MODULE"))
       (mode (getenv "FZF_NATIVE_INIT_PROBE")))
   (unless (and module (file-readable-p module))
