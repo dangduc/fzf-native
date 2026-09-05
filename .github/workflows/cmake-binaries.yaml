@@ -474,9 +474,8 @@ jobs:
       id: bump
       run: |
         current=$(grep -E '^;; Version: ' fzf-native.el | sed -E 's/^;; Version: //')
-        eask_current=$(sed -n -E 's/^[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' Eask | head -1)
-        if [ -z "$current" ] || [ "$current" != "$eask_current" ]; then
-          echo "Version mismatch before bump: fzf-native.el=$current Eask=$eask_current" >&2
+        if [ -z "$current" ]; then
+          echo "Could not read current version from fzf-native.el" >&2
           exit 1
         fi
         major=$(echo "$current" | cut -d. -f1)
@@ -496,13 +495,12 @@ jobs:
           exit 1
         fi
         sed -i "s/^;; Version: ${current}$/;; Version: ${new}/" fzf-native.el
-        sed -i -E "s/^([[:space:]]+)\"${current}\"$/\1\"${new}\"/" Eask
         echo "version=${new}" >> "$GITHUB_OUTPUT"
         echo "Bumped $current -> $new"
 
     - name: Stage generated release
       run: |
-        git add --all -- bin fzf-native.el Eask
+        git add --all -- bin fzf-native.el
         git diff --cached --name-status
 
     - name: Commit changes
@@ -514,5 +512,4 @@ jobs:
         add: |
           bin/**
           fzf-native.el
-          Eask
         tag: ${{ steps.bump.outputs.version }}

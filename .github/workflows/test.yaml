@@ -41,20 +41,10 @@ jobs:
           nix profile install --accept-flake-config \
             "github:purcell/nix-emacs-ci/b12b5b31e40df750478c9fc68c1e81c91ed079ec#${package}"
 
-      - uses: actions/setup-node@v2
-        with:
-          node-version: '16'
-
-      - uses: emacs-eask/setup-eask@master
-        with:
-          version: 'snapshot'
-
       - name: Print emacs version
         run: |
           emacs --version
 
-      - run: echo "$HOME/.cask/bin" >> $GITHUB_PATH
-      - run: make check-version
       - run: make compile
       - run: make lint
       - run: make ctest

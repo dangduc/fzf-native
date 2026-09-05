@@ -1,7 +1,5 @@
 *.elc
 build
 .ccls-cache
-/.eask/
-/dist/
+/.lint-sandbox/
 fzf-native.log
-fzf-native-pkg.el

@@ -726,7 +726,6 @@ Use these commands from the repository root:
 | =make build= | Build the native module. |
 | =make test= | Run the ERT suites. |
 | =make lint= | Run package lint. |
-| =make check-version= | Compare the Elisp and Eask versions. |
 | =make ctest= | Run native unit and allocation-failure tests. |
 | =make ctest-asan= | Run native tests with ASan and UBSan. |
 | =make fuzz-replay= | Replay matcher and session sanitizer corpora. |

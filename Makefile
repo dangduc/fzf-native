@@ -21,10 +21,10 @@ UTF8PROC_SRC := $(UTF8PROC_DIR)/utf8proc.c
 PACKAGE := fzf-native
 AUTOLOADS := $(PACKAGE)-autoloads.el
 
-.PHONY: install
-install:
-	eask package
-	eask install
+# Sandbox for `make lint` — package-lint is fetched from MELPA into this
+# directory the first time it runs, so linting does not touch the user's
+# global ~/.emacs.d/elpa.
+LINT_SANDBOX := .lint-sandbox
 
 .PHONY: autoloads
 autoloads:
@@ -33,25 +33,26 @@ autoloads:
 
 .PHONY: compile
 compile: autoloads
-	eask compile
+	$(EMACS) -Q --batch -L . -f batch-byte-compile \
+	  fzf-native.el fzf-native-module-init-probe.el
 
 .PHONY: test
 test:
-	eask install-deps --dev
-	eask test ert ./fzf-native-test.el ./fzf-native-utf8-test.el
+	$(EMACS) -Q --batch -L . \
+	  -l ert -l fzf-native-test.el -l fzf-native-utf8-test.el \
+	  -f ert-run-tests-batch-and-exit
 
 .PHONY: lint
 lint:
-	eask lint package
-
-.PHONY: check-version
-check-version:
-	@elisp_version=$$(sed -n 's/^;; Version: //p' fzf-native.el); \
-	eask_version=$$(sed -n 's/^[[:space:]]*"\([^"]*\)"[[:space:]]*$$/\1/p' Eask | head -1); \
-	if test -z "$$elisp_version" || test "$$elisp_version" != "$$eask_version"; then \
-	  echo "Version mismatch: fzf-native.el=$$elisp_version Eask=$$eask_version" >&2; \
-	  exit 1; \
-	fi
+	$(EMACS) -Q --batch \
+	  --eval "(setq package-user-dir (expand-file-name \"$(LINT_SANDBOX)/elpa\"))" \
+	  --eval "(setq network-security-level 'low)" \
+	  --eval "(require 'package)" \
+	  --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+	  --eval "(package-initialize)" \
+	  --eval "(unless (package-installed-p 'package-lint) (package-refresh-contents) (package-install 'package-lint))" \
+	  --eval "(require 'package-lint)" \
+	  -f package-lint-batch-and-exit fzf-native.el
 
 .PHONY: format
 format:
