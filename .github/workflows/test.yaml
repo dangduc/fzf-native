@@ -99,4 +99,9 @@ jobs:
       - name: Build native module
         run: cmake --build build --config Release
 
+      # Windows is intentionally skipped: the session/async API is
+      # POSIX-only (see README) and several tests hit it without a
+      # `system-type' guard.  Under eask this step silently no-op'd on
+      # Windows; keep the same effective coverage here.
       - run: make test
+        if: runner.os != 'Windows'
