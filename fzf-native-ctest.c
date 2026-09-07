@@ -1732,7 +1732,8 @@ static void test_shared_membership_growth_reuses_immutable_prefix(void) {
   Cache cache;
   cache_init_limits(&cache, 4, 1024 * 1024);
   cache_insert_shared_for_request_abortable(
-      &cache, "needle", 24, CaseSmart, true, false,
+      &cache, "needle", 24, CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_DEFAULT, false,
       NULL, 0, extended->count, extended, NULL);
   ScoredStr *top = NULL;
   size_t top_count = 0, pool_gen = 0, matched_count = 0;

@@ -3001,8 +3001,8 @@ static void cache_insert_for_request_abortable(
   SharedIdx *membership = !strchr(query, '|') && membership_complete
       ? shared_idx_alloc_abortable(m_idx_src, m_idx_count, stop) : NULL;
   cache_insert_shared_for_request_abortable(
-      c, query, pool_gen, case_mode, fuzzy, normalize, forward, score_scheme,
-      filter_only,
+      c, query, pool_gen, case_mode, fuzzy, normalize, forward,
+      score_scheme, filter_only,
       top, top_count, matched_count, membership, stop);
   shared_idx_release(membership);
 }
