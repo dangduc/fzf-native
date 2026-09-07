@@ -801,5 +801,76 @@ Each specification has the form (KEY VALUES)."
           (when (file-exists-p starts)
             (delete-file starts)))))))
 
+(ert-deftest fzf-native-fuzz-upstream-structured-query-results ()
+  "Compare deterministic parsed-query results with a pinned fzf CLI."
+  (let* ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf")))
+         (seed (fzf-native-upstream--env-integer
+                "FZF_NATIVE_FUZZ_SEED" 12648430))
+         (cases (fzf-native-upstream--env-integer
+                 "FZF_NATIVE_UPSTREAM_CASES" 200))
+         (start (fzf-native-upstream--env-integer
+                 "FZF_NATIVE_UPSTREAM_START" 0))
+         (profile (fzf-native-upstream--profile))
+         (exceptions (make-hash-table :test #'eq)))
+    (skip-unless fzf)
+    (fzf-native-upstream--verify-reference fzf)
+    (dotimes (iteration cases)
+      (let* ((serial (+ start iteration))
+             (case
+              (fzf-native-upstream--generated-case seed serial profile))
+             (native-order
+              (fzf-native-upstream--identities
+               case (fzf-native-upstream--native case)))
+             (upstream-order
+             (fzf-native-upstream--identities
+               case (fzf-native-upstream--fzf fzf case) t))
+             (native-membership
+              (fzf-native-upstream--membership native-order))
+             (upstream-membership
+              (fzf-native-upstream--membership upstream-order))
+             (membership-equal
+              (equal native-membership upstream-membership)))
+        (ert-info ((fzf-native-differential-case-description case))
+          (when (plist-get (fzf-native-differential-case-dimensions case)
+                           :valid-utf8)
+            (should (memq 0 upstream-membership)))
+          (unless membership-equal
+            (let ((exception
+                   (fzf-native-differential-classify
+                    case 'membership
+                    (list
+                     :differing-identities
+                     (fzf-native-upstream--membership-difference
+                      native-membership upstream-membership)))))
+              (if exception
+                  (progn
+                    (fzf-native-upstream--record-exception exceptions exception)
+                    (unless (fzf-native-upstream--accepted-exception-p exception)
+                      (should (equal native-membership upstream-membership))))
+                (should (equal native-membership upstream-membership)))))
+          (when (and membership-equal
+                     (eq (fzf-native-differential-case-comparison case)
+                         'ranking)
+                     (not (equal native-order upstream-order)))
+            (let ((exception
+                   (fzf-native-differential-classify
+                    case 'ranking '(:membership-equal t))))
+              (if exception
+                  (progn
+                    (fzf-native-upstream--record-exception exceptions exception)
+                    (unless (fzf-native-upstream--accepted-exception-p exception)
+                      (should (equal native-order upstream-order))))
+                (should (equal native-order upstream-order))))))))
+    (let ((summary (fzf-native-upstream--exception-alist exceptions)))
+      (when (eq profile 'common)
+        (dolist (count summary)
+          (let ((entry
+                 (cl-find (car count) fzf-native-differential-exceptions
+                          :key (lambda (item) (plist-get item :name)))))
+            (should (fzf-native-upstream--accepted-exception-p entry)))))
+      (message
+       "fzf-native upstream differential seed=%d start=%d profile=%S cases=%d exceptions=%S"
+       seed start profile cases summary))))
+
 (provide 'fzf-native-upstream-test)
 ;;; fzf-native-upstream-test.el ends here
