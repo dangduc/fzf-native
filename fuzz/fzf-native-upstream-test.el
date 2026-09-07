@@ -562,5 +562,244 @@ Each specification has the form (KEY VALUES)."
      (fzf-native-differential-classify
       query-case 'membership '(:differing-identities (99))))))
 
+(defconst fzf-native-upstream--session-candidate-bodies
+  '("alpha"
+    "alphabet soup"
+    "alphanumeric"
+    "alpine trail"
+    "beta alpha"
+    "beta"
+    "gamma"
+    "FOO alpha"
+    "foo beta"
+    "Food"
+    "prefix FOO suffix"
+    "σ alpha"
+    "Σ beta"
+    "κόσμος"
+    "中文 alpha"
+    "中間 beta"
+    "😀 alpha"
+    "café"
+    "CAFÉ beta"
+    "kelvin k"
+    "Kelvin K"
+    "literal pipe"
+    "inverse bang")
+  "Stable candidate bodies for persistent-session comparisons.")
+
+(defconst fzf-native-upstream--session-rounds
+  '((:name broad :query "a" :case-mode smart :fuzzy t)
+    (:name narrow :query "al" :case-mode smart :fuzzy t)
+    (:name narrower :query "alp" :case-mode smart :fuzzy t)
+    (:name broaden :query "a" :case-mode smart :fuzzy t)
+    (:name repeat :query "a" :case-mode smart :fuzzy t)
+    (:name or :query "alpha | beta" :case-mode smart :fuzzy t)
+    (:name inverse :query "a !beta" :case-mode smart :fuzzy t)
+    (:name case-ignore :query "FOO" :case-mode ignore :fuzzy t)
+    (:name case-respect :query "FOO" :case-mode respect :fuzzy t)
+    (:name global-exact :query "alpha" :case-mode smart :fuzzy nil)
+    (:name unicode-fold :query "σ" :case-mode ignore :fuzzy t)
+    (:name unicode-case :query "Σ" :case-mode respect :fuzzy t)
+    (:name unicode-cjk :query "中" :case-mode smart :fuzzy t)
+    (:name unicode-kelvin :query "K" :case-mode ignore :fuzzy t))
+  "Ordered query rounds for one persistent native session.")
+
+(defun fzf-native-upstream--shuffle (rng values)
+  "Return a deterministic shuffled copy of VALUES using RNG."
+  (let ((items (vconcat values)))
+    (cl-loop for index downfrom (1- (length items)) above 0
+             for swap = (fzf-native-differential-random rng (1+ index))
+             do (cl-rotatef (aref items index) (aref items swap)))
+    (append items nil)))
+
+(defun fzf-native-upstream--session-candidates (seed serial)
+  "Return a deterministic candidate pool for SEED and SERIAL."
+  (let ((rng (fzf-native-upstream--case-rng seed serial)) decoys)
+    (dotimes (index 7)
+      (push (format "noise-%08x-%02d-%02d"
+                    (fzf-native-differential-random rng #xffffffff)
+                    serial index)
+            decoys))
+    (cl-loop
+     for text in
+     (fzf-native-upstream--shuffle
+      rng (append fzf-native-upstream--session-candidate-bodies decoys))
+     for id from 0
+     collect (make-fzf-native-differential-candidate
+              :id id :text text :role 'session))))
+
+(defun fzf-native-upstream--session-case
+    (seed serial round candidates)
+  "Return an oracle case for SEED, SERIAL, ROUND, and CANDIDATES."
+  (let ((query
+         (make-fzf-native-differential-query
+          :sets nil
+          :case-mode (plist-get round :case-mode)
+          :fuzzy (plist-get round :fuzzy)
+          :normalize nil
+          :forward t)))
+    (make-fzf-native-differential-case
+     :seed seed
+     :serial serial
+     :profile 'session
+     :query query
+     :rendered-query (plist-get round :query)
+     :candidates candidates
+     :dimensions (list :round (plist-get round :name)
+                       :valid-utf8 t
+                       :producer-eof t)
+     :comparison 'membership)))
+
+(defun fzf-native-upstream--wait-for-producer-eof (handle &optional timeout)
+  "Wait for producer EOF on HANDLE for at most TIMEOUT seconds."
+  (let ((deadline (+ (float-time) (or timeout 10.0))) status)
+    (while (and (< (float-time) deadline)
+                (progn
+                  (setq status (fzf-native-async-status handle))
+                  (not (plist-get status :reader-done))))
+      (sleep-for 0.01))
+    (unless (and status (plist-get status :reader-done))
+      (error "Timed out waiting for fzf-native producer EOF: %S" status))
+    status))
+
+(defun fzf-native-upstream--wait-for-session-request
+    (handle request-id &optional timeout)
+  "Wait for REQUEST-ID on HANDLE for at most TIMEOUT seconds."
+  (let ((deadline (+ (float-time) (or timeout 10.0))) status)
+    (while (and (< (float-time) deadline)
+                (progn
+                  (setq status (fzf-native-async-status handle request-id))
+                  (or (memq (plist-get status :state) '(queued running))
+                      (and (eq (plist-get status :state) 'complete)
+                           (plist-get status :stale)))))
+      (sleep-for 0.01))
+    (when (or (memq (plist-get status :state) '(queued running))
+              (and (eq (plist-get status :state) 'complete)
+                   (plist-get status :stale)))
+      (error "Timed out waiting for fzf-native request %d: %S"
+             request-id status))
+    (fzf-native-async-snapshot handle request-id)))
+
+(defun fzf-native-upstream--write-session-input (file candidates)
+  "Write CANDIDATES as UTF-8 lines to FILE."
+  (let ((coding-system-for-write 'utf-8-unix))
+    (with-temp-file file
+      (dolist (candidate candidates)
+        (insert (fzf-native-differential-candidate-text candidate) "\n")))))
+
+(ert-deftest fzf-native-fuzz-upstream-session-rounds ()
+  "Compare identity sets from one native session with fresh fzf processes."
+  (let* ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf")))
+         (cat (executable-find "cat"))
+         (seed (fzf-native-upstream--env-integer
+                "FZF_NATIVE_FUZZ_SEED" 12648430))
+         (cases (fzf-native-upstream--env-integer
+                 "FZF_NATIVE_UPSTREAM_SESSION_CASES" 4))
+         (start (fzf-native-upstream--env-integer
+                 "FZF_NATIVE_UPSTREAM_SESSION_START" 0)))
+    (skip-unless (and fzf cat
+                      (fboundp 'fzf-native-async-start)
+                      (fboundp 'fzf-native-async-submit)
+                      (fboundp 'fzf-native-async-snapshot)))
+    (should (> cases 0))
+    (fzf-native-upstream--verify-reference fzf)
+    (dotimes (iteration cases)
+      (let* ((serial (+ start iteration))
+             (candidates
+              (fzf-native-upstream--session-candidates seed serial))
+             (input (make-temp-file "fzf-native-upstream-session-"
+                                    nil ".txt"))
+             (starts (make-temp-file "fzf-native-upstream-starts-"
+                                     nil ".txt"))
+             handle
+             (last-request-id 0))
+        (unwind-protect
+            (let ((fzf-native-max-line-length nil)
+                  (fzf-native-async-cache-size 40)
+                  (fzf-native-async-cache-bytes (* 4 1024 1024))
+                  (fzf-native-async-batch-cache-bytes (* 4 1024 1024))
+                  (fzf-native-filter-only-min-pool nil)
+                  (fzf-native-filter-only-length nil)
+                  (fzf-native-async-highlight nil))
+              (fzf-native-upstream--write-session-input input candidates)
+              (setq handle
+                    (fzf-native-async-start
+                     (format "printf 'start\\n' >> %s; exec %s -- %s"
+                             (shell-quote-argument starts)
+                             (shell-quote-argument cat)
+                             (shell-quote-argument input))))
+              (let ((producer
+                     (fzf-native-upstream--wait-for-producer-eof handle)))
+                (should (eq (plist-get producer :producer-state) 'complete))
+                (should (= (plist-get producer :producer-exit-status) 0))
+                (should (= (plist-get producer :pool-generation)
+                           (length candidates)))
+                (with-temp-buffer
+                  (insert-file-contents-literally starts)
+                  (should (equal (buffer-string) "start\n"))))
+              (cl-loop
+               for round in fzf-native-upstream--session-rounds
+               for round-index from 0
+               do
+               (let* ((case
+                       (fzf-native-upstream--session-case
+                        seed serial round candidates))
+                      (query (plist-get round :query))
+                      (fzf-native-case-mode (plist-get round :case-mode))
+                      (fzf-native-fuzzy (plist-get round :fuzzy))
+                      (request-id
+                       (fzf-native-async-submit handle query 0))
+                      (snapshot
+                       (fzf-native-upstream--wait-for-session-request
+                        handle request-id))
+                      ;; Ranking remains explicit parity debt.  This lane is
+                      ;; strict about the complete set of candidate identities.
+                      (native
+                       (fzf-native-upstream--membership
+                        (fzf-native-upstream--identities
+                         case (plist-get snapshot :candidates))))
+                      (upstream
+                       (fzf-native-upstream--membership
+                        (fzf-native-upstream--identities
+                         case (fzf-native-upstream--fzf fzf case) t))))
+                 (ert-info
+                     ((format
+                       "seed=%d serial=%d round=%d name=%S query=%S mode=%S fuzzy=%S"
+                       seed serial round-index (plist-get round :name)
+                       query fzf-native-case-mode fzf-native-fuzzy))
+                   (if (eq (plist-get round :name) 'repeat)
+                       (should (= request-id last-request-id))
+                     (should (> request-id last-request-id)))
+                   (should (eq (plist-get snapshot :state) 'complete))
+                   (should (= (plist-get snapshot :result-request-id)
+                              request-id))
+                   (should-not (plist-get snapshot :stale))
+                   (should (plist-get snapshot :reader-done))
+                   (should (eq (plist-get snapshot :producer-state)
+                               'complete))
+                   (should (= (plist-get snapshot :pool-generation)
+                              (length candidates)))
+                   (should (= (plist-get snapshot :result-pool-generation)
+                              (length candidates)))
+                   (should (= (plist-get snapshot :total)
+                              (length candidates)))
+                   (should (= (plist-get snapshot :filtered)
+                              (length native)))
+                   (should (equal (plist-get snapshot :query) query))
+                   (should (eq (plist-get snapshot :case-mode)
+                               fzf-native-case-mode))
+                   (should (eq (plist-get snapshot :fuzzy)
+                               fzf-native-fuzzy))
+                   (should upstream)
+                   (should (equal native upstream)))
+                 (setq last-request-id request-id))))
+          (when handle
+            (fzf-native-async-stop handle))
+          (when (file-exists-p input)
+            (delete-file input))
+          (when (file-exists-p starts)
+            (delete-file starts)))))))
+
 (provide 'fzf-native-upstream-test)
 ;;; fzf-native-upstream-test.el ends here
