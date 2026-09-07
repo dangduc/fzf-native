@@ -1259,7 +1259,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
         env, "fzf-native: matcher could not allocate parsed query");
     goto err;
   }
-  bool sortable = !pattern->only_inv;
+  bool sortable = pattern->has_positive_term;
   struct Shared shared = {
     .pattern = pattern,
     .batches = batches,
@@ -6091,7 +6091,7 @@ static void *scoring_thread_fn(void *arg) {
       free(growth_top);
       continue;
     }
-    bool sortable = pattern && !pattern->only_inv;
+    bool sortable = pattern && pattern->has_positive_term;
     /* Materialize and score a bounded batch window at a time.  Positive-limit
        full-mode requests reduce every window to top-K, then merge it into a
        running top-K.  Filter-only requests retain the first K matches in
