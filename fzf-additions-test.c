@@ -929,6 +929,54 @@ static void test_pinned_fzf_latin_normalization(void) {
   fzf_free_pattern(uppercase);
 }
 
+static void test_normalized_utf8_prefilter(void) {
+  fzf_slab_t *slab = fzf_make_default_slab();
+  fzf_position_t *positions = fzf_pos_array(0);
+  CHECK(slab != NULL);
+  CHECK(positions != NULL);
+  if (!slab || !positions) goto done;
+
+  fzf_string_t miss_text = {.data = "cafzzzz", .size = 7};
+  fzf_string_t miss_pattern = {.data = "cafe", .size = 4};
+  fzf_result_t miss = fzf_fuzzy_match_v2_utf8(
+      true, true, &miss_text, &miss_pattern, positions, slab);
+  CHECK(miss.start < 0);
+  CHECK(slab->UTF8.map.byte_to_char == NULL);
+  CHECK(slab->UTF8.byte_slot_capacity == 0);
+
+  fzf_string_t hit_text = {
+      .data = "xxcaf\xC3\xA9yy",
+      .size = sizeof "xxcaf\xC3\xA9yy" - 1,
+  };
+  fzf_string_t hit_pattern = {.data = "cafe", .size = 4};
+  fzf_result_t hit = fzf_fuzzy_match_v2_utf8(
+      true, true, &hit_text, &hit_pattern, positions, slab);
+  CHECK(hit.start == 2);
+  CHECK(hit.end == 6);
+  CHECK(hit.score > 0);
+  CHECK(positions->size == 4);
+
+  utf8proc_int32_t cached_accent = 0x00e9;
+  fzf_string_t cached_pattern = {
+      .data = "\xC3\xA9",
+      .size = 2,
+      .codepoints = &cached_accent,
+      .codepoint_count = 1,
+      .codepoints_case_folded = false,
+  };
+  fzf_string_t ascii_text = {.data = "e", .size = 1};
+  positions->size = 0;
+  fzf_result_t cached = fzf_fuzzy_match_v2_utf8(
+      true, true, &ascii_text, &cached_pattern, positions, slab);
+  CHECK(cached.start == 0);
+  CHECK(cached.end == 1);
+  CHECK(cached.score > 0);
+
+done:
+  fzf_free_positions(positions);
+  fzf_free_slab(slab);
+}
+
 static void test_pinned_fzf_backward_direction(void) {
   fzf_string_t ascii_text = {.data = "ab/ab", .size = 5};
   fzf_string_t ascii_v2_text = {.data = "-ab-ab-", .size = 7};
@@ -1038,54 +1086,6 @@ static void test_pinned_fzf_backward_direction(void) {
   fzf_free_positions(positions);
 }
 
-static void test_normalized_utf8_prefilter(void) {
-  fzf_slab_t *slab = fzf_make_default_slab();
-  fzf_position_t *positions = fzf_pos_array(0);
-  CHECK(slab != NULL);
-  CHECK(positions != NULL);
-  if (!slab || !positions) goto done;
-
-  fzf_string_t miss_text = {.data = "cafzzzz", .size = 7};
-  fzf_string_t miss_pattern = {.data = "cafe", .size = 4};
-  fzf_result_t miss = fzf_fuzzy_match_v2_utf8(
-      true, true, &miss_text, &miss_pattern, positions, slab);
-  CHECK(miss.start < 0);
-  CHECK(slab->UTF8.map.byte_to_char == NULL);
-  CHECK(slab->UTF8.byte_slot_capacity == 0);
-
-  fzf_string_t hit_text = {
-      .data = "xxcaf\xC3\xA9yy",
-      .size = sizeof "xxcaf\xC3\xA9yy" - 1,
-  };
-  fzf_string_t hit_pattern = {.data = "cafe", .size = 4};
-  fzf_result_t hit = fzf_fuzzy_match_v2_utf8(
-      true, true, &hit_text, &hit_pattern, positions, slab);
-  CHECK(hit.start == 2);
-  CHECK(hit.end == 6);
-  CHECK(hit.score > 0);
-  CHECK(positions->size == 4);
-
-  utf8proc_int32_t cached_accent = 0x00e9;
-  fzf_string_t cached_pattern = {
-      .data = "\xC3\xA9",
-      .size = 2,
-      .codepoints = &cached_accent,
-      .codepoint_count = 1,
-      .codepoints_case_folded = false,
-  };
-  fzf_string_t ascii_text = {.data = "e", .size = 1};
-  positions->size = 0;
-  fzf_result_t cached = fzf_fuzzy_match_v2_utf8(
-      true, true, &ascii_text, &cached_pattern, positions, slab);
-  CHECK(cached.start == 0);
-  CHECK(cached.end == 1);
-  CHECK(cached.score > 0);
-
-done:
-  fzf_free_positions(positions);
-  fzf_free_slab(slab);
-}
-
 int main(void) {
   printf("--- fzf-additions: fzf_has_match ---\n");
   RUN(test_fuzzy_basic_match);
@@ -1131,8 +1131,8 @@ int main(void) {
   RUN(test_score_schemes_are_slab_local);
   RUN(test_utf8_empty_suffix_trims_trailing_whitespace);
   RUN(test_pinned_fzf_latin_normalization);
-  RUN(test_pinned_fzf_backward_direction);
   RUN(test_normalized_utf8_prefilter);
+  RUN(test_pinned_fzf_backward_direction);
 
   if (failed == 0) {
     printf("\nAll fzf-additions tests passed.\n");
