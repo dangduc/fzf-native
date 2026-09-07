@@ -373,20 +373,19 @@ static void run_one(const uint8_t *data, size_t size) {
   check_positions(candidate, score > 0, positions);
   fzf_free_positions(positions);
 
-  /* Exercise the filter-only matcher as part of the public C surface.  The
-     baseline implementation intentionally has historical whitespace/anchor
-     differences from the scorer; this test-only layer must not redefine
-     those semantics. */
+  /* Filtering and scoring implement the same match predicate. */
 #ifdef FZF_NATIVE_HAS_MATCH_SLAB
-  (void)fzf_has_match(candidate, pattern, default_slab);
+  bool fast_match = fzf_has_match(candidate, pattern, default_slab);
 #else
-  (void)fzf_has_match(candidate, pattern);
+  bool fast_match = fzf_has_match(candidate, pattern);
 #endif
+  if (fast_match != (score > 0))
+    fuzz_fail("fzf_has_match disagrees with fzf_get_score");
 
-  /* Exercise the documented small-slab fallback under sanitizers.  The base
-     implementation has historical score differences between algorithms, so
-     this additive layer deliberately asserts safety rather than score parity. */
+  /* A slab can select a different algorithm, but not different membership. */
   int32_t selected_score = fzf_get_score(candidate, pattern, selected_slab);
+  if ((selected_score > 0) != (score > 0))
+    fuzz_fail("slab fallback changed match membership");
   positions = fzf_get_positions(candidate, pattern, selected_slab);
   check_positions(candidate, selected_score > 0, positions);
   fzf_free_positions(positions);
