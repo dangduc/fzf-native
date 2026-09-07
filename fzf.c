@@ -3061,6 +3061,47 @@ int32_t fzf_get_score_bytes_preclassified(
 #include "fzf-score-input.inc"
 }
 
+static void fzf_score_bounds_add(fzf_score_bounds_t *bounds,
+                                 fzf_result_t result) {
+  if (!bounds) return;
+  bounds->raw_score += result.score;
+  if (result.start < 0 || result.end <= result.start) return;
+  if (!bounds->valid) {
+    bounds->min_begin = result.start;
+    bounds->min_end = result.end;
+    bounds->max_end = result.end;
+    bounds->valid = true;
+    return;
+  }
+  if (result.start < bounds->min_begin) bounds->min_begin = result.start;
+  if (result.end < bounds->min_end) bounds->min_end = result.end;
+  if (result.end > bounds->max_end) bounds->max_end = result.end;
+}
+
+int32_t fzf_get_score_with_bounds(const char *text,
+                                  fzf_pattern_t *pattern,
+                                  fzf_slab_t *slab,
+                                  fzf_score_bounds_t *bounds) {
+  size_t text_len = strlen(text);
+  return fzf_get_score_with_bounds_bytes_preclassified(
+      text, text_len, is_ascii_utf8proc(text, text_len), pattern, slab,
+      bounds);
+}
+
+int32_t fzf_get_score_with_bounds_bytes_preclassified(
+    const char *text, size_t text_len, bool input_is_ascii,
+    fzf_pattern_t *pattern, fzf_slab_t *slab,
+    fzf_score_bounds_t *bounds) {
+  fzf_clear_allocation_failure();
+  if (bounds) *bounds = (fzf_score_bounds_t){0};
+  if (pattern->ptr == NULL) return 1;
+
+  fzf_string_t input = {.data = text, .size = text_len};
+#define FZF_SCORE_RECORD_BOUNDS(result) fzf_score_bounds_add(bounds, (result))
+#include "fzf-score-input.inc"
+#undef FZF_SCORE_RECORD_BOUNDS
+}
+
 fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
                                   fzf_slab_t *slab) {
   fzf_clear_allocation_failure();

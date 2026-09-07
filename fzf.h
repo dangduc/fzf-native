@@ -38,6 +38,16 @@ typedef struct {
   int32_t score;
 } fzf_result_t;
 
+/* Aggregate positive-term bounds for fzf result ranking.  Inverse-only and
+   empty patterns have no valid bounds. */
+typedef struct {
+  int32_t min_begin;
+  int32_t min_end;
+  int32_t max_end;
+  int64_t raw_score;
+  bool valid;
+} fzf_score_bounds_t;
+
 typedef enum {
   FZF_SCORE_SCHEME_DEFAULT = 0,
   FZF_SCORE_SCHEME_PATH,
@@ -163,6 +173,16 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
    are otherwise identical to fzf_get_score. */
 int32_t fzf_get_score_bytes(const char *text, size_t text_len,
                             fzf_pattern_t *pattern, fzf_slab_t *slab);
+/* Score one byte string and retain the positive-term bounds from the same
+   matcher pass.  The bounds use logical character indexes. */
+int32_t fzf_get_score_with_bounds_bytes_preclassified(
+    const char *text, size_t text_len, bool input_is_ascii,
+    fzf_pattern_t *pattern, fzf_slab_t *slab,
+    fzf_score_bounds_t *bounds);
+int32_t fzf_get_score_with_bounds(const char *text,
+                                  fzf_pattern_t *pattern,
+                                  fzf_slab_t *slab,
+                                  fzf_score_bounds_t *bounds);
 
 fzf_position_t *fzf_pos_array(size_t len);
 fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
