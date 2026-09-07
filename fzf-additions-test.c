@@ -140,6 +140,50 @@ static void test_equal_no_match_different_string(void) {
                   CaseIgnore, true, false);
 }
 
+static void test_equal_preserves_pattern_edge_whitespace(void) {
+  fzf_string_t ascii_text = {.data = "- ", .size = 2};
+  fzf_string_t ascii_pattern = {.data = "- ", .size = 2};
+  fzf_result_t ascii = fzf_equal_match(
+      false, false, &ascii_text, &ascii_pattern, NULL, NULL);
+  CHECK(ascii.start == 0);
+  CHECK(ascii.end == 2);
+  CHECK(ascii.score > 0);
+
+  fzf_string_t ascii_leading_text = {.data = " -", .size = 2};
+  fzf_string_t ascii_leading_pattern = {.data = " -", .size = 2};
+  fzf_result_t ascii_leading = fzf_equal_match(
+      false, false, &ascii_leading_text, &ascii_leading_pattern, NULL, NULL);
+  CHECK(ascii_leading.start == 0);
+  CHECK(ascii_leading.end == 2);
+  CHECK(ascii_leading.score > 0);
+
+  fzf_string_t space_text = {.data = " ", .size = 1};
+  fzf_string_t space_pattern = {.data = " ", .size = 1};
+  fzf_result_t space = fzf_equal_match(
+      false, false, &space_text, &space_pattern, NULL, NULL);
+  CHECK(space.start == 0);
+  CHECK(space.end == 1);
+  CHECK(space.score > 0);
+
+  fzf_string_t utf8_text = {.data = "你 ", .size = strlen("你 ")};
+  fzf_string_t utf8_pattern = {.data = "你 ", .size = strlen("你 ")};
+  fzf_result_t utf8 = fzf_equal_match_utf8(
+      false, false, &utf8_text, &utf8_pattern, NULL, NULL);
+  CHECK(utf8.start == 0);
+  CHECK(utf8.end == 2);
+  CHECK(utf8.score > 0);
+
+  fzf_string_t utf8_leading_text = {
+      .data = " 你", .size = strlen(" 你")};
+  fzf_string_t utf8_leading_pattern = {
+      .data = " 你", .size = strlen(" 你")};
+  fzf_result_t utf8_leading = fzf_equal_match_utf8(
+      false, false, &utf8_leading_text, &utf8_leading_pattern, NULL, NULL);
+  CHECK(utf8_leading.start == 0);
+  CHECK(utf8_leading.end == 2);
+  CHECK(utf8_leading.score > 0);
+}
+
 static void test_negation_term_excludes(void) {
   /* "foo !bar" — must contain foo AND must NOT contain bar. */
   check_agreement("negation excludes", "src/foobar.c", "foo !bar",
@@ -498,6 +542,7 @@ int main(void) {
   RUN(test_anchored_matches_trim_candidate_whitespace);
   RUN(test_equal_match);
   RUN(test_equal_no_match_different_string);
+  RUN(test_equal_preserves_pattern_edge_whitespace);
   RUN(test_negation_term_excludes);
   RUN(test_and_across_term_sets);
   RUN(test_or_within_term_set);

@@ -1,11 +1,33 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * Coverage-guided state-machine fuzzer for fzf-native interactive sessions.
+ * Coverage-guided fuzzers for fzf-native interactive sessions.
  *
  * This target includes the real native module implementation through the same
- * plain-C path as fzf-native-ctest.c.  A compact bytecode drives candidate
- * growth, request submission, cancellation, polling, cache reuse, worker
- * scoring, publication, and teardown without requiring an Emacs process.
+ * plain-C path as fzf-native-ctest.c.  State mode uses a compact bytecode to
+ * drive candidate growth, request submission, cancellation, polling, cache
+ * reuse, worker scoring, publication, and teardown without requiring an Emacs
+ * process.  Reader mode separately exercises the real blocking producer path.
+ * Keeping the modes separate lets libFuzzer mutate session state at high
+ * throughput without paying for a pipe, reader thread, and blocking teardown
+ * on every input.
  */
+
+#define FZF_SESSION_FUZZ_MODE_STATE 1
+#define FZF_SESSION_FUZZ_MODE_READER 2
+
+#ifndef FZF_SESSION_FUZZ_MODE
+#define FZF_SESSION_FUZZ_MODE FZF_SESSION_FUZZ_MODE_STATE
+#endif
+
+#if FZF_SESSION_FUZZ_MODE != FZF_SESSION_FUZZ_MODE_STATE && \
+    FZF_SESSION_FUZZ_MODE != FZF_SESSION_FUZZ_MODE_READER
+#error "FZF_SESSION_FUZZ_MODE must be STATE (1) or READER (2)"
+#endif
+
+#if FZF_SESSION_FUZZ_MODE == FZF_SESSION_FUZZ_MODE_READER
+#define FZF_SESSION_FUZZ_MODE_NAME "reader"
+#else
+#define FZF_SESSION_FUZZ_MODE_NAME "state"
+#endif
 
 #define FZF_NATIVE_CTEST 1
 #include "../fzf-native-module.c"
@@ -19,11 +41,13 @@ enum {
   SESSION_FUZZ_MAX_CANDIDATES = 4097,
 };
 
+#if FZF_SESSION_FUZZ_MODE == FZF_SESSION_FUZZ_MODE_STATE
 typedef struct {
   const uint8_t *data;
   size_t size;
   size_t offset;
 } FuzzInput;
+#endif
 
 typedef struct {
   AsyncSession *session;
@@ -64,6 +88,7 @@ static void session_fuzz_check_candidate_analyzer(
     session_fuzz_fail(NULL, "candidate classification disagrees with scalar oracle");
 }
 
+#if FZF_SESSION_FUZZ_MODE == FZF_SESSION_FUZZ_MODE_STATE
 static uint8_t fuzz_take(FuzzInput *input) {
   return input->offset < input->size ? input->data[input->offset++] : 0;
 }
@@ -71,6 +96,7 @@ static uint8_t fuzz_take(FuzzInput *input) {
 static size_t fuzz_remaining(const FuzzInput *input) {
   return input->offset < input->size ? input->size - input->offset : 0;
 }
+#endif
 
 static AsyncSession *session_fuzz_create(uint8_t options) {
   AsyncSession *s = calloc(1, sizeof *s);
@@ -119,6 +145,7 @@ static AsyncSession *session_fuzz_create(uint8_t options) {
   return s;
 }
 
+#if FZF_SESSION_FUZZ_MODE == FZF_SESSION_FUZZ_MODE_READER
 static bool session_fuzz_write_all(int fd, const uint8_t *data, size_t size) {
   size_t offset = 0;
   while (offset < size) {
@@ -298,7 +325,9 @@ static void session_fuzz_reader_probe(const uint8_t *data, size_t size) {
   session_fuzz_reader_reference_free(&reference);
   async_session_destroy(s);
 }
+#endif
 
+#if FZF_SESSION_FUZZ_MODE == FZF_SESSION_FUZZ_MODE_STATE
 static char *fuzz_copy_string(FuzzInput *input, size_t requested,
                               size_t *out_len) {
   size_t len = requested < fuzz_remaining(input)
@@ -806,12 +835,16 @@ static void session_fuzz_run(const uint8_t *data, size_t size) {
   }
   async_session_destroy(session);
 }
+#endif
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   session_fuzz_check_candidate_analyzer(data, size);
+#if FZF_SESSION_FUZZ_MODE == FZF_SESSION_FUZZ_MODE_READER
   if (size <= SESSION_FUZZ_MAX_INPUT)
     session_fuzz_reader_probe(data, size);
+#else
   session_fuzz_run(data, size);
+#endif
   return 0;
 }
 
@@ -849,7 +882,8 @@ int main(int argc, char **argv) {
   if (argc < 2) return 2;
   for (int i = 1; i < argc; i++)
     if (session_fuzz_replay_file(argv[i]) != 0) return 1;
-  printf("Replayed %d interactive session corpus files.\n", argc - 1);
+  printf("Replayed %d interactive session %s corpus files.\n", argc - 1,
+         FZF_SESSION_FUZZ_MODE_NAME);
   return 0;
 }
 #endif

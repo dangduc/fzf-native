@@ -173,8 +173,10 @@ if(CMAKE_C_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
   # -DENABLE_UBSAN=ON -DCMAKE_BUILD_TYPE=Debug ..
   if(ENABLE_UBSAN)
     target_compile_options(fzf-native-module PRIVATE -fsanitize=undefined
+                                                     -fno-sanitize-recover=undefined
                                                      -fno-omit-frame-pointer -g)
     target_compile_options(utf8proc PRIVATE -fsanitize=undefined
+                                            -fno-sanitize-recover=undefined
                                             -fno-omit-frame-pointer -g)
     target_link_options(fzf-native-module PRIVATE -fsanitize=undefined)
     message(STATUS "UndefinedBehaviorSanitizer enabled")
