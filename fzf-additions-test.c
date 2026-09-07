@@ -843,6 +843,37 @@ static void test_pinned_fzf_backward_direction(void) {
   CHECK(legacy.start == explicit_forward.start);
   CHECK(legacy.end == explicit_forward.end);
   CHECK(legacy.score == explicit_forward.score);
+
+  char forward_query[] = "ab";
+  char backward_query[] = "ab";
+  fzf_pattern_t *forward_pattern = fzf_parse_pattern_with_direction(
+      CaseRespect, false, forward_query, true, true);
+  fzf_pattern_t *backward_pattern = fzf_parse_pattern_with_direction(
+      CaseRespect, false, backward_query, true, false);
+  CHECK(forward_pattern != NULL);
+  CHECK(backward_pattern != NULL);
+  if (forward_pattern && backward_pattern) {
+    CHECK(forward_pattern->forward);
+    CHECK(!backward_pattern->forward);
+    positions->size = 0;
+    CHECK(fzf_get_score("-ab-ab-", forward_pattern, NULL) > 0);
+    fzf_position_t *forward_positions = fzf_get_positions(
+        "-ab-ab-", forward_pattern, NULL);
+    fzf_position_t *backward_positions = fzf_get_positions(
+        "-ab-ab-", backward_pattern, NULL);
+    CHECK(forward_positions != NULL && forward_positions->size == 2);
+    CHECK(backward_positions != NULL && backward_positions->size == 2);
+    if (forward_positions && forward_positions->size == 2)
+      CHECK(forward_positions->data[0] == 2 &&
+            forward_positions->data[1] == 1);
+    if (backward_positions && backward_positions->size == 2)
+      CHECK(backward_positions->data[0] == 5 &&
+            backward_positions->data[1] == 4);
+    fzf_free_positions(forward_positions);
+    fzf_free_positions(backward_positions);
+  }
+  fzf_free_pattern(forward_pattern);
+  fzf_free_pattern(backward_pattern);
   fzf_free_positions(positions);
 }
 
