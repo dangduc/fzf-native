@@ -2266,10 +2266,9 @@ fzf_result_t fzf_fuzzy_match_v1_utf8(
                                       pattern, pos, slab);
 }
 
-fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
-                                     fzf_string_t *text,
-                                     fzf_string_t *pattern,
-                                     fzf_position_t *pos, fzf_slab_t *slab) {
+static fzf_result_t fzf_fuzzy_match_v2_utf8_impl(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
   const size_t M = pattern->size;
   const size_t N = text->size;
   const score_scheme_config_t *config = score_scheme_config(slab);
@@ -2302,8 +2301,8 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   if (slab != NULL &&
       (Nc != 0 && Mc > SIZE_MAX / Nc ? true : Nc * Mc > slab->I16.cap)) {
     utf8_free_char_map(char_map);
-    return fzf_fuzzy_match_v1_utf8(case_sensitive, normalize, text, pattern,
-                                   pos, slab);
+    return fzf_fuzzy_match_v1_utf8_impl(case_sensitive, normalize, forward,
+                                        text, pattern, pos, slab);
   }
 
   // Check if pattern exists in text (returns byte position)
@@ -2440,10 +2439,10 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
       int16_t score = ScoreMatch + bonus * BonusFirstCharMultiplier;
       h0_sub.data[off] = score;
       c0_sub.data[off] = 1;
-      if (Mc == 1 && (score > max_score)) {
+      if (Mc == 1 && (forward ? score > max_score : score >= max_score)) {
         max_score = score;
         max_score_pos = idx + off;
-        if (bonus >= BonusBoundary) {
+        if (forward && bonus >= BonusBoundary) {
           break;
         }
       }
@@ -2594,7 +2593,8 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
       c_sub.data[j] = consecutive;
       in_gap = s1 < s2;
       int16_t score = max16(max16(s1, s2), 0);
-      if (pidx == Mc - 1 && (score > max_score)) {
+      if (pidx == Mc - 1 &&
+          (forward ? score > max_score : score >= max_score)) {
         max_score = score;
         max_score_pos = col;
       }
@@ -2651,6 +2651,20 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
 
   return (fzf_result_t){(int32_t)j, (int32_t)max_score_pos + 1,
                         (int32_t)max_score};
+}
+
+fzf_result_t fzf_fuzzy_match_v2_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_fuzzy_match_v2_utf8_impl(case_sensitive, normalize, forward,
+                                      text, pattern, pos, slab);
+}
+
+fzf_result_t fzf_fuzzy_match_v2_utf8(
+    bool case_sensitive, bool normalize, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_fuzzy_match_v2_utf8_impl(case_sensitive, normalize, true, text,
+                                      pattern, pos, slab);
 }
 
 static bool append_set(fzf_term_set_t *set, fzf_term_t value) {
