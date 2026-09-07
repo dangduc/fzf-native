@@ -314,7 +314,12 @@ fuzz-module:
 .PHONY: fuzz-elisp
 fuzz-elisp: fuzz-module
 	FZF_NATIVE_TEST_MODULE=$(FUZZ_MODULE) \
-		$(FUZZ_EMACS) -Q --batch -L . -l ./fuzz/fzf-native-fuzz-test.el \
+		FZF_NATIVE_FUZZ_SEED=$(FZF_NATIVE_FUZZ_SEED) \
+		FZF_NATIVE_FUZZ_ABI_CASES=$(FZF_NATIVE_FUZZ_ABI_CASES) \
+		FZF_NATIVE_FUZZ_SESSION_CASES=$(FZF_NATIVE_FUZZ_SESSION_CASES) \
+		$(FUZZ_EMACS) -Q --batch -L . \
+		--eval '(setq load-prefer-newer t)' \
+		-l ./fuzz/fzf-native-fuzz-test.el \
 		--eval '(ert-run-tests-batch-and-exit "^fzf-native-fuzz-")'
 
 .PHONY: fuzz-upstream
