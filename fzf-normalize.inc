@@ -3,13 +3,25 @@
  *
  * Generated from junegunn/fzf src/algo/normalize.go at
  * 1372d04f79bde0daa3bab4b96a068baafa808e67.  Keep this sorted by source
- * codepoint so fzf_normalize_codepoint can use binary search.
+ * codepoint so fzf_normalize_codepoint can use binary search.  The source-page
+ * inventory is generated and audited from these same entries.
  */
 
 typedef struct {
   utf8proc_int32_t source;
   utf8proc_int32_t target;
 } fzf_normalized_rune_t;
+
+#define FZF_NORMALIZED_SOURCE_PAGES \
+  FZF_NORMALIZED_SOURCE_PAGE(0x00) \
+  FZF_NORMALIZED_SOURCE_PAGE(0x01) \
+  FZF_NORMALIZED_SOURCE_PAGE(0x02) \
+  FZF_NORMALIZED_SOURCE_PAGE(0x03) \
+  FZF_NORMALIZED_SOURCE_PAGE(0x1D) \
+  FZF_NORMALIZED_SOURCE_PAGE(0x1E) \
+  FZF_NORMALIZED_SOURCE_PAGE(0x20) \
+  FZF_NORMALIZED_SOURCE_PAGE(0x21) \
+  FZF_NORMALIZED_SOURCE_PAGE(0xFF)
 
 static const fzf_normalized_rune_t fzf_normalized_runes[] = {
   {0x00C0, 'A'}, {0x00C1, 'A'}, {0x00C2, 'A'}, {0x00C3, 'A'},

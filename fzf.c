@@ -586,6 +586,16 @@ static int16_t bonus_at(fzf_string_t *input, size_t idx,
 }
 
 static utf8proc_int32_t fzf_normalize_codepoint(utf8proc_int32_t codepoint) {
+  if (codepoint < 0x00c0) return codepoint;
+  switch ((uint32_t)codepoint >> 8) {
+#define FZF_NORMALIZED_SOURCE_PAGE(page) case page:
+      FZF_NORMALIZED_SOURCE_PAGES
+#undef FZF_NORMALIZED_SOURCE_PAGE
+#undef FZF_NORMALIZED_SOURCE_PAGES
+      break;
+    default:
+      return codepoint;
+  }
   size_t lo = 0;
   size_t hi = sizeof fzf_normalized_runes / sizeof fzf_normalized_runes[0];
   while (lo < hi) {
