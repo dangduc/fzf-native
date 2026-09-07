@@ -180,8 +180,14 @@ int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
 fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
                                   fzf_string_t *text, fzf_string_t *pattern,
                                   fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_exact_match_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
 fzf_result_t fzf_exact_match_boundary_utf8(
     bool case_sensitive, bool normalize, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_exact_match_boundary_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
     fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
 fzf_result_t fzf_prefix_match_utf8(bool case_sensitive, bool normalize,
                                    fzf_string_t *text, fzf_string_t *pattern,

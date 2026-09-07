@@ -1660,7 +1660,7 @@ fzf_result_t fzf_equal_match(bool case_sensitive, bool normalize,
 /* UTF-8 aware matching algorithms */
 
 static fzf_result_t fzf_exact_match_utf8_impl(
-    bool case_sensitive, bool normalize, bool boundary_check,
+    bool case_sensitive, bool normalize, bool forward, bool boundary_check,
     fzf_string_t *text, fzf_string_t *pattern, fzf_position_t *pos,
     fzf_slab_t *slab) {
   const size_t M = pattern->size;
@@ -1697,6 +1697,7 @@ static fzf_result_t fzf_exact_match_utf8_impl(
   int32_t best_pos = -1;
   int16_t bonus = 0;
   int16_t best_bonus = -1;
+  bool best_has_boundary_bonus = false;
   size_t match_start_byte = 0;
   size_t match_start_first_char_bytes = 0;
 
@@ -1750,11 +1751,19 @@ static fzf_result_t fzf_exact_match_utf8_impl(
                 char_class_of_codepoint(next_cp, config));
           }
         }
-        if (boundary_match && bonus > best_bonus) {
-          best_pos = (int32_t)match_start_byte;
-          best_bonus = bonus;
+        if (boundary_match) {
+          bool replace = bonus > best_bonus;
+          if (!forward) {
+            replace = bonus >= BonusBoundary ||
+                      (!best_has_boundary_bonus && bonus >= best_bonus);
+          }
+          if (replace) {
+            best_pos = (int32_t)match_start_byte;
+            best_bonus = bonus;
+          }
+          if (bonus >= BonusBoundary) best_has_boundary_bonus = true;
         }
-        if (boundary_match && bonus >= BonusBoundary) {
+        if (boundary_match && forward && bonus >= BonusBoundary) {
           break;
         }
         // Reset for next potential match — advance by first matched char's byte length
@@ -1826,17 +1835,31 @@ static fzf_result_t fzf_exact_match_utf8_impl(
   return (fzf_result_t){-1, -1, 0};
 }
 
+fzf_result_t fzf_exact_match_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_exact_match_utf8_impl(case_sensitive, normalize, forward, false,
+                                   text, pattern, pos, slab);
+}
+
+fzf_result_t fzf_exact_match_boundary_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_exact_match_utf8_impl(case_sensitive, normalize, forward, true,
+                                   text, pattern, pos, slab);
+}
+
 fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
                                   fzf_string_t *text, fzf_string_t *pattern,
                                   fzf_position_t *pos, fzf_slab_t *slab) {
-  return fzf_exact_match_utf8_impl(case_sensitive, normalize, false, text,
-                                   pattern, pos, slab);
+  return fzf_exact_match_utf8_impl(case_sensitive, normalize, true, false,
+                                   text, pattern, pos, slab);
 }
 
 fzf_result_t fzf_exact_match_boundary_utf8(
     bool case_sensitive, bool normalize, fzf_string_t *text,
     fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
-  return fzf_exact_match_utf8_impl(case_sensitive, normalize, true, text,
+  return fzf_exact_match_utf8_impl(case_sensitive, normalize, true, true, text,
                                    pattern, pos, slab);
 }
 
