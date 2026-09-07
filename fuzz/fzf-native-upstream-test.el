@@ -121,6 +121,65 @@
   (mapcar #'fzf-native-differential-candidate-text
           (fzf-native-differential-case-candidates case)))
 
+(defun fzf-native-upstream--fzf (fzf case)
+  "Return raw matches from FZF for CASE."
+  (let* ((query (fzf-native-differential-case-query case))
+         (collection (fzf-native-upstream--candidate-texts case))
+         (valid-utf8
+          (plist-get (fzf-native-differential-case-dimensions case)
+                     :valid-utf8))
+         (args
+          (append
+           (list "--read0" "--print0" "--no-color" "--no-multi-line"
+                 (concat "--filter="
+                         (fzf-native-differential-case-rendered-query case)))
+           (when (eq (fzf-native-differential-case-comparison case)
+                     'membership)
+             '("--no-sort"))
+           (unless (fzf-native-differential-query-normalize query)
+             '("--literal"))
+           (pcase (fzf-native-differential-query-case-mode query)
+             ('ignore '("--ignore-case"))
+             ('respect '("--no-ignore-case"))
+             (_ '("--smart-case")))
+           (unless (fzf-native-differential-query-fuzzy query)
+             '("--exact"))))
+         (output (generate-new-buffer " *fzf-native-upstream*")))
+    (unwind-protect
+        (with-temp-buffer
+          (unless valid-utf8
+            (set-buffer-multibyte nil))
+          (insert (mapconcat #'identity collection "\0") "\0")
+          (with-current-buffer output
+            (unless valid-utf8
+              (set-buffer-multibyte nil)))
+          (let ((coding-system-for-write
+                 (if valid-utf8 'utf-8-unix 'binary))
+                (coding-system-for-read
+                 (if valid-utf8 'utf-8-unix 'binary))
+                (status (apply #'call-process-region
+                               (point-min) (point-max) fzf nil output nil
+                               args)))
+            (unless (memq status '(0 1))
+              (error "%s exited with status %S" fzf status)))
+          (with-current-buffer output
+            (butlast (split-string (buffer-string) "\0" nil))))
+      (kill-buffer output))))
+
+(defun fzf-native-upstream--native (case)
+  "Return raw fzf-native matches for CASE."
+  (let* ((query (fzf-native-differential-case-query case))
+         (fzf-native-case-mode
+          (fzf-native-differential-query-case-mode query))
+         (fzf-native-fuzzy
+          (fzf-native-differential-query-fuzzy query))
+         (fzf-native-batch-highlight nil)
+         (fzf-native-filter-only-min-pool nil)
+         (fzf-native-filter-only-length nil))
+    (fzf-native-score-all
+     (mapcar #'copy-sequence (fzf-native-upstream--candidate-texts case))
+     (fzf-native-differential-case-rendered-query case))))
+
 
 (defun fzf-native-upstream--dimension-value (case key)
   "Return dimension KEY from CASE, including query options."
