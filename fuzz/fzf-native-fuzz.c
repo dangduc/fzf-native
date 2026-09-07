@@ -456,7 +456,9 @@ static bool token_is_plain_literal(const fuzz_query_token_t *token) {
   if (token->size == 0 || token_is_bar(token)) return false;
   char first = token->data[0];
   char last = token->data[token->size - 1];
-  return first != '!' && first != '\'' && first != '^' && last != '$';
+  /* Prefixing a trailing quote would create exact-boundary syntax. */
+  return first != '!' && first != '\'' && first != '^' && last != '$' &&
+         last != '\'';
 }
 
 static void require_score(const char *candidate, const char *query,
