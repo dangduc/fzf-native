@@ -143,10 +143,12 @@ fuzz-replay: fuzz-matcher-replay fuzz-session-replay
 fuzz-matcher-replay: fuzz-replay-build
 	$(FUZZ_REPLAY_BINARY) $(FUZZ_SEED_DIR)/*
 
-# The state target includes the real AsyncSession core.  Its bytecode reaches
-# the scorer, worker pool, caches, request publication, and teardown.
-.PHONY: fuzz-session-build fuzz-session-state-build
-fuzz-session-build: fuzz-session-state-build
+# Both targets include the real AsyncSession core.  The state bytecode reaches
+# the scorer, worker pool, caches, request publication, and teardown at high
+# throughput.  The separate reader target covers blocking producer I/O without
+# making every state-machine input wait for a pipe reader.
+.PHONY: fuzz-session-build fuzz-session-state-build fuzz-session-reader-build
+fuzz-session-build: fuzz-session-state-build fuzz-session-reader-build
 
 fuzz-session-state-build:
 	mkdir -p $(BUILD_DIR)
@@ -158,9 +160,18 @@ fuzz-session-state-build:
 		-o $(FUZZ_SESSION_BINARY) fuzz/fzf-native-session-fuzz.c fzf.c \
 		fzf-additions.c $(FUZZ_UTF8PROC_SOURCE)
 
+fuzz-session-reader-build:
+	mkdir -p $(BUILD_DIR)
+	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
+		-fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
+		-fno-omit-frame-pointer \
+		-DFZF_SESSION_FUZZ_MODE=FZF_SESSION_FUZZ_MODE_READER \
+		-I. $(FUZZ_UTF8PROC_FLAGS) -pthread \
+		-o $(FUZZ_SESSION_READER_BINARY) fuzz/fzf-native-session-fuzz.c \
+		fzf.c fzf-additions.c $(FUZZ_UTF8PROC_SOURCE)
 
-.PHONY: fuzz-session fuzz-session-state
-fuzz-session: fuzz-session-state
+.PHONY: fuzz-session fuzz-session-state fuzz-session-reader
+fuzz-session: fuzz-session-state fuzz-session-reader
 
 fuzz-session-state: fuzz-session-state-build
 	mkdir -p $(FUZZ_SESSION_CORPUS_DIR) $(FUZZ_SESSION_ARTIFACT_DIR)
@@ -172,10 +183,21 @@ fuzz-session-state: fuzz-session-state-build
 		-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) \
 		-max_total_time=$(FUZZ_SESSION_SECONDS) -print_final_stats=1
 
+fuzz-session-reader: fuzz-session-reader-build
+	mkdir -p $(FUZZ_SESSION_READER_CORPUS_DIR) \
+		$(FUZZ_SESSION_READER_ARTIFACT_DIR)
+	cp $(FUZZ_SESSION_READER_SEED_DIR)/* $(FUZZ_SESSION_READER_CORPUS_DIR)/
+	$(FUZZ_SESSION_READER_BINARY) $(FUZZ_SESSION_READER_CORPUS_DIR) \
+		-max_len=$(FUZZ_SESSION_MAX_LEN) -dict=$(FUZZ_DICTIONARY) \
+		-verbosity=$(FUZZ_VERBOSITY) \
+		-artifact_prefix=$(FUZZ_SESSION_READER_ARTIFACT_DIR)/ \
+		-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) \
+		-max_total_time=$(FUZZ_SESSION_READER_SECONDS) -print_final_stats=1
 
 # Keep only inputs that add coverage for each independently instrumented
 # target.  The learned corpus directories remain stable for CI caching.
-.PHONY: fuzz-merge fuzz-matcher-merge fuzz-session-merge fuzz-session-state-merge
+.PHONY: fuzz-merge fuzz-matcher-merge fuzz-session-merge \
+	fuzz-session-state-merge fuzz-session-reader-merge
 fuzz-merge: fuzz-matcher-merge fuzz-session-merge
 
 fuzz-matcher-merge: fuzz-build
@@ -187,7 +209,7 @@ fuzz-matcher-merge: fuzz-build
 	rm -rf $(FUZZ_CORPUS_DIR)
 	mv $(FUZZ_MERGED_CORPUS_DIR) $(FUZZ_CORPUS_DIR)
 
-fuzz-session-merge: fuzz-session-state-merge
+fuzz-session-merge: fuzz-session-state-merge fuzz-session-reader-merge
 
 fuzz-session-state-merge: fuzz-session-state-build
 	rm -rf $(FUZZ_SESSION_MERGED_CORPUS_DIR)
@@ -198,9 +220,22 @@ fuzz-session-state-merge: fuzz-session-state-build
 	rm -rf $(FUZZ_SESSION_CORPUS_DIR)
 	mv $(FUZZ_SESSION_MERGED_CORPUS_DIR) $(FUZZ_SESSION_CORPUS_DIR)
 
+fuzz-session-reader-merge: fuzz-session-reader-build
+	rm -rf $(FUZZ_SESSION_READER_MERGED_CORPUS_DIR)
+	mkdir -p $(FUZZ_SESSION_READER_MERGED_CORPUS_DIR) \
+		$(FUZZ_SESSION_READER_CORPUS_DIR)
+	$(FUZZ_SESSION_READER_BINARY) -merge=1 \
+		$(FUZZ_SESSION_READER_MERGED_CORPUS_DIR) \
+		$(FUZZ_SESSION_READER_SEED_DIR) $(FUZZ_SESSION_READER_CORPUS_DIR) \
+		-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) -verbosity=$(FUZZ_VERBOSITY)
+	rm -rf $(FUZZ_SESSION_READER_CORPUS_DIR)
+	mv $(FUZZ_SESSION_READER_MERGED_CORPUS_DIR) \
+		$(FUZZ_SESSION_READER_CORPUS_DIR)
 
-.PHONY: fuzz-session-replay-build fuzz-session-state-replay-build
-fuzz-session-replay-build: fuzz-session-state-replay-build
+.PHONY: fuzz-session-replay-build fuzz-session-state-replay-build \
+	fuzz-session-reader-replay-build
+fuzz-session-replay-build: fuzz-session-state-replay-build \
+	fuzz-session-reader-replay-build
 
 fuzz-session-state-replay-build:
 	mkdir -p $(BUILD_DIR)
@@ -212,16 +247,31 @@ fuzz-session-state-replay-build:
 		-o $(FUZZ_SESSION_REPLAY_BINARY) fuzz/fzf-native-session-fuzz.c \
 		fzf.c fzf-additions.c $(FUZZ_UTF8PROC_SOURCE)
 
+fuzz-session-reader-replay-build:
+	mkdir -p $(BUILD_DIR)
+	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
+		-DFZF_SESSION_FUZZ_STANDALONE=1 \
+		-DFZF_SESSION_FUZZ_MODE=FZF_SESSION_FUZZ_MODE_READER \
+		-fsanitize=address,undefined -fno-sanitize-recover=undefined \
+		-fno-omit-frame-pointer -I. $(FUZZ_UTF8PROC_FLAGS) -pthread \
+		-o $(FUZZ_SESSION_READER_REPLAY_BINARY) \
+		fuzz/fzf-native-session-fuzz.c fzf.c fzf-additions.c \
+		$(FUZZ_UTF8PROC_SOURCE)
 
-.PHONY: fuzz-session-replay fuzz-session-state-replay
-fuzz-session-replay: fuzz-session-state-replay
+.PHONY: fuzz-session-replay fuzz-session-state-replay \
+	fuzz-session-reader-replay
+fuzz-session-replay: fuzz-session-state-replay fuzz-session-reader-replay
 
 fuzz-session-state-replay: fuzz-session-state-replay-build
 	$(FUZZ_SESSION_REPLAY_BINARY) $(FUZZ_SESSION_SEED_DIR)/*
 
+fuzz-session-reader-replay: fuzz-session-reader-replay-build
+	$(FUZZ_SESSION_READER_REPLAY_BINARY) $(FUZZ_SESSION_READER_SEED_DIR)/*
 
-.PHONY: fuzz-session-tsan-build fuzz-session-state-tsan-build
-fuzz-session-tsan-build: fuzz-session-state-tsan-build
+.PHONY: fuzz-session-tsan-build fuzz-session-state-tsan-build \
+	fuzz-session-reader-tsan-build
+fuzz-session-tsan-build: fuzz-session-state-tsan-build \
+	fuzz-session-reader-tsan-build
 
 fuzz-session-state-tsan-build:
 	mkdir -p $(BUILD_DIR)
@@ -233,14 +283,27 @@ fuzz-session-state-tsan-build:
 		-o $(FUZZ_SESSION_TSAN_BINARY) fuzz/fzf-native-session-fuzz.c \
 		fzf.c fzf-additions.c $(FUZZ_UTF8PROC_SOURCE)
 
+fuzz-session-reader-tsan-build:
+	mkdir -p $(BUILD_DIR)
+	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
+		-DFZF_SESSION_FUZZ_STANDALONE=1 -DFZF_NATIVE_DEBUG=1 \
+		-DFZF_SESSION_FUZZ_MODE=FZF_SESSION_FUZZ_MODE_READER \
+		-fsanitize=thread \
+		-fno-omit-frame-pointer -I. $(FUZZ_UTF8PROC_FLAGS) -pthread \
+		-o $(FUZZ_SESSION_READER_TSAN_BINARY) \
+		fuzz/fzf-native-session-fuzz.c fzf.c fzf-additions.c \
+		$(FUZZ_UTF8PROC_SOURCE)
 
-.PHONY: fuzz-session-tsan fuzz-session-state-tsan
-fuzz-session-tsan: fuzz-session-state-tsan
+.PHONY: fuzz-session-tsan fuzz-session-state-tsan fuzz-session-reader-tsan
+fuzz-session-tsan: fuzz-session-state-tsan fuzz-session-reader-tsan
 
 fuzz-session-state-tsan: fuzz-session-state-tsan-build
 	TSAN_OPTIONS=halt_on_error=1:history_size=7 \
 		$(FUZZ_SESSION_TSAN_BINARY) $(FUZZ_SESSION_SEED_DIR)/*
 
+fuzz-session-reader-tsan: fuzz-session-reader-tsan-build
+	TSAN_OPTIONS=halt_on_error=1:history_size=7 \
+		$(FUZZ_SESSION_READER_TSAN_BINARY) $(FUZZ_SESSION_READER_SEED_DIR)/*
 
 .PHONY: fuzz-module
 fuzz-module:
