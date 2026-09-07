@@ -24,7 +24,7 @@
   kind inverse literal)
 
 (cl-defstruct fzf-native-differential-query
-  sets case-mode fuzzy normalize forward)
+  sets case-mode fuzzy normalize direction forward score-scheme)
 
 (cl-defstruct fzf-native-differential-candidate
   id text role)
@@ -53,6 +53,13 @@
    ["ⱥ" "Ⱥ"]
    ["i" "İ"]
    ["ß" "ẞ"]])
+
+(defconst fzf-native-differential--normalization-pairs
+  [["cafe" "café"]
+   ["A" "Ấ"]
+   ["O" "Ờ"]
+   ["u" "ự"]]
+  "ASCII and Latin pairs that pinned fzf treats as normalization peers.")
 
 (defconst fzf-native-differential--separators
   ["/" "-" "_" "." ":" " "])
@@ -207,17 +214,25 @@ For fuzzy and exact terms, derive text from QUERY-NEEDLE or NEEDLE."
       (aref [999 1000 1001] (% serial 3))
     (aref [1 2 7 31 32 63 64] (% serial 7))))
 
-(defun fzf-native-differential--text-plan (rng profile serial case-mode)
-  "Return a text-generation plan for RNG, PROFILE, SERIAL, and CASE-MODE."
+(defun fzf-native-differential--text-plan
+    (rng profile serial case-mode normalize)
+  "Return a text plan for RNG, PROFILE, SERIAL, CASE-MODE, and NORMALIZE."
   (let* ((variant
           (fzf-native-differential--pick
            rng [ascii unicode unicode casefold malformed]))
          ;; A case-fold pair cannot be the guaranteed matching candidate in
          ;; respect-case mode.  Keep that draw as ordinary Unicode instead.
-         (casefold (and (eq variant 'casefold)
+         (normalization-pair
+          (and normalize
+               (zerop (fzf-native-differential-random rng 2))
+               (fzf-native-differential--pick
+                rng fzf-native-differential--normalization-pairs)))
+         (casefold (and (not normalization-pair)
+                        (eq variant 'casefold)
                         (not (eq case-mode 'respect))))
          (text-class
-          (cond (casefold 'unicode)
+          (cond (normalization-pair 'unicode)
+                (casefold 'unicode)
                 ((eq variant 'casefold) 'unicode)
                 (t variant)))
          (target (fzf-native-differential--length-target profile serial))
@@ -226,6 +241,7 @@ For fuzzy and exact terms, derive text from QUERY-NEEDLE or NEEDLE."
                      rng fzf-native-differential--case-pairs)))
          (query-unit
           (cond
+           (normalization-pair (aref normalization-pair 0))
            (pair (aref pair 0))
            ((eq text-class 'unicode)
             (fzf-native-differential--pick
@@ -236,13 +252,17 @@ For fuzzy and exact terms, derive text from QUERY-NEEDLE or NEEDLE."
            (t
             (fzf-native-differential--pick
              rng fzf-native-differential--ascii-atoms))))
-         (candidate-unit (if pair (aref pair 1) query-unit))
+         (candidate-unit
+          (cond (normalization-pair (aref normalization-pair 1))
+                (pair (aref pair 1))
+                (t query-unit)))
          (query-needle
           (fzf-native-differential--fit-length query-unit target))
          (candidate-needle
           (fzf-native-differential--fit-length candidate-unit target)))
     (list :class text-class
           :casefold casefold
+          :normalization-pair (and normalization-pair t)
           :target target
           :query-needle query-needle
           :candidate-needle candidate-needle)))
@@ -442,6 +462,29 @@ of `common', `parity', or `long'."
           (if (eq profile 'long)
               t
             (not (zerop (fzf-native-differential-random rng 2)))))
+         (normalize
+          (and (eq profile 'parity)
+               (not (zerop (fzf-native-differential-random rng 2)))))
+         (score-scheme
+          (if (eq profile 'parity)
+              (fzf-native-differential--pick rng [default path history])
+            'default))
+         ;; The fzf CLI couples path scoring with backward matching.  Explicit
+         ;; overrides use membership comparison here.  Go also replaces
+         ;; malformed UTF-8, so its ranking is not comparable with preserved
+         ;; input bytes.  The raw oracle checks independent score and position
+         ;; behavior for supported text and directions.
+         (natural-forward (not (eq score-scheme 'path)))
+         (direction
+          (if (eq profile 'parity)
+              (fzf-native-differential--pick
+               rng [auto auto forward backward])
+            'auto))
+         (forward
+          (pcase direction
+            ('auto natural-forward)
+            ('forward t)
+            (_ nil)))
          (shape (fzf-native-differential--query-shape rng profile))
          (primary-kind
           (fzf-native-differential--primary-kind rng profile))
@@ -449,7 +492,7 @@ of `common', `parity', or `long'."
           (fzf-native-differential--pick rng [front middle tail ambiguous]))
          (text-plan
           (fzf-native-differential--text-plan
-           rng profile serial case-mode))
+           rng profile serial case-mode normalize))
          (text-class (plist-get text-plan :class))
          (casefold (plist-get text-plan :casefold))
          (query-needle (plist-get text-plan :query-needle))
@@ -469,11 +512,14 @@ of `common', `parity', or `long'."
          (query
           (make-fzf-native-differential-query
            :sets sets :case-mode case-mode :fuzzy fuzzy
-           :normalize nil :forward t))
+           :normalize normalize :direction direction :forward forward
+           :score-scheme score-scheme))
          (rendered-query (fzf-native-differential-render-query query))
          (comparison
           (if (and (eq profile 'parity)
+                   (not (eq text-class 'malformed))
                    (not (eq primary-kind 'boundary-exact))
+                   (eq forward natural-forward)
                    (zerop (% serial 3)))
               'ranking
             'membership))
@@ -490,6 +536,11 @@ of `common', `parity', or `long'."
      :dimensions
      (list :text-class text-class
            :unicode-casefold casefold
+           :normalization-pair (plist-get text-plan :normalization-pair)
+           :normalize normalize
+           :direction direction
+           :forward forward
+           :score-scheme score-scheme
            :needle-length (plist-get text-plan :target)
            :query-length (length rendered-query)
            :anchor-length (length anchor)
