@@ -9,9 +9,9 @@
 
 #include "fzf.h"
 
-/* See fzf-additions.c.  SLAB is used only for the full-scorer fallback taken
-   when PATTERN contains a non-ASCII (UTF-8) or otherwise unrecognized term;
-   pure-ASCII patterns never touch it. */
+/* See fzf-additions.c.  SLAB is used only for the full-scorer fallback.  This
+   includes non-ASCII input, UTF-8 terms, normalized terms, and unrecognized
+   algorithms. */
 bool fzf_has_match(const char *text, fzf_pattern_t *pattern, fzf_slab_t *slab);
 /* Safe counterpart for a bounded byte string.  TEXT must reference at least
    TEXT_LEN readable bytes.  Every byte in that range is candidate data,
