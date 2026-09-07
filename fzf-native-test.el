@@ -118,6 +118,123 @@
      (equal (fzf-native-score "sfsjoc" "jo" slab)
             '(36)))))
 
+(ert-deftest fzf-native-score-scheme-public-batch-test ()
+  "Batch calls apply the selected fzf score scheme on every slab."
+  (let ((slab (fzf-native-make-default-slab)))
+    (dolist (case '((default ":fzf" 84)
+                    (path ":fzf" 80)
+                    (history ":fzf" 80)))
+      (let ((fzf-native-score-scheme (nth 0 case)))
+        (should (= (car (fzf-native-score (nth 1 case) "fzf" slab))
+                   (nth 2 case)))))
+    (let ((fzf-native-score-scheme 'default))
+      (should (equal (fzf-native-score-all '(" fzf" "src/fzf") "fzf")
+                     '(" fzf" "src/fzf"))))
+    (let ((fzf-native-score-scheme 'path))
+      (should (equal (fzf-native-score-all '(" fzf" "src/fzf") "fzf")
+                     '("src/fzf" " fzf"))))))
+
+(ert-deftest fzf-native-score-scheme-ranking-parity-test ()
+  "Each score scheme applies the secondary rank keys from fzf."
+  (let ((candidates '("foo/a" "fooXXXXXXXXXXXXXXXX" "foo\\a"
+                      "foo/zz" "foo😀😀😀")))
+    (dolist
+        (case
+         '((default ("foo/a" "foo\\a" "foo/zz"
+                     "foo😀😀😀" "fooXXXXXXXXXXXXXXXX"))
+           (path ("foo😀😀😀" "fooXXXXXXXXXXXXXXXX" "foo/a"
+                  "foo\\a" "foo/zz"))
+           (history ("foo/a" "fooXXXXXXXXXXXXXXXX" "foo\\a"
+                      "foo/zz" "foo😀😀😀"))))
+      (let ((fzf-native-score-scheme (car case)))
+        (should (equal (fzf-native-score-all candidates "^foo")
+                       (cadr case))))))
+  ;; Suffix scores exercise UTF-8 rune length, saturated score ties, and the
+  ;; stable producer-index fallback in the same order as pinned fzf.
+  (let ((candidates '("zλ" "longλ" "😀λ" "bλ" "λ")))
+    (dolist
+        (case
+         '((default ("λ" "😀λ" "zλ" "bλ" "longλ"))
+           (path ("λ" "😀λ" "zλ" "bλ" "longλ"))
+           (history ("😀λ" "λ" "zλ" "longλ" "bλ"))))
+      (let ((fzf-native-score-scheme (car case)))
+        (should (equal (fzf-native-score-all candidates "λ$")
+                       (cadr case)))))))
+
+(ert-deftest fzf-native-inverse-only-or-preserves-producer-order-test ()
+  "Inverse-only OR terms do not activate fzf ranking."
+  (let ((candidates '("longer" "x" "path/to/value")))
+    (dolist (scheme '(default path history))
+      (let ((fzf-native-score-scheme scheme))
+        (should (equal (fzf-native-score-all candidates "!z | !q")
+                       candidates))))))
+
+(ert-deftest fzf-native-score-scheme-invalid-value-test ()
+  "An invalid scheme signals before batch or highlight work is published."
+  (let ((fzf-native-score-scheme 'not-a-scheme)
+        (fzf-native-batch-highlight t))
+    (should-error (fzf-native-score "src/fzf" "fzf"))
+    (should-error (fzf-native-score-all '("src/fzf") "fzf"))
+    (should-error (fzf-native-highlight-one "src/fzf" "fzf"))
+    (should-error (fzf-native-highlight-all (list "src/fzf") "fzf"))))
+
+(ert-deftest fzf-native-normalize-public-batch-test ()
+  "Batch scoring and highlighting apply fzf Latin normalization."
+  (should (eq (default-value 'fzf-native-normalize) t))
+  (let ((fzf-native-normalize nil))
+    (should (equal (fzf-native-score "café" "cafe") '(0))))
+  (let ((fzf-native-normalize t))
+    (should (> (car (fzf-native-score "café" "cafe")) 0))
+    (should (equal (fzf-native-score-all '("café" "tea") "cafe")
+                   '("café")))
+    (let ((fzf-native-case-mode 'respect))
+      (should (> (car (fzf-native-score "Ờ" "O")) 0))
+      (should (equal (fzf-native-score "O" "Ờ") '(0)))
+      (should (equal (fzf-native-score-all '("A" "Ā" "ā") "Ā")
+                     '("Ā"))))))
+
+(ert-deftest fzf-native-search-direction-public-batch-test ()
+  "The direction option selects earlier or later equal-score occurrences."
+  (should (eq (default-value 'fzf-native-search-direction) 'auto))
+  (let* ((fzf-native-score-scheme 'default)
+         (fzf-native-search-direction 'auto)
+         (default-auto (fzf-native-highlight-one "-ab-ab-" "ab"))
+         (fzf-native-score-scheme 'path)
+         (path-auto (fzf-native-highlight-one "-ab-ab-" "ab"))
+         (fzf-native-search-direction 'forward)
+         (forward (fzf-native-highlight-one "-ab-ab-" "ab"))
+         (fzf-native-search-direction 'backward)
+         (backward (fzf-native-highlight-one "-ab-ab-" "ab"))
+         (faced-p
+          (lambda (string index)
+            (let ((face (get-text-property index 'face string)))
+              (or (eq face 'completions-common-part)
+                  (and (listp face)
+                       (memq 'completions-common-part face)))))))
+    (should (funcall faced-p default-auto 1))
+    (should-not (funcall faced-p default-auto 4))
+    (should-not (funcall faced-p path-auto 1))
+    (should (funcall faced-p path-auto 4))
+    (should (funcall faced-p forward 1))
+    (should-not (funcall faced-p forward 4))
+    (should-not (funcall faced-p backward 1))
+    (should (funcall faced-p backward 4))))
+
+(ert-deftest fzf-native-exact-boundary-public-batch-test ()
+  "A paired trailing quote requires exact word boundaries."
+  (let ((fzf-native-fuzzy t))
+    (should (equal (fzf-native-score-all
+                    '("xyz" "/xyz/" "xxyz" "xyzz") "'xyz'")
+                   '("xyz" "/xyz/")))))
+
+(ert-deftest fzf-native-search-direction-invalid-value-test ()
+  "An invalid direction signals before batch work is published."
+  (let ((fzf-native-search-direction 'sideways))
+    (should-error (fzf-native-score "-ab-ab-" "ab"))
+    (should-error (fzf-native-score-all '("-ab-ab-") "ab"))
+    (should-error (fzf-native-highlight-one "-ab-ab-" "ab"))
+    (should-error (fzf-native-highlight-all (list "-ab-ab-") "ab"))))
+
 (ert-deftest fzf-native-score-with-slab-test ()
   "Test slab can be reused."
   (let* ((slab (fzf-native-make-slab (* 100 1024) 2048))
