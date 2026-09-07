@@ -657,13 +657,13 @@ static void test_growth_retry_query_oom_is_terminal(void) {
 
 static void test_n_zero(void) {
   struct Candidate xs[1] = { make_candidate(7, 0) };
-  counting_sort_candidates(xs, 0);
+  counting_sort_candidates(xs, 0, FZF_SCORE_SCHEME_PATH);
   CHECK(xs[0].score == 7);  /* untouched */
 }
 
 static void test_n_one(void) {
   struct Candidate xs[1] = { make_candidate(42, 0) };
-  counting_sort_candidates(xs, 1);
+  counting_sort_candidates(xs, 1, FZF_SCORE_SCHEME_PATH);
   CHECK(xs[0].score == 42);
 }
 
@@ -674,7 +674,7 @@ static void test_small_n_insertion_sort(void) {
     make_candidate(1, 3), make_candidate(7, 4), make_candidate(0, 5),
     make_candidate(9, 6), make_candidate(4, 7),
   };
-  counting_sort_candidates(xs, 8);
+  counting_sort_candidates(xs, 8, FZF_SCORE_SCHEME_PATH);
   CHECK(is_descending_by_score(xs, 8));
   CHECK(xs[0].score == 9);
   CHECK(xs[7].score == 0);
@@ -684,7 +684,7 @@ static void test_small_n_stability(void) {
   struct Candidate xs[8];
   for (size_t i = 0; i < 8; i++)
     xs[i] = make_candidate(7, i);
-  counting_sort_candidates(xs, 8);
+  counting_sort_candidates(xs, 8, FZF_SCORE_SCHEME_PATH);
   for (size_t i = 0; i < 8; i++) {
     CHECK(xs[i].score == 7);
     CHECK(xs[i].s.len == i);
@@ -700,7 +700,7 @@ static void test_large_n_correctness(void) {
   for (size_t i = 0; i < N; i++) {
     xs[i] = make_candidate((int)(rand_r(&seed) % 5000), i);
   }
-  counting_sort_candidates(xs, N);
+  counting_sort_candidates(xs, N, FZF_SCORE_SCHEME_PATH);
   CHECK(is_descending_by_score(xs, N));
   free(xs);
 }
@@ -713,7 +713,7 @@ static void test_stability_with_ties(void) {
     /* score alternates 10 / 5; tag = original index */
     xs[i] = make_candidate((i % 2 == 0) ? 10 : 5, i);
   }
-  counting_sort_candidates(xs, N);
+  counting_sort_candidates(xs, N, FZF_SCORE_SCHEME_PATH);
 
   /* First N/2 entries: score=10, tags 0,2,4,... in order */
   for (size_t i = 0; i < N / 2; i++) {
@@ -732,7 +732,7 @@ static void test_all_same_score(void) {
   enum { N = 128 };
   struct Candidate xs[N];
   for (size_t i = 0; i < N; i++) xs[i] = make_candidate(7, i);
-  counting_sort_candidates(xs, N);
+  counting_sort_candidates(xs, N, FZF_SCORE_SCHEME_PATH);
   for (size_t i = 0; i < N; i++) {
     CHECK(xs[i].score == 7);
     CHECK(xs[i].s.len == i);
@@ -744,7 +744,7 @@ static void test_all_zero_score(void) {
   enum { N = 100 };
   struct Candidate xs[N];
   for (size_t i = 0; i < N; i++) xs[i] = make_candidate(0, i);
-  counting_sort_candidates(xs, N);
+  counting_sort_candidates(xs, N, FZF_SCORE_SCHEME_PATH);
   for (size_t i = 0; i < N; i++) {
     CHECK(xs[i].score == 0);
     CHECK(xs[i].s.len == i);
@@ -762,7 +762,7 @@ static void test_matches_qsort(void) {
     a[i] = make_candidate(s, i);
     b[i] = make_candidate(s, i);
   }
-  counting_sort_candidates(a, N);
+  counting_sort_candidates(a, N, FZF_SCORE_SCHEME_PATH);
   qsort(b, N, sizeof *b, cmp_candidate);
   for (size_t i = 0; i < N; i++) {
     CHECK(a[i].score == b[i].score);
@@ -965,13 +965,13 @@ static int is_scored_descending(ScoredStr *xs, size_t n) {
 
 static void test_scored_n_zero(void) {
   ScoredStr xs[1] = { make_scored(7, 0) };
-  counting_sort_scored(xs, 0);
+  counting_sort_scored(xs, 0, FZF_SCORE_SCHEME_PATH);
   CHECK(xs[0].score == 7);
 }
 
 static void test_scored_n_one(void) {
   ScoredStr xs[1] = { make_scored(42, 0) };
-  counting_sort_scored(xs, 1);
+  counting_sort_scored(xs, 1, FZF_SCORE_SCHEME_PATH);
   CHECK(xs[0].score == 42);
 }
 
@@ -982,7 +982,7 @@ static void test_scored_large_n_correctness(void) {
   unsigned seed = 0xBEEF;
   for (size_t i = 0; i < N; i++)
     xs[i] = make_scored((int)(rand_r(&seed) % 5000), i);
-  counting_sort_scored(xs, N);
+  counting_sort_scored(xs, N, FZF_SCORE_SCHEME_PATH);
   CHECK(is_scored_descending(xs, N));
   free(xs);
 }
@@ -992,7 +992,7 @@ static void test_scored_stability(void) {
   ScoredStr xs[N];
   for (size_t i = 0; i < N; i++)
     xs[i] = make_scored((i % 2 == 0) ? 10 : 5, i);
-  counting_sort_scored(xs, N);
+  counting_sort_scored(xs, N, FZF_SCORE_SCHEME_PATH);
   for (size_t i = 0; i < N / 2; i++) {
     CHECK(xs[i].score == 10);
     CHECK((size_t)(uintptr_t)xs[i].str == i * 2);
@@ -1012,7 +1012,7 @@ static void test_scored_matches_qsort(void) {
     a[i] = make_scored(s, i);
     b[i] = make_scored(s, i);
   }
-  counting_sort_scored(a, N);
+  counting_sort_scored(a, N, FZF_SCORE_SCHEME_PATH);
   qsort(b, N, sizeof *b, cmp_scored_desc);
   for (size_t i = 0; i < N; i++) {
     CHECK(a[i].score == b[i].score);
@@ -1027,7 +1027,7 @@ static void test_scored_sort_uses_fzf_secondary_keys(void) {
   values[0].rank = (FzfRankKeys){.score = 100, .first = 9, .second = 1};
   values[1].rank = (FzfRankKeys){.score = 100, .first = 3, .second = 8};
   values[2].rank = (FzfRankKeys){.score = 100, .first = 3, .second = 2};
-  counting_sort_scored(values, 3);
+  counting_sort_scored(values, 3, FZF_SCORE_SCHEME_PATH);
   CHECK(values[0].idx == 2);
   CHECK(values[1].idx == 1);
   CHECK(values[2].idx == 0);
@@ -1037,9 +1037,38 @@ static void test_scored_sort_uses_fzf_secondary_keys(void) {
   };
   saturated[0].rank.first = 1;
   saturated[1].rank.first = 2;
-  counting_sort_scored(saturated, 2);
+  counting_sort_scored(saturated, 2, FZF_SCORE_SCHEME_PATH);
   CHECK(saturated[0].idx == 4);
   CHECK(saturated[1].idx == 5);
+}
+
+static void test_scheme_specific_radix_ranges_match_total_order(void) {
+  CHECK(fzf_rank_radix_first_pass(FZF_SCORE_SCHEME_HISTORY) == 4);
+  CHECK(fzf_rank_radix_first_pass(FZF_SCORE_SCHEME_DEFAULT) == 2);
+  CHECK(fzf_rank_radix_first_pass(FZF_SCORE_SCHEME_PATH) == 0);
+
+  enum { N = 512 };
+  unsigned seed = 0x51cedu;
+  for (fzf_score_scheme_t scheme = FZF_SCORE_SCHEME_DEFAULT;
+       scheme <= FZF_SCORE_SCHEME_HISTORY; scheme++) {
+    ScoredStr actual[N], expected[N];
+    for (size_t i = 0; i < N; i++) {
+      FzfRankKeys rank = {
+        .score = (uint16_t)(rand_r(&seed) % 64),
+        .first = scheme == FZF_SCORE_SCHEME_HISTORY
+                     ? 0 : (uint16_t)(rand_r(&seed) % 64),
+        .second = scheme == FZF_SCORE_SCHEME_PATH
+                      ? (uint16_t)(rand_r(&seed) % 64) : 0,
+      };
+      actual[i] = (ScoredStr){
+        .score = rank.score, .idx = (uint32_t)i, .rank = rank};
+    }
+    memcpy(expected, actual, sizeof actual);
+    counting_sort_scored(actual, N, scheme);
+    qsort(expected, N, sizeof *expected, cmp_scored_desc);
+    for (size_t i = 0; i < N; i++)
+      CHECK(actual[i].idx == expected[i].idx);
+  }
 }
 
 static void test_bounded_top_k_matches_full_stable_sort(void) {
@@ -1053,8 +1082,8 @@ static void test_bounded_top_k_matches_full_stable_sort(void) {
   memcpy(left, input, sizeof left);
   memcpy(right, input + SPLIT, sizeof right);
   qsort(reference, N, sizeof *reference, cmp_scored_desc);
-  counting_sort_scored(left, SPLIT);
-  counting_sort_scored(right, N - SPLIT);
+  counting_sort_scored(left, SPLIT, FZF_SCORE_SCHEME_PATH);
+  counting_sort_scored(right, N - SPLIT, FZF_SCORE_SCHEME_PATH);
   size_t count = async_merge_top_k(
       left, MIN((size_t)K, (size_t)SPLIT),
       right, MIN((size_t)K, (size_t)(N - SPLIT)),
@@ -1085,7 +1114,18 @@ static void test_top_k_finalization_observes_cancellation(void) {
   ScoredStr out[2];
   _Atomic bool stop = true;
   CHECK(async_merge_top_k(left, 1, right, 1, 2, out, &stop) == SIZE_MAX);
-  CHECK(!counting_sort_scored_abortable(right, 1, &stop));
+  CHECK(!counting_sort_scored_abortable(
+      right, 1, &stop, FZF_SCORE_SCHEME_PATH));
+}
+
+static void test_top_k_unchanged_requires_dominated_window(void) {
+  ScoredStr top[] = {make_scored(10, 0), make_scored(10, 1)};
+  ScoredStr later_tie[] = {make_scored(10, 2)};
+  ScoredStr better[] = {make_scored(11, 2)};
+  CHECK(async_top_k_unchanged(top, 2, later_tie, 1, 2));
+  CHECK(!async_top_k_unchanged(top, 2, better, 1, 2));
+  CHECK(!async_top_k_unchanged(top, 1, later_tie, 1, 2));
+  CHECK(!async_top_k_unchanged(top, 2, later_tie, 0, 2));
 }
 
 static void test_allocationless_sort_matches_total_order(void) {
@@ -4310,9 +4350,11 @@ int main(void) {
   RUN(test_scored_stability);
   RUN(test_scored_matches_qsort);
   RUN(test_scored_sort_uses_fzf_secondary_keys);
+  RUN(test_scheme_specific_radix_ranges_match_total_order);
   RUN(test_bounded_top_k_matches_full_stable_sort);
   RUN(test_membership_cap_discards_incomplete_prefix);
   RUN(test_top_k_finalization_observes_cancellation);
+  RUN(test_top_k_unchanged_requires_dominated_window);
   RUN(test_allocationless_sort_matches_total_order);
 
   printf("--- async_strip_ansi ---\n");

@@ -503,6 +503,15 @@ static uint64_t fzf_rank_sort_key(FzfRankKeys rank) {
          ((uint64_t)rank.first << 16) | (uint64_t)rank.second;
 }
 
+/* Each scheme uses an upper portion of the packed rank key.  LSD sorting can
+   skip the lower bytes that are constant for the scheme: history has only
+   score, default adds one secondary key, and path uses all three keys. */
+static unsigned fzf_rank_radix_first_pass(fzf_score_scheme_t scheme) {
+  if (scheme == FZF_SCORE_SCHEME_HISTORY) return 4;
+  if (scheme == FZF_SCORE_SCHEME_DEFAULT) return 2;
+  return 0;
+}
+
 /* Build the non-score sort keys used by pinned fzf.  Default ranks by the
    Unicode-trimmed character count.  Path ranks by the distance from the last
    slash or backslash, then by that count.  History has no extra key. */
@@ -664,23 +673,58 @@ static void insertion_sort_candidates(struct Candidate *xs, size_t n) {
 /* Stable radix sort of xs[0..n-1] by the packed fzf rank key.  The input is
    in producer order, so an exact key tie already has the final index order.
    Allocation failure uses the same total comparator through qsort. */
-static void counting_sort_candidates(struct Candidate *xs, size_t n) {
+static void counting_sort_candidates(struct Candidate *xs, size_t n,
+                                     fzf_score_scheme_t scheme) {
   if (n <= 1) return;
   /* Avoid the radix scratch allocation for tiny inputs. */
   if (n < 64) { insertion_sort_candidates(xs, n); return; }
+  unsigned first_pass = fzf_rank_radix_first_pass(scheme);
+  uint64_t first_key = fzf_rank_sort_key(xs[0].rank);
+  uint64_t varying_bits = 0;
+  for (size_t i = 1; i < n; i++)
+    varying_bits |= fzf_rank_sort_key(xs[i].rank) ^ first_key;
+  varying_bits &= UINT64_MAX << (first_pass * 8);
+  if (varying_bits == 0) return;
+
   struct Candidate *out = malloc(n * sizeof *out);
   if (!out) { qsort(xs, n, sizeof *xs, cmp_candidate); return; }
 
+  unsigned active_passes[6];
+  size_t active_count = 0;
+  size_t counts[6][256];
+  for (unsigned pass = first_pass; pass < 6; pass++) {
+    if ((varying_bits & (UINT64_C(0xff) << (pass * 8))) != 0) {
+      active_passes[active_count] = pass;
+      memset(counts[active_count], 0, sizeof counts[active_count]);
+      active_count++;
+    }
+  }
+  if (active_count == 2) {
+    unsigned first_shift = active_passes[0] * 8;
+    unsigned second_shift = active_passes[1] * 8;
+    for (size_t i = 0; i < n; i++) {
+      uint64_t key = fzf_rank_sort_key(xs[i].rank);
+      counts[0][(key >> first_shift) & 0xff]++;
+      counts[1][(key >> second_shift) & 0xff]++;
+    }
+  } else {
+    for (size_t i = 0; i < n; i++) {
+      uint64_t key = fzf_rank_sort_key(xs[i].rank);
+      for (size_t active = 0; active < active_count; active++) {
+        unsigned shift = active_passes[active] * 8;
+        counts[active][(key >> shift) & 0xff]++;
+      }
+    }
+  }
+
   struct Candidate *src = xs, *dst = out;
-  for (unsigned pass = 0; pass < 6; pass++) {
-    size_t count[256] = {0};
+  for (size_t active = 0; active < active_count; active++) {
+    unsigned pass = active_passes[active];
     unsigned shift = pass * 8;
-    for (size_t i = 0; i < n; i++)
-      count[(fzf_rank_sort_key(src[i].rank) >> shift) & 0xff]++;
     size_t offset[256];
     offset[0] = 0;
     for (size_t i = 1; i < 256; i++)
-      offset[i] = offset[i - 1] + count[i - 1];
+      offset[i] = offset[i - 1] + counts[active][i - 1];
     for (size_t i = 0; i < n; i++) {
       size_t byte = (fzf_rank_sort_key(src[i].rank) >> shift) & 0xff;
       dst[offset[byte]++] = src[i];
@@ -689,6 +733,7 @@ static void counting_sort_candidates(struct Candidate *xs, size_t n) {
     src = dst;
     dst = swap;
   }
+  if (src != xs) memcpy(xs, src, n * sizeof *xs);
   free(out);
 }
 
@@ -1385,7 +1430,7 @@ err_join_threads:
      preserve input order so callers (e.g. fussy) can run their own
      ranking against a stable, subsumable candidate set. */
   if (!filter_only_mode && sortable)
-    counting_sort_candidates(xs, len);
+    counting_sort_candidates(xs, len, score_scheme);
 
   /* Resolve C-side highlight cap from fussy-fzf-native-highlight.  After
      the (possibly skipped) sort, xs[0..hl_cap-1] is the top-N to highlight
@@ -5670,26 +5715,66 @@ static bool async_heap_sort_scored(ScoredStr *xs, size_t n,
 /* Return false when STOP was raised while sorting.  The ordinary test and
    batch APIs use the wrapper below with no stop flag. */
 static bool counting_sort_scored_abortable(ScoredStr *xs, size_t n,
-                                            _Atomic bool *stop) {
+                                            _Atomic bool *stop,
+                                            fzf_score_scheme_t scheme) {
   if (n <= 1) return !async_stop_requested(stop);
+  unsigned first_pass = fzf_rank_radix_first_pass(scheme);
+  uint64_t first_key = fzf_rank_sort_key(xs[0].rank);
+  uint64_t varying_bits = 0;
+  for (size_t i = 1; i < n; i++) {
+    if ((i & 0x3fff) == 0 && async_stop_requested(stop)) return false;
+    varying_bits |= fzf_rank_sort_key(xs[i].rank) ^ first_key;
+  }
+  varying_bits &= UINT64_MAX << (first_pass * 8);
+  if (varying_bits == 0) return !async_stop_requested(stop);
+
   ScoredStr *out = malloc(n * sizeof *out);
   if (!out) return async_heap_sort_scored(xs, n, stop);
 
-  ScoredStr *src = xs, *dst = out;
-  for (unsigned pass = 0; pass < 6; pass++) {
-    size_t count[256] = {0};
-    size_t offset[256];
-    unsigned shift = pass * 8;
+  unsigned active_passes[6];
+  size_t active_count = 0;
+  size_t counts[6][256];
+  for (unsigned pass = first_pass; pass < 6; pass++) {
+    if ((varying_bits & (UINT64_C(0xff) << (pass * 8))) != 0) {
+      active_passes[active_count] = pass;
+      memset(counts[active_count], 0, sizeof counts[active_count]);
+      active_count++;
+    }
+  }
+  if (active_count == 2) {
+    unsigned first_shift = active_passes[0] * 8;
+    unsigned second_shift = active_passes[1] * 8;
     for (size_t i = 0; i < n; i++) {
       if ((i & 0x3fff) == 0 && async_stop_requested(stop)) {
         free(out);
         return false;
       }
-      count[(fzf_rank_sort_key(src[i].rank) >> shift) & 0xff]++;
+      uint64_t key = fzf_rank_sort_key(xs[i].rank);
+      counts[0][(key >> first_shift) & 0xff]++;
+      counts[1][(key >> second_shift) & 0xff]++;
     }
+  } else {
+    for (size_t i = 0; i < n; i++) {
+      if ((i & 0x3fff) == 0 && async_stop_requested(stop)) {
+        free(out);
+        return false;
+      }
+      uint64_t key = fzf_rank_sort_key(xs[i].rank);
+      for (size_t active = 0; active < active_count; active++) {
+        unsigned shift = active_passes[active] * 8;
+        counts[active][(key >> shift) & 0xff]++;
+      }
+    }
+  }
+
+  ScoredStr *src = xs, *dst = out;
+  for (size_t active = 0; active < active_count; active++) {
+    unsigned pass = active_passes[active];
+    size_t offset[256];
+    unsigned shift = pass * 8;
     offset[0] = 0;
     for (size_t i = 1; i < 256; i++)
-      offset[i] = offset[i - 1] + count[i - 1];
+      offset[i] = offset[i - 1] + counts[active][i - 1];
     for (size_t i = 0; i < n; i++) {
       if ((i & 0x3fff) == 0 && async_stop_requested(stop)) {
         free(out);
@@ -5702,12 +5787,25 @@ static bool counting_sort_scored_abortable(ScoredStr *xs, size_t n,
     src = dst;
     dst = swap;
   }
+  if (src != xs && !async_copy_bytes_abortable(
+                       xs, src, n * sizeof *xs, stop)) {
+    free(out);
+    return false;
+  }
   free(out);
   return !async_stop_requested(stop);
 }
 
-static void counting_sort_scored(ScoredStr *xs, size_t n) {
-  (void)counting_sort_scored_abortable(xs, n, NULL);
+static void counting_sort_scored(ScoredStr *xs, size_t n,
+                                 fzf_score_scheme_t scheme) {
+  (void)counting_sort_scored_abortable(xs, n, NULL, scheme);
+}
+
+static bool async_top_k_unchanged(
+    const ScoredStr *top, size_t top_count,
+    const ScoredStr *window, size_t window_count, size_t limit) {
+  return limit > 0 && top_count == limit && window_count > 0 &&
+      cmp_scored_desc(top + top_count - 1, window) <= 0;
 }
 
 /* Merge two ranked arrays into the first LIMIT results.  Score descending and
@@ -6733,33 +6831,37 @@ static void *scoring_thread_fn(void *arg) {
           }
         }
         if (!counting_sort_scored_abortable(
-                window_values, window_pos, &s->score_abort)) {
+                window_values, window_pos, &s->score_abort, score_scheme)) {
           aborted = true;
           break;
         }
         size_t window_keep = MIN(limit, window_pos);
-        size_t merged_count = pos > limit - window_keep
-                                  ? limit : pos + window_keep;
-        if (merged_count && !async_scored_reserve(
-                                &merge_values, &merge_values_capacity,
-                                merged_count)) {
-          result_allocation_failed = true;
-          break;
+        bool top_unchanged = async_top_k_unchanged(
+            flat, pos, window_values, window_keep, limit);
+        if (!top_unchanged) {
+          size_t merged_count = pos > limit - window_keep
+                                    ? limit : pos + window_keep;
+          if (merged_count && !async_scored_reserve(
+                                  &merge_values, &merge_values_capacity,
+                                  merged_count)) {
+            result_allocation_failed = true;
+            break;
+          }
+          size_t produced = async_merge_top_k(
+              flat, pos, window_values, window_keep, limit,
+              merge_values, &s->score_abort);
+          if (produced == SIZE_MAX) {
+            aborted = true;
+            break;
+          }
+          ScoredStr *old_flat = flat;
+          size_t old_flat_capacity = flat_capacity;
+          flat = merge_values;
+          flat_capacity = merge_values_capacity;
+          merge_values = old_flat;
+          merge_values_capacity = old_flat_capacity;
+          pos = produced;
         }
-        size_t produced = async_merge_top_k(
-            flat, pos, window_values, window_keep, limit,
-            merge_values, &s->score_abort);
-        if (produced == SIZE_MAX) {
-          aborted = true;
-          break;
-        }
-        ScoredStr *old_flat = flat;
-        size_t old_flat_capacity = flat_capacity;
-        flat = merge_values;
-        flat_capacity = merge_values_capacity;
-        merge_values = old_flat;
-        merge_values_capacity = old_flat_capacity;
-        pos = produced;
       }
     }
 
@@ -6881,7 +6983,7 @@ static void *scoring_thread_fn(void *arg) {
     if (sortable && !filter_only_mode && !bounded_full &&
         ranked_count > 1 &&
         !counting_sort_scored_abortable(
-            flat, ranked_count, &s->score_abort)) {
+            flat, ranked_count, &s->score_abort, score_scheme)) {
       free(m_idx_buf);
       shared_idx_release(refine_idx);
       if (pattern) fzf_free_pattern(pattern);
@@ -6938,7 +7040,7 @@ static void *scoring_thread_fn(void *arg) {
         continue;
       }
       if (rank_aborted || !counting_sort_scored_abortable(
-                              flat, emit, &s->score_abort)) {
+                              flat, emit, &s->score_abort, score_scheme)) {
         free(m_idx_buf);
         shared_idx_release(refine_idx);
         if (pattern) fzf_free_pattern(pattern);
