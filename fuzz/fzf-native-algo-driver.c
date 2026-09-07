@@ -240,13 +240,11 @@ static bool handle_match(const uint8_t *payload, size_t size) {
   if (scheme != (uint8_t)driver_scheme)
     return send_error(OPCODE_MATCH, STATUS_BAD_REQUEST,
                       "request scheme does not match process scheme");
-  if ((flags & 4u) == 0)
-    return send_error(OPCODE_MATCH, STATUS_UNSUPPORTED,
-                      "fzf-native supports only forward matching");
   const uint8_t *pattern_bytes = payload + 13;
   const uint8_t *candidate_bytes = pattern_bytes + pattern_len;
   bool case_sensitive = (flags & 1u) != 0;
   bool normalize = (flags & 2u) != 0;
+  bool forward = (flags & 4u) != 0;
   size_t lowered_len = pattern_len;
   char *owned_pattern = NULL;
   if (case_sensitive) {
@@ -295,8 +293,43 @@ static bool handle_match(const uint8_t *payload, size_t size) {
   }
 
   fzf_clear_allocation_failure();
-  fzf_result_t result = matcher(case_sensitive, normalize, &candidate,
-                                &pattern, positions, slab);
+  fzf_result_t result;
+  if (algorithm == 0) {
+    result = utf8
+                 ? fzf_fuzzy_match_v1_utf8_with_direction(
+                       case_sensitive, normalize, forward, &candidate,
+                       &pattern, positions, slab)
+                 : fzf_fuzzy_match_v1_with_direction(
+                       case_sensitive, normalize, forward, &candidate,
+                       &pattern, positions, slab);
+  } else if (algorithm == 1) {
+    result = utf8
+                 ? fzf_fuzzy_match_v2_utf8_with_direction(
+                       case_sensitive, normalize, forward, &candidate,
+                       &pattern, positions, slab)
+                 : fzf_fuzzy_match_v2_with_direction(
+                       case_sensitive, normalize, forward, &candidate,
+                       &pattern, positions, slab);
+  } else if (algorithm == 2) {
+    result = utf8
+                 ? fzf_exact_match_utf8_with_direction(
+                       case_sensitive, normalize, forward, &candidate,
+                       &pattern, positions, slab)
+                 : fzf_exact_match_naive_with_direction(
+                       case_sensitive, normalize, forward, &candidate,
+                       &pattern, positions, slab);
+  } else if (algorithm == 3) {
+    result = utf8
+                 ? fzf_exact_match_boundary_utf8_with_direction(
+                       case_sensitive, normalize, forward, &candidate,
+                       &pattern, positions, slab)
+                 : fzf_exact_match_boundary_with_direction(
+                       case_sensitive, normalize, forward, &candidate,
+                       &pattern, positions, slab);
+  } else {
+    result = matcher(case_sensitive, normalize, &candidate, &pattern,
+                     positions, slab);
+  }
   bool allocation_failed = fzf_allocation_failed();
   bool ok = allocation_failed
                 ? send_error(OPCODE_MATCH, STATUS_INTERNAL,
