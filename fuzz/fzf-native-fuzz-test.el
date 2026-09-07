@@ -29,20 +29,50 @@
 (require 'cl-lib)
 (require 'ert)
 (require 'fzf-native)
+(require 'subr-x)
 
 (declare-function fzf-native-score "fzf-native-module"
                   (string query &optional slab))
 (declare-function fzf-native-score-all "fzf-native-module"
                   (collection query &optional slab))
+(declare-function fzf-native-highlight-one "fzf-native-module" (cand query))
+(declare-function fzf-native-make-slab "fzf-native-module" (size16 size32))
+(declare-function fzf-native-async-start "fzf-native-module"
+                  (command &optional directory))
+(declare-function fzf-native-async-stop "fzf-native-module" (handle))
+(declare-function fzf-native-async-submit "fzf-native-module"
+                  (handle query &optional limit))
+(declare-function fzf-native-async-snapshot "fzf-native-module"
+                  (handle &optional request-id))
+(declare-function fzf-native-async-status "fzf-native-module"
+                  (handle &optional request-id))
+(declare-function fzf-native--session-platform-p "fzf-native" ())
+(declare-function fzf-native--verify-initialized-module "fzf-native" ())
+(declare-function fzf-native--verify-session-abi "fzf-native" ())
 
 (let ((module (getenv "FZF_NATIVE_TEST_MODULE")))
   (if (and module (not (string-empty-p module)))
       (progn
         (module-load module)
+        (fzf-native--verify-initialized-module)
         (setq fzf-native-loaded t))
     (fzf-native-load-dyn)))
 
+(when (fzf-native--session-platform-p)
+  (dolist (function '(fzf-native-session-abi-version
+                      fzf-native-async-start
+                      fzf-native-async-stop
+                      fzf-native-async-submit
+                      fzf-native-async-snapshot
+                      fzf-native-async-status))
+    (unless (fboundp function)
+      (error "Required fzf-native session ABI function is missing: %S"
+             function))))
+
 (defvar fzf-native-fuzz--state 1)
+
+(defvar fzf-native-fuzz--allow-malformed t
+  "When non-nil, generated strings can contain arbitrary unibyte data.")
 
 (defun fzf-native-fuzz--env-integer (name default)
   "Read non-negative integer NAME, or return DEFAULT."
@@ -65,30 +95,50 @@
     (if (<= limit 0) 0 (% fzf-native-fuzz--state limit))))
 
 (defconst fzf-native-fuzz--candidate-pieces
-  ["a" "b" "c" "F" "K" "-" "_" "/" "." " " "\t"])
+  ["a" "b" "c" "F" "K" "-" "_" "/" "." " " "\t"
+   "é" "é" "σ" "Σ" "你" "中文" "😀" "𐐷" "K" "Ⱥ" "ⱥ"])
 
 (defconst fzf-native-fuzz--query-pieces
-  ["a" "b" "c" "f" "F" "k" "K" "foo" "bar"])
+  ["a" "b" "c" "f" "F" "k" "K" "foo" "bar"
+   "é" "é" "σ" "Σ" "你" "😀" "𐐷" "K" "Ⱥ" "ⱥ"])
+
+(defconst fzf-native-fuzz--raw-bytes
+  [1 9 32 65 127 128 191 192 193 224 237 240 245 254 255])
+
+(defun fzf-native-fuzz--unibyte-string ()
+  "Generate a short string with arbitrary bytes, including malformed UTF-8."
+  (apply #'unibyte-string
+         (cl-loop repeat (fzf-native-fuzz--random 9)
+                  collect (aref fzf-native-fuzz--raw-bytes
+                                (fzf-native-fuzz--random
+                                 (length fzf-native-fuzz--raw-bytes))))))
 
 (defun fzf-native-fuzz--candidate ()
-  "Generate one short ASCII candidate."
-  (let ((count (fzf-native-fuzz--random 12)) pieces)
-    (dotimes (_ count)
-      (push (aref fzf-native-fuzz--candidate-pieces
-                  (fzf-native-fuzz--random
-                   (length fzf-native-fuzz--candidate-pieces)))
-            pieces))
-    (apply #'concat (nreverse pieces))))
+  "Generate one short candidate across valid and malformed text classes."
+  (if (and fzf-native-fuzz--allow-malformed
+           (zerop (fzf-native-fuzz--random 8)))
+      (fzf-native-fuzz--unibyte-string)
+    (let ((count (fzf-native-fuzz--random 12)) pieces)
+      (dotimes (_ count)
+        (push (aref fzf-native-fuzz--candidate-pieces
+                    (fzf-native-fuzz--random
+                     (length fzf-native-fuzz--candidate-pieces)))
+              pieces))
+      (apply #'concat (nreverse pieces)))))
 
 (defun fzf-native-fuzz--literal ()
   "Generate a nonempty operator-free query literal."
-  (let ((count (1+ (fzf-native-fuzz--random 3))) pieces)
-    (dotimes (_ count)
-      (push (aref fzf-native-fuzz--query-pieces
-                  (fzf-native-fuzz--random
-                   (length fzf-native-fuzz--query-pieces)))
-            pieces))
-    (apply #'concat (nreverse pieces))))
+  (if (and fzf-native-fuzz--allow-malformed
+           (zerop (fzf-native-fuzz--random 16)))
+      (let ((raw (fzf-native-fuzz--unibyte-string)))
+        (if (string-empty-p raw) (unibyte-string 255) raw))
+    (let ((count (1+ (fzf-native-fuzz--random 3))) pieces)
+      (dotimes (_ count)
+        (push (aref fzf-native-fuzz--query-pieces
+                    (fzf-native-fuzz--random
+                     (length fzf-native-fuzz--query-pieces)))
+              pieces))
+      (apply #'concat (nreverse pieces)))))
 
 (defun fzf-native-fuzz--term ()
   "Generate one extended-search term."
@@ -117,6 +167,15 @@
                   (substring-no-properties string))
                 (append collection nil))
         #'string<))
+
+(defun fzf-native-fuzz--common-part-positions (string)
+  "Return character positions highlighted on STRING by fzf-native."
+  (cl-loop for index below (length string)
+           for face = (get-text-property index 'face string)
+           when (or (eq face 'completions-common-part)
+                    (and (listp face)
+                         (memq 'completions-common-part face)))
+           collect index))
 
 (defun fzf-native-fuzz--scalar-matches (collection query)
   "Return members of COLLECTION with positive scalar scores for QUERY."
@@ -174,6 +233,15 @@
             (should (equal list-full vector-full))
             (should (equal list-full
                            (fzf-native-fuzz--keys highlighted)))
+            (dolist (candidate highlighted)
+              (let ((scalar-highlight
+                     (fzf-native-highlight-one
+                      (substring-no-properties candidate) query)))
+                (should
+                 (equal
+                  (fzf-native-fuzz--common-part-positions candidate)
+                  (fzf-native-fuzz--common-part-positions
+                   scalar-highlight)))))
             (dolist (candidate highlight-input)
               (should-not
                (text-property-not-all 0 (length candidate) 'face nil
