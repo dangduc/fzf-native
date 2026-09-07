@@ -82,6 +82,8 @@ static fzf_algo_t utf8_variant(fzf_algo_t algorithm) {
   if (algorithm == fzf_fuzzy_match_v2) return fzf_fuzzy_match_v2_utf8;
   if (algorithm == fzf_fuzzy_match_v1) return fzf_fuzzy_match_v1_utf8;
   if (algorithm == fzf_exact_match_naive) return fzf_exact_match_utf8;
+  if (algorithm == fzf_exact_match_boundary)
+    return fzf_exact_match_boundary_utf8;
   if (algorithm == fzf_prefix_match) return fzf_prefix_match_utf8;
   if (algorithm == fzf_suffix_match) return fzf_suffix_match_utf8;
   if (algorithm == fzf_equal_match) return fzf_equal_match_utf8;
@@ -95,6 +97,9 @@ static const char *algo_name(fzf_algo_t algorithm) {
   if (algorithm == fzf_fuzzy_match_v1_utf8) return "fuzzy-v1-utf8";
   if (algorithm == fzf_exact_match_naive) return "exact";
   if (algorithm == fzf_exact_match_utf8) return "exact-utf8";
+  if (algorithm == fzf_exact_match_boundary) return "exact-boundary";
+  if (algorithm == fzf_exact_match_boundary_utf8)
+    return "exact-boundary-utf8";
   if (algorithm == fzf_prefix_match) return "prefix";
   if (algorithm == fzf_prefix_match_utf8) return "prefix-utf8";
   if (algorithm == fzf_suffix_match) return "suffix";
