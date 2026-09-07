@@ -545,6 +545,34 @@ static void test_utf8_char_map_scratch_reuse_and_cap(void) {
   fzf_free_slab(slab);
 }
 
+static int32_t default_fuzzy_score(const char *candidate) {
+  fzf_string_t text = {.data = candidate, .size = strlen(candidate)};
+  fzf_string_t pattern = {.data = "fzf", .size = 3};
+  fzf_slab_t *slab = fzf_make_default_slab();
+  fzf_position_t *positions = fzf_pos_array(0);
+  CHECK(slab != NULL);
+  CHECK(positions != NULL);
+  if (!slab || !positions) {
+    fzf_free_positions(positions);
+    fzf_free_slab(slab);
+    return -1;
+  }
+  fzf_result_t result = fzf_fuzzy_match_v2(
+      true, false, &text, &pattern, positions, slab);
+  fzf_free_positions(positions);
+  fzf_free_slab(slab);
+  return result.score;
+}
+
+static void test_default_score_distinguishes_boundaries(void) {
+  /* Pinned fzf gives a larger boundary bonus to whitespace and a distinct
+     bonus to delimiters. */
+  CHECK(default_fuzzy_score("src/fzf") == 84);
+  CHECK(default_fuzzy_score(":fzf") == 84);
+  CHECK(default_fuzzy_score(" fzf") == 88);
+  CHECK(default_fuzzy_score("_fzf") == 80);
+}
+
 int main(void) {
   printf("--- fzf-additions: fzf_has_match ---\n");
   RUN(test_fuzzy_basic_match);
@@ -583,6 +611,7 @@ int main(void) {
   RUN(test_invalid_utf8_fuzzy_fallback_returns_positions);
   RUN(test_slab_allocation_failure_is_reported);
   RUN(test_utf8_char_map_scratch_reuse_and_cap);
+  RUN(test_default_score_distinguishes_boundaries);
 
   if (failed == 0) {
     printf("\nAll fzf-additions tests passed.\n");

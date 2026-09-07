@@ -92,12 +92,29 @@ typedef enum {
 } score_t;
 
 typedef enum {
-  CharNonWord = 0,
+  CharWhite = 0,
+  CharNonWord,
+  CharDelimiter,
   CharLower,
   CharUpper,
   CharLetter,
   CharNumber
 } char_types;
+
+typedef struct {
+  int16_t boundary_white;
+  int16_t boundary_delimiter;
+  char_class initial_class;
+} score_scheme_config_t;
+
+static const score_scheme_config_t default_score_config = {
+    BonusBoundary + 2, BonusBoundary + 1, CharWhite};
+
+static const score_scheme_config_t *score_scheme_config(
+    const fzf_slab_t *slab) {
+  (void)slab;
+  return &default_score_config;
+}
 
 static int32_t index_byte(fzf_string_t *string, char b) {
   for (size_t i = 0; i < string->size; i++) {
@@ -470,7 +487,14 @@ static fzf_i32_t alloc32(size_t *offset, fzf_slab_t *slab, size_t size) {
       .data = data, .size = size, .cap = size, .allocated = true};
 }
 
+static bool score_scheme_delimiter(utf8proc_int32_t codepoint) {
+  return codepoint == '/' || codepoint == ',' || codepoint == ':' ||
+         codepoint == ';' ||
+         codepoint == '|';
+}
+
 static char_class char_class_of_ascii(char ch) {
+  unsigned char byte = (unsigned char)ch;
   if (ch >= 'a' && ch <= 'z') {
     return CharLower;
   }
@@ -479,6 +503,12 @@ static char_class char_class_of_ascii(char ch) {
   }
   if (ch >= '0' && ch <= '9') {
     return CharNumber;
+  }
+  if ((byte >= 0x09 && byte <= 0x0d) || byte == 0x20) {
+    return CharWhite;
+  }
+  if (score_scheme_delimiter(byte)) {
+    return CharDelimiter;
   }
   return CharNonWord;
 }
@@ -495,25 +525,36 @@ static char_class char_class_of(char ch) {
   // return char_class_of_non_ascii(ch);
 }
 
-static int16_t bonus_for(char_class prev_class, char_class class) {
-  if (prev_class == CharNonWord && class != CharNonWord) {
-    return BonusBoundary;
+static int16_t bonus_for(const score_scheme_config_t *config,
+                         char_class prev_class, char_class class) {
+  if (class >= CharNonWord) {
+    if (prev_class == CharWhite) {
+      return config->boundary_white;
+    }
+    if (prev_class == CharDelimiter) {
+      return config->boundary_delimiter;
+    }
+    if (prev_class == CharNonWord) {
+      return BonusBoundary;
+    }
   }
   if ((prev_class == CharLower && class == CharUpper) ||
       (prev_class != CharNumber && class == CharNumber)) {
     return BonusCamel123;
   }
-  if (class == CharNonWord) {
+  if (class == CharNonWord || class == CharDelimiter) {
     return BonusNonWord;
   }
+  if (class == CharWhite) return config->boundary_white;
   return 0;
 }
 
-static int16_t bonus_at(fzf_string_t *input, size_t idx) {
+static int16_t bonus_at(fzf_string_t *input, size_t idx,
+                        const score_scheme_config_t *config) {
   if (idx == 0) {
-    return BonusBoundary;
+    return config->boundary_white;
   }
-  return bonus_for(char_class_of(input->data[idx - 1]),
+  return bonus_for(config, char_class_of(input->data[idx - 1]),
                    char_class_of(input->data[idx]));
 }
 
@@ -610,7 +651,7 @@ bool is_ascii_utf8proc(const char *text, size_t len) {
   return true;
 }
 
-int32_t char_class_of_utf8proc(utf8proc_int32_t codepoint) {
+static char_class char_class_of_codepoint(utf8proc_int32_t codepoint) {
   const utf8proc_property_t *prop = utf8proc_get_property(codepoint);
   
   switch (prop->category) {
@@ -627,8 +668,14 @@ int32_t char_class_of_utf8proc(utf8proc_int32_t codepoint) {
     case UTF8PROC_CATEGORY_NO: // Other number
       return CharNumber;
     default:
+      if (fzf_unicode_is_space(codepoint)) return CharWhite;
+      if (score_scheme_delimiter(codepoint)) return CharDelimiter;
       return CharNonWord;
   }
+}
+
+int32_t char_class_of_utf8proc(utf8proc_int32_t codepoint) {
+  return char_class_of_codepoint(codepoint);
 }
 
 utf8proc_int32_t utf8proc_case_fold(utf8proc_int32_t codepoint) {
@@ -784,24 +831,12 @@ static size_t utf8_lossy_previous_char(const char *data, size_t pos,
 }
 
 // UTF-8 aware bonus calculation
-static int16_t bonus_for_utf8(int32_t prev_class, int32_t class) {
-  if (prev_class == CharNonWord && class != CharNonWord) {
-    // Word boundary
-    return BonusBoundary;
-  } else if ((prev_class == CharLower && class == CharUpper) ||
-             (prev_class != CharNumber && class == CharNumber)) {
-    // camelCase transition or number transition
-    return BonusCamel123;
-  } else if (class == CharNonWord) {
-    return BonusNonWord;
-  }
-  return 0;
-}
-
 static int32_t calculate_score(bool case_sensitive, bool normalize,
                                fzf_string_t *text, fzf_string_t *pattern,
-                               size_t sidx, size_t eidx, fzf_position_t *pos) {
+                               size_t sidx, size_t eidx, fzf_position_t *pos,
+                               fzf_slab_t *slab) {
   const size_t M = pattern->size;
+  const score_scheme_config_t *config = score_scheme_config(slab);
 
   size_t pidx = 0;
   int32_t score = 0;
@@ -810,7 +845,7 @@ static int32_t calculate_score(bool case_sensitive, bool normalize,
   int16_t first_bonus = 0;
 
   if (!resize_pos(pos, M, M)) return 0;
-  int32_t prev_class = CharNonWord;
+  int32_t prev_class = config->initial_class;
   if (sidx > 0) {
     prev_class = char_class_of(text->data[sidx - 1]);
   }
@@ -827,11 +862,11 @@ static int32_t calculate_score(bool case_sensitive, bool normalize,
     if (c == pattern->data[pidx]) {
       if (!append_pos(pos, idx)) return 0;
       score += ScoreMatch;
-      int16_t bonus = bonus_for(prev_class, class);
+      int16_t bonus = bonus_for(config, prev_class, class);
       if (consecutive == 0) {
         first_bonus = bonus;
       } else {
-        if (bonus == BonusBoundary) {
+        if (bonus >= BonusBoundary && bonus > first_bonus) {
           first_bonus = bonus;
         }
         bonus = max16(max16(bonus, first_bonus), BonusConsecutive);
@@ -862,7 +897,8 @@ static int32_t calculate_score(bool case_sensitive, bool normalize,
 // UTF-8 aware calculate_score
 static int32_t calculate_score_utf8(bool case_sensitive, bool normalize,
                                     fzf_string_t *text, fzf_string_t *pattern,
-                                    size_t start, size_t end, fzf_position_t *pos) {
+                                    size_t start, size_t end,
+                                    fzf_position_t *pos, fzf_slab_t *slab) {
   size_t pidx = 0;
   size_t text_pos = start;
   int32_t score = 0;
@@ -872,9 +908,10 @@ static int32_t calculate_score_utf8(bool case_sensitive, bool normalize,
 
   const size_t M = pattern->size;
   const size_t N = text->size;
+  const score_scheme_config_t *config = score_scheme_config(slab);
 
   // Determine prev_class: the character class of the character before 'start'
-  int32_t prev_class = CharNonWord;
+  int32_t prev_class = config->initial_class;
   if (start > 0) {
     // Walk forward from 0 to find the codepoint just before start
     size_t scan = 0;
@@ -887,7 +924,7 @@ static int32_t calculate_score_utf8(bool case_sensitive, bool normalize,
       prev_cp = cp;
       scan += b;
     }
-    prev_class = char_class_of_utf8proc(prev_cp);
+    prev_class = char_class_of_codepoint(prev_cp);
   }
 
   size_t pat_byte_pos = 0; // tracks current byte offset into pattern
@@ -899,8 +936,8 @@ static int32_t calculate_score_utf8(bool case_sensitive, bool normalize,
       (const utf8proc_uint8_t*)(text->data + text_pos),
       end - text_pos, &text_cp);
 
-    int32_t class = char_class_of_utf8proc(text_cp);
-    int16_t bonus = bonus_for_utf8(prev_class, class);
+    int32_t class = char_class_of_codepoint(text_cp);
+    int16_t bonus = bonus_for(config, prev_class, class);
 
     // Check if we still have pattern characters to match
     if (pat_byte_pos < M) {
@@ -916,7 +953,7 @@ static int32_t calculate_score_utf8(bool case_sensitive, bool normalize,
         if (consecutive == 0) {
           first_bonus = bonus;
         } else {
-          if (bonus == BonusBoundary) {
+          if (bonus >= BonusBoundary && bonus > first_bonus) {
             first_bonus = bonus;
           }
           bonus = max16(max16(bonus, first_bonus), BonusConsecutive);
@@ -1006,7 +1043,7 @@ fzf_result_t fzf_fuzzy_match_v1(bool case_sensitive, bool normalize,
     }
 
     int32_t score = calculate_score(case_sensitive, normalize, text, pattern,
-                                    start, end, pos);
+                                    start, end, pos, slab);
     return (fzf_result_t){(int32_t)start, (int32_t)end, score};
   }
   return (fzf_result_t){-1, -1, 0};
@@ -1017,6 +1054,7 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
                                 fzf_position_t *pos, fzf_slab_t *slab) {
   const size_t M = pattern->size;
   const size_t N = text->size;
+  const score_scheme_config_t *config = score_scheme_config(slab);
   if (M == 0) {
     return (fzf_result_t){0, 0, 0};
   }
@@ -1066,7 +1104,7 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
   char pchar0 = pattern->data[0];
   char pchar = pattern->data[0];
   int16_t prev_h0 = 0;
-  int32_t prev_class = CharNonWord;
+  int32_t prev_class = config->initial_class;
   bool in_gap = false;
 
   i32_slice_t t_sub = slice_i32(t.data, idx, t.size); // T[idx:];
@@ -1090,7 +1128,7 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
     }
 
     t_sub.data[off] = (uint8_t)c;
-    int16_t bonus = bonus_for(prev_class, class);
+    int16_t bonus = bonus_for(config, prev_class, class);
     b_sub.data[off] = bonus;
     prev_class = class;
     if (c == pchar) {
@@ -1109,7 +1147,7 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
       if (M == 1 && (score > max_score)) {
         max_score = score;
         max_score_pos = idx + off;
-        if (bonus == BonusBoundary) {
+        if (bonus >= BonusBoundary) {
           break;
         }
       }
@@ -1229,11 +1267,13 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
         s1 = h_diag.data[j] + ScoreMatch;
         int16_t b = b_sub.data[j];
         consecutive = c_diag.data[j] + 1;
-        if (b == BonusBoundary) {
-          consecutive = 1;
-        } else if (consecutive > 1) {
-          b = max16(b, max16(BonusConsecutive,
-                             bo.data[col - ((size_t)consecutive) + 1]));
+        if (consecutive > 1) {
+          int16_t first_bonus =
+              bo.data[col - ((size_t)consecutive) + 1];
+          if (b >= BonusBoundary && b > first_bonus)
+            consecutive = 1;
+          else
+            b = max16(b, max16(BonusConsecutive, first_bonus));
         }
         if (s1 + b < s2) {
           s1 += b_sub.data[j];
@@ -1272,6 +1312,7 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
         s2 = h.data[ii + j0 - 1];
       }
 
+      size_t row = i;
       if (s > s1 && (s > s2 || (s == s2 && prefer_match))) {
         unsafe_append_pos(pos, j);
         if (i == 0) {
@@ -1279,8 +1320,10 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
         }
         i--;
       }
-      prefer_match = c.data[ii + j0] > 1 || (ii + width + j0 + 1 < c.size &&
-                                             c.data[ii + width + j0 + 1] > 0);
+      prefer_match = c.data[ii + j0] > 1 ||
+                     (row + 1 < M && j < last_idx &&
+                      j + 1 >= (size_t)f.data[row + 1] &&
+                      c.data[ii + width + j0 + 1] > 0);
       j--;
     }
   }
@@ -1301,6 +1344,7 @@ fzf_result_t fzf_exact_match_naive(bool case_sensitive, bool normalize,
                                    fzf_position_t *pos, fzf_slab_t *slab) {
   const size_t M = pattern->size;
   const size_t N = text->size;
+  const score_scheme_config_t *config = score_scheme_config(slab);
 
   if (M == 0) {
     return (fzf_result_t){0, 0, 0};
@@ -1327,7 +1371,7 @@ fzf_result_t fzf_exact_match_naive(bool case_sensitive, bool normalize,
     }
     if (c == pattern->data[pidx]) {
       if (pidx == 0) {
-        bonus = bonus_at(text, idx);
+        bonus = bonus_at(text, idx, config);
       }
       pidx++;
       if (pidx == M) {
@@ -1335,7 +1379,7 @@ fzf_result_t fzf_exact_match_naive(bool case_sensitive, bool normalize,
           best_pos = (int32_t)idx;
           best_bonus = bonus;
         }
-        if (bonus == BonusBoundary) {
+        if (bonus >= BonusBoundary) {
           break;
         }
         idx -= pidx - 1;
@@ -1353,7 +1397,7 @@ fzf_result_t fzf_exact_match_naive(bool case_sensitive, bool normalize,
     size_t sidx = bp - M + 1;
     size_t eidx = bp + 1;
     int32_t score = calculate_score(case_sensitive, normalize, text, pattern,
-                                    sidx, eidx, NULL);
+                                    sidx, eidx, NULL, slab);
     insert_range(pos, sidx, eidx);
     return (fzf_result_t){(int32_t)sidx, (int32_t)eidx, score};
   }
@@ -1390,7 +1434,7 @@ fzf_result_t fzf_prefix_match(bool case_sensitive, bool normalize,
   size_t start = trimmed_len;
   size_t end = trimmed_len + M;
   int32_t score = calculate_score(case_sensitive, normalize, text, pattern,
-                                  start, end, NULL);
+                                  start, end, NULL, slab);
   insert_range(pos, start, end);
   return (fzf_result_t){(int32_t)start, (int32_t)end, score};
 }
@@ -1432,7 +1476,7 @@ fzf_result_t fzf_suffix_match(bool case_sensitive, bool normalize,
   size_t start = trimmed_len - M;
   size_t end = trimmed_len;
   int32_t score = calculate_score(case_sensitive, normalize, text, pattern,
-                                  start, end, NULL);
+                                  start, end, NULL, slab);
   insert_range(pos, start, end);
   return (fzf_result_t){(int32_t)start, (int32_t)end, score};
 }
@@ -1441,6 +1485,7 @@ fzf_result_t fzf_equal_match(bool case_sensitive, bool normalize,
                              fzf_string_t *text, fzf_string_t *pattern,
                              fzf_position_t *pos, fzf_slab_t *slab) {
   const size_t M = pattern->size;
+  const score_scheme_config_t *config = score_scheme_config(slab);
   if (M == 0) {
     return (fzf_result_t){-1, -1, 0};
   }
@@ -1493,8 +1538,9 @@ fzf_result_t fzf_equal_match(bool case_sensitive, bool normalize,
     insert_range(pos, trimmed_len, trimmed_len + M);
     return (fzf_result_t){(int32_t)trimmed_len,
                           ((int32_t)trimmed_len + (int32_t)M),
-                          (ScoreMatch + BonusBoundary) * (int32_t)M +
-                              (BonusFirstCharMultiplier - 1) * BonusBoundary};
+                          (ScoreMatch + config->boundary_white) * (int32_t)M +
+                              (BonusFirstCharMultiplier - 1) *
+                                  config->boundary_white};
   }
   return (fzf_result_t){-1, -1, 0};
 }
@@ -1506,6 +1552,7 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
                                   fzf_position_t *pos, fzf_slab_t *slab) {
   const size_t M = pattern->size;
   const size_t N = text->size;
+  const score_scheme_config_t *config = score_scheme_config(slab);
 
   if (M == 0) {
     return (fzf_result_t){0, 0, 0};
@@ -1557,9 +1604,9 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
         match_start_byte = text_pos;
         match_start_first_char_bytes = (size_t)text_bytes;
         // Use UTF-8 aware bonus for the match start
-        int32_t cur_class = char_class_of_utf8proc(text_cp);
+        int32_t cur_class = char_class_of_codepoint(text_cp);
         if (text_pos == 0) {
-          bonus = BonusBoundary;
+          bonus = config->boundary_white;
         } else {
           // Get previous character's class
           utf8proc_int32_t prev_cp;
@@ -1576,8 +1623,8 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
             last_prev_cp = prev_cp;
             prev_pos += pb;
           }
-          int32_t prev_class = char_class_of_utf8proc(last_prev_cp);
-          bonus = bonus_for_utf8(prev_class, cur_class);
+          int32_t prev_class = char_class_of_codepoint(last_prev_cp);
+          bonus = bonus_for(config, prev_class, cur_class);
         }
       }
       pidx++;
@@ -1589,7 +1636,7 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
           best_pos = (int32_t)match_start_byte;
           best_bonus = bonus;
         }
-        if (bonus == BonusBoundary) {
+        if (bonus >= BonusBoundary) {
           break;
         }
         // Reset for next potential match — advance by first matched char's byte length
@@ -1632,8 +1679,8 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
       pattern_pos += pb;
     }
 
-    int32_t score = calculate_score_utf8(case_sensitive, normalize, text, pattern,
-                                         sidx, eidx, NULL);
+    int32_t score = calculate_score_utf8(case_sensitive, normalize, text,
+                                         pattern, sidx, eidx, NULL, slab);
 
     // Convert byte positions to character positions
     size_t char_start = utf8_byte_to_char(char_map, sidx);
@@ -1711,8 +1758,8 @@ fzf_result_t fzf_prefix_match_utf8(bool case_sensitive, bool normalize,
   
   size_t start = trimmed_start;
   size_t end = text_pos;
-  int32_t score = calculate_score_utf8(case_sensitive, normalize, text, pattern,
-                                       start, end, NULL);
+  int32_t score = calculate_score_utf8(case_sensitive, normalize, text,
+                                       pattern, start, end, NULL, slab);
 
   // Convert byte positions to character positions
   size_t char_start = utf8_byte_to_char(char_map, start);
@@ -1789,8 +1836,8 @@ fzf_result_t fzf_suffix_match_utf8(bool case_sensitive, bool normalize,
 
   size_t start = text_pos;
   size_t end = trimmed_len;
-  int32_t score = calculate_score_utf8(case_sensitive, normalize, text, pattern,
-                                       start, end, NULL);
+  int32_t score = calculate_score_utf8(case_sensitive, normalize, text,
+                                       pattern, start, end, NULL, slab);
 
   // Convert byte positions to character positions
   size_t char_start = utf8_byte_to_char(char_map, start);
@@ -1807,6 +1854,7 @@ fzf_result_t fzf_equal_match_utf8(bool case_sensitive, bool normalize,
                                   fzf_string_t *text, fzf_string_t *pattern,
                                   fzf_position_t *pos, fzf_slab_t *slab) {
   const size_t M = pattern->size;
+  const score_scheme_config_t *config = score_scheme_config(slab);
   if (M == 0) {
     return (fzf_result_t){-1, -1, 0};
   }
@@ -1898,8 +1946,10 @@ fzf_result_t fzf_equal_match_utf8(bool case_sensitive, bool normalize,
   utf8_free_char_map(char_map);
   return (fzf_result_t){(int32_t)char_start,
                         (int32_t)char_end,
-                        (ScoreMatch + BonusBoundary) * (int32_t)char_count +
-                            (BonusFirstCharMultiplier - 1) * BonusBoundary};
+                        (ScoreMatch + config->boundary_white) *
+                                (int32_t)char_count +
+                            (BonusFirstCharMultiplier - 1) *
+                                config->boundary_white};
 }
 
 fzf_result_t fzf_fuzzy_match_v1_utf8(bool case_sensitive, bool normalize,
@@ -1985,8 +2035,8 @@ fzf_result_t fzf_fuzzy_match_v1_utf8(bool case_sensitive, bool normalize,
       }
     }
     
-    int32_t score = calculate_score_utf8(case_sensitive, normalize, text, pattern,
-                                         start, end, pos);
+    int32_t score = calculate_score_utf8(case_sensitive, normalize, text,
+                                         pattern, start, end, pos, slab);
     
     // Convert byte positions to character positions
     size_t char_start = utf8_byte_to_char(char_map, start);
@@ -2012,6 +2062,7 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
                                      fzf_position_t *pos, fzf_slab_t *slab) {
   const size_t M = pattern->size;
   const size_t N = text->size;
+  const score_scheme_config_t *config = score_scheme_config(slab);
 
   if (M == 0) {
     return (fzf_result_t){0, 0, 0};
@@ -2131,7 +2182,7 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   utf8proc_int32_t pchar0 = pattern_cps[0];
   utf8proc_int32_t pchar = pattern_cps[0];
   int16_t prev_h0 = 0;
-  int32_t prev_class = CharNonWord;
+  int32_t prev_class = config->initial_class;
   bool in_gap = false;
 
   i32_slice_t t_sub = slice_i32(t.data, idx, t.size);
@@ -2144,7 +2195,7 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
 
   for (size_t off = 0; off < t_sub.size; off++) {
     utf8proc_int32_t cp = t_sub.data[off];
-    char_class class = char_class_of_utf8proc(cp);
+    char_class class = char_class_of_codepoint(cp);
 
     utf8proc_int32_t c = cp;
     if (!case_sensitive) {
@@ -2152,7 +2203,7 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
     }
 
     t_sub.data[off] = c;
-    int16_t bonus = bonus_for_utf8(prev_class, class);
+    int16_t bonus = bonus_for(config, prev_class, class);
     b_sub.data[off] = bonus;
     prev_class = class;
 
@@ -2172,7 +2223,7 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
       if (Mc == 1 && (score > max_score)) {
         max_score = score;
         max_score_pos = idx + off;
-        if (bonus == BonusBoundary) {
+        if (bonus >= BonusBoundary) {
           break;
         }
       }
@@ -2305,11 +2356,13 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
         s1 = h_diag.data[j] + ScoreMatch;
         int16_t b = b_sub.data[j];
         consecutive = c_diag.data[j] + 1;
-        if (b == BonusBoundary) {
-          consecutive = 1;
-        } else if (consecutive > 1) {
-          b = max16(b, max16(BonusConsecutive,
-                             bo.data[col - ((size_t)consecutive) + 1]));
+        if (consecutive > 1) {
+          int16_t first_bonus =
+              bo.data[col - ((size_t)consecutive) + 1];
+          if (b >= BonusBoundary && b > first_bonus)
+            consecutive = 1;
+          else
+            b = max16(b, max16(BonusConsecutive, first_bonus));
         }
         if (s1 + b < s2) {
           s1 += b_sub.data[j];
@@ -2349,6 +2402,7 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
         s2 = h.data[ii + j0 - 1];
       }
 
+      size_t row = i;
       if (s > s1 && (s > s2 || (s == s2 && prefer_match))) {
         unsafe_append_pos(pos, j);
         if (i == 0) {
@@ -2356,9 +2410,10 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
         }
         i--;
       }
-      prefer_match =
-          c.data[ii + j0] > 1 ||
-          (ii + width + j0 + 1 < c.size && c.data[ii + width + j0 + 1] > 0);
+      prefer_match = c.data[ii + j0] > 1 ||
+                     (row + 1 < Mc && j < last_idx &&
+                      j + 1 >= (size_t)f.data[row + 1] &&
+                      c.data[ii + width + j0 + 1] > 0);
       j--;
     }
   }
