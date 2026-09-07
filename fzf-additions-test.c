@@ -545,32 +545,63 @@ static void test_utf8_char_map_scratch_reuse_and_cap(void) {
   fzf_free_slab(slab);
 }
 
-static int32_t default_fuzzy_score(const char *candidate) {
+static int32_t fuzzy_score_with_slab(const char *candidate, fzf_slab_t *slab) {
   fzf_string_t text = {.data = candidate, .size = strlen(candidate)};
   fzf_string_t pattern = {.data = "fzf", .size = 3};
-  fzf_slab_t *slab = fzf_make_default_slab();
   fzf_position_t *positions = fzf_pos_array(0);
-  CHECK(slab != NULL);
   CHECK(positions != NULL);
-  if (!slab || !positions) {
+  if (!positions) {
     fzf_free_positions(positions);
-    fzf_free_slab(slab);
     return -1;
   }
   fzf_result_t result = fzf_fuzzy_match_v2(
       true, false, &text, &pattern, positions, slab);
   fzf_free_positions(positions);
-  fzf_free_slab(slab);
   return result.score;
 }
 
 static void test_default_score_distinguishes_boundaries(void) {
+  fzf_slab_t *slab = fzf_make_default_slab();
+  CHECK(slab != NULL);
+  if (!slab) return;
   /* Pinned fzf gives a larger boundary bonus to whitespace and a distinct
      bonus to delimiters. */
-  CHECK(default_fuzzy_score("src/fzf") == 84);
-  CHECK(default_fuzzy_score(":fzf") == 84);
-  CHECK(default_fuzzy_score(" fzf") == 88);
-  CHECK(default_fuzzy_score("_fzf") == 80);
+  CHECK(fuzzy_score_with_slab("src/fzf", slab) == 84);
+  CHECK(fuzzy_score_with_slab(":fzf", slab) == 84);
+  CHECK(fuzzy_score_with_slab(" fzf", slab) == 88);
+  CHECK(fuzzy_score_with_slab("_fzf", slab) == 80);
+  fzf_free_slab(slab);
+}
+
+static void test_score_schemes_are_slab_local(void) {
+  fzf_slab_t *default_slab = fzf_make_default_slab();
+  fzf_slab_t *path_slab = fzf_make_default_slab();
+  fzf_slab_t *history_slab = fzf_make_default_slab();
+  CHECK(default_slab != NULL);
+  CHECK(path_slab != NULL);
+  CHECK(history_slab != NULL);
+  if (!default_slab || !path_slab || !history_slab) goto done;
+
+  CHECK(fzf_slab_set_score_scheme(path_slab, FZF_SCORE_SCHEME_PATH));
+  CHECK(fzf_slab_set_score_scheme(history_slab, FZF_SCORE_SCHEME_HISTORY));
+  CHECK(!fzf_slab_set_score_scheme(NULL, FZF_SCORE_SCHEME_DEFAULT));
+  CHECK(!fzf_slab_set_score_scheme(default_slab,
+                                   (fzf_score_scheme_t)99));
+
+  CHECK(fuzzy_score_with_slab("src/fzf", default_slab) == 84);
+  CHECK(fuzzy_score_with_slab("src/fzf", path_slab) == 84);
+  CHECK(fuzzy_score_with_slab("src/fzf", history_slab) == 80);
+  CHECK(fuzzy_score_with_slab(":fzf", default_slab) == 84);
+  CHECK(fuzzy_score_with_slab(":fzf", path_slab) == 80);
+  CHECK(fuzzy_score_with_slab(":fzf", history_slab) == 80);
+  CHECK(fuzzy_score_with_slab(" fzf", default_slab) == 88);
+  CHECK(fuzzy_score_with_slab(" fzf", path_slab) == 80);
+  CHECK(fuzzy_score_with_slab(" fzf", history_slab) == 80);
+
+done:
+  fzf_free_slab(default_slab);
+  fzf_free_slab(path_slab);
+  fzf_free_slab(history_slab);
 }
 
 int main(void) {
@@ -612,6 +643,7 @@ int main(void) {
   RUN(test_slab_allocation_failure_is_reported);
   RUN(test_utf8_char_map_scratch_reuse_and_cap);
   RUN(test_default_score_distinguishes_boundaries);
+  RUN(test_score_schemes_are_slab_local);
 
   if (failed == 0) {
     printf("\nAll fzf-additions tests passed.\n");

@@ -105,15 +105,25 @@ typedef struct {
   int16_t boundary_white;
   int16_t boundary_delimiter;
   char_class initial_class;
+  bool path_delimiters_only;
 } score_scheme_config_t;
 
-static const score_scheme_config_t default_score_config = {
-    BonusBoundary + 2, BonusBoundary + 1, CharWhite};
+static const score_scheme_config_t score_scheme_configs[] = {
+    [FZF_SCORE_SCHEME_DEFAULT] =
+        {BonusBoundary + 2, BonusBoundary + 1, CharWhite, false},
+    [FZF_SCORE_SCHEME_PATH] =
+        {BonusBoundary, BonusBoundary + 1, CharDelimiter, true},
+    [FZF_SCORE_SCHEME_HISTORY] =
+        {BonusBoundary, BonusBoundary, CharWhite, false},
+};
 
 static const score_scheme_config_t *score_scheme_config(
     const fzf_slab_t *slab) {
-  (void)slab;
-  return &default_score_config;
+  fzf_score_scheme_t scheme = slab ? slab->score_scheme
+                                    : FZF_SCORE_SCHEME_DEFAULT;
+  if ((unsigned int)scheme > FZF_SCORE_SCHEME_HISTORY)
+    scheme = FZF_SCORE_SCHEME_DEFAULT;
+  return &score_scheme_configs[scheme];
 }
 
 static int32_t index_byte(fzf_string_t *string, char b) {
@@ -487,13 +497,16 @@ static fzf_i32_t alloc32(size_t *offset, fzf_slab_t *slab, size_t size) {
       .data = data, .size = size, .cap = size, .allocated = true};
 }
 
-static bool score_scheme_delimiter(utf8proc_int32_t codepoint) {
-  return codepoint == '/' || codepoint == ',' || codepoint == ':' ||
-         codepoint == ';' ||
-         codepoint == '|';
+static bool score_scheme_delimiter(const score_scheme_config_t *config,
+                                   utf8proc_int32_t codepoint) {
+  if (codepoint == '/') return true;
+  return !config->path_delimiters_only &&
+         (codepoint == ',' || codepoint == ':' || codepoint == ';' ||
+          codepoint == '|');
 }
 
-static char_class char_class_of_ascii(char ch) {
+static char_class char_class_of_ascii(char ch,
+                                      const score_scheme_config_t *config) {
   unsigned char byte = (unsigned char)ch;
   if (ch >= 'a' && ch <= 'z') {
     return CharLower;
@@ -507,7 +520,7 @@ static char_class char_class_of_ascii(char ch) {
   if ((byte >= 0x09 && byte <= 0x0d) || byte == 0x20) {
     return CharWhite;
   }
-  if (score_scheme_delimiter(byte)) {
+  if (score_scheme_delimiter(config, byte)) {
     return CharDelimiter;
   }
   return CharNonWord;
@@ -517,8 +530,9 @@ static char_class char_class_of_ascii(char ch) {
 //   return 0;
 // }
 
-static char_class char_class_of(char ch) {
-  return char_class_of_ascii(ch);
+static char_class char_class_of(char ch,
+                                const score_scheme_config_t *config) {
+  return char_class_of_ascii(ch, config);
   // if (ch <= 0x7f) {
   //   return char_class_of_ascii(ch);
   // }
@@ -554,8 +568,8 @@ static int16_t bonus_at(fzf_string_t *input, size_t idx,
   if (idx == 0) {
     return config->boundary_white;
   }
-  return bonus_for(config, char_class_of(input->data[idx - 1]),
-                   char_class_of(input->data[idx]));
+  return bonus_for(config, char_class_of(input->data[idx - 1], config),
+                   char_class_of(input->data[idx], config));
 }
 
 /* TODO(conni2461): maybe just not do this */
@@ -651,7 +665,8 @@ bool is_ascii_utf8proc(const char *text, size_t len) {
   return true;
 }
 
-static char_class char_class_of_codepoint(utf8proc_int32_t codepoint) {
+static char_class char_class_of_codepoint(
+    utf8proc_int32_t codepoint, const score_scheme_config_t *config) {
   const utf8proc_property_t *prop = utf8proc_get_property(codepoint);
   
   switch (prop->category) {
@@ -669,13 +684,14 @@ static char_class char_class_of_codepoint(utf8proc_int32_t codepoint) {
       return CharNumber;
     default:
       if (fzf_unicode_is_space(codepoint)) return CharWhite;
-      if (score_scheme_delimiter(codepoint)) return CharDelimiter;
+      if (score_scheme_delimiter(config, codepoint)) return CharDelimiter;
       return CharNonWord;
   }
 }
 
 int32_t char_class_of_utf8proc(utf8proc_int32_t codepoint) {
-  return char_class_of_codepoint(codepoint);
+  return char_class_of_codepoint(codepoint,
+                                 &score_scheme_configs[FZF_SCORE_SCHEME_DEFAULT]);
 }
 
 utf8proc_int32_t utf8proc_case_fold(utf8proc_int32_t codepoint) {
@@ -847,11 +863,11 @@ static int32_t calculate_score(bool case_sensitive, bool normalize,
   if (!resize_pos(pos, M, M)) return 0;
   int32_t prev_class = config->initial_class;
   if (sidx > 0) {
-    prev_class = char_class_of(text->data[sidx - 1]);
+    prev_class = char_class_of(text->data[sidx - 1], config);
   }
   for (size_t idx = sidx; idx < eidx; idx++) {
     char c = text->data[idx];
-    int32_t class = char_class_of(c);
+    int32_t class = char_class_of(c, config);
     if (!case_sensitive) {
       /* TODO(conni2461): He does some unicode stuff here, investigate */
       c = (char)tolower((uint8_t)c);
@@ -924,7 +940,7 @@ static int32_t calculate_score_utf8(bool case_sensitive, bool normalize,
       prev_cp = cp;
       scan += b;
     }
-    prev_class = char_class_of_codepoint(prev_cp);
+    prev_class = char_class_of_codepoint(prev_cp, config);
   }
 
   size_t pat_byte_pos = 0; // tracks current byte offset into pattern
@@ -936,7 +952,7 @@ static int32_t calculate_score_utf8(bool case_sensitive, bool normalize,
       (const utf8proc_uint8_t*)(text->data + text_pos),
       end - text_pos, &text_cp);
 
-    int32_t class = char_class_of_codepoint(text_cp);
+    int32_t class = char_class_of_codepoint(text_cp, config);
     int16_t bonus = bonus_for(config, prev_class, class);
 
     // Check if we still have pattern characters to match
@@ -1118,7 +1134,7 @@ fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
   for (size_t off = 0; off < t_sub.size; off++) {
     char_class class;
     char c = (char)t_sub.data[off];
-    class = char_class_of_ascii(c);
+    class = char_class_of_ascii(c, config);
     if (!case_sensitive && class == CharUpper) {
       /* TODO(conni2461): unicode support */
       c = (char)tolower((uint8_t)c);
@@ -1604,7 +1620,7 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
         match_start_byte = text_pos;
         match_start_first_char_bytes = (size_t)text_bytes;
         // Use UTF-8 aware bonus for the match start
-        int32_t cur_class = char_class_of_codepoint(text_cp);
+        int32_t cur_class = char_class_of_codepoint(text_cp, config);
         if (text_pos == 0) {
           bonus = config->boundary_white;
         } else {
@@ -1623,7 +1639,7 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
             last_prev_cp = prev_cp;
             prev_pos += pb;
           }
-          int32_t prev_class = char_class_of_codepoint(last_prev_cp);
+          int32_t prev_class = char_class_of_codepoint(last_prev_cp, config);
           bonus = bonus_for(config, prev_class, cur_class);
         }
       }
@@ -2195,7 +2211,7 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
 
   for (size_t off = 0; off < t_sub.size; off++) {
     utf8proc_int32_t cp = t_sub.data[off];
-    char_class class = char_class_of_codepoint(cp);
+    char_class class = char_class_of_codepoint(cp, config);
 
     utf8proc_int32_t c = cp;
     if (!case_sensitive) {
@@ -2867,6 +2883,14 @@ fail:
 
 fzf_slab_t *fzf_make_default_slab(void) {
   return fzf_make_slab((fzf_slab_config_t){(size_t)100 * 1024, 2048});
+}
+
+bool fzf_slab_set_score_scheme(fzf_slab_t *slab,
+                               fzf_score_scheme_t score_scheme) {
+  if (!slab || (unsigned int)score_scheme > FZF_SCORE_SCHEME_HISTORY)
+    return false;
+  slab->score_scheme = score_scheme;
+  return true;
 }
 
 void fzf_free_slab(fzf_slab_t *slab) {

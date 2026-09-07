@@ -38,12 +38,21 @@ typedef struct {
   int32_t score;
 } fzf_result_t;
 
+typedef enum {
+  FZF_SCORE_SCHEME_DEFAULT = 0,
+  FZF_SCORE_SCHEME_PATH,
+  FZF_SCORE_SCHEME_HISTORY,
+} fzf_score_scheme_t;
+
 typedef struct {
   fzf_i16_t I16;
   fzf_i32_t I32;
   /* Thread-confined high-water scratch.  As with I16/I32, a slab must not be
      used by overlapping scoring calls; fzf_free_slab owns its allocation. */
   utf8_char_map_scratch_t UTF8;
+  /* Scoring configuration is slab-local, like the scratch space.  This lets
+     independent callers use different schemes in one process. */
+  fzf_score_scheme_t score_scheme;
 } fzf_slab_t;
 
 typedef struct {
@@ -138,6 +147,8 @@ void fzf_free_positions(fzf_position_t *pos);
 
 fzf_slab_t *fzf_make_slab(fzf_slab_config_t config);
 fzf_slab_t *fzf_make_default_slab(void);
+bool fzf_slab_set_score_scheme(fzf_slab_t *slab,
+                               fzf_score_scheme_t score_scheme);
 void fzf_free_slab(fzf_slab_t *slab);
 
 /* UTF-8 utility functions for testing */
