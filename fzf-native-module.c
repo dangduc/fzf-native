@@ -2013,10 +2013,26 @@ typedef struct {
    indices for a query, so a later subsuming query can refine-score that
    set + only the candidates that arrived since (delta scoring) instead of
    re-scanning the whole pool. */
-typedef struct {
+#define SHARED_IDX_MAX_DEPTH 32
+
+/* Immutable membership can be extended by producer growth without copying
+   the already-cached prefix.  PREFIX owns one reference to the older
+   membership and IDX contains only this node's suffix.  COUNT and
+   STORAGE_BYTES describe the complete logical chain so cache limits retain
+   their previous whole-membership accounting.  Chains flatten at the depth
+   limit or before their storage exceeds the membership byte budget.  This
+   keeps later query-refinement traversal and cache storage bounded. */
+typedef struct SharedIdx {
   _Atomic uint32_t refcount;
+  struct SharedIdx *prefix;
   size_t           count;
-  uint32_t         idx[];   /* flexible array */
+  size_t           own_count;
+  size_t           depth;
+  size_t           storage_bytes;
+  uint32_t         first_idx;
+  uint32_t         last_idx;
+  bool             ordered;
+  uint32_t         idx[];   /* this node's suffix */
 } SharedIdx;
 
 static bool async_stop_requested(_Atomic bool *stop) {
@@ -2043,11 +2059,24 @@ static SharedIdx *shared_idx_alloc_abortable(const uint32_t *src, size_t n,
   SharedIdx *p = malloc(sizeof *p + n * sizeof *p->idx);
   if (!p) return NULL;
   atomic_init(&p->refcount, 1);
+  p->prefix = NULL;
   p->count = n;
+  p->own_count = n;
+  p->depth = 1;
+  p->storage_bytes = sizeof *p + n * sizeof *p->idx;
+  p->first_idx = n ? src[0] : 0;
+  p->last_idx = n ? src[n - 1] : 0;
+  p->ordered = true;
   if (n && !async_copy_bytes_abortable(
                p->idx, src, n * sizeof *p->idx, stop)) {
     free(p);
     return NULL;
+  }
+  for (size_t i = 1; i < n; i++) {
+    if (p->idx[i - 1] >= p->idx[i]) {
+      p->ordered = false;
+      break;
+    }
   }
   return p;
 }
@@ -2056,8 +2085,172 @@ static SharedIdx *shared_idx_retain(SharedIdx *p) {
   return p;
 }
 static void shared_idx_release(SharedIdx *p) {
-  if (p && atomic_fetch_sub_explicit(&p->refcount, 1, memory_order_acq_rel) == 1)
+  /* Iterative release prevents a producer with many growth epochs from
+     consuming the C stack when the last cache reference is evicted. */
+  while (p &&
+         atomic_fetch_sub_explicit(&p->refcount, 1,
+                                   memory_order_acq_rel) == 1) {
+    SharedIdx *prefix = p->prefix;
     free(p);
+    p = prefix;
+  }
+}
+
+typedef struct {
+  const SharedIdx *segments[SHARED_IDX_MAX_DEPTH];
+  size_t segment_count;
+  size_t segment;
+  size_t offset;
+  size_t remaining;
+} SharedIdxCursor;
+
+/* Build an oldest-to-newest view over a bounded membership chain.  Besides
+   supporting sequential refinement without flattening, this verifies the
+   internal count/depth metadata once, outside the candidate loop. */
+static bool shared_idx_cursor_init(SharedIdxCursor *cursor,
+                                   const SharedIdx *membership) {
+  memset(cursor, 0, sizeof *cursor);
+  if (!membership || !membership->ordered || membership->depth == 0 ||
+      membership->depth > SHARED_IDX_MAX_DEPTH)
+    return false;
+
+  const SharedIdx *node = membership;
+  while (node) {
+    if (cursor->segment_count >= SHARED_IDX_MAX_DEPTH ||
+        node->own_count > node->count)
+      return false;
+    cursor->segments[cursor->segment_count++] = node;
+    node = node->prefix;
+  }
+  if (cursor->segment_count != membership->depth) return false;
+
+  for (size_t left = 0, right = cursor->segment_count - 1;
+       left < right; left++, right--) {
+    const SharedIdx *swap = cursor->segments[left];
+    cursor->segments[left] = cursor->segments[right];
+    cursor->segments[right] = swap;
+  }
+
+  size_t total = 0;
+  for (size_t i = 0; i < cursor->segment_count; i++) {
+    const SharedIdx *segment = cursor->segments[i];
+    if (segment->own_count > SIZE_MAX - total) return false;
+    total += segment->own_count;
+  }
+  if (total != membership->count) return false;
+  cursor->remaining = total;
+  return true;
+}
+
+static bool shared_idx_cursor_next(SharedIdxCursor *cursor,
+                                   uint32_t *out) {
+  while (cursor->segment < cursor->segment_count &&
+         cursor->offset ==
+             cursor->segments[cursor->segment]->own_count) {
+    cursor->segment++;
+    cursor->offset = 0;
+  }
+  if (cursor->segment >= cursor->segment_count || cursor->remaining == 0)
+    return false;
+  *out = cursor->segments[cursor->segment]->idx[cursor->offset++];
+  cursor->remaining--;
+  return true;
+}
+
+static bool shared_idx_valid_for_boundary(const SharedIdx *membership,
+                                          size_t boundary) {
+  return membership && membership->ordered &&
+         (membership->count == 0 || membership->last_idx < boundary);
+}
+
+/* Extend an immutable membership with a strictly later suffix.  Small growth
+   stores only DELTA.  The chain flattens at SHARED_IDX_MAX_DEPTH or before its
+   headers exceed MAX_STORAGE_BYTES. */
+static SharedIdx *shared_idx_extend_abortable(
+    SharedIdx *prefix, const uint32_t *delta, size_t delta_count,
+    size_t max_storage_bytes, _Atomic bool *stop) {
+  if (!prefix) {
+    if (delta_count > (SIZE_MAX - sizeof(SharedIdx)) / sizeof *delta ||
+        sizeof(SharedIdx) + delta_count * sizeof *delta > max_storage_bytes)
+      return NULL;
+    return shared_idx_alloc_abortable(delta, delta_count, stop);
+  }
+  if (!prefix->ordered || (delta_count && !delta) ||
+      delta_count > SIZE_MAX - prefix->count)
+    return NULL;
+
+  for (size_t i = 1; i < delta_count; i++)
+    if (delta[i - 1] >= delta[i]) return NULL;
+  if (delta_count && prefix->count && prefix->last_idx >= delta[0]) return NULL;
+
+  size_t total = prefix->count + delta_count;
+  if (delta_count == 0 && prefix->storage_bytes <= max_storage_bytes)
+    return shared_idx_retain(prefix);
+
+  if (delta_count > (SIZE_MAX - sizeof(SharedIdx)) / sizeof *delta)
+    return NULL;
+  size_t own_bytes = sizeof(SharedIdx) + delta_count * sizeof *delta;
+  bool chain_fits = prefix->depth < SHARED_IDX_MAX_DEPTH &&
+                    prefix->storage_bytes <= max_storage_bytes &&
+                    own_bytes <= max_storage_bytes - prefix->storage_bytes;
+  if (chain_fits) {
+    SharedIdx *extended = malloc(own_bytes);
+    if (!extended) return NULL;
+    atomic_init(&extended->refcount, 1);
+    extended->prefix = shared_idx_retain(prefix);
+    extended->count = total;
+    extended->own_count = delta_count;
+    extended->depth = prefix->depth + 1;
+    extended->storage_bytes = prefix->storage_bytes + own_bytes;
+    extended->first_idx = prefix->count ? prefix->first_idx : delta[0];
+    extended->last_idx = delta[delta_count - 1];
+    extended->ordered = true;
+    if (!async_copy_bytes_abortable(
+            extended->idx, delta, delta_count * sizeof *delta, stop)) {
+      shared_idx_release(extended);
+      return NULL;
+    }
+    return extended;
+  }
+
+  if (total > (SIZE_MAX - sizeof(SharedIdx)) / sizeof *delta) return NULL;
+  size_t flat_bytes = sizeof(SharedIdx) + total * sizeof *delta;
+  if (flat_bytes > max_storage_bytes) return NULL;
+  SharedIdx *flat = malloc(flat_bytes);
+  if (!flat) return NULL;
+  atomic_init(&flat->refcount, 1);
+  flat->prefix = NULL;
+  flat->count = total;
+  flat->own_count = total;
+  flat->depth = 1;
+  flat->storage_bytes = flat_bytes;
+  flat->first_idx = prefix->count ? prefix->first_idx
+                                  : (delta_count ? delta[0] : 0);
+  flat->last_idx = delta_count ? delta[delta_count - 1] : prefix->last_idx;
+  flat->ordered = true;
+
+  SharedIdxCursor cursor;
+  if (!shared_idx_cursor_init(&cursor, prefix)) {
+    free(flat);
+    return NULL;
+  }
+  size_t copied = 0;
+  while (copied < prefix->count) {
+    if ((copied & 0x3FFF) == 0 && async_stop_requested(stop)) {
+      free(flat);
+      return NULL;
+    }
+    if (!shared_idx_cursor_next(&cursor, &flat->idx[copied++])) {
+      free(flat);
+      return NULL;
+    }
+  }
+  if (!async_copy_bytes_abortable(
+          flat->idx + copied, delta, delta_count * sizeof *delta, stop)) {
+    free(flat);
+    return NULL;
+  }
+  return flat;
 }
 
 /* LRU result cache.  Per-session, mutex-protected doubly-linked list with
@@ -2207,9 +2400,7 @@ static size_t cache_entry_bytes(const char *query, size_t top_count,
       !cache_bytes_mul_add(&bytes, top_count, sizeof(ScoredStr)))
     return SIZE_MAX;
   if (m_idx) {
-    if (!cache_bytes_add(&bytes, sizeof *m_idx) ||
-        !cache_bytes_mul_add(
-            &bytes, m_idx->count, sizeof *m_idx->idx))
+    if (!cache_bytes_add(&bytes, m_idx->storage_bytes))
       return SIZE_MAX;
   }
   size_t parsed_bytes = cache_pattern_bytes(parsed);
@@ -2500,13 +2691,13 @@ static bool cache_lookup_prefix_with_scheme(
    Evicted entries are freed after the unlock.  m_idx may be NULL (OR queries
    or empty match sets); the entry is still inserted, but is then ineligible
    as a prefix-refinement source. */
-static void cache_insert_for_request_abortable(
+static void cache_insert_shared_for_request_abortable(
     Cache *c, const char *query, size_t pool_gen,
     fzf_case_types case_mode, bool fuzzy, bool normalize, bool forward,
     fzf_score_scheme_t score_scheme,
     bool filter_only,
     const ScoredStr *top, size_t top_count, size_t matched_count,
-    const uint32_t *m_idx_src, size_t m_idx_count,
+    SharedIdx *membership,
     _Atomic bool *stop) {
   if (c->max_bytes == 0) return;
   /* Pre-allocate everything outside the mutex. */
@@ -2525,12 +2716,10 @@ static void cache_insert_for_request_abortable(
       top_count = 0;
     }
   }
-  bool membership_complete =
-      matched_count == 0 ||
-      (m_idx_src && m_idx_count == matched_count);
+  bool membership_complete = matched_count == 0 ||
+      (membership && membership->count == matched_count);
   SharedIdx *sidx = !strchr(query, '|') && membership_complete
-                    ? shared_idx_alloc_abortable(
-                          m_idx_src, m_idx_count, stop) : NULL;
+                    ? shared_idx_retain(membership) : NULL;
   /* Parse once on insert so cache_lookup_prefix doesn't pay parse cost on
      every iteration of its scan loop.  NULL is fine — entries with NULL
      parsed only participate via the byte-prefix subsumption fallback. */
@@ -2646,6 +2835,25 @@ static void cache_insert_for_request_abortable(
     cache_entry_free(evicted);
     evicted = next;
   }
+}
+
+static void cache_insert_for_request_abortable(
+    Cache *c, const char *query, size_t pool_gen,
+    fzf_case_types case_mode, bool fuzzy, bool normalize, bool forward,
+    fzf_score_scheme_t score_scheme,
+    bool filter_only,
+    const ScoredStr *top, size_t top_count, size_t matched_count,
+    const uint32_t *m_idx_src, size_t m_idx_count,
+    _Atomic bool *stop) {
+  bool membership_complete = matched_count == 0 ||
+      (m_idx_src && m_idx_count == matched_count);
+  SharedIdx *membership = !strchr(query, '|') && membership_complete
+      ? shared_idx_alloc_abortable(m_idx_src, m_idx_count, stop) : NULL;
+  cache_insert_shared_for_request_abortable(
+      c, query, pool_gen, case_mode, fuzzy, normalize, forward, score_scheme,
+      filter_only,
+      top, top_count, matched_count, membership, stop);
+  shared_idx_release(membership);
 }
 
 static void cache_insert_for_request_with_scheme(
@@ -5476,22 +5684,6 @@ static void async_membership_append(AsyncMembershipBuilder *builder,
   }
 }
 
-static void async_membership_append_indices(
-    AsyncMembershipBuilder *builder, const uint32_t *values, size_t count,
-    _Atomic bool *stop) {
-  if (!builder->enabled || count == 0) return;
-  if (!values || count > SIZE_MAX - builder->count ||
-      !async_membership_reserve(builder, builder->count + count))
-    return;
-  for (size_t base = 0; base < count; base += 16384) {
-    if (async_stop_requested(stop)) return;
-    size_t amount = MIN((size_t)16384, count - base);
-    memcpy(builder->idx + builder->count, values + base,
-           amount * sizeof *values);
-    builder->count += amount;
-  }
-}
-
 struct AsyncScoringBatch {
   unsigned len;
   size_t batch_id;
@@ -6123,22 +6315,25 @@ static void *scoring_thread_fn(void *arg) {
       shared_idx_release(growth_idx);
     }
 
-    /* Validate whole-result refinement evidence before using it.  Stored
-       membership is sorted in producer order, contains only indices below
-       its pool boundary, and is followed by the unseen append-only suffix.
-       Any malformed/stale evidence falls back to a full scan. */
-    bool use_refinement = refine_idx && refine_delta_from <= count;
-    if (use_refinement) {
-      for (size_t i = 0; i < refine_idx->count; i++) {
-        if (refine_idx->idx[i] >= refine_delta_from ||
-            (i > 0 && refine_idx->idx[i - 1] >= refine_idx->idx[i])) {
-          use_refinement = false;
-          break;
-        }
-      }
-    }
+    /* SharedIdx validates ordering when immutable evidence is created, so a
+       small producer delta does not re-walk a million-index cached prefix.
+       The boundary check remains mandatory because it belongs to this
+       request rather than to the membership object. */
+    bool use_refinement = refine_delta_from <= count &&
+        shared_idx_valid_for_boundary(refine_idx, refine_delta_from);
     if (!use_refinement) {
       incremental_growth = false;
+      free(growth_top);
+      growth_top = NULL;
+      growth_top_count = 0;
+    }
+
+    SharedIdxCursor refinement_cursor;
+    bool needs_refinement_cursor = use_refinement && !incremental_growth &&
+                                   refine_idx->count > 0;
+    if (needs_refinement_cursor &&
+        !shared_idx_cursor_init(&refinement_cursor, refine_idx)) {
+      use_refinement = false;
       free(growth_top);
       growth_top = NULL;
       growth_top_count = 0;
@@ -6235,15 +6430,21 @@ static void *scoring_thread_fn(void *arg) {
     }
 
     size_t membership_budget = s->cache.max_bytes / 2;
-    size_t membership_capacity = membership_budget > sizeof(SharedIdx)
+    bool membership_header_fits = membership_budget >= sizeof(SharedIdx);
+    size_t membership_capacity = membership_header_fits
         ? (membership_budget - sizeof(SharedIdx)) / sizeof(uint32_t) : 0;
+    size_t membership_prefix_count = incremental_growth && refine_idx
+        ? refine_idx->count : 0;
+    bool membership_prefix_fits =
+        membership_prefix_count <= membership_capacity;
     AsyncMembershipBuilder membership = {
-      .max_count = membership_capacity,
-      .enabled = strchr(filter, '|') == NULL && membership_capacity > 0,
+      /* Incremental growth stores only new matches.  The immutable cached
+         prefix is linked into the completed membership below. */
+      .max_count = membership_prefix_fits
+          ? membership_capacity - membership_prefix_count : 0,
+      .enabled = strchr(filter, '|') == NULL &&
+                 membership_header_fits && membership_prefix_fits,
     };
-    if (incremental_growth && refine_idx)
-      async_membership_append_indices(
-          &membership, refine_idx->idx, refine_idx->count, &s->score_abort);
 
     bool score_allocation_failed = false;
     bool result_allocation_failed = false;
@@ -6286,9 +6487,17 @@ static void *scoring_thread_fn(void *arg) {
           size_t local = reused ? cached_local[local_i] : local_i;
           size_t ordinal = start + local;
           size_t global_i;
-          if (use_refinement && ordinal < old_scan_count)
-            global_i = refine_idx->idx[ordinal];
-          else if (use_refinement)
+          if (use_refinement && ordinal < old_scan_count) {
+            uint32_t cached_index = 0;
+            bool have_cached_index = shared_idx_cursor_next(
+                &refinement_cursor, &cached_index);
+            assert(have_cached_index);
+            if (!have_cached_index) {
+              aborted = true;
+              break;
+            }
+            global_i = cached_index;
+          } else if (use_refinement)
             global_i = delta_from + (ordinal - old_scan_count);
           else
             global_i = ordinal;
@@ -6299,6 +6508,7 @@ static void *scoring_thread_fn(void *arg) {
           batch->xs[local_i].idx = (uint32_t)global_i;
         }
         pthread_mutex_unlock(&s->mu);
+        if (aborted) break;
         scan_count += selected_count;
         if (reused) {
           reused_batches++;
@@ -6509,12 +6719,13 @@ static void *scoring_thread_fn(void *arg) {
                                ? growth_matched_count + delta_matches
                                : delta_matches;
 
-    /* Membership is optional cache evidence.  It is authoritative only when
-       the independent builder retained every matched index.  On overflow or
-       allocation failure the builder discards its prefix, so an incomplete
-       set can never be mistaken for refinement evidence. */
+    /* Membership is optional cache evidence.  During incremental growth the
+       builder contains only DELTA_MATCHES; the previous complete membership
+       stays immutable and is linked in at publication. */
+    size_t expected_built_members = incremental_growth
+                                        ? delta_matches : matched_total;
     bool membership_complete = membership.enabled &&
-                               membership.count == matched_total;
+                               membership.count == expected_built_members;
     uint32_t *m_idx_buf = membership_complete ? membership.idx : NULL;
     if (membership_complete)
       membership.idx = NULL;
@@ -6649,16 +6860,27 @@ static void *scoring_thread_fn(void *arg) {
       }
     }
 
+    SharedIdx *completed_membership = NULL;
+    if (membership_complete) {
+      completed_membership = incremental_growth
+          ? shared_idx_extend_abortable(
+                refine_idx, m_idx_buf, expected_built_members,
+                membership_budget, &s->score_abort)
+          : shared_idx_alloc_abortable(
+                m_idx_buf, expected_built_members, &s->score_abort);
+    }
+    free(m_idx_buf);
+
     /* Cache the result.  pool_gen = count (the pool size we actually scored).
-       For refine runs, count may be > refine_delta_from, so the new entry
-       supersedes the old one as a refinement source for the same query.  All
-       matching controls are part of the semantic cache key. */
-    cache_insert_for_request_abortable(
+       For exact producer growth, COMPLETED_MEMBERSHIP shares the immutable
+       old prefix and owns only the newly matched suffix.  All matching
+       controls are part of the semantic cache key. */
+    cache_insert_shared_for_request_abortable(
         &s->cache, filter, count, case_mode, fuzzy, normalize, forward,
         score_scheme,
         filter_only_mode, flat, emit, matched_total,
-        m_idx_buf, m_idx_buf ? matched_total : 0, &s->score_abort);
-    free(m_idx_buf);
+        completed_membership, &s->score_abort);
+    shared_idx_release(completed_membership);
     shared_idx_release(refine_idx);
     refine_idx = NULL;
 

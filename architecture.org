@@ -429,8 +429,13 @@ Otherwise, it queues the latest request against the new pool boundary.
 The prior completed result stays public during this retry.
 The snapshot marks that result stale until the retry finishes.
 
-When complete membership exists, the retry scans prior members and the appended delta.
-Otherwise, it uses stable-batch evidence or scans the selected pool boundary.
+When complete membership and a covering top K exist, the retry scores only the
+appended delta.  It merges the new scores into the cached top K and extends the
+membership with an immutable delta node.
+
+With complete membership but no covering top K, the retry scans prior members
+and the appended delta.  Without complete membership, it uses stable-batch
+evidence or scans the selected pool boundary.
 
 ** Coordinator work
 
@@ -491,7 +496,9 @@ Each entry records these values:
 An exact result must match the effective filter-only mode.
 A cached top K must also cover the requested limit.
 
-Complete membership uses a reference-counted =SharedIdx= array.
+Complete membership uses a reference-counted =SharedIdx= chain.  Producer growth
+shares the immutable prior membership and stores only new matching indexes.
+Chains flatten after 32 nodes or before they exceed the membership byte budget.
 The builder stops before membership exceeds half of the whole-result byte budget.
 
 OR queries do not retain whole-result membership.

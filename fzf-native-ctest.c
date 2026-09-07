@@ -1637,6 +1637,140 @@ static ScoredStr make_top(const char *str, int score) {
   return s;
 }
 
+static void test_shared_membership_growth_reuses_immutable_prefix(void) {
+  uint32_t base_values[] = {1, 3, 7, 11};
+  uint32_t delta_values[] = {14, 19, 23};
+  SharedIdx *base = shared_idx_alloc_abortable(
+      base_values, sizeof base_values / sizeof *base_values, NULL);
+  CHECK(base != NULL);
+  SharedIdx *extended = shared_idx_extend_abortable(
+      base, delta_values, sizeof delta_values / sizeof *delta_values,
+      SIZE_MAX, NULL);
+  CHECK(extended != NULL);
+  if (!base || !extended) {
+    shared_idx_release(base);
+    shared_idx_release(extended);
+    return;
+  }
+
+  CHECK(extended->prefix == base);
+  CHECK(extended->count == 7);
+  CHECK(extended->own_count == 3);
+  CHECK(extended->depth == 2);
+  CHECK(extended->storage_bytes ==
+        base->storage_bytes + sizeof *extended +
+            3 * sizeof *extended->idx);
+  CHECK(shared_idx_valid_for_boundary(extended, 24));
+  CHECK(!shared_idx_valid_for_boundary(extended, 23));
+
+  _Atomic bool stop = true;
+  CHECK(shared_idx_extend_abortable(
+            base, delta_values,
+            sizeof delta_values / sizeof *delta_values,
+            SIZE_MAX, &stop) == NULL);
+  uint32_t out_of_order[] = {14, 13};
+  CHECK(shared_idx_extend_abortable(
+            base, out_of_order, 2, SIZE_MAX, NULL) == NULL);
+
+  uint32_t expected[] = {1, 3, 7, 11, 14, 19, 23};
+  SharedIdxCursor cursor;
+  CHECK(shared_idx_cursor_init(&cursor, extended));
+  for (size_t i = 0; i < sizeof expected / sizeof *expected; i++) {
+    uint32_t actual = UINT32_MAX;
+    CHECK(shared_idx_cursor_next(&cursor, &actual));
+    CHECK(actual == expected[i]);
+  }
+  uint32_t exhausted = 0;
+  CHECK(!shared_idx_cursor_next(&cursor, &exhausted));
+
+  Cache cache;
+  cache_init_limits(&cache, 4, 1024 * 1024);
+  cache_insert_shared_for_request_abortable(
+      &cache, "needle", 24, CaseSmart, true, false,
+      NULL, 0, extended->count, extended, NULL);
+  ScoredStr *top = NULL;
+  size_t top_count = 0, pool_gen = 0, matched_count = 0;
+  bool covered = false;
+  SharedIdx *cached = NULL;
+  CHECK(cache_lookup_exact_for_request(
+      &cache, "needle", CaseSmart, true, false, 0,
+      &top, &top_count, &cached, &pool_gen, &matched_count, &covered));
+  CHECK(cached == extended);
+  CHECK(pool_gen == 24);
+  CHECK(matched_count == extended->count);
+  shared_idx_release(cached);
+  free(top);
+  cache_free(&cache);
+  shared_idx_release(extended);
+  shared_idx_release(base);
+}
+
+static void test_shared_membership_growth_flattens_at_depth_limit(void) {
+  uint32_t first = 0;
+  SharedIdx *membership = shared_idx_alloc_abortable(&first, 1, NULL);
+  CHECK(membership != NULL);
+  if (!membership) return;
+
+  for (uint32_t value = 1; value <= SHARED_IDX_MAX_DEPTH; value++) {
+    SharedIdx *next = shared_idx_extend_abortable(
+        membership, &value, 1, SIZE_MAX, NULL);
+    CHECK(next != NULL);
+    shared_idx_release(membership);
+    membership = next;
+    if (!membership) return;
+  }
+  CHECK(membership->depth == 1);
+  CHECK(membership->count == SHARED_IDX_MAX_DEPTH + 1);
+  CHECK(membership->prefix == NULL);
+
+  SharedIdxCursor cursor;
+  CHECK(shared_idx_cursor_init(&cursor, membership));
+  for (uint32_t expected = 0; expected <= SHARED_IDX_MAX_DEPTH; expected++) {
+    uint32_t actual = UINT32_MAX;
+    CHECK(shared_idx_cursor_next(&cursor, &actual));
+    CHECK(actual == expected);
+  }
+  shared_idx_release(membership);
+}
+
+static void test_shared_membership_growth_respects_storage_budget(void) {
+  const size_t budget = 2048;
+  uint32_t first = 0;
+  SharedIdx *membership = shared_idx_alloc_abortable(&first, 1, NULL);
+  CHECK(membership != NULL);
+  if (!membership) return;
+
+  bool flattened_for_budget = false;
+  for (uint32_t value = 1; value < SHARED_IDX_MAX_DEPTH; value++) {
+    size_t previous_depth = membership->depth;
+    SharedIdx *next = shared_idx_extend_abortable(
+        membership, &value, 1, budget, NULL);
+    CHECK(next != NULL);
+    shared_idx_release(membership);
+    membership = next;
+    if (!membership) return;
+    CHECK(membership->storage_bytes <= budget);
+    if (previous_depth > 1 && membership->depth == 1)
+      flattened_for_budget = true;
+  }
+  CHECK(flattened_for_budget);
+  CHECK(membership->count == SHARED_IDX_MAX_DEPTH);
+
+  SharedIdx *unchanged = shared_idx_extend_abortable(
+      membership, NULL, 0, budget, NULL);
+  CHECK(unchanged == membership);
+  shared_idx_release(unchanged);
+
+  SharedIdxCursor cursor;
+  CHECK(shared_idx_cursor_init(&cursor, membership));
+  for (uint32_t expected = 0; expected < SHARED_IDX_MAX_DEPTH; expected++) {
+    uint32_t actual = UINT32_MAX;
+    CHECK(shared_idx_cursor_next(&cursor, &actual));
+    CHECK(actual == expected);
+  }
+  shared_idx_release(membership);
+}
+
 static void test_cache_lookup_miss_on_empty(void) {
   Cache c;
   cache_init(&c, 20);
@@ -4038,6 +4172,9 @@ int main(void) {
   RUN(test_cands_top_accessor_reads_block_pointer);
 
   printf("--- cache (phase 1: exact-match) ---\n");
+  RUN(test_shared_membership_growth_reuses_immutable_prefix);
+  RUN(test_shared_membership_growth_flattens_at_depth_limit);
+  RUN(test_shared_membership_growth_respects_storage_budget);
   RUN(test_cache_lookup_miss_on_empty);
   RUN(test_cache_insert_then_lookup_hit);
   RUN(test_cache_lookup_miss_distinct_query);
