@@ -748,10 +748,13 @@ static utf8proc_int32_t v2_case_fold_candidate(
 }
 
 /* Find the first byte of a fuzzy UTF-8 subsequence without narrowing an
-   input offset.  The public compatibility wrapper below still returns an
-   int32_t, while internal callers can safely prefilter size_t-bounded input. */
+   input offset.  Apply the same case-fold and pinned normalization map as
+   the scorer when NORMALIZE is true.  The public compatibility wrapper below
+   still returns an int32_t, while internal callers can safely prefilter
+   size_t-bounded input. */
 static bool utf8_fuzzy_index_size(fzf_string_t *input, const char *pattern,
                                   size_t pattern_len, bool case_sensitive,
+                                  bool normalize,
                                   bool v2_candidate_case,
                                   size_t *first_idx_out) {
   *first_idx_out = 0;
@@ -781,6 +784,9 @@ static bool utf8_fuzzy_index_size(fzf_string_t *input, const char *pattern,
     if (!case_sensitive) {
       pattern_cp = utf8proc_case_fold(pattern_cp);
     }
+    if (normalize) {
+      pattern_cp = fzf_normalize_codepoint(pattern_cp);
+    }
     
     // Search for this pattern character starting from current position
     bool found = false;
@@ -796,6 +802,9 @@ static bool utf8_fuzzy_index_size(fzf_string_t *input, const char *pattern,
         input_cp_cmp = v2_candidate_case
                            ? v2_case_fold_candidate(input_cp)
                            : utf8proc_case_fold(input_cp);
+      }
+      if (normalize) {
+        input_cp_cmp = fzf_normalize_codepoint(input_cp_cmp);
       }
       
       if (input_cp_cmp == pattern_cp) {
@@ -828,7 +837,7 @@ int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
                          size_t pattern_len, bool case_sensitive) {
   size_t first_idx = 0;
   if (!utf8_fuzzy_index_size(input, pattern, pattern_len, case_sensitive,
-                             false, &first_idx) ||
+                             false, false, &first_idx) ||
       first_idx > INT32_MAX)
     return -1;
   return (int32_t)first_idx;
@@ -2320,9 +2329,8 @@ static fzf_result_t fzf_fuzzy_match_v2_utf8_impl(
      table decodes the whole candidate twice and writes one slot per byte;
      none of that state is observed when the subsequence prefilter fails. */
   size_t tmp_idx = 0;
-  if (!normalize &&
-      !utf8_fuzzy_index_size(text, pattern->data, M, case_sensitive,
-                             true, &tmp_idx)) {
+  if (!utf8_fuzzy_index_size(text, pattern->data, M, case_sensitive,
+                             normalize, true, &tmp_idx)) {
     return (fzf_result_t){-1, -1, 0};
   }
 
