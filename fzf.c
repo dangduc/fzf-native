@@ -1802,8 +1802,10 @@ fzf_result_t fzf_suffix_match_utf8(bool case_sensitive, bool normalize,
     return (fzf_result_t){-1, -1, 0};
   }
   
-  // Skip trailing whitespace if pattern doesn't end with whitespace
-  if (M > 0) {
+  // Skip trailing whitespace if pattern is empty or doesn't end with whitespace
+  if (M == 0) {
+    trimmed_len -= trailing_whitespaces(text);
+  } else {
     utf8proc_int32_t last_pattern_cp = 0;
     // Forward scan to find the last codepoint in the pattern
     size_t scan_pos = 0;
@@ -1816,7 +1818,7 @@ fzf_result_t fzf_suffix_match_utf8(bool case_sensitive, bool normalize,
       scan_pos += bytes;
     }
 
-    if (scan_pos > 0 && !fzf_unicode_is_space(last_pattern_cp)) {
+    if (!fzf_unicode_is_space(last_pattern_cp)) {
       trimmed_len -= trailing_whitespaces(text);
     }
   }

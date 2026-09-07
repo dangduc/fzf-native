@@ -604,6 +604,28 @@ done:
   fzf_free_slab(history_slab);
 }
 
+static void test_utf8_empty_suffix_trims_trailing_whitespace(void) {
+  const char *candidate = "σa你 " "\xe2\x80\x83"; /* U+2003 EM SPACE */
+  fzf_string_t text = {.data = candidate, .size = strlen(candidate)};
+  fzf_string_t pattern = {.data = "", .size = 0};
+  fzf_slab_t *slab = fzf_make_default_slab();
+  fzf_position_t *positions = fzf_pos_array(0);
+  CHECK(slab != NULL);
+  CHECK(positions != NULL);
+  if (!slab || !positions) goto done;
+
+  fzf_result_t result =
+      fzf_suffix_match_utf8(true, false, &text, &pattern, positions, slab);
+  CHECK(result.start == 3);
+  CHECK(result.end == 3);
+  CHECK(result.score == 0);
+  CHECK(positions->size == 0);
+
+done:
+  fzf_free_positions(positions);
+  fzf_free_slab(slab);
+}
+
 int main(void) {
   printf("--- fzf-additions: fzf_has_match ---\n");
   RUN(test_fuzzy_basic_match);
@@ -644,6 +666,7 @@ int main(void) {
   RUN(test_utf8_char_map_scratch_reuse_and_cap);
   RUN(test_default_score_distinguishes_boundaries);
   RUN(test_score_schemes_are_slab_local);
+  RUN(test_utf8_empty_suffix_trims_trailing_whitespace);
 
   if (failed == 0) {
     printf("\nAll fzf-additions tests passed.\n");

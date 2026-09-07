@@ -659,6 +659,41 @@ func TestNativePeerKnownContiguousResultGaps(t *testing.T) {
 	}
 }
 
+func TestNativePeerUTF8EmptySuffixRangeMatchesRawOracle(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := matchRequest{
+		algorithm: algorithmSuffix,
+		scheme:    schemeDefault,
+		flags:     flagCaseSensitive | flagForward,
+		pattern:   []byte{},
+		candidate: []byte("σa你 \u2003"),
+	}
+	upstream, err := oracle.match(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	native, _, err := decodeMatchResponse(peer.exchange(t,
+		matchRequestPayload(request.algorithm, request.scheme, request.flags,
+			request.pattern, request.candidate)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upstream.start != 3 || upstream.end != 3 ||
+		!matchResponsesEquivalent(native, upstream) {
+		t.Fatalf("native=%+v upstream=%+v; want empty suffix range [3,3)",
+			native, upstream)
+	}
+}
+
 func TestNativePeerMembershipMatrix(t *testing.T) {
 	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
 	if driver == "" {
@@ -1045,8 +1080,7 @@ func TestNativePeerDeterministicResultMatrices(t *testing.T) {
 				if err != nil {
 					t.Fatalf("seed=%d serial=%d native error: %v", seed, serial, err)
 				}
-				if !matchResponsesEquivalent(native, upstream) &&
-					!(request.algorithm == algorithmSuffix && len(request.pattern) == 0) {
+				if !matchResponsesEquivalent(native, upstream) {
 					audit.add(seed, serial, request, upstream, native)
 				}
 			}
