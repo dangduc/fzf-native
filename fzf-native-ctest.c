@@ -978,7 +978,32 @@ static void test_scored_matches_qsort(void) {
   }
   counting_sort_scored(a, N);
   qsort(b, N, sizeof *b, cmp_scored_desc);
-  for (size_t i = 0; i < N; i++) CHECK(a[i].score == b[i].score);
+  for (size_t i = 0; i < N; i++) {
+    CHECK(a[i].score == b[i].score);
+    CHECK(a[i].idx == b[i].idx);
+  }
+}
+
+static void test_scored_sort_uses_fzf_secondary_keys(void) {
+  ScoredStr values[] = {
+    make_scored(100, 0), make_scored(100, 1), make_scored(100, 2),
+  };
+  values[0].rank = (FzfRankKeys){.score = 100, .first = 9, .second = 1};
+  values[1].rank = (FzfRankKeys){.score = 100, .first = 3, .second = 8};
+  values[2].rank = (FzfRankKeys){.score = 100, .first = 3, .second = 2};
+  counting_sort_scored(values, 3);
+  CHECK(values[0].idx == 2);
+  CHECK(values[1].idx == 1);
+  CHECK(values[2].idx == 0);
+
+  ScoredStr saturated[] = {
+    make_scored(70000, 4), make_scored(80000, 5),
+  };
+  saturated[0].rank.first = 1;
+  saturated[1].rank.first = 2;
+  counting_sort_scored(saturated, 2);
+  CHECK(saturated[0].idx == 4);
+  CHECK(saturated[1].idx == 5);
 }
 
 static void test_bounded_top_k_matches_full_stable_sort(void) {
@@ -3846,6 +3871,7 @@ int main(void) {
   RUN(test_scored_large_n_correctness);
   RUN(test_scored_stability);
   RUN(test_scored_matches_qsort);
+  RUN(test_scored_sort_uses_fzf_secondary_keys);
   RUN(test_bounded_top_k_matches_full_stable_sort);
   RUN(test_membership_cap_discards_incomplete_prefix);
   RUN(test_top_k_finalization_observes_cancellation);
