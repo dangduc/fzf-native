@@ -62,11 +62,12 @@ Query updates reuse that producer, its candidate pool, and the process-wide work
 | FreeBSD | x86-64 | yes | yes |
 | Windows | x86-64 | yes | no |
 
-macOS, Linux, and FreeBSD expose session ABI version 1.
-Windows keeps batch-only support.
+Every platform exposes module ABI version 2.
+Windows keeps batch-only support, but the scoring scheme changes its batch results.
 
-=fzf-native.el= checks =fzf-native-session-abi-version= after a POSIX module loads.
-The loader rejects a missing or incompatible session ABI.
+=fzf-native.el= checks =fzf-native-abi-version= after a module loads.
+The loader rejects a missing or incompatible module ABI.
+It repeats this check when =fzf-native-loaded= is already non-nil.
 
 Emacs does not unload an initialized dynamic module.
 After an ABI failure, replace or rebuild the module and restart Emacs.
@@ -87,6 +88,7 @@ Use =M-x fzf-native-load-own-build-dyn= on another architecture.
 | =(fzf-native-make-default-slab)= | A default matcher slab handle. |
 | =(fzf-native-make-slab SIZE16 SIZE32)= | A configured matcher slab handle. |
 | =(fzf-native-filter-only-p QUERY-LENGTH POOL-SIZE)= | Non-nil for the current filter-only configuration. |
+| =(fzf-native-abi-version)= | The module ABI version on every platform. |
 | =(fzf-native-session-abi-version)= | The POSIX session ABI version. |
 
 =fzf-native-score= no longer returns match positions.
@@ -438,6 +440,7 @@ This rule prevents one large session from excluding another session.
 
 Every persistent worker owns one matcher slab.
 It reuses that slab across requests and sessions.
+The worker sets the request score scheme before it uses the slab.
 
 * Cache and refinement model
 
@@ -452,7 +455,7 @@ Its default limits are 40 entries and 64 MiB.
 Each entry records these values:
 
 - literal query
-- case mode and fuzzy mode
+- case mode, fuzzy mode, and score scheme
 - filter-only mode
 - completed pool boundary
 - total match count
@@ -569,6 +572,7 @@ Progress belongs to the inspected request, not the retained candidate list.
 | =:limit= | The retained result limit. |
 | =:case-mode= | The retained result case mode. |
 | =:fuzzy= | The retained result fuzzy mode. |
+| =:score-scheme= | The retained result score scheme. |
 | =:filter-only= | The retained result filter-only mode. |
 | =:filtered= | The full match count. |
 | =:total= | The scored pool size. |
@@ -690,6 +694,7 @@ This rule prevents finalization from blocking the Emacs main thread.
 
 | Variable | Read point |
 |----------+------------|
+| =fzf-native-score-scheme= | Each match, score, or highlight call. |
 | =fzf-native-case-mode= | Every scoring request. |
 | =fzf-native-fuzzy= | Every scoring request. |
 | =fzf-native-batch-highlight= | Every synchronous score call. |
