@@ -200,3 +200,27 @@ benchmark-batch-cache-history:
 # Coverage-guided and differential test targets live in a separate include so
 # they do not alter the release build or the public module ABI.
 include fuzz/fuzz.mk
+
+# Real persistent-session growth probe.  Timings include producer appends,
+# growth notification, coordinator work, shared workers, cache update, and
+# result publication.  Full-scan validation runs after all timed rounds.
+SESSION_GROWTH_INITIAL ?= 1000000
+SESSION_GROWTH_DELTA ?= 1000
+SESSION_GROWTH_ROUNDS ?= 8
+SESSION_GROWTH_WORKERS ?= 8
+SESSION_GROWTH_LIMIT ?= 10000
+SESSION_GROWTH_BENCH := $(BUILD_DIR)/session-growth-benchmark
+
+.PHONY: benchmark-session-growth-build benchmark-session-growth
+benchmark-session-growth-build:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O3 -DNDEBUG \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(SESSION_GROWTH_BENCH) etc/session-growth-benchmark.c \
+		fzf.c fzf-additions.c $(UTF8PROC_SRC)
+
+benchmark-session-growth: benchmark-session-growth-build
+	$(SESSION_GROWTH_BENCH) \
+		$(SESSION_GROWTH_INITIAL) $(SESSION_GROWTH_DELTA) \
+		$(SESSION_GROWTH_ROUNDS) $(SESSION_GROWTH_WORKERS) \
+		$(SESSION_GROWTH_LIMIT)
