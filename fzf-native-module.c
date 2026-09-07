@@ -160,9 +160,11 @@ static unsigned fzf_worker_count(long detected_cpus, size_t work_items) {
   return count;
 }
 
-/* Increment when the public interactive-session contract requires matching
-   Elisp.  The loader checks this before it marks a bundled module usable. */
-#define FZF_NATIVE_SESSION_ABI 1
+/* Increment when any public native-module contract requires matching Elisp.
+   This covers batch APIs on every platform and interactive APIs on POSIX. */
+#define FZF_NATIVE_ABI 2
+/* Retain the C-test and POSIX compatibility name for the session API. */
+#define FZF_NATIVE_SESSION_ABI FZF_NATIVE_ABI
 
 EXPORT
 int plugin_is_GPL_compatible;
@@ -191,7 +193,7 @@ emacs_value Qsym_process_environment;
 emacs_value Qsym_highlight_fn;
 /* Cached value symbols for `type-of' comparisons and signal/error names. */
 emacs_value Qvector, Qstring, Qdefault, Qpath, Qhistory, Qignore, Qrespect;
-emacs_value Qforward, Qbackward;
+emacs_value Qauto, Qforward, Qbackward;
 emacs_value Qor, Qand;
 emacs_value Qstringp, Qwrong_type_argument, Qerror;
 
@@ -1082,22 +1084,26 @@ static bool resolve_fzf_native_fuzzy(emacs_env *env) {
 
 /* Read `fzf-native-normalize' once for each public request. */
 static bool resolve_fzf_native_normalize(emacs_env *env) {
-  emacs_value v = defcustom_value(env, Qsym_normalize, Qnil);
+  emacs_value v = defcustom_value(env, Qsym_normalize, Qt);
   return !env->eq(env, v, Qnil);
 }
 
 /* Resolve `fzf-native-search-direction'.  Direction changes ranges and can
    change scores, so an invalid value must not share a cache identity with a
    silently selected fallback. */
-static bool resolve_fzf_native_forward(emacs_env *env, bool *out) {
-  emacs_value v = defcustom_value(env, Qsym_search_direction, Qforward);
-  if (env->eq(env, v, Qforward))
+static bool resolve_fzf_native_forward(emacs_env *env,
+                                       fzf_score_scheme_t score_scheme,
+                                       bool *out) {
+  emacs_value v = defcustom_value(env, Qsym_search_direction, Qauto);
+  if (env->eq(env, v, Qauto))
+    *out = score_scheme != FZF_SCORE_SCHEME_PATH;
+  else if (env->eq(env, v, Qforward))
     *out = true;
   else if (env->eq(env, v, Qbackward))
     *out = false;
   else {
     async_signal_error(
-        env, "fzf-native-search-direction must be forward or backward");
+        env, "fzf-native-search-direction must be auto, forward, or backward");
     return false;
   }
   return true;
@@ -1263,10 +1269,10 @@ emacs_value fzf_native_score_all(emacs_env *env,
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool           fuzzy     = resolve_fzf_native_fuzzy(env);
   bool           normalize = resolve_fzf_native_normalize(env);
-  bool           forward;
-  if (!resolve_fzf_native_forward(env, &forward)) goto err;
   fzf_score_scheme_t score_scheme;
   if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto err;
+  bool           forward;
+  if (!resolve_fzf_native_forward(env, score_scheme, &forward)) goto err;
 
   /* Decide filter-only mode from the two thresholds and the logic knob.
      Evaluated once before the workers spawn; the result rides on `shared'.
@@ -1536,10 +1542,10 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
     fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
     bool           fuzzy     = resolve_fzf_native_fuzzy(env);
     bool           normalize = resolve_fzf_native_normalize(env);
-    bool           forward;
-    if (!resolve_fzf_native_forward(env, &forward)) goto done;
     fzf_score_scheme_t score_scheme;
     if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto done;
+    bool           forward;
+    if (!resolve_fzf_native_forward(env, score_scheme, &forward)) goto done;
     pattern = fzf_parse_pattern_with_direction(
         case_mode, normalize, query.b, fuzzy, forward);
     if (!pattern) {
@@ -1670,10 +1676,10 @@ emacs_value fzf_native_highlight_one(emacs_env *env,
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool           fuzzy     = resolve_fzf_native_fuzzy(env);
   bool           normalize = resolve_fzf_native_normalize(env);
-  bool           forward;
-  if (!resolve_fzf_native_forward(env, &forward)) goto done;
   fzf_score_scheme_t score_scheme;
   if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto done;
+  bool           forward;
+  if (!resolve_fzf_native_forward(env, score_scheme, &forward)) goto done;
   pattern = fzf_parse_pattern_with_direction(
       case_mode, normalize, query.b, fuzzy, forward);
   if (!pattern) {
@@ -1765,10 +1771,10 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool           fuzzy     = resolve_fzf_native_fuzzy(env);
   bool           normalize = resolve_fzf_native_normalize(env);
-  bool           forward;
-  if (!resolve_fzf_native_forward(env, &forward)) goto err;
   fzf_score_scheme_t score_scheme;
   if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto err;
+  bool           forward;
+  if (!resolve_fzf_native_forward(env, score_scheme, &forward)) goto err;
   pattern = fzf_parse_pattern_with_direction(
       case_mode, normalize, query.b, fuzzy, forward);
   if (!pattern) {
@@ -7058,13 +7064,13 @@ static uint64_t async_submit_request(emacs_env *env, AsyncSession *s,
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool fuzzy = resolve_fzf_native_fuzzy(env);
   bool normalize = resolve_fzf_native_normalize(env);
-  bool forward;
-  if (!resolve_fzf_native_forward(env, &forward)) {
+  fzf_score_scheme_t score_scheme;
+  if (!resolve_fzf_native_score_scheme(env, &score_scheme)) {
     free(filter);
     return 0;
   }
-  fzf_score_scheme_t score_scheme;
-  if (!resolve_fzf_native_score_scheme(env, &score_scheme)) {
+  bool forward;
+  if (!resolve_fzf_native_forward(env, score_scheme, &forward)) {
     free(filter);
     return 0;
   }
@@ -7887,13 +7893,13 @@ fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool fuzzy = resolve_fzf_native_fuzzy(env);
   bool normalize = resolve_fzf_native_normalize(env);
-  bool forward;
-  if (!resolve_fzf_native_forward(env, &forward)) {
+  fzf_score_scheme_t score_scheme;
+  if (!resolve_fzf_native_score_scheme(env, &score_scheme)) {
     free(query.b);
     return async_session_unpin_return(s, Qnil);
   }
-  fzf_score_scheme_t score_scheme;
-  if (!resolve_fzf_native_score_scheme(env, &score_scheme)) {
+  bool forward;
+  if (!resolve_fzf_native_forward(env, score_scheme, &forward)) {
     free(query.b);
     return async_session_unpin_return(s, Qnil);
   }
@@ -7952,14 +7958,11 @@ fzf_native_async_result_fresh_p(emacs_env *env, ptrdiff_t UNUSED(nargs),
 
 #endif /* APPLE || linux || FreeBSD */
 
-#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 static emacs_value
-fzf_native_session_abi_version(emacs_env *env, ptrdiff_t UNUSED(nargs),
-                               emacs_value UNUSED(args[]),
-                               void *UNUSED(data)) {
-  return env->make_integer(env, FZF_NATIVE_SESSION_ABI);
+fzf_native_abi_version(emacs_env *env, ptrdiff_t UNUSED(nargs),
+                       emacs_value UNUSED(args[]), void *UNUSED(data)) {
+  return env->make_integer(env, FZF_NATIVE_ABI);
 }
-#endif
 
 /* fzf-native-filter-only-p QUERY-LENGTH POOL-SIZE -> t / nil
    Single source of truth for the filter-only decision.  Exposes the
@@ -8086,6 +8089,7 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qhistory = env->make_global_ref(env, env->intern(env, "history"));
   Qignore  = env->make_global_ref(env, env->intern(env, "ignore"));
   Qrespect = env->make_global_ref(env, env->intern(env, "respect"));
+  Qauto    = env->make_global_ref(env, env->intern(env, "auto"));
   Qforward = env->make_global_ref(env, env->intern(env, "forward"));
   Qbackward = env->make_global_ref(env, env->intern(env, "backward"));
   Qstringp = env->make_global_ref(env, env->intern(env, "stringp"));
@@ -8170,10 +8174,18 @@ int emacs_module_init(struct emacs_runtime *rt) {
     });
   FZF_INIT_CHECK_EXIT();
 
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
+      env->intern(env, "fzf-native-abi-version"),
+      env->make_function(env, 0, 0, fzf_native_abi_version,
+                         "Return the native module ABI version.\n\n"
+                         "\\(fn)", NULL),
+    });
+  FZF_INIT_CHECK_EXIT();
+
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
   env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]) {
       env->intern(env, "fzf-native-session-abi-version"),
-      env->make_function(env, 0, 0, fzf_native_session_abi_version,
+      env->make_function(env, 0, 0, fzf_native_abi_version,
                          "Return the interactive-session ABI version.\n\n"
                          "\\(fn)", NULL),
     });
@@ -8209,6 +8221,8 @@ int emacs_module_init(struct emacs_runtime *rt) {
                          "Optional LIMIT caps the completed result.  Identical queued or\n"
                          "running work reuses its existing request ID.  This call never\n"
                          "waits for scoring and does not build an Emacs candidate list.\n"
+                         "It captures the case, fuzzy, normalization, resolved search\n"
+                         "direction, and score-scheme options in the request identity.\n"
                          "Signals instead of returning nil on failure: `error' if HANDLE\n"
                          "is stopped, `wrong-type-argument' if QUERY is not an encodable\n"
                          "string or LIMIT is not a natural number.\n\n"
@@ -8238,7 +8252,8 @@ int emacs_module_init(struct emacs_runtime *rt) {
                          "  :filtered :total  match count / pool size for a counts overlay\n"
                          "  :result-request-id :result-pool-generation  which request\n"
                          "               produced it, at what pool boundary\n"
-                         "  :query :limit :case-mode :fuzzy\n"
+                         "  :query :limit :case-mode :fuzzy :normalize\n"
+                         "  :search-direction\n"
                          "  :score-scheme :filter-only  options used for this result.\n"
                          "               These describe the retained\n"
                          "               result, NOT necessarily REQUEST-ID's options;\n"

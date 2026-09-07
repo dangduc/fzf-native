@@ -57,6 +57,7 @@
                   (handle query))
 (declare-function fzf-native-filter-only-p "fzf-native-module"
                   (query-length pool-size))
+(declare-function fzf-native-abi-version "fzf-native-module" ())
 (declare-function fzf-native-session-abi-version "fzf-native-module" ())
 
 (defconst fzf-native-test--directory
@@ -811,8 +812,13 @@ Reentry tests use this option because their callback needs one candidate."
         (should (fzf-native-test--wait-for-data handle))
       (fzf-native-async-stop handle))))
 
+(ert-deftest fzf-native-module-abi-handshake-test ()
+  "The loaded module and Elisp public ABI must agree on every platform."
+  (should (= (fzf-native-abi-version) fzf-native-abi-required))
+  (should (fzf-native--verify-abi)))
+
 (ert-deftest fzf-native-session-abi-handshake-test ()
-  "The loaded module and Elisp session contracts must agree exactly."
+  "The loaded POSIX session ABI must agree with the public module ABI."
   (skip-unless (fboundp 'fzf-native-session-abi-version))
   (should (= (fzf-native-session-abi-version)
              fzf-native-session-abi-required))
@@ -2862,23 +2868,34 @@ the uninitialised scratch."
       (should-error (fzf-native--bundled-module-relative-path)
                     :type 'user-error))))
 
-(ert-deftest fzf-native-session-abi-platform-matches-bundled-freebsd-test ()
-  "The ABI handshake and bundled loader must agree on FreeBSD support."
+(ert-deftest fzf-native-abi-handshake-runs-on-every-platform-test ()
+  "Batch APIs require the ABI handshake even without POSIX sessions."
   (let ((calls 0))
-    (cl-letf (((symbol-function 'fzf-native-session-abi-version)
+    (cl-letf (((symbol-function 'fzf-native-abi-version)
                (lambda ()
                  (cl-incf calls)
-                 fzf-native-session-abi-required)))
+                 fzf-native-abi-required)))
       (let ((system-type 'berkeley-unix)
             (system-configuration "amd64-portbld-freebsd13.2"))
         (should (fzf-native--session-platform-p))
-        (should (fzf-native--verify-session-abi))
+        (should (fzf-native--verify-abi))
         (should (= calls 1)))
-      (let ((system-type 'berkeley-unix)
-            (system-configuration "x86_64-unknown-netbsd10.0"))
+      (let ((system-type 'windows-nt))
         (should-not (fzf-native--session-platform-p))
-        (should (fzf-native--verify-session-abi))
-        (should (= calls 1))))))
+        (should (fzf-native--verify-abi))
+        (should (= calls 2))))))
+
+(ert-deftest fzf-native-ensure-loaded-rechecks-existing-module-abi-test ()
+  "An already-loaded flag must not bypass a stale-module check."
+  (let ((fzf-native-loaded t)
+        (loads 0))
+    (cl-letf (((symbol-function 'fzf-native--verify-abi)
+               (lambda () (error "stale module")))
+              ((symbol-function 'fzf-native-load-dyn)
+               (lambda () (cl-incf loads))))
+      (should-error (fzf-native-ensure-loaded))
+      (should (= loads 0))
+      (should-not fzf-native-loaded))))
 
 ;;; Review regression gates (PR #39 multi-agent review)
 
@@ -2890,7 +2907,7 @@ the uninitialised scratch."
     (cl-letf (((symbol-function 'featurep)
                (lambda (feature)
                  (eq feature 'fzf-native-module)))
-              ((symbol-function 'fzf-native--verify-session-abi)
+              ((symbol-function 'fzf-native--verify-abi)
                (lambda ()
                  (error "Module has ABI 2, Elisp requires ABI 1")))
               ((symbol-function 'fzf-native-module-compile)
@@ -2913,7 +2930,7 @@ the uninitialised scratch."
                (lambda (_feature) nil))
               ((symbol-function 'module-load)
                (lambda (_path) (cl-incf module-loads)))
-              ((symbol-function 'fzf-native--verify-session-abi)
+              ((symbol-function 'fzf-native--verify-abi)
                (lambda ()
                  (error "Module has ABI 2, Elisp requires ABI 1"))))
       (let ((message
@@ -2934,7 +2951,7 @@ the uninitialised scratch."
                (lambda () "stale-module.so"))
               ((symbol-function 'module-load)
                (lambda (_path) (cl-incf module-loads)))
-              ((symbol-function 'fzf-native--verify-session-abi)
+              ((symbol-function 'fzf-native--verify-abi)
                (lambda ()
                  (error "Module has ABI 2, Elisp requires ABI 1"))))
       (let ((message
@@ -2956,8 +2973,10 @@ the uninitialised scratch."
         (progn
           (should (plist-get (fzf-native-test--wait-for-producer handle)
                              :reader-done))
-          (dolist (query '("" "!x"))
-            (let* ((request-id (fzf-native-async-submit handle query 20))
+          (dolist (case `(("" ,expected) ("!x" ,expected)))
+            (let* ((query (car case))
+                   (expected-order (cadr case))
+                   (request-id (fzf-native-async-submit handle query 20))
                    (snapshot (fzf-native-test--wait-for-request
                               handle request-id))
                    (actual
@@ -2968,7 +2987,9 @@ the uninitialised scratch."
                             (fzf-native-score-all expected query))))
               (should (eq (plist-get snapshot :state) 'complete))
               (should-not (plist-get snapshot :stale))
-              (should (equal actual expected))
+              ;; Pinned fzf keeps producer order for empty and inverse-only
+              ;; patterns because neither pattern has a sortable positive term.
+              (should (equal actual expected-order))
               (should (equal actual batch)))))
       (fzf-native-async-stop handle))))
 

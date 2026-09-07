@@ -75,7 +75,7 @@ static int is_descending_by_score(struct Candidate *xs, size_t n) {
 }
 
 static void test_session_abi_is_versioned(void) {
-  CHECK(FZF_NATIVE_SESSION_ABI == 1);
+  CHECK(FZF_NATIVE_SESSION_ABI == 2);
 }
 
 static void test_async_snapshot_staleness_covers_pool_growth(void) {
