@@ -632,6 +632,128 @@ func TestNativePeerPinnedNormalizationMembership(t *testing.T) {
 		})
 	}
 }
+func TestNativePeerPinnedExactBoundaryMembership(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name               string
+		flags              byte
+		pattern, candidate string
+		wantMatch          bool
+	}{
+		{"whole", flagCaseSensitive | flagForward, "xyz", "xyz", true},
+		{"slash-boundary", flagCaseSensitive | flagForward, "xyz", "/xyz/", true},
+		{"dash-boundary", flagCaseSensitive | flagForward, "xyz", "-xyz-", true},
+		{"underscore-boundary", flagCaseSensitive | flagForward, "xyz", "_xyz_", true},
+		{"space-boundary", flagCaseSensitive | flagForward, "xyz", "x xyz y", true},
+		{"word-neighbors", flagCaseSensitive | flagForward, "xyz", "xxyzx", false},
+		{"unicode-boundary", flagCaseSensitive | flagForward, "组件", "界/组件-界", true},
+		{"unicode-word-neighbors", flagCaseSensitive | flagForward, "组件", "界组件界", false},
+		{"case-fold", flagForward, "xyz", "/XYZ/", true},
+		{"normalized", flagCaseSensitive | flagNormalize | flagForward, "cafe", "/café/", true},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := matchRequest{
+				algorithm: algorithmExactBoundary,
+				scheme:    schemeDefault,
+				flags:     testCase.flags,
+				pattern:   []byte(testCase.pattern),
+				candidate: []byte(testCase.candidate),
+			}
+			upstream, err := oracle.match(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			native, _, err := decodeMatchResponse(peer.exchange(t,
+				matchRequestPayload(request.algorithm, request.scheme, request.flags,
+					request.pattern, request.candidate)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if upstream.matched != testCase.wantMatch ||
+				native.matched != upstream.matched ||
+				native.start != upstream.start || native.end != upstream.end {
+				t.Fatalf("exact-boundary range differs: native=%+v upstream=%+v",
+					native, upstream)
+			}
+		})
+	}
+}
+
+func TestNativePeerExactBoundarySchemesMatchRawOracle(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	oracleBinary := os.Getenv("FZF_RAW_ORACLE_BINARY")
+	if oracleBinary == "" {
+		t.Fatal("FZF_RAW_ORACLE_BINARY is required with FZF_NATIVE_ALGO_DRIVER")
+	}
+	testCases := []struct {
+		name               string
+		pattern, candidate []byte
+		scores             [3]int64
+	}{
+		{"ascii-slash", []byte("xyz"), []byte("/xyz/"), [3]int64{97, 89, 88}},
+		{"ascii-space", []byte("xyz"), []byte(" xyz "), [3]int64{98, 88, 88}},
+		{"unicode-slash", []byte("组件"), []byte("/组件/"), [3]int64{71, 65, 64}},
+		{"unicode-space", []byte("组件"), []byte(" 组件 "), [3]int64{72, 64, 64}},
+	}
+	schemes := []struct {
+		name string
+		id   schemeID
+	}{
+		{"default", schemeDefault},
+		{"path", schemePath},
+		{"history", schemeHistory},
+	}
+	for schemeIndex, scheme := range schemes {
+		t.Run(scheme.name, func(t *testing.T) {
+			nativePeer := startNativePeerWithArgs(t, driver, "--scheme="+scheme.name)
+			defer nativePeer.close(t)
+			oraclePeer := startNativePeerWithArgs(t, oracleBinary, "--scheme="+scheme.name)
+			defer oraclePeer.close(t)
+			for _, testCase := range testCases {
+				t.Run(testCase.name, func(t *testing.T) {
+					request := matchRequest{
+						algorithm: algorithmExactBoundary,
+						scheme:    scheme.id,
+						flags:     flagCaseSensitive | flagForward,
+						pattern:   testCase.pattern,
+						candidate: testCase.candidate,
+					}
+					payload := matchRequestPayload(request.algorithm, request.scheme,
+						request.flags, request.pattern, request.candidate)
+					upstream, _, err := decodeMatchResponse(oraclePeer.exchange(t, payload))
+					if err != nil {
+						t.Fatal(err)
+					}
+					native, _, err := decodeMatchResponse(nativePeer.exchange(t, payload))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if upstream.score != testCase.scores[schemeIndex] ||
+						native.matched != upstream.matched || native.start != upstream.start ||
+						native.end != upstream.end || native.score != upstream.score {
+						t.Fatalf("native=%+v upstream=%+v want-score=%d",
+							native, upstream, testCase.scores[schemeIndex])
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestNativePeerKnownContiguousResultGaps(t *testing.T) {
 	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
 	if driver == "" {
@@ -809,6 +931,13 @@ func TestNativePeerReportsCurrentCapabilityBoundary(t *testing.T) {
 	}
 	peer := startNativePeer(t, driver)
 	defer peer.close(t)
+	exactBoundary := matchRequestPayload(
+		algorithmExactBoundary, schemeDefault, flagCaseSensitive|flagForward,
+		[]byte("a"), []byte("/a/"))
+	result, status, err := decodeMatchResponse(peer.exchange(t, exactBoundary))
+	if err != nil || status != statusOK || !result.matched {
+		t.Fatalf("exact-boundary status=%d result=%+v error=%v", status, result, err)
+	}
 
 	unsupported := []struct {
 		name      string
@@ -816,7 +945,6 @@ func TestNativePeerReportsCurrentCapabilityBoundary(t *testing.T) {
 		scheme    schemeID
 		flags     byte
 	}{
-		{"exact-boundary", algorithmExactBoundary, schemeDefault, flagForward},
 		{"backward-search", algorithmV2, schemeDefault, 0},
 	}
 	for _, testCase := range unsupported {
@@ -831,7 +959,7 @@ func TestNativePeerReportsCurrentCapabilityBoundary(t *testing.T) {
 
 	request := matchRequestPayload(algorithmV2, schemePath, flagForward,
 		[]byte("a"), []byte("a"))
-	_, status, err := decodeMatchResponse(peer.exchange(t, request))
+	_, status, err = decodeMatchResponse(peer.exchange(t, request))
 	if status != statusBadRequest || err == nil {
 		t.Fatalf("scheme mismatch got status %d and error %v; want bad request",
 			status, err)
@@ -911,7 +1039,7 @@ func rawMatrixRequest(seed, serial uint64) matchRequest {
 		state = 0x6a09e667f3bcc909
 	}
 	algorithms := [...]algorithmID{
-		algorithmV1, algorithmV2, algorithmExact,
+		algorithmV1, algorithmV2, algorithmExact, algorithmExactBoundary,
 		algorithmPrefix, algorithmSuffix, algorithmEqual,
 	}
 	alphabet := []byte("abAB/_- .:")
