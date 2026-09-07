@@ -125,12 +125,15 @@
   "Return raw matches from FZF for CASE."
   (let* ((query (fzf-native-differential-case-query case))
          (collection (fzf-native-upstream--candidate-texts case))
+         (score-scheme
+          (or (fzf-native-differential-query-score-scheme query) 'default))
          (valid-utf8
           (plist-get (fzf-native-differential-case-dimensions case)
                      :valid-utf8))
          (args
           (append
            (list "--read0" "--print0" "--no-color" "--no-multi-line"
+                 (format "--scheme=%s" score-scheme)
                  (concat "--filter="
                          (fzf-native-differential-case-rendered-query case)))
            (when (eq (fzf-native-differential-case-comparison case)
@@ -173,6 +176,12 @@
           (fzf-native-differential-query-case-mode query))
          (fzf-native-fuzzy
           (fzf-native-differential-query-fuzzy query))
+         (fzf-native-normalize
+          (fzf-native-differential-query-normalize query))
+         (fzf-native-search-direction
+          (or (fzf-native-differential-query-direction query) 'auto))
+         (fzf-native-score-scheme
+          (or (fzf-native-differential-query-score-scheme query) 'default))
          (fzf-native-batch-highlight nil)
          (fzf-native-filter-only-min-pool nil)
          (fzf-native-filter-only-length nil))
@@ -303,6 +312,12 @@ UPSTREAM-OUTPUT selects Go's malformed-byte output representation."
     (pcase key
       (:case-mode (fzf-native-differential-query-case-mode query))
       (:fuzzy (fzf-native-differential-query-fuzzy query))
+      (:normalize (fzf-native-differential-query-normalize query))
+      (:direction
+       (or (fzf-native-differential-query-direction query) 'auto))
+      (:forward (fzf-native-differential-query-forward query))
+      (:score-scheme
+       (or (fzf-native-differential-query-score-scheme query) 'default))
       (_ (plist-get dimensions key)))))
 
 (defun fzf-native-upstream--assert-pairwise-coverage (cases specifications)
@@ -334,23 +349,25 @@ Each specification has the form (KEY VALUES)."
          (left
           (cl-loop for serial below 6000
                    collect (fzf-native-upstream--generated-case
-                            seed serial 'common)))
+                            seed serial 'parity)))
          (right
           (cl-loop for serial below 6000
                    collect (fzf-native-upstream--generated-case
-                            seed serial 'common)))
+                            seed serial 'parity)))
          (replay-start 733)
          (replay-count 20)
          (replay
           (cl-loop for serial from replay-start
                    below (+ replay-start replay-count)
                    collect (fzf-native-upstream--generated-case
-                            seed serial 'common)))
+                            seed serial 'parity)))
          (long-cases
           (cl-loop for serial below 3
                    collect (fzf-native-upstream--generated-case
                             seed serial 'long)))
-         text-classes length-targets query-shapes primary-kinds rank-shapes)
+         text-classes length-targets query-shapes primary-kinds rank-shapes
+         normalize-modes direction-modes directions score-schemes
+         normalization-pairs)
     (should
      (equal (mapcar #'fzf-native-differential-case-description left)
             (mapcar #'fzf-native-differential-case-description right)))
