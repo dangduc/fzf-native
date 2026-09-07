@@ -222,16 +222,13 @@ benchmark-core-hotpath-probe:
 		benchmarks/core-hotpath-probe.c fzf.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/core-hotpath-probe
 
-# Coverage-guided and differential test targets live in a separate include so
-# they do not alter the release build or the public module ABI.
-include fuzz/fuzz.mk
-
 # Real persistent-session growth probe.  Timings include producer appends,
 # growth notification, coordinator work, shared workers, cache update, and
 # result publication.  Full-scan validation runs after all timed rounds.
 SESSION_GROWTH_INITIAL ?= 1000000
 SESSION_GROWTH_DELTA ?= 1000
-SESSION_GROWTH_ROUNDS ?= 8
+# Exercise enough growth epochs to include bounded-chain flatten tail latency.
+SESSION_GROWTH_ROUNDS ?= 40
 SESSION_GROWTH_WORKERS ?= 8
 SESSION_GROWTH_LIMIT ?= 10000
 SESSION_GROWTH_BENCH := $(BUILD_DIR)/session-growth-benchmark
@@ -249,3 +246,7 @@ benchmark-session-growth: benchmark-session-growth-build
 		$(SESSION_GROWTH_INITIAL) $(SESSION_GROWTH_DELTA) \
 		$(SESSION_GROWTH_ROUNDS) $(SESSION_GROWTH_WORKERS) \
 		$(SESSION_GROWTH_LIMIT)
+
+# Coverage-guided and differential test targets live in a separate include so
+# they do not alter the release build or the public module ABI.
+include fuzz/fuzz.mk

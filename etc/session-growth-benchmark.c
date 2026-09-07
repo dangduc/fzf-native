@@ -28,6 +28,15 @@ typedef struct {
   uint64_t checksum;
 } BenchSnapshot;
 
+typedef struct {
+  bool available;
+  size_t pool_generation;
+  size_t matched_count;
+  size_t depth;
+  size_t storage_bytes;
+  size_t suffix_compactions_since_flatten;
+} BenchMembershipStats;
+
 static double bench_now_ms(void) {
   struct timespec now;
   if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0.0;
@@ -202,6 +211,33 @@ static bool bench_capture_snapshot(AsyncSession *session,
   return true;
 }
 
+static BenchMembershipStats bench_membership_stats(
+    AsyncSession *session, const char *query) {
+  SharedIdx *membership = NULL;
+  size_t pool_generation = 0;
+  BenchMembershipStats stats = {0};
+  if (!cache_lookup_membership_exact(
+          &session->cache, query, CaseSmart, true,
+          &membership, &pool_generation))
+    return stats;
+
+  stats.available = true;
+  stats.pool_generation = pool_generation;
+  stats.matched_count = membership->count;
+#ifdef SHARED_IDX_MAX_DEPTH
+  stats.depth = membership->depth;
+  stats.storage_bytes = membership->storage_bytes;
+  stats.suffix_compactions_since_flatten =
+      membership->suffix_compactions_since_flatten;
+#else
+  stats.depth = 1;
+  stats.storage_bytes = sizeof *membership +
+      membership->count * sizeof *membership->idx;
+#endif
+  shared_idx_release(membership);
+  return stats;
+}
+
 static bool bench_validate_snapshot(AsyncSession *session,
                                     const BenchSnapshot *snapshot,
                                     const char *query, size_t limit) {
@@ -317,7 +353,9 @@ static bool bench_parse_size(const char *text, size_t *out) {
 int main(int argc, char **argv) {
   size_t initial = 1000000;
   size_t delta = 1000;
-  size_t rounds = 8;
+  /* Cross the bounded-chain flatten horizon under the default burst workload
+     so the summary includes both cheap linked growth and flatten tail cost. */
+  size_t rounds = 40;
   size_t workers_size = 8;
   size_t limit = 10000;
   if (argc > 6 ||
@@ -379,12 +417,19 @@ int main(int argc, char **argv) {
     return 5;
   }
   double initial_ms = bench_now_ms() - started;
+  BenchMembershipStats previous_membership =
+      bench_membership_stats(session, query);
   printf("initial pool=%zu latency_ms=%.3f matched=%zu top=%zu "
-         "checksum=%016" PRIx64 "\n",
+         "checksum=%016" PRIx64 " membership_depth=%zu "
+         "membership_bytes=%zu suffix_compactions=%zu\n",
          initial, initial_ms, snapshots[0].matched_count,
-         snapshots[0].top_count, snapshots[0].checksum);
+         snapshots[0].top_count, snapshots[0].checksum,
+         previous_membership.depth, previous_membership.storage_bytes,
+         previous_membership.suffix_compactions_since_flatten);
 
   bool timed_ok = true;
+  size_t observed_suffix_compaction_rounds = 0;
+  size_t observed_full_flatten_rounds = 0;
   for (size_t round = 0; round < rounds; round++) {
     size_t old_pool = initial + round * delta;
     size_t new_pool = old_pool + delta;
@@ -400,12 +445,46 @@ int main(int argc, char **argv) {
       timed_ok = false;
       break;
     }
+    BenchMembershipStats membership =
+        bench_membership_stats(session, query);
+    bool membership_consistent = !membership.available ||
+        (membership.pool_generation == new_pool &&
+         membership.matched_count == snapshots[round + 1].matched_count);
+    if (!membership_consistent) {
+      fprintf(stderr,
+              "membership mismatch: pool=%zu cache-pool=%zu "
+              "matched=%zu cache-matched=%zu\n",
+              new_pool, membership.pool_generation,
+              snapshots[round + 1].matched_count,
+              membership.matched_count);
+      timed_ok = false;
+      break;
+    }
+    bool observed_depth_drop = membership.available &&
+        previous_membership.available &&
+        membership.depth < previous_membership.depth;
+    const char *compaction_kind = "none";
+    if (observed_depth_drop) {
+      if (membership.suffix_compactions_since_flatten > 0) {
+        observed_suffix_compaction_rounds++;
+        compaction_kind = "suffix";
+      } else {
+        observed_full_flatten_rounds++;
+        compaction_kind = "full";
+      }
+    }
     printf("growth round=%zu pool=%zu latency_ms=%.3f matched=%zu top=%zu "
-           "checksum=%016" PRIx64 "\n",
+           "checksum=%016" PRIx64 " membership_depth=%zu "
+           "membership_bytes=%zu suffix_compactions=%zu "
+           "compaction_observed=%s\n",
            round + 1, new_pool, latencies[round],
            snapshots[round + 1].matched_count,
            snapshots[round + 1].top_count,
-           snapshots[round + 1].checksum);
+           snapshots[round + 1].checksum,
+           membership.depth, membership.storage_bytes,
+           membership.suffix_compactions_since_flatten,
+           compaction_kind);
+    previous_membership = membership;
   }
 
   bool validation_ok = timed_ok;
@@ -425,13 +504,22 @@ int main(int argc, char **argv) {
     } else {
       memcpy(sorted, latencies, rounds * sizeof *sorted);
       qsort(sorted, rounds, sizeof *sorted, bench_compare_double);
+      double total = 0.0;
+      for (size_t i = 0; i < rounds; i++) total += latencies[i];
       double median = rounds & 1
           ? sorted[rounds / 2]
           : (sorted[rounds / 2 - 1] + sorted[rounds / 2]) / 2.0;
-      printf("summary initial_ms=%.3f growth_median_ms=%.3f "
+      size_t p95_rank = rounds - rounds / 20;
+      printf("summary initial_ms=%.3f growth_total_ms=%.3f "
+             "growth_mean_ms=%.3f growth_median_ms=%.3f "
+             "growth_p95_ms=%.3f growth_max_ms=%.3f "
+             "suffix_compaction_rounds=%zu full_flatten_rounds=%zu "
              "validation=%s snapshots=%zu\n",
-             initial_ms, median, validation_ok ? "ok" : "failed",
-             rounds + 1);
+             initial_ms, total, total / rounds, median,
+             sorted[p95_rank - 1], sorted[rounds - 1],
+             observed_suffix_compaction_rounds,
+             observed_full_flatten_rounds,
+             validation_ok ? "ok" : "failed", rounds + 1);
       free(sorted);
     }
   }
