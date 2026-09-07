@@ -690,6 +690,93 @@ func TestNativePeerPinnedExactBoundaryMembership(t *testing.T) {
 	}
 }
 
+func TestNativePeerPinnedBackwardRanges(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	longPattern := bytes.Repeat([]byte("a"), 1001)
+	longCandidate := append(append(append([]byte{}, longPattern...), '/'), longPattern...)
+	cases := []struct {
+		name                string
+		algorithm           algorithmID
+		pattern, candidate  []byte
+		caseSensitive       bool
+		normalize           bool
+		wantDifferentRanges bool
+	}{
+		{"v1-ascii", algorithmV1, []byte("ab"), []byte("ab/ab"), true, false, true},
+		{"v2-ascii", algorithmV2, []byte("ab"), []byte("-ab-ab-"), true, false, true},
+		{"exact-ascii", algorithmExact, []byte("ab"), []byte("ab/ab"), true, false, true},
+		{"boundary-ascii", algorithmExactBoundary, []byte("ab"), []byte("/ab/ab/"), true, false, true},
+		{"v1-unicode", algorithmV1, []byte("组件"), []byte("组件/组件"), true, false, true},
+		{"v2-unicode", algorithmV2, []byte("组件"), []byte("-组件-组件-"), true, false, true},
+		{"exact-unicode", algorithmExact, []byte("组件"), []byte("组件/组件"), true, false, true},
+		{"boundary-unicode", algorithmExactBoundary, []byte("组件"), []byte("/组件/组件/"), true, false, true},
+		{"normalized-v1", algorithmV1, []byte("cafe"), []byte("café/café"), true, true, true},
+		{"v2-fallback", algorithmV2, longPattern, longCandidate, true, false, true},
+		{"prefix-invariant", algorithmPrefix, []byte("ab"), []byte("ab/ab"), true, false, false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			results := make([]matchResponse, 2)
+			for direction := 0; direction < 2; direction++ {
+				flags := byte(0)
+				if testCase.caseSensitive {
+					flags |= flagCaseSensitive
+				}
+				if testCase.normalize {
+					flags |= flagNormalize
+				}
+				if direction == 0 {
+					flags |= flagForward
+				}
+				request := matchRequest{
+					algorithm: testCase.algorithm,
+					scheme:    schemeDefault,
+					flags:     flags,
+					pattern:   testCase.pattern,
+					candidate: testCase.candidate,
+				}
+				upstream, err := oracle.match(request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				native, _, err := decodeMatchResponse(peer.exchange(t,
+					matchRequestPayload(request.algorithm, request.scheme, request.flags,
+						request.pattern, request.candidate)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if native.matched != upstream.matched || native.start != upstream.start ||
+					native.end != upstream.end {
+					t.Fatalf("direction flags=0x%02x range differs: native=%+v upstream=%+v",
+						flags, native, upstream)
+				}
+				if testCase.algorithm <= algorithmV2 &&
+					!reflect.DeepEqual(native.positions, upstream.positions) {
+					t.Fatalf("direction flags=0x%02x positions differ: native=%+v upstream=%+v",
+						flags, native, upstream)
+				}
+				results[direction] = native
+			}
+			different := results[0].start != results[1].start ||
+				results[0].end != results[1].end
+			if different != testCase.wantDifferentRanges {
+				t.Fatalf("forward=%+v backward=%+v wantDifferent=%t",
+					results[0], results[1], testCase.wantDifferentRanges)
+			}
+		})
+	}
+}
+
 func TestNativePeerExactBoundarySchemesMatchRawOracle(t *testing.T) {
 	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
 	if driver == "" {
