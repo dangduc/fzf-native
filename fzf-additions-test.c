@@ -682,6 +682,39 @@ static void test_pinned_fzf_latin_normalization(void) {
   fzf_free_slab(slab);
   fzf_free_pattern(plain);
   fzf_free_pattern(normalized);
+
+  char accented_query[] = "Ờ";
+  fzf_pattern_t *accented = fzf_parse_pattern(
+      CaseRespect, true, accented_query, true);
+  slab = fzf_make_default_slab();
+  CHECK(accented != NULL);
+  CHECK(slab != NULL);
+  if (accented && slab) {
+    CHECK(!accented->ptr[0]->ptr[0].normalize);
+    CHECK(fzf_get_score("O", accented, slab) == 0);
+    CHECK(fzf_get_score("Ờ", accented, slab) > 0);
+    CHECK(fzf_get_score("Ổ", accented, slab) == 0);
+    CHECK(!fzf_has_match("O", accented, slab));
+    CHECK(fzf_has_match("Ờ", accented, slab));
+    CHECK(!fzf_has_match("Ổ", accented, slab));
+  }
+  fzf_free_slab(slab);
+  fzf_free_pattern(accented);
+
+  char uppercase_query[] = "Ā";
+  fzf_pattern_t *uppercase = fzf_parse_pattern(
+      CaseRespect, true, uppercase_query, true);
+  slab = fzf_make_default_slab();
+  CHECK(uppercase != NULL);
+  CHECK(slab != NULL);
+  if (uppercase && slab) {
+    CHECK(!uppercase->ptr[0]->ptr[0].normalize);
+    CHECK(fzf_get_score("A", uppercase, slab) == 0);
+    CHECK(fzf_get_score("Ā", uppercase, slab) > 0);
+    CHECK(fzf_get_score("ā", uppercase, slab) == 0);
+  }
+  fzf_free_slab(slab);
+  fzf_free_pattern(uppercase);
 }
 
 int main(void) {

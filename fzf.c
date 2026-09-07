@@ -594,6 +594,23 @@ static char normalize_rune(char r) {
   return (char)fzf_normalize_codepoint((uint8_t)r);
 }
 
+/* fzf normalizes candidate text only when the lowercased query is already in
+   normalized form.  A query that contains a foldable rune stays literal.
+   This preserves the directional contract: "e" matches "é", but "é" does
+   not match "e" or "ê". */
+static bool pattern_can_normalize(const char *pattern, size_t byte_len) {
+  size_t offset = 0;
+  while (offset < byte_len) {
+    utf8proc_int32_t codepoint;
+    utf8proc_ssize_t width = utf8_iterate_lossy(
+        (const utf8proc_uint8_t *)pattern + offset,
+        (utf8proc_ssize_t)(byte_len - offset), &codepoint);
+    if (fzf_normalize_codepoint(codepoint) != codepoint) return false;
+    offset += (size_t)width;
+  }
+  return true;
+}
+
 static int32_t try_skip(fzf_string_t *input, bool case_sensitive, byte b,
                         int32_t from) {
   str_slice_t slice = slice_str(input->data, (size_t)from, input->size);
@@ -2603,6 +2620,9 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
       free(og_str);
       goto parse_failure;
     }
+    size_t lower_len = strlen(lower_text);
+    bool normalize_term =
+        normalize && pattern_can_normalize(lower_text, lower_len);
     bool case_sensitive =
         case_mode == CaseRespect ||
         (case_mode == CaseSmart && strcmp(text, lower_text) != 0);
@@ -2615,7 +2635,7 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
          ASCII "k").  Every parser check below, and fzf_string_t.size, uses
          LEN as a byte count, so retain the transformed length rather than the
          source token's length. */
-      len = strlen(text);
+      len = lower_len;
     } else {
       SFREE(lower_text);
     }
@@ -2692,7 +2712,7 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
                                         .ptr = og_str,
                                         .text = text_ptr,
                                         .case_sensitive = case_sensitive,
-                                        .normalize = normalize})) {
+                                        .normalize = normalize_term})) {
         free(text_ptr);
         free(og_str);
         goto parse_failure;
