@@ -182,6 +182,9 @@ static fzf_algo_t select_algorithm(uint8_t algorithm, bool utf8) {
       return utf8 ? fzf_fuzzy_match_v2_utf8 : fzf_fuzzy_match_v2;
     case 2:
       return utf8 ? fzf_exact_match_utf8 : fzf_exact_match_naive;
+    case 3:
+      return utf8 ? fzf_exact_match_boundary_utf8
+                  : fzf_exact_match_boundary;
     case 4:
       return utf8 ? fzf_prefix_match_utf8 : fzf_prefix_match;
     case 5:
@@ -240,10 +243,6 @@ static bool handle_match(const uint8_t *payload, size_t size) {
   if ((flags & 4u) == 0)
     return send_error(OPCODE_MATCH, STATUS_UNSUPPORTED,
                       "fzf-native supports only forward matching");
-  if (algorithm == 3)
-    return send_error(OPCODE_MATCH, STATUS_UNSUPPORTED,
-                      "fzf-native lacks exact-boundary matching");
-
   const uint8_t *pattern_bytes = payload + 13;
   const uint8_t *candidate_bytes = pattern_bytes + pattern_len;
   bool case_sensitive = (flags & 1u) != 0;
