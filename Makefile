@@ -158,19 +158,19 @@ ctest-scorer-oom:
 ctest-asan: export UBSAN_OPTIONS = halt_on_error=1:print_stacktrace=1
 ctest-asan:
 	mkdir -p $(BUILD_DIR)
-	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -g \
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
 		-I. -I$(UTF8PROC_DIR) -pthread \
 		-o $(BUILD_DIR)/fzf-native-ctest-asan fzf-native-ctest.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-native-ctest-asan
-	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -g \
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
 		-I. -I$(UTF8PROC_DIR) -pthread \
 		-o $(BUILD_DIR)/fzf-additions-test-asan fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-additions-test-asan
-	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -g \
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
 		-I. -I$(UTF8PROC_DIR) \
 		-o $(BUILD_DIR)/fzf-parser-oom-ctest-asan fzf-parser-oom-ctest.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-parser-oom-ctest-asan
-	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -g \
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
 		-I. -I$(UTF8PROC_DIR) \
 		-o $(BUILD_DIR)/fzf-scorer-oom-ctest-asan fzf-scorer-oom-ctest.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-scorer-oom-ctest-asan
