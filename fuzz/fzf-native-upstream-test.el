@@ -38,6 +38,72 @@
   (add-to-list 'load-path directory))
 
 (require 'fzf-native-differential-generator)
+(require 'fzf-native-differential-exceptions)
+
+(declare-function fzf-native-score-all "fzf-native-module"
+                  (collection query &optional slab))
+(declare-function fzf-native-async-start "fzf-native-module"
+                  (command &optional directory))
+(declare-function fzf-native-async-stop "fzf-native-module" (handle))
+(declare-function fzf-native-async-submit "fzf-native-module"
+                  (handle query &optional limit))
+(declare-function fzf-native-async-snapshot "fzf-native-module"
+                  (handle &optional request-id))
+(declare-function fzf-native-async-status "fzf-native-module"
+                  (handle &optional request-id))
+(declare-function fzf-native--session-platform-p "fzf-native" ())
+(declare-function fzf-native--verify-initialized-module "fzf-native" ())
+(declare-function fzf-native--verify-session-abi "fzf-native" ())
+
+(let ((module (getenv "FZF_NATIVE_TEST_MODULE")))
+  (if (and module (not (string-empty-p module)))
+      (progn
+        (module-load module)
+        (fzf-native--verify-initialized-module)
+        (setq fzf-native-loaded t))
+    (fzf-native-load-dyn)))
+
+(when (fzf-native--session-platform-p)
+  (dolist (function '(fzf-native-session-abi-version
+                      fzf-native-async-start
+                      fzf-native-async-stop
+                      fzf-native-async-submit
+                      fzf-native-async-snapshot
+                      fzf-native-async-status))
+    (unless (fboundp function)
+      (error "Required fzf-native session ABI function is missing: %S"
+             function))))
+
+(defun fzf-native-upstream--env-integer (name default)
+  "Read non-negative integer NAME, or return DEFAULT."
+  (let ((value (getenv name)))
+    (if (and value (string-match-p "\\`[0-9]+\\'" value))
+        (string-to-number value)
+      default)))
+
+(defun fzf-native-upstream--profile ()
+  "Return the requested differential profile."
+  (let ((name (or (getenv "FZF_NATIVE_UPSTREAM_PROFILE") "common")))
+    (pcase name
+      ("common" 'common)
+      ("parity" 'parity)
+      ("long" 'long)
+      (_ (error "Unknown FZF_NATIVE_UPSTREAM_PROFILE: %s" name)))))
+
+(defun fzf-native-upstream--verify-reference (fzf)
+  "Verify the configured version and revision of FZF.
+
+`FZF_REFERENCE_VERSION' is an optional output prefix.
+`FZF_REFERENCE_REVISION' is an optional literal substring."
+  (let ((expected-version (getenv "FZF_REFERENCE_VERSION"))
+        (expected-revision (getenv "FZF_REFERENCE_REVISION"))
+        (actual (car (process-lines fzf "--version"))))
+    (when (and expected-version (not (string-empty-p expected-version)))
+      (should (string-prefix-p expected-version actual)))
+    (when (and expected-revision (not (string-empty-p expected-revision)))
+      (should (string-search expected-revision actual)))
+    actual))
+
 (defun fzf-native-upstream--case-rng (seed serial)
   "Return an independent deterministic generator for SEED and SERIAL."
   (fzf-native-differential-rng-create
@@ -54,6 +120,7 @@
   "Return candidate text from CASE in producer order."
   (mapcar #'fzf-native-differential-candidate-text
           (fzf-native-differential-case-candidates case)))
+
 
 (defun fzf-native-upstream--dimension-value (case key)
   "Return dimension KEY from CASE, including query options."
