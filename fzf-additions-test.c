@@ -100,6 +100,57 @@ static void test_exact_no_match(void) {
                   CaseIgnore, true, false);
 }
 
+static void test_pinned_fzf_exact_boundary(void) {
+  const char *matching[] = {
+      "xyz", "/xyz/", "-xyz-", "_xyz_", "x xyz y"};
+  for (size_t i = 0; i < sizeof matching / sizeof matching[0]; i++) {
+    check_agreement("paired quote boundary fuzzy", matching[i], "'xyz'",
+                    CaseRespect, true, true);
+    check_agreement("paired quote boundary exact", matching[i], "'xyz'",
+                    CaseRespect, false, true);
+  }
+  check_agreement("paired quote rejects word neighbors", "xxyzx", "'xyz'",
+                  CaseRespect, true, false);
+  check_agreement("paired quote inverse rejects", "/xyz/", "!'xyz'",
+                  CaseRespect, true, false);
+  check_agreement("paired quote inverse keeps", "xxyzx", "!'xyz'",
+                  CaseRespect, true, true);
+  check_agreement("paired quote before suffix", "/xyz/", "'xyz'$",
+                  CaseRespect, true, true);
+  check_agreement("two quotes are literal", "'", "''",
+                  CaseRespect, true, true);
+  check_agreement("three quotes bound literal", "-'_", "'''",
+                  CaseRespect, true, true);
+  check_agreement("paired quote escaped space", "-foo bar-", "'foo\\ bar'",
+                  CaseRespect, true, true);
+  check_agreement("unicode delimiter boundary", "界/组件-界", "'组件'",
+                  CaseRespect, true, true);
+  check_agreement("unicode word neighbor rejects", "界组件界", "'组件'",
+                  CaseRespect, true, false);
+
+  fzf_string_t query = {.data = "xyz", .size = 3};
+  fzf_string_t plain = {.data = "xyz", .size = 3};
+  fzf_string_t slash = {.data = "/xyz/", .size = 5};
+  fzf_string_t dash = {.data = "-xyz-", .size = 5};
+  fzf_string_t underscore = {.data = "_xyz_", .size = 5};
+  fzf_result_t plain_result = fzf_exact_match_boundary(
+      true, false, &plain, &query, NULL, NULL);
+  fzf_result_t slash_result = fzf_exact_match_boundary(
+      true, false, &slash, &query, NULL, NULL);
+  fzf_result_t dash_result = fzf_exact_match_boundary(
+      true, false, &dash, &query, NULL, NULL);
+  fzf_result_t underscore_result = fzf_exact_match_boundary(
+      true, false, &underscore, &query, NULL, NULL);
+  CHECK(plain_result.start == 0 && plain_result.end == 3);
+  CHECK(slash_result.start == 1 && slash_result.end == 4);
+  CHECK(dash_result.start == 1 && dash_result.end == 4);
+  CHECK(underscore_result.start == 1 && underscore_result.end == 4);
+  CHECK(plain_result.score > 0);
+  CHECK(slash_result.score > 0);
+  CHECK(dash_result.score > 0);
+  CHECK(dash_result.score > underscore_result.score);
+}
+
 static void test_prefix_match(void) {
   check_agreement("prefix ^pat", "fzf-native", "^fzf",
                   CaseIgnore, true, true);
@@ -725,6 +776,7 @@ int main(void) {
   RUN(test_fuzzy_pattern_longer_than_text);
   RUN(test_exact_match);
   RUN(test_exact_no_match);
+  RUN(test_pinned_fzf_exact_boundary);
   RUN(test_prefix_match);
   RUN(test_prefix_no_match);
   RUN(test_suffix_match);

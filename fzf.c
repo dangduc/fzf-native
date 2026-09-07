@@ -2621,6 +2621,8 @@ static fzf_algo_t get_utf8_algo(fzf_algo_t ascii_algo) {
   if (ascii_algo == fzf_fuzzy_match_v2) return fzf_fuzzy_match_v2_utf8;
   if (ascii_algo == fzf_fuzzy_match_v1) return fzf_fuzzy_match_v1_utf8;
   if (ascii_algo == fzf_exact_match_naive) return fzf_exact_match_utf8;
+  if (ascii_algo == fzf_exact_match_boundary)
+    return fzf_exact_match_boundary_utf8;
   if (ascii_algo == fzf_prefix_match) return fzf_prefix_match_utf8;
   if (ascii_algo == fzf_suffix_match) return fzf_suffix_match_utf8;
   if (ascii_algo == fzf_equal_match) return fzf_equal_match_utf8;
@@ -2742,7 +2744,14 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
       len--;
     }
 
-    if (has_prefix(text, "'", 1)) {
+    if (len > 2 && has_prefix(text, "'", 1) &&
+        has_suffix(text, len, "'", 1)) {
+      fn = is_utf8 ? fzf_exact_match_boundary_utf8
+                   : fzf_exact_match_boundary;
+      text[len - 1] = 0;
+      text++;
+      len -= 2;
+    } else if (has_prefix(text, "'", 1)) {
       if (fuzzy && !inv) {
         fn = is_utf8 ? fzf_exact_match_utf8 : fzf_exact_match_naive;
         text++;
