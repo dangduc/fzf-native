@@ -30,6 +30,8 @@ enum {
 #define FZF_NATIVE_REVISION "unknown"
 #endif
 
+static fzf_score_scheme_t driver_scheme = FZF_SCORE_SCHEME_DEFAULT;
+
 static uint32_t read_u32(const uint8_t *bytes) {
   return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
          ((uint32_t)bytes[2] << 8) | (uint32_t)bytes[3];
@@ -232,9 +234,9 @@ static bool handle_match(const uint8_t *payload, size_t size) {
     return send_error(OPCODE_MATCH, STATUS_BAD_REQUEST, "invalid flags");
   if ((uint64_t)pattern_len + candidate_len != size - 13)
     return send_error(OPCODE_MATCH, STATUS_BAD_REQUEST, "invalid lengths");
-  if (scheme != 0)
-    return send_error(OPCODE_MATCH, STATUS_UNSUPPORTED,
-                      "fzf-native supports only the default scheme");
+  if (scheme != (uint8_t)driver_scheme)
+    return send_error(OPCODE_MATCH, STATUS_BAD_REQUEST,
+                      "request scheme does not match process scheme");
   if ((flags & 4u) == 0)
     return send_error(OPCODE_MATCH, STATUS_UNSUPPORTED,
                       "fzf-native supports only forward matching");
@@ -285,7 +287,7 @@ static bool handle_match(const uint8_t *payload, size_t size) {
   };
   fzf_slab_t *slab = fzf_make_default_slab();
   fzf_position_t *positions = fzf_pos_array(0);
-  if (!slab || !positions) {
+  if (!slab || !positions || !fzf_slab_set_score_scheme(slab, driver_scheme)) {
     fzf_free_positions(positions);
     fzf_free_slab(slab);
     free(owned_candidate);
@@ -324,7 +326,28 @@ static bool handle_frame(const uint8_t *payload, size_t size) {
   return send_error(payload[1], STATUS_BAD_REQUEST, "invalid opcode");
 }
 
-int main(void) {
+static bool parse_driver_scheme(const char *argument) {
+  static const char prefix[] = "--scheme=";
+  if (strncmp(argument, prefix, sizeof(prefix) - 1) != 0) return false;
+  const char *name = argument + sizeof(prefix) - 1;
+  if (strcmp(name, "default") == 0)
+    driver_scheme = FZF_SCORE_SCHEME_DEFAULT;
+  else if (strcmp(name, "path") == 0)
+    driver_scheme = FZF_SCORE_SCHEME_PATH;
+  else if (strcmp(name, "history") == 0)
+    driver_scheme = FZF_SCORE_SCHEME_HISTORY;
+  else
+    return false;
+  return true;
+}
+
+int main(int argc, char **argv) {
+  if (argc > 2 || (argc == 2 && !parse_driver_scheme(argv[1]))) {
+    fprintf(stderr,
+            "usage: fzf-native-algo-driver "
+            "[--scheme=default|path|history]\n");
+    return 2;
+  }
   for (;;) {
     uint8_t header[4];
     int first;
