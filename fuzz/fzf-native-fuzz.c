@@ -25,6 +25,24 @@ static void fuzz_fail(const char *property) {
   abort();
 }
 
+static bool valid_utf8(const char *text, size_t len) {
+  size_t offset = 0;
+  while (offset < len) {
+    utf8proc_int32_t codepoint;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)text + offset,
+        (utf8proc_ssize_t)(len - offset), &codepoint);
+    if (width <= 0) return false;
+    offset += (size_t)width;
+  }
+  return true;
+}
+
+static size_t visible_character_count(const char *text) {
+  size_t bytes = strlen(text);
+  return valid_utf8(text, bytes) ? utf8_strlen(text, bytes) : bytes;
+}
+
 static fzf_slab_t *make_selected_slab(uint8_t options) {
   static const size_t caps16[] = {1, 8, 64, 1024, 8192, 100 * 1024};
   static const size_t caps32[] = {1, 8, 64, 256, 1024, 2048};
@@ -34,11 +52,12 @@ static fzf_slab_t *make_selected_slab(uint8_t options) {
 
 static void check_positions(const char *candidate, bool matched,
                             const fzf_position_t *positions) {
-  (void)matched;
+  if (!matched && positions && positions->size != 0)
+    fuzz_fail("a failed match returned highlight positions");
   if (!positions)
     return;
 
-  size_t limit = strlen(candidate);
+  size_t limit = visible_character_count(candidate);
   for (size_t i = 0; i < positions->size; i++) {
     if (positions->data[i] >= limit)
       fuzz_fail("a highlight position is outside the candidate");
@@ -57,6 +76,32 @@ static void check_position_order(const fzf_position_t *positions) {
         ((positions->data[i] > positions->data[i - 1]) != increasing))
       fuzz_fail("unordered highlight positions");
   }
+}
+
+static fzf_algo_t utf8_variant(fzf_algo_t algorithm) {
+  if (algorithm == fzf_fuzzy_match_v2) return fzf_fuzzy_match_v2_utf8;
+  if (algorithm == fzf_fuzzy_match_v1) return fzf_fuzzy_match_v1_utf8;
+  if (algorithm == fzf_exact_match_naive) return fzf_exact_match_utf8;
+  if (algorithm == fzf_prefix_match) return fzf_prefix_match_utf8;
+  if (algorithm == fzf_suffix_match) return fzf_suffix_match_utf8;
+  if (algorithm == fzf_equal_match) return fzf_equal_match_utf8;
+  return algorithm;
+}
+
+static const char *algo_name(fzf_algo_t algorithm) {
+  if (algorithm == fzf_fuzzy_match_v2) return "fuzzy-v2";
+  if (algorithm == fzf_fuzzy_match_v2_utf8) return "fuzzy-v2-utf8";
+  if (algorithm == fzf_fuzzy_match_v1) return "fuzzy-v1";
+  if (algorithm == fzf_fuzzy_match_v1_utf8) return "fuzzy-v1-utf8";
+  if (algorithm == fzf_exact_match_naive) return "exact";
+  if (algorithm == fzf_exact_match_utf8) return "exact-utf8";
+  if (algorithm == fzf_prefix_match) return "prefix";
+  if (algorithm == fzf_prefix_match_utf8) return "prefix-utf8";
+  if (algorithm == fzf_suffix_match) return "suffix";
+  if (algorithm == fzf_suffix_match_utf8) return "suffix-utf8";
+  if (algorithm == fzf_equal_match) return "equal";
+  if (algorithm == fzf_equal_match_utf8) return "equal-utf8";
+  return "unknown";
 }
 
 static bool pattern_has_inverse(const fzf_pattern_t *pattern) {
@@ -99,13 +144,16 @@ static void check_term(const char *candidate, const fzf_term_t *term,
 
   fzf_string_t input = {.data = candidate, .size = strlen(candidate)};
   fzf_string_t *pattern = (fzf_string_t *)term->text;
+  fzf_algo_t algorithm = term->fn;
+  if (!is_ascii_utf8proc(input.data, input.size))
+    algorithm = utf8_variant(algorithm);
   fzf_result_t without_positions =
-      term->fn(term->case_sensitive, false, &input, pattern, NULL, slab);
+      algorithm(term->case_sensitive, false, &input, pattern, NULL, slab);
   fzf_position_t *positions = fzf_pos_array(0);
   if (!positions)
     abort();
-  fzf_result_t with_positions = term->fn(term->case_sensitive, false, &input,
-                                         pattern, positions, slab);
+  fzf_result_t with_positions = algorithm(
+      term->case_sensitive, false, &input, pattern, positions, slab);
 
   /* Fuzzy v2 may backtrack to a more precise START only when positions are
      requested.  Membership and score must not depend on observability. */
@@ -116,12 +164,26 @@ static void check_term(const char *candidate, const fzf_term_t *term,
     fuzz_fail("a failed term returned highlight positions");
   check_positions(candidate, with_positions.start >= 0, positions);
   check_position_order(positions);
+  if (with_positions.start >= 0 && valid_utf8(input.data, input.size) &&
+      valid_utf8(pattern->data, pattern->size)) {
+    size_t pattern_characters = utf8_strlen(pattern->data, pattern->size);
+    if (positions->size != pattern_characters) {
+      fprintf(stderr,
+              "%s returned %zu positions for a %zu-character pattern\n",
+              algo_name(algorithm), positions->size, pattern_characters);
+      fuzz_fail("a matched term returned the wrong position count");
+    }
+  }
   fzf_free_positions(positions);
 
-  if (term->fn == fzf_fuzzy_match_v2) {
-    fzf_result_t v1 = fzf_fuzzy_match_v1(
+  if (algorithm == fzf_fuzzy_match_v2 ||
+      algorithm == fzf_fuzzy_match_v2_utf8) {
+    fzf_algo_t v1 = algorithm == fzf_fuzzy_match_v2_utf8
+                        ? fzf_fuzzy_match_v1_utf8
+                        : fzf_fuzzy_match_v1;
+    fzf_result_t v1_result = v1(
         term->case_sensitive, false, &input, pattern, NULL, slab);
-    if ((v1.start >= 0) != (with_positions.start >= 0))
+    if ((v1_result.start >= 0) != (with_positions.start >= 0))
       fuzz_fail("fuzzy v1 and v2 disagree on match membership");
   }
 }
@@ -146,6 +208,9 @@ static int32_t score_query(const char *candidate, const char *query,
 
 static void check_case_monotonicity(const char *candidate, const char *query,
                                     bool fuzzy, fzf_slab_t *slab) {
+  if (!valid_utf8(candidate, strlen(candidate)) ||
+      !valid_utf8(query, strlen(query)))
+    return;
   bool inverse = false;
   int32_t respect = score_query(candidate, query, CaseRespect, fuzzy, slab,
                                 &inverse);
