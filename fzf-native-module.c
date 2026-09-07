@@ -180,6 +180,7 @@ emacs_value Fsymbol_value;
    `defcustom_value' on each read.  The values themselves stay dynamic
    so user `setq' / `customize-set-variable' is respected. */
 emacs_value Qsym_score_scheme, Qsym_case_mode, Qsym_fuzzy;
+emacs_value Qsym_normalize, Qsym_search_direction;
 emacs_value Qsym_batch_highlight, Qsym_async_highlight;
 emacs_value Qsym_max_line_length, Qsym_async_cache_size;
 emacs_value Qsym_async_cache_bytes;
@@ -190,6 +191,7 @@ emacs_value Qsym_process_environment;
 emacs_value Qsym_highlight_fn;
 /* Cached value symbols for `type-of' comparisons and signal/error names. */
 emacs_value Qvector, Qstring, Qdefault, Qpath, Qhistory, Qignore, Qrespect;
+emacs_value Qforward, Qbackward;
 emacs_value Qor, Qand;
 emacs_value Qstringp, Qwrong_type_argument, Qerror;
 
@@ -1078,6 +1080,29 @@ static bool resolve_fzf_native_fuzzy(emacs_env *env) {
   return !env->eq(env, v, Qnil);
 }
 
+/* Read `fzf-native-normalize' once for each public request. */
+static bool resolve_fzf_native_normalize(emacs_env *env) {
+  emacs_value v = defcustom_value(env, Qsym_normalize, Qnil);
+  return !env->eq(env, v, Qnil);
+}
+
+/* Resolve `fzf-native-search-direction'.  Direction changes ranges and can
+   change scores, so an invalid value must not share a cache identity with a
+   silently selected fallback. */
+static bool resolve_fzf_native_forward(emacs_env *env, bool *out) {
+  emacs_value v = defcustom_value(env, Qsym_search_direction, Qforward);
+  if (env->eq(env, v, Qforward))
+    *out = true;
+  else if (env->eq(env, v, Qbackward))
+    *out = false;
+  else {
+    async_signal_error(
+        env, "fzf-native-search-direction must be forward or backward");
+    return false;
+  }
+  return true;
+}
+
 /* Read fussy-fzf-native-highlight via symbol-value and resolve to a cap.
    Returns:
      0    — no highlighting (nil, negative, unreadable, or zero).
@@ -1237,6 +1262,9 @@ emacs_value fzf_native_score_all(emacs_env *env,
 
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+  bool           normalize = resolve_fzf_native_normalize(env);
+  bool           forward;
+  if (!resolve_fzf_native_forward(env, &forward)) goto err;
   fzf_score_scheme_t score_scheme;
   if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto err;
 
@@ -1253,7 +1281,8 @@ emacs_value fzf_native_score_all(emacs_env *env,
           (int)filter_only_mode, fo_min_pool, fo_max_len,
           fo_logic_and ? "and" : "or", query_char_len, n);
 
-  fzf_pattern_t *pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
+  fzf_pattern_t *pattern = fzf_parse_pattern_with_direction(
+      case_mode, normalize, query.b, fuzzy, forward);
   if (!pattern) {
     async_signal_error(
         env, "fzf-native: matcher could not allocate parsed query");
@@ -1348,7 +1377,8 @@ err_join_threads:
   emacs_value    hl_hook    = Qnil;
   HlScratch      hl_scratch = { 0 };
   if (hl_cap > 0) {
-    hl_pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
+    hl_pattern = fzf_parse_pattern_with_direction(
+        case_mode, normalize, query.b, fuzzy, forward);
     if (hl_pattern) hl_slab = fzf_make_default_slab();
     if (hl_slab && !fzf_slab_set_score_scheme(hl_slab, score_scheme)) {
       fzf_free_slab(hl_slab);
@@ -1505,9 +1535,13 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
   if (!clear_only) {
     fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
     bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+    bool           normalize = resolve_fzf_native_normalize(env);
+    bool           forward;
+    if (!resolve_fzf_native_forward(env, &forward)) goto done;
     fzf_score_scheme_t score_scheme;
     if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto done;
-    pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
+    pattern = fzf_parse_pattern_with_direction(
+        case_mode, normalize, query.b, fuzzy, forward);
     if (!pattern) {
       async_signal_error(
           env, "fzf-native: matcher could not allocate parsed query");
@@ -1635,9 +1669,13 @@ emacs_value fzf_native_highlight_one(emacs_env *env,
 
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+  bool           normalize = resolve_fzf_native_normalize(env);
+  bool           forward;
+  if (!resolve_fzf_native_forward(env, &forward)) goto done;
   fzf_score_scheme_t score_scheme;
   if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto done;
-  pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
+  pattern = fzf_parse_pattern_with_direction(
+      case_mode, normalize, query.b, fuzzy, forward);
   if (!pattern) {
     async_signal_error(
         env, "fzf-native: matcher could not allocate parsed query");
@@ -1723,17 +1761,16 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
 
   fzf_log("fzf_native_score: str='%.*s' query='%.*s'\n", (int)str.len, str.b, (int)query.len, query.b);
 
-  /* fzf_case_mode enum : CaseSmart = 0, CaseIgnore, CaseRespect
-   * normalize bool     : Always set to false because its not implemented yet.
-   *                      This is reserved for future use
-   * pattern char*      : Pattern you want to match. e.g. "src | lua !.c$
-   * fuzzy bool         : Enable or disable fuzzy matching
-   */
+  /* Matching settings are snapshots of the dynamic Elisp options. */
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+  bool           normalize = resolve_fzf_native_normalize(env);
+  bool           forward;
+  if (!resolve_fzf_native_forward(env, &forward)) goto err;
   fzf_score_scheme_t score_scheme;
   if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto err;
-  pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
+  pattern = fzf_parse_pattern_with_direction(
+      case_mode, normalize, query.b, fuzzy, forward);
   if (!pattern) {
     async_signal_error(
         env, "fzf-native: matcher could not allocate parsed query");
@@ -7903,6 +7940,8 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qsym_score_scheme          = env->make_global_ref(env, env->intern(env, "fzf-native-score-scheme"));
   Qsym_case_mode            = env->make_global_ref(env, env->intern(env, "fzf-native-case-mode"));
   Qsym_fuzzy                = env->make_global_ref(env, env->intern(env, "fzf-native-fuzzy"));
+  Qsym_normalize            = env->make_global_ref(env, env->intern(env, "fzf-native-normalize"));
+  Qsym_search_direction     = env->make_global_ref(env, env->intern(env, "fzf-native-search-direction"));
   Qsym_batch_highlight      = env->make_global_ref(env, env->intern(env, "fzf-native-batch-highlight"));
   Qsym_async_highlight      = env->make_global_ref(env, env->intern(env, "fzf-native-async-highlight"));
   Qsym_max_line_length      = env->make_global_ref(env, env->intern(env, "fzf-native-max-line-length"));
@@ -7929,6 +7968,8 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Qhistory = env->make_global_ref(env, env->intern(env, "history"));
   Qignore  = env->make_global_ref(env, env->intern(env, "ignore"));
   Qrespect = env->make_global_ref(env, env->intern(env, "respect"));
+  Qforward = env->make_global_ref(env, env->intern(env, "forward"));
+  Qbackward = env->make_global_ref(env, env->intern(env, "backward"));
   Qstringp = env->make_global_ref(env, env->intern(env, "stringp"));
   Qwrong_type_argument = env->make_global_ref(env, env->intern(env, "wrong-type-argument"));
   Qerror   = env->make_global_ref(env, env->intern(env, "error"));
