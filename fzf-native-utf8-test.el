@@ -376,45 +376,46 @@ than returned in the score list."
 ;;
 ;; Key fact (fzf.c): multibyte match positions and lengths are counted in
 ;; CHARACTERS, not bytes.  The equal-match closed form is therefore
-;;   (ScoreMatch+BonusBoundary)*M + (BonusFirstCharMultiplier-1)*BonusBoundary
-;;   = 24*M + 8,  where M is the CHARACTER count (fzf.c:1704).
-;; A contiguous prefix/suffix run whose first char sits at a word boundary
-;; uses the same closed form: 32 + 24*(M-1) = 24*M + 8.
-;; Constants: ScoreMatch=16, BonusBoundary=8, BonusConsecutive=4,
+;;   (ScoreMatch+BonusBoundaryWhite)*M
+;;     + (BonusFirstCharMultiplier-1)*BonusBoundaryWhite
+;;   = 26*M + 10,  where M is the CHARACTER count.
+;; A contiguous run at the start of a candidate uses the same closed form:
+;; 36 + 26*(M-1) = 26*M + 10.
+;; Constants: ScoreMatch=16, BonusBoundaryWhite=10, BonusConsecutive=4,
 ;;            BonusFirstCharMultiplier=2.
 
 (ert-deftest fzf-native-utf8-equal-exact-score-test ()
-  "Equal match (^X$) on UTF-8: score = 24*M + 8 for M = char count.
+  "Equal match (^X$) on UTF-8: score = 26*M + 10 for M = char count.
 
-  café       M=4 -> 24*4 + 8 = 104
-  résumé     M=6 -> 24*6 + 8 = 152   (r é s u m é, 6 codepoints)
-  中文       M=2 -> 24*2 + 8 = 56    (CJK, 2 codepoints)
-  测试中文   M=4 -> 24*4 + 8 = 104
-  θεωρία     M=6 -> 24*6 + 8 = 152   (Greek, 6 codepoints)
+  café       M=4 -> 26*4 + 10 = 114
+  résumé     M=6 -> 26*6 + 10 = 166  (r é s u m é, 6 codepoints)
+  中文       M=2 -> 26*2 + 10 = 62   (CJK, 2 codepoints)
+  测试中文   M=4 -> 26*4 + 10 = 114
+  θεωρία     M=6 -> 26*6 + 10 = 166  (Greek, 6 codepoints)
 M counts characters, so the multibyte é / CJK / Greek codepoints each
 count as one even though they occupy 2-3 bytes."
   ;; (length "café") = 4, (length "résumé") = 6, (length "中文") = 2,
   ;; (length "测试中文") = 4, (length "θεωρία") = 6 — verified in Emacs.
-  (should (equal (fzf-native-score "café"     "^café$")     '(104)))
-  (should (equal (fzf-native-score "résumé"   "^résumé$")   '(152)))
-  (should (equal (fzf-native-score "中文"     "^中文$")     '(56)))
-  (should (equal (fzf-native-score "测试中文" "^测试中文$") '(104)))
-  (should (equal (fzf-native-score "θεωρία"   "^θεωρία$")   '(152)))
+  (should (equal (fzf-native-score "café"     "^café$")     '(114)))
+  (should (equal (fzf-native-score "résumé"   "^résumé$")   '(166)))
+  (should (equal (fzf-native-score "中文"     "^中文$")     '(62)))
+  (should (equal (fzf-native-score "测试中文" "^测试中文$") '(114)))
+  (should (equal (fzf-native-score "θεωρία"   "^θεωρία$")   '(166)))
   ;; Length is compared in CHARACTERS: a 3-char pattern against a 4-char
   ;; candidate is a length mismatch -> 0 (not a byte-length coincidence).
   (should (equal (fzf-native-score "café" "^caf$") '(0))))
 
 (ert-deftest fzf-native-utf8-prefix-suffix-exact-score-test ()
-  "Prefix/suffix on UTF-8: contiguous boundary run = 24*M + 8.
+  "Prefix/suffix on UTF-8 use their actual opening boundary bonus.
 
 \"café.txt\" \"^café\": prefix \"café\" (4 chars) is a contiguous run
-from the start boundary -> 24*4 + 8 = 104.
+from the start boundary -> 26*4 + 10 = 114.
 
 \"restaurant café\" \"café$\": suffix \"café\" (4 chars, multibyte term
--> UTF-8 suffix matcher).  The char before it is a space (NonWord), so
-the run opens at a word boundary -> 24*4 + 8 = 104."
-  (should (equal (fzf-native-score "café.txt"        "^café") '(104)))
-  (should (equal (fzf-native-score "restaurant café" "café$") '(104))))
+-> UTF-8 suffix matcher).  The char before it is whitespace, so it receives
+the same white-boundary bonus -> 26*4 + 10 = 114."
+  (should (equal (fzf-native-score "café.txt"        "^café") '(114)))
+  (should (equal (fzf-native-score "restaurant café" "café$") '(114))))
 
 (ert-deftest fzf-native-utf8-or-exact-score-test ()
   "OR (|) on UTF-8 takes the FIRST matching term's score, not the max.
@@ -423,13 +424,13 @@ Both terms are anchored so each score is a closed form, and the same
 pair reordered yields different totals — proving first-match semantics.
 
 text \"café\":
-  \"^café$ | ^caf\": term 1 equal \"café\" = 24*4 + 8 = 104. Wins first.
+  \"^café$ | ^caf\": term 1 equal \"café\" = 26*4 + 10 = 114. Wins first.
   \"^caf | ^café$\": term 1 prefix \"caf\" (3-char boundary run) =
-     24*3 + 8 = 80. Wins first, even though equal \"^café$\" = 104.
-  \"zzz | ^café$\": term 1 \"zzz\" misses; falls through to equal = 104."
-  (should (equal (fzf-native-score "café" "^café$ | ^caf") '(104)))
-  (should (equal (fzf-native-score "café" "^caf | ^café$") '(80)))
-  (should (equal (fzf-native-score "café" "zzz | ^café$")  '(104))))
+     26*3 + 10 = 88. Wins first, even though equal \"^café$\" = 114.
+  \"zzz | ^café$\": term 1 \"zzz\" misses; falls through to equal = 114."
+  (should (equal (fzf-native-score "café" "^café$ | ^caf") '(114)))
+  (should (equal (fzf-native-score "café" "^caf | ^café$") '(88)))
+  (should (equal (fzf-native-score "café" "zzz | ^café$")  '(114))))
 
 ;; Broad, relative guard only: the standalone completion benchmark remains the
 ;; source of publishable timings.  This catches catastrophic UTF-8 regressions

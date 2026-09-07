@@ -107,13 +107,13 @@
          (_result (fzf-native-score "abcdefghi" "acef" slab)))
     (should
      (equal (fzf-native-score "abcdefghi" "acef" slab)
-            '(78)))
+            '(82)))
     (should
      (equal (fzf-native-score "abc" "acef" slab)
             '(0)))
     (should
      (equal (fzf-native-score "zzzzzabc" "z" slab)
-            '(32)))
+            '(36)))
     (should
      (equal (fzf-native-score "sfsjoc" "jo" slab)
             '(36)))))
@@ -124,13 +124,13 @@
          (_result (fzf-native-score "abcdefghi" "acef" slab)))
     (should
      (equal (fzf-native-score "abcdefghi" "acef" slab)
-            '(78)))
+            '(82)))
     (should
      (equal (fzf-native-score "abc" "acef" slab)
             '(0)))
     (should
      (equal (fzf-native-score "zzzzzabc" "z" slab)
-            '(32)))
+            '(36)))
     (should
      (equal (fzf-native-score "sfsjoc" "jo" slab)
             '(36)))))
@@ -187,26 +187,26 @@
 Any uppercase query character makes matching case-sensitive."
   (should (eq fzf-native-case-mode 'smart))
   ;; Lowercase query → insensitive: matches uppercase target.
-  (should (equal (fzf-native-score "Foo" "foo") '(80)))
+  (should (equal (fzf-native-score "Foo" "foo") '(88)))
   ;; Uppercase query → sensitive: lowercase target no longer matches.
   (should (equal (fzf-native-score "foo" "Foo") '(0))))
 
 (ert-deftest fzf-native-score-case-mode-ignore-test ()
   "`fzf-native-case-mode' = ignore matches regardless of case."
   (let ((fzf-native-case-mode 'ignore))
-    (should (equal (fzf-native-score "foo" "Foo") '(80)))
-    (should (equal (fzf-native-score "Foo" "foo") '(80)))))
+    (should (equal (fzf-native-score "foo" "Foo") '(88)))
+    (should (equal (fzf-native-score "Foo" "foo") '(88)))))
 
 (ert-deftest fzf-native-score-case-mode-respect-test ()
   "`fzf-native-case-mode' = respect requires exact case."
   (let ((fzf-native-case-mode 'respect))
     (should (equal (fzf-native-score "Foo" "foo") '(0)))
-    (should (equal (fzf-native-score "foo" "foo") '(80)))))
+    (should (equal (fzf-native-score "foo" "foo") '(88)))))
 
 (ert-deftest fzf-native-score-fuzzy-default-test ()
   "Default `fzf-native-fuzzy' is t: non-contiguous query matches."
   (should (eq fzf-native-fuzzy t))
-  (should (equal (fzf-native-score "src/foo.c" "sfc") '(70))))
+  (should (equal (fzf-native-score "src/foo.c" "sfc") '(75))))
 
 (ert-deftest fzf-native-score-fuzzy-disabled-no-fuzzy-test ()
   "`fzf-native-fuzzy' = nil: non-contiguous query no longer matches."
@@ -216,22 +216,22 @@ Any uppercase query character makes matching case-sensitive."
 (ert-deftest fzf-native-score-fuzzy-disabled-substring-still-matches-test ()
   "`fzf-native-fuzzy' = nil: contiguous substring still matches."
   (let ((fzf-native-fuzzy nil))
-    (should (equal (fzf-native-score "src/foo.c" "foo") '(80)))))
+    (should (equal (fzf-native-score "src/foo.c" "foo") '(84)))))
 
 (ert-deftest fzf-native-score-fuzzy-disabled-quote-prefix-inverts-test ()
   "`fzf-native-fuzzy' = nil: ' prefix re-enables fuzzy for that term."
   (let ((fzf-native-fuzzy nil))
-    (should (equal (fzf-native-score "src/foo.c" "'sfc") '(70)))))
+    (should (equal (fzf-native-score "src/foo.c" "'sfc") '(75)))))
 
 (ert-deftest fzf-native-score-fuzzy-disabled-operators-still-work-test ()
   "`fzf-native-fuzzy' = nil: ^, !, and AND tokenization keep working."
   (let ((fzf-native-fuzzy nil))
     ;; ^ prefix anchor matches at start.
-    (should (equal (fzf-native-score "src/foo.c" "^src") '(80)))
+    (should (equal (fzf-native-score "src/foo.c" "^src") '(88)))
     ;; ! negation excludes a term and the bare term still matches.
-    (should (equal (fzf-native-score "src/foo.c" "!xyz foo") '(80)))
+    (should (equal (fzf-native-score "src/foo.c" "!xyz foo") '(84)))
     ;; Space-separated AND: both substrings must match.
-    (should (equal (fzf-native-score "src/foo.c" "src foo") '(160)))))
+    (should (equal (fzf-native-score "src/foo.c" "src foo") '(172)))))
 
 ;;
 ;; Exact-value oracle tests for the operators that the rest of the
@@ -252,11 +252,12 @@ Any uppercase query character makes matching case-sensitive."
 ;;   doubled (BonusFirstCharMultiplier).
 ;;
 ;; Two closed forms used repeatedly:
-;;   * contiguous run of M chars whose first char sits at a word boundary:
-;;       (ScoreMatch + 2*BonusBoundary) + (M-1)*(ScoreMatch + BonusBoundary)
-;;       = 32 + 24*(M-1) = 24*M + 8.
-;;   * equal match (^X$): hardcoded (ScoreMatch+BonusBoundary)*M +
-;;       (BonusFirstCharMultiplier-1)*BonusBoundary = 24*M + 8 (fzf.c:1280).
+;;   * contiguous run of M chars whose first char starts the candidate:
+;;       (ScoreMatch + 2*BonusBoundaryWhite)
+;;         + (M-1)*(ScoreMatch + BonusBoundaryWhite)
+;;       = 36 + 26*(M-1) = 26*M + 10.
+;;   * equal match (^X$): hardcoded (ScoreMatch+BonusBoundaryWhite)*M +
+;;       (BonusFirstCharMultiplier-1)*BonusBoundaryWhite = 26*M + 10.
 
 (ert-deftest fzf-native-score-suffix-operator-test ()
   "Suffix ($) exact scores; boundary vs non-boundary first char.
@@ -279,16 +280,16 @@ General form (no opening boundary): 16*M + 4*(M-1) = 16*3 + 4*2 = 56.
   (should (equal (fzf-native-score "barfoo"  "bar$") '(0))))
 
 (ert-deftest fzf-native-score-equal-operator-test ()
-  "Equal (^...$) exact scores: closed form 24*M + 8, length-exact.
+  "Equal (^...$) exact scores: closed form 26*M + 10, length-exact.
 
-equal_match returns (ScoreMatch+BonusBoundary)*M +
-\(BonusFirstCharMultiplier-1)*BonusBoundary = 24*M + 8 (fzf.c:1280).
-  M=3 \"^abc$\"  -> 24*3 + 8 = 80
-  M=4 \"^abcd$\" -> 24*4 + 8 = 104
+equal_match returns (ScoreMatch+BonusBoundaryWhite)*M +
+\(BonusFirstCharMultiplier-1)*BonusBoundaryWhite = 26*M + 10.
+  M=3 \"^abc$\"  -> 26*3 + 10 = 88
+  M=4 \"^abcd$\" -> 26*4 + 10 = 114
 The candidate length must equal the pattern length exactly, so a
 shorter pattern against a longer candidate scores 0."
-  (should (equal (fzf-native-score "abc"  "^abc$")  '(80)))
-  (should (equal (fzf-native-score "abcd" "^abcd$") '(104)))
+  (should (equal (fzf-native-score "abc"  "^abc$")  '(88)))
+  (should (equal (fzf-native-score "abcd" "^abcd$") '(114)))
   ;; Length mismatch -> no equal match.
   (should (equal (fzf-native-score "foobar" "^foo$")    '(0)))
   (should (equal (fzf-native-score "abc"    "^abcd$")  '(0))))
@@ -302,26 +303,26 @@ the same two terms reordered give different totals.
 
 text \"abcdef\":
   \"^abc | ^abcdef$\": term 1 is prefix \"abc\" -> contiguous run of 3 at
-     the start boundary = 24*3 + 8 = 80.  Matches first, so total 80
-     even though equal \"^abcdef$\" (24*6+8=152) would score higher.
-  \"^abcdef$ | ^abc\": term 1 is equal \"abcdef\" = 24*6 + 8 = 152.
-     Matches first -> total 152.
+     the start boundary = 26*3 + 10 = 88.  Matches first, so total 88
+     even though equal \"^abcdef$\" (26*6+10=166) would score higher.
+  \"^abcdef$ | ^abc\": term 1 is equal \"abcdef\" = 26*6 + 10 = 166.
+     Matches first -> total 166.
   \"zzz | ^abc\": term 1 \"zzz\" does not match; falls through to prefix
-     \"abc\" = 80.
+     \"abc\" = 88.
   \"zzz | qqq\": neither term matches -> 0."
-  (should (equal (fzf-native-score "abcdef" "^abc | ^abcdef$") '(80)))
-  (should (equal (fzf-native-score "abcdef" "^abcdef$ | ^abc") '(152)))
-  (should (equal (fzf-native-score "abcdef" "zzz | ^abc")      '(80)))
+  (should (equal (fzf-native-score "abcdef" "^abc | ^abcdef$") '(88)))
+  (should (equal (fzf-native-score "abcdef" "^abcdef$ | ^abc") '(166)))
+  (should (equal (fzf-native-score "abcdef" "zzz | ^abc")      '(88)))
   (should (equal (fzf-native-score "abcdef" "zzz | qqq")       '(0))))
 
 (ert-deftest fzf-native-score-and-sum-of-operators-test ()
   "AND (space) sums the per-term-set scores; combine new operators.
 
 text \"foo.bar\", query \"^foo bar$\" = two term-sets ANDed:
-  prefix \"foo\" : contiguous run of 3 at start boundary = 24*3 + 8 = 80.
+  prefix \"foo\" : starts the candidate, so its score is 26*3 + 10 = 88.
   suffix \"bar\" : opens after '.' (boundary)            = 24*3 + 8 = 80.
-Sum = 160."
-  (should (equal (fzf-native-score "foo.bar" "^foo bar$") '(160)))
+Sum = 168."
+  (should (equal (fzf-native-score "foo.bar" "^foo bar$") '(168)))
   ;; If either ANDed term fails, the whole pattern scores 0.
   (should (equal (fzf-native-score "foo.bar" "^foo zzz$") '(0))))
 
@@ -2122,7 +2123,7 @@ needed.  No `async-stop' here on purpose — we want the finalizer path."
     (garbage-collect))
   ;; If we got here without aborting Emacs, the finalizer survived
   ;; the race for this run.  Confirm the module is still usable.
-  (should (equal (fzf-native-score "abcdefghi" "acef") '(78))))
+  (should (equal (fzf-native-score "abcdefghi" "acef") '(82))))
 
 (ert-deftest fzf-native-async-stop-returns-fast-test ()
   "`fzf-native-async-stop' returns quickly on Emacs's main thread.
