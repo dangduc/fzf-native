@@ -15,6 +15,7 @@ FZF_NATIVE_FUZZ_SESSION_CASES ?= 100
 FUZZ_MAX_LEN ?= 4096
 FUZZ_VERBOSITY ?= 0
 FUZZ_RSS_LIMIT_MB ?= 2048
+FUZZ_ASAN_OPTIONS ?= quarantine_size_mb=64:malloc_context_size=5
 FUZZ_SEED_DIR ?= fuzz/corpus
 FUZZ_DICTIONARY ?= fuzz/fzf-native.dict
 FUZZ_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-corpus
@@ -24,6 +25,8 @@ FUZZ_BINARY := $(BUILD_DIR)/fzf-native-fuzz
 FUZZ_REPLAY_BINARY := $(BUILD_DIR)/fzf-native-fuzz-replay
 FUZZ_SESSION_SECONDS ?= $(FUZZ_SECONDS)
 FUZZ_SESSION_READER_SECONDS ?= $(FUZZ_SESSION_SECONDS)
+FUZZ_SESSION_READER_EPOCH_SECONDS ?= 1800
+FUZZ_SESSION_READER_EPOCHS ?= 0
 FUZZ_SESSION_MAX_LEN ?= 8192
 FUZZ_SESSION_SEED_DIR ?= fuzz/session-corpus
 FUZZ_SESSION_READER_SEED_DIR ?= $(FUZZ_SESSION_SEED_DIR)
@@ -33,6 +36,7 @@ FUZZ_SESSION_MERGED_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-session-corpus-merged
 FUZZ_SESSION_READER_MERGED_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-session-reader-corpus-merged
 FUZZ_SESSION_ARTIFACT_DIR ?= $(BUILD_DIR)/fuzz-session-artifacts
 FUZZ_SESSION_READER_ARTIFACT_DIR ?= $(FUZZ_SESSION_ARTIFACT_DIR)/reader
+FUZZ_SESSION_READER_LOCK_DIR ?= $(BUILD_DIR)/fuzz-session-reader-continuous.lock
 FUZZ_SESSION_BINARY := $(BUILD_DIR)/fzf-native-session-fuzz
 FUZZ_SESSION_READER_BINARY := $(BUILD_DIR)/fzf-native-session-reader-fuzz
 FUZZ_SESSION_REPLAY_BINARY := $(BUILD_DIR)/fzf-native-session-fuzz-replay
@@ -199,6 +203,7 @@ fuzz-session-reader: fuzz-session-reader-build
 	mkdir -p $(FUZZ_SESSION_READER_CORPUS_DIR) \
 		$(FUZZ_SESSION_READER_ARTIFACT_DIR)
 	cp $(FUZZ_SESSION_READER_SEED_DIR)/* $(FUZZ_SESSION_READER_CORPUS_DIR)/
+	ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
 	$(FUZZ_SESSION_READER_BINARY) $(FUZZ_SESSION_READER_CORPUS_DIR) \
 		-max_len=$(FUZZ_SESSION_MAX_LEN) -dict=$(FUZZ_DICTIONARY) \
 		-verbosity=$(FUZZ_VERBOSITY) \
@@ -236,13 +241,58 @@ fuzz-session-reader-merge: fuzz-session-reader-build
 	rm -rf $(FUZZ_SESSION_READER_MERGED_CORPUS_DIR)
 	mkdir -p $(FUZZ_SESSION_READER_MERGED_CORPUS_DIR) \
 		$(FUZZ_SESSION_READER_CORPUS_DIR)
+	ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
 	$(FUZZ_SESSION_READER_BINARY) -merge=1 \
 		$(FUZZ_SESSION_READER_MERGED_CORPUS_DIR) \
 		$(FUZZ_SESSION_READER_SEED_DIR) $(FUZZ_SESSION_READER_CORPUS_DIR) \
+		-max_len=$(FUZZ_SESSION_MAX_LEN) \
 		-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) -verbosity=$(FUZZ_VERBOSITY)
 	rm -rf $(FUZZ_SESSION_READER_CORPUS_DIR)
 	mv $(FUZZ_SESSION_READER_MERGED_CORPUS_DIR) \
 		$(FUZZ_SESSION_READER_CORPUS_DIR)
+
+# A fresh process starts each reader epoch.  This releases libFuzzer and ASan
+# allocator state while the coverage corpus stays available for the next epoch.
+# Zero FUZZ_SESSION_READER_EPOCHS runs until a signal or a failure stops it.
+.PHONY: fuzz-session-reader-continuous
+fuzz-session-reader-continuous: fuzz-session-reader-build
+	mkdir -p $(FUZZ_SESSION_READER_CORPUS_DIR) \
+		$(FUZZ_SESSION_READER_ARTIFACT_DIR)
+	@if ! mkdir $(FUZZ_SESSION_READER_LOCK_DIR) 2>/dev/null; then \
+		echo "fzf-native: another reader campaign holds" \
+			"$(FUZZ_SESSION_READER_LOCK_DIR)" >&2; \
+		exit 2; \
+	fi; \
+	trap 'status=$$?; rmdir $(FUZZ_SESSION_READER_LOCK_DIR); exit $$status' EXIT; \
+	trap 'exit 130' HUP INT TERM; \
+	cp $(FUZZ_SESSION_READER_SEED_DIR)/* $(FUZZ_SESSION_READER_CORPUS_DIR)/; \
+	epoch=0; set -e; \
+	while test $(FUZZ_SESSION_READER_EPOCHS) -eq 0 || \
+		test $$epoch -lt $(FUZZ_SESSION_READER_EPOCHS); do \
+		ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
+		$(FUZZ_SESSION_READER_BINARY) $(FUZZ_SESSION_READER_CORPUS_DIR) \
+			-max_len=$(FUZZ_SESSION_MAX_LEN) -dict=$(FUZZ_DICTIONARY) \
+			-verbosity=$(FUZZ_VERBOSITY) \
+			-artifact_prefix=$(FUZZ_SESSION_READER_ARTIFACT_DIR)/ \
+			-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) \
+			-max_total_time=$(FUZZ_SESSION_READER_EPOCH_SECONDS) \
+			-print_final_stats=1; \
+		rm -rf $(FUZZ_SESSION_READER_MERGED_CORPUS_DIR); \
+		mkdir -p $(FUZZ_SESSION_READER_MERGED_CORPUS_DIR) \
+			$(FUZZ_SESSION_READER_CORPUS_DIR); \
+		ASAN_OPTIONS=$(FUZZ_ASAN_OPTIONS) \
+		$(FUZZ_SESSION_READER_BINARY) -merge=1 \
+			$(FUZZ_SESSION_READER_MERGED_CORPUS_DIR) \
+			$(FUZZ_SESSION_READER_SEED_DIR) \
+			$(FUZZ_SESSION_READER_CORPUS_DIR) \
+			-max_len=$(FUZZ_SESSION_MAX_LEN) \
+			-rss_limit_mb=$(FUZZ_RSS_LIMIT_MB) \
+			-verbosity=$(FUZZ_VERBOSITY); \
+		rm -rf $(FUZZ_SESSION_READER_CORPUS_DIR); \
+		mv $(FUZZ_SESSION_READER_MERGED_CORPUS_DIR) \
+			$(FUZZ_SESSION_READER_CORPUS_DIR); \
+		epoch=$$((epoch + 1)); \
+	done
 
 .PHONY: fuzz-session-replay-build fuzz-session-state-replay-build \
 	fuzz-session-reader-replay-build

@@ -108,6 +108,31 @@ make fuzz-session-replay
 make fuzz-session-tsan
 #+end_src
 
+For a three-hour reader campaign, run six bounded process epochs:
+
+#+begin_src sh
+make FUZZ_SESSION_READER_EPOCHS=6 fuzz-session-reader-continuous
+#+end_src
+
+Each epoch runs for 30 minutes by default. After a clean epoch, a new process
+starts and a coverage merge keeps the useful inputs. The restart releases
+libFuzzer and sanitizer allocator state.
+
+Set =FUZZ_SESSION_READER_EPOCH_SECONDS=SECONDS= to change the epoch duration.
+Set =FUZZ_SESSION_READER_EPOCHS=0= to run until a signal or a failure stops the
+campaign.
+
+Do not classify a libFuzzer RSS-guard artifact as a product failure. First,
+replay the artifact without libFuzzer:
+
+#+begin_src sh
+make fuzz-session-reader-replay-build
+build/fzf-native-session-reader-fuzz-replay /path/to/artifact
+#+end_src
+
+If target memory increases during replay, classify the artifact as a product
+failure.
+
 The end-to-end session check loads the native module in Emacs.
 It compares completed session rounds with fresh fzf results.
 It keeps one native handle for broad, narrow, repeated, and Unicode queries.
