@@ -420,8 +420,10 @@ static uint64_t session_fuzz_submit(FuzzSession *fuzz, FuzzInput *input) {
 
   fzf_case_types case_mode = (fzf_case_types)(settings % 3);
   bool fuzzy = (settings & 4) != 0;
+  bool normalize = (scheme_byte & 4) != 0;
+  bool forward = (scheme_byte & 8) == 0;
   fzf_score_scheme_t score_scheme =
-      (fzf_score_scheme_t)(scheme_byte % 3);
+      (fzf_score_scheme_t)((scheme_byte & 3) % 3);
   static const size_t filter_only_lengths[] = {0, 1, 3, 8};
   size_t fo_length = filter_only_lengths[(settings >> 3) & 3];
   bool fo_logic_and = (settings & 32) != 0;
@@ -438,8 +440,8 @@ static uint64_t session_fuzz_submit(FuzzSession *fuzz, FuzzInput *input) {
   }
 
   uint64_t request_id = async_submit_request_resolved_for_scheme(
-      fuzz->session, query, query_len, limit, case_mode, fuzzy, score_scheme,
-      fo_length, fo_logic_and);
+      fuzz->session, query, query_len, limit, case_mode, fuzzy, normalize,
+      forward, score_scheme, fo_length, fo_logic_and);
   if (request_id) fuzz->submitted = true;
   return request_id;
 }
@@ -527,7 +529,8 @@ static void session_fuzz_check_invariants(FuzzSession *fuzz) {
       session_fuzz_fail(fuzz, "batch query LRU links disagree");
     if (batch_cache_find_query_locked_for_scheme(
             batch_cache, query->query, query->case_mode,
-            query->fuzzy, query->score_scheme, query->hash) != query)
+            query->fuzzy, query->normalize, query->forward,
+            query->score_scheme, query->hash) != query)
       session_fuzz_fail(fuzz, "batch query hash lost an LRU record");
     size_t owner_entry_count = 0;
     BatchCacheEntry *owner_previous = NULL;
@@ -599,11 +602,13 @@ static void session_fuzz_check_invariants(FuzzSession *fuzz) {
   char *copied_filter = NULL, *copied_error = NULL;
   fzf_case_types copied_case_mode = CaseSmart;
   fzf_score_scheme_t copied_scheme = FZF_SCORE_SCHEME_DEFAULT;
-  bool copied_fuzzy = true, copied_filter_only = false;
+  bool copied_fuzzy = true, copied_normalize = false, copied_forward = true;
+  bool copied_filter_only = false;
   bool copied_allocation_failed = false;
   ScoredStr *copied = async_copy_public_result_with_scheme(
       s, true, &copied_count, &copied_result, &copied_filter, &copied_limit,
-      &copied_case_mode, &copied_fuzzy, &copied_scheme, &copied_filter_only,
+      &copied_case_mode, &copied_fuzzy, &copied_normalize, &copied_forward,
+      &copied_scheme, &copied_filter_only,
       &copied_generation, &copied_completed, &copied_total,
       &copied_error_id, &copied_error, &copied_filtered,
       &copied_source_total, &copied_allocation_failed);
@@ -623,6 +628,8 @@ static void session_fuzz_check_invariants(FuzzSession *fuzz) {
       session_fuzz_fail(fuzz, "an owned result copy has an invalid index");
   (void)copied_case_mode;
   (void)copied_fuzzy;
+  (void)copied_normalize;
+  (void)copied_forward;
   (void)copied_filter_only;
   (void)copied_generation;
   (void)copied_error_id;
@@ -687,6 +694,8 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
   size_t limit = s->score_result_limit;
   fzf_case_types case_mode = s->score_result_case_mode;
   bool fuzzy = s->score_result_fuzzy;
+  bool normalize = s->score_result_normalize;
+  bool forward = s->score_result_forward;
   fzf_score_scheme_t score_scheme = s->score_result_scheme;
   bool filter_only = s->score_result_filter_only;
   char *query = s->score_result_filter ? strdup(s->score_result_filter) : NULL;
@@ -713,8 +722,9 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
   }
   char *pattern_query = *query ? strdup(query) : NULL;
   fzf_pattern_t *pattern = pattern_query
-                               ? fzf_parse_pattern(
-                                     case_mode, false, pattern_query, fuzzy)
+                               ? fzf_parse_pattern_with_direction(
+                                     case_mode, normalize, pattern_query,
+                                     fuzzy, forward)
                                : NULL;
   bool sortable = pattern && pattern->has_positive_term;
   fzf_slab_t *slab = fzf_make_default_slab();
