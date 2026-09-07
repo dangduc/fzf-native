@@ -1025,23 +1025,12 @@ func TestNativePeerReportsCurrentCapabilityBoundary(t *testing.T) {
 	if err != nil || status != statusOK || !result.matched {
 		t.Fatalf("exact-boundary status=%d result=%+v error=%v", status, result, err)
 	}
-
-	unsupported := []struct {
-		name      string
-		algorithm algorithmID
-		scheme    schemeID
-		flags     byte
-	}{
-		{"backward-search", algorithmV2, schemeDefault, 0},
-	}
-	for _, testCase := range unsupported {
-		t.Run(testCase.name, func(t *testing.T) {
-			request := matchRequestPayload(testCase.algorithm, testCase.scheme, testCase.flags, []byte("a"), []byte("a"))
-			_, status, err := decodeMatchResponse(peer.exchange(t, request))
-			if status != statusUnsupported || err == nil {
-				t.Fatalf("got status %d and error %v; want unsupported status", status, err)
-			}
-		})
+	backward := matchRequestPayload(
+		algorithmExact, schemeDefault, flagCaseSensitive,
+		[]byte("a"), []byte("a/a"))
+	result, status, err = decodeMatchResponse(peer.exchange(t, backward))
+	if err != nil || status != statusOK || !result.matched || result.start != 2 {
+		t.Fatalf("backward status=%d result=%+v error=%v", status, result, err)
 	}
 
 	request := matchRequestPayload(algorithmV2, schemePath, flagForward,
@@ -1133,7 +1122,10 @@ func rawMatrixRequest(seed, serial uint64) matchRequest {
 	request := matchRequest{
 		algorithm: algorithms[state.next()%uint64(len(algorithms))],
 		scheme:    schemeDefault,
-		flags:     flagForward,
+		flags:     0,
+	}
+	if state.next()%2 != 0 {
+		request.flags |= flagForward
 	}
 	if state.next()%2 != 0 {
 		request.flags |= flagCaseSensitive
