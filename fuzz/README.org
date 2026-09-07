@@ -158,9 +158,10 @@ The only accepted difference is malformed UTF-8 decoder behavior.
 Go and utf8proc replace malformed byte sequences differently.
 The exception applies only to membership and position differences for malformed input.
 
-Raw algorithm normalization uses the pinned fzf Latin-fold table.
-The Emacs API does not expose normalization yet.
-Scoring, ranking, backward search, and that API gap are parity debt.
+Raw algorithms use the pinned fzf Latin-fold table and support both search
+directions.
+The Emacs API does not expose normalization or backward search yet.
+Scoring, ranking, and those API gaps are parity debt.
 The exception file names these differences, but it does not make them pass.
 Crashes, hangs, races, unknown candidates, and valid UTF-8 differences always fail.
 

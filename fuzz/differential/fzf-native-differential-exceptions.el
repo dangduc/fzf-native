@@ -170,10 +170,10 @@ arbitrary valid-candidate difference to the decoder policy."
      :remove-when "Normalized-query membership matches the pinned fzf revision."
      :predicate ,#'fzf-native-differential--exception-normalization-p)
     (:name backward-search-capability
-     :reason "fzf-native does not expose fzf's backward matcher direction."
+     :reason "The public Emacs API does not expose fzf's backward matcher direction."
      :disposition parity-debt
      :upstream-revision ,fzf-native-differential-upstream-revision
-     :owner "fzf-native matcher API"
+     :owner "fzf-native Emacs binding"
      :remove-when "Backward membership, positions, and ranking match pinned fzf."
      :predicate ,#'fzf-native-differential--exception-backward-p)
     (:name malformed-utf8-decoder
