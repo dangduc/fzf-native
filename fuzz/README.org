@@ -160,7 +160,7 @@ The exception applies only to membership and position differences for malformed 
 
 Raw algorithm normalization uses the pinned fzf Latin-fold table.
 The Emacs API does not expose normalization yet.
-Scoring, ranking, backward search, boundary syntax, and that API gap are parity debt.
+Scoring, ranking, backward search, and that API gap are parity debt.
 The exception file names these differences, but it does not make them pass.
 Crashes, hangs, races, unknown candidates, and valid UTF-8 differences always fail.
 

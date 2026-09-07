@@ -33,14 +33,6 @@
    (fzf-native-differential-query-sets
     (fzf-native-differential-case-query case))))
 
-(defun fzf-native-differential--exception-exact-boundary-p
-    (case facet _context)
-  "Return non-nil for current fzf boundary syntax in CASE and FACET.
-
-CONTEXT is not applicable to this classifier."
-  (and (eq facet 'membership)
-       (fzf-native-differential--case-has-kind-p case 'boundary-exact)))
-
 (defun fzf-native-differential--exception-ranking-p
     (case facet context)
   "Return non-nil for CASE and FACET after CONTEXT confirms membership."
@@ -163,14 +155,7 @@ arbitrary valid-candidate difference to the decoder policy."
        (fzf-native-differential--malformed-difference-p case context)))
 
 (defconst fzf-native-differential-exceptions
-  `((:name exact-boundary-syntax
-     :reason "Current fzf implements the trailing-quote boundary term."
-     :disposition parity-debt
-     :upstream-revision ,fzf-native-differential-upstream-revision
-     :owner "fzf-native query parser"
-     :remove-when "Boundary-term membership matches the pinned fzf revision."
-     :predicate ,#'fzf-native-differential--exception-exact-boundary-p)
-    (:name score-ranking-revision
+  `((:name score-ranking-revision
      :reason "Current fzf and fzf-native use different score and rank rules."
      :disposition parity-debt
      :upstream-revision ,fzf-native-differential-upstream-revision

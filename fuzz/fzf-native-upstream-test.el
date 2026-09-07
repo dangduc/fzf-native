@@ -423,8 +423,14 @@ Each specification has the form (KEY VALUES)."
           (cl-loop for serial below 1000
                    for case = (fzf-native-upstream--generated-case
                                seed serial 'parity)
-                   when (fzf-native-differential--case-has-kind-p
-                         case 'boundary-exact)
+                   when (and
+                         (fzf-native-differential--case-has-kind-p
+                          case 'boundary-exact)
+                         (fzf-native-differential-query-forward
+                          (fzf-native-differential-case-query case))
+                         (not
+                          (fzf-native-differential-query-normalize
+                           (fzf-native-differential-case-query case))))
                    return case))
          (ranking
           (cl-loop for serial below 1000
@@ -452,7 +458,7 @@ Each specification has the form (KEY VALUES)."
           (fzf-native-differential-candidate-id
            (or malformed-candidate
                (car (fzf-native-differential-case-candidates malformed)))))
-         boundary-exception ranking-exception malformed-exception)
+         ranking-exception malformed-exception)
     (setf (fzf-native-differential-case-dimensions forged)
           (plist-put
            (copy-sequence
@@ -462,12 +468,8 @@ Each specification has the form (KEY VALUES)."
      (fzf-native-differential-classify common 'membership))
     (should-not
      (fzf-native-differential-classify forged 'membership))
-    (setq boundary-exception
-          (fzf-native-differential-classify boundary 'membership))
-    (should (eq (plist-get boundary-exception :name)
-                'exact-boundary-syntax))
-    (should (eq (plist-get boundary-exception :disposition)
-                'parity-debt))
+    (should-not
+     (fzf-native-differential-classify boundary 'membership))
     (should-not
      (fzf-native-differential-classify
       ranking 'ranking '(:membership-equal nil)))
@@ -561,6 +563,40 @@ Each specification has the form (KEY VALUES)."
     (should-not
      (fzf-native-differential-classify
       query-case 'membership '(:differing-identities (99))))))
+
+(ert-deftest fzf-native-fuzz-upstream-exact-boundary-membership ()
+  "Compare parsed trailing-quote boundary terms with the pinned fzf CLI."
+  (let* ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf")))
+         (seed (fzf-native-upstream--env-integer
+                "FZF_NATIVE_FUZZ_SEED" 12648430))
+         (checked 0))
+    (skip-unless fzf)
+    (fzf-native-upstream--verify-reference fzf)
+    (cl-loop
+     for serial below 2000
+     until (= checked 32)
+     for case = (fzf-native-upstream--generated-case seed serial 'parity)
+     for query = (fzf-native-differential-case-query case)
+     when (and
+           (eq (fzf-native-differential-case-comparison case) 'membership)
+           (plist-get (fzf-native-differential-case-dimensions case)
+                      :valid-utf8)
+           (fzf-native-differential-query-forward query)
+           (not (fzf-native-differential-query-normalize query))
+           (fzf-native-differential--case-has-kind-p case 'boundary-exact))
+     do
+     (let ((native
+            (fzf-native-upstream--membership
+             (fzf-native-upstream--identities
+              case (fzf-native-upstream--native case))))
+           (upstream
+            (fzf-native-upstream--membership
+             (fzf-native-upstream--identities
+              case (fzf-native-upstream--fzf fzf case) t))))
+       (ert-info ((fzf-native-differential-case-description case))
+         (should (equal native upstream)))
+       (setq checked (1+ checked))))
+    (should (= checked 32))))
 
 (defconst fzf-native-upstream--session-candidate-bodies
   '("alpha"
