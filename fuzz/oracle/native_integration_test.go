@@ -465,6 +465,60 @@ func TestBuiltOracleProcessIsPersistent(t *testing.T) {
 	}
 }
 
+func TestNativePeerScoringSchemesMatchRawOracle(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	oracleBinary := os.Getenv("FZF_RAW_ORACLE_BINARY")
+	if oracleBinary == "" {
+		t.Fatal("FZF_RAW_ORACLE_BINARY is required with FZF_NATIVE_ALGO_DRIVER")
+	}
+
+	schemes := []struct {
+		name   string
+		id     schemeID
+		scores []int64
+	}{
+		{"default", schemeDefault, []int64{84, 84, 88}},
+		{"path", schemePath, []int64{84, 80, 80}},
+		{"history", schemeHistory, []int64{80, 80, 80}},
+	}
+	candidates := [][]byte{[]byte("src/fzf"), []byte(":fzf"), []byte(" fzf")}
+	for _, scheme := range schemes {
+		t.Run(scheme.name, func(t *testing.T) {
+			peer := startNativePeerWithArgs(t, driver, "--scheme="+scheme.name)
+			defer peer.close(t)
+			oraclePeer := startNativePeerWithArgs(t, oracleBinary,
+				"--scheme="+scheme.name)
+			defer oraclePeer.close(t)
+			for index, candidate := range candidates {
+				request := matchRequest{
+					algorithm: algorithmV2,
+					scheme:    scheme.id,
+					flags:     flagCaseSensitive | flagForward,
+					pattern:   []byte("fzf"),
+					candidate: candidate,
+				}
+				payload := matchRequestPayload(request.algorithm, request.scheme,
+					request.flags, request.pattern, request.candidate)
+				upstream, _, err := decodeMatchResponse(oraclePeer.exchange(t, payload))
+				if err != nil {
+					t.Fatal(err)
+				}
+				native, _, err := decodeMatchResponse(peer.exchange(t, payload))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if upstream.score != scheme.scores[index] || !reflect.DeepEqual(native, upstream) {
+					t.Fatalf("candidate %q: native=%+v upstream=%+v want-score=%d",
+						candidate, native, upstream, scheme.scores[index])
+				}
+			}
+		})
+	}
+}
+
 func TestNativePeerKnownNormalizationGap(t *testing.T) {
 	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
 	if driver == "" {
@@ -676,7 +730,6 @@ func TestNativePeerReportsCurrentCapabilityBoundary(t *testing.T) {
 		flags     byte
 	}{
 		{"exact-boundary", algorithmExactBoundary, schemeDefault, flagForward},
-		{"path-scheme", algorithmV2, schemePath, flagForward},
 		{"backward-search", algorithmV2, schemeDefault, 0},
 	}
 	for _, testCase := range unsupported {
@@ -687,6 +740,14 @@ func TestNativePeerReportsCurrentCapabilityBoundary(t *testing.T) {
 				t.Fatalf("got status %d and error %v; want unsupported status", status, err)
 			}
 		})
+	}
+
+	request := matchRequestPayload(algorithmV2, schemePath, flagForward,
+		[]byte("a"), []byte("a"))
+	_, status, err := decodeMatchResponse(peer.exchange(t, request))
+	if status != statusBadRequest || err == nil {
+		t.Fatalf("scheme mismatch got status %d and error %v; want bad request",
+			status, err)
 	}
 }
 
@@ -933,7 +994,7 @@ func TestFullResultAuditUsesCompactBoundedExamples(t *testing.T) {
 	}
 }
 
-func TestNativePeerDeterministicDefaultResultMatrix(t *testing.T) {
+func TestNativePeerDeterministicResultMatrices(t *testing.T) {
 	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
 	if driver == "" {
 		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
@@ -945,45 +1006,57 @@ func TestNativePeerDeterministicDefaultResultMatrix(t *testing.T) {
 	seed := rawMatrixEnv(t, "FZF_RAW_MATRIX_SEED", 20260906)
 	start := rawMatrixEnv(t, "FZF_RAW_MATRIX_START", 0)
 	caseCount := rawMatrixEnv(t, "FZF_RAW_MATRIX_CASES", 20000)
-	nativePeer := startNativePeer(t, driver)
-	defer nativePeer.close(t)
-	oraclePeer := startNativePeerWithArgs(t, oracleBinary, "--scheme=default")
-	defer oraclePeer.close(t)
-	oracleInfo, err := decodeInfoResponse(
-		oraclePeer.exchange(t, []byte{protocolVersion, opcodeInfo}))
-	if err != nil {
-		t.Fatal(err)
+	for _, scheme := range []struct {
+		name string
+		id   schemeID
+	}{
+		{"default", schemeDefault},
+		{"path", schemePath},
+		{"history", schemeHistory},
+	} {
+		t.Run(scheme.name, func(t *testing.T) {
+			nativePeer := startNativePeerWithArgs(t, driver, "--scheme="+scheme.name)
+			defer nativePeer.close(t)
+			oraclePeer := startNativePeerWithArgs(t, oracleBinary, "--scheme="+scheme.name)
+			defer oraclePeer.close(t)
+			oracleInfo, err := decodeInfoResponse(
+				oraclePeer.exchange(t, []byte{protocolVersion, opcodeInfo}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if oracleInfo.revision != pinnedUpstreamCommit || oracleInfo.runtime != runtime.Version() {
+				t.Fatalf("oracle INFO got revision=%q runtime=%q", oracleInfo.revision, oracleInfo.runtime)
+			}
+			var audit fullResultAudit
+			for iteration := uint64(0); iteration < caseCount; iteration++ {
+				serial := start + iteration
+				if serial < start {
+					t.Fatal("raw matrix serial overflow")
+				}
+				request := rawMatrixRequest(seed, serial)
+				request.scheme = scheme.id
+				payload := matchRequestPayload(request.algorithm, request.scheme, request.flags,
+					request.pattern, request.candidate)
+				upstream, _, err := decodeMatchResponse(oraclePeer.exchange(t, payload))
+				if err != nil {
+					t.Fatalf("seed=%d serial=%d upstream error: %v", seed, serial, err)
+				}
+				native, _, err := decodeMatchResponse(nativePeer.exchange(t, payload))
+				if err != nil {
+					t.Fatalf("seed=%d serial=%d native error: %v", seed, serial, err)
+				}
+				if !matchResponsesEquivalent(native, upstream) &&
+					!(request.algorithm == algorithmSuffix && len(request.pattern) == 0) {
+					audit.add(seed, serial, request, upstream, native)
+				}
+			}
+			if audit.differenceCount != 0 {
+				t.Fatalf("%s result debt in %d of %d cases; first %d differences:\n%s\nreplay one case with FZF_RAW_MATRIX_SEED=%d FZF_RAW_MATRIX_START=SERIAL FZF_RAW_MATRIX_CASES=1",
+					scheme.name, audit.differenceCount, caseCount, len(audit.examples),
+					strings.Join(audit.examples, "\n"), seed)
+			}
+			t.Logf("%s result matrix seed=%d start=%d cases=%d",
+				scheme.name, seed, start, caseCount)
+		})
 	}
-	if oracleInfo.revision != pinnedUpstreamCommit || oracleInfo.runtime != runtime.Version() {
-		t.Fatalf("oracle INFO got revision=%q runtime=%q", oracleInfo.revision, oracleInfo.runtime)
-	}
-	var audit fullResultAudit
-	for iteration := uint64(0); iteration < caseCount; iteration++ {
-		serial := start + iteration
-		if serial < start {
-			t.Fatal("raw matrix serial overflow")
-		}
-		request := rawMatrixRequest(seed, serial)
-		payload := matchRequestPayload(request.algorithm, request.scheme, request.flags,
-			request.pattern, request.candidate)
-		upstream, _, err := decodeMatchResponse(oraclePeer.exchange(t, payload))
-		if err != nil {
-			t.Fatalf("seed=%d serial=%d upstream error: %v", seed, serial, err)
-		}
-		native, _, err := decodeMatchResponse(nativePeer.exchange(t, payload))
-		if err != nil {
-			t.Fatalf("seed=%d serial=%d native error: %v", seed, serial, err)
-		}
-		if !matchResponsesEquivalent(native, upstream) &&
-			!(request.algorithm == algorithmSuffix && len(request.pattern) == 0) {
-			audit.add(seed, serial, request, upstream, native)
-		}
-	}
-	if audit.differenceCount != 0 {
-		t.Fatalf("default-result debt in %d of %d cases; first %d differences:\n%s\nreplay one case with FZF_RAW_MATRIX_SEED=%d FZF_RAW_MATRIX_START=SERIAL FZF_RAW_MATRIX_CASES=1",
-			audit.differenceCount, caseCount, len(audit.examples),
-			strings.Join(audit.examples, "\n"), seed)
-	}
-	t.Logf("default result matrix seed=%d start=%d cases=%d",
-		seed, start, caseCount)
 }

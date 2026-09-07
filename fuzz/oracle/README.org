@@ -189,12 +189,15 @@ The checks compare two separate oracle builds for identical bytes.
 Set =FZF_NATIVE_ALGO_DRIVER= to the path of the native peer for differential checks.
 Also set =FZF_RAW_ORACLE_BINARY= and =FZF_NATIVE_EXPECTED_REVISION=.
 The matrix sends each request to both persistent executables.
-They compare strict Unicode results and a matrix of membership results.
-Named checks enforce current default-scheme score and alignment parity.
+The native driver also accepts =--scheme=default=, =--scheme=path=, or
+=--scheme=history= and keeps that choice for its process lifetime.
+The checks compare strict Unicode results and full result matrices for all
+three scoring schemes.
+Named checks enforce scheme score and alignment parity.
 They also record normalization and malformed UTF-8 gaps.
 Delete each gap check after fzf-native gains parity for that case.
 
-The default raw result matrix runs 20,000 deterministic cases.
+Each raw result matrix runs 20,000 deterministic cases.
 It includes ASCII, valid Unicode, case folds, and V2 fallback boundaries.
 It rejects score, range, and semantic position differences.
 It temporarily excludes empty suffix patterns because they have a separate
