@@ -24,6 +24,7 @@ on:
       - "fzf-native-module.def"
       - "fzf-native-module.map"
       - "CMakeLists.txt"
+      - "bin/**"
       - ".github/workflows/cmake-binaries.yaml"
   push:
     branches: ["main"]
@@ -35,6 +36,7 @@ on:
       - "fzf-native-module.def"
       - "fzf-native-module.map"
       - "CMakeLists.txt"
+      - "bin/**"
       - ".github/workflows/cmake-binaries.yaml"
 
 concurrency:
