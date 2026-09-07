@@ -201,6 +201,9 @@ fzf_result_t fzf_equal_match_utf8(bool case_sensitive, bool normalize,
 fzf_result_t fzf_fuzzy_match_v1_utf8(bool case_sensitive, bool normalize,
                                      fzf_string_t *text, fzf_string_t *pattern,
                                      fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_fuzzy_match_v1_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
 fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
                                      fzf_string_t *text, fzf_string_t *pattern,
                                      fzf_position_t *pos, fzf_slab_t *slab);
