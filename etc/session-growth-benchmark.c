@@ -218,6 +218,7 @@ static BenchMembershipStats bench_membership_stats(
   BenchMembershipStats stats = {0};
   if (!cache_lookup_membership_exact(
           &session->cache, query, CaseSmart, true,
+          false, true, FZF_SCORE_SCHEME_DEFAULT,
           &membership, &pool_generation))
     return stats;
 
@@ -282,7 +283,8 @@ static bool bench_validate_snapshot(AsyncSession *session,
   }
   pthread_mutex_unlock(&session->mu);
 
-  if (matched > 1) counting_sort_scored(reference, matched);
+  if (matched > 1)
+    counting_sort_scored(reference, matched, FZF_SCORE_SCHEME_DEFAULT);
   size_t expected_count = limit && limit < matched ? limit : matched;
   BenchSnapshot expected_snapshot = {
       .top = reference,
@@ -402,9 +404,10 @@ int main(int argc, char **argv) {
   double started = bench_now_ms();
   char *owned_query = strdup(query);
   uint64_t request_id = owned_query
-      ? async_submit_request_resolved(
+      ? async_submit_request_resolved_for_scheme(
             session, owned_query, strlen(query), limit,
-            CaseSmart, true, 0, false)
+            CaseSmart, true, false, true, FZF_SCORE_SCHEME_DEFAULT,
+            0, false)
       : 0;
   if (!request_id ||
       !bench_wait_for_result(session, request_id, initial) ||
