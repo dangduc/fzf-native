@@ -1,0 +1,294 @@
+#+title: PR 48 hand-off
+#+author: Codex
+#+date: 2026-09-06
+#+startup: overview
+
+* Purpose
+
+This document transfers [[https://github.com/dangduc/fzf-native/pull/48][PR 48]] to =@dangduc=.
+It records the current state, completed work, review evidence, known debt, and next actions.
+This document is a dated snapshot at commit =13b2365=.
+
+* Current state
+
+| Field | Value |
+|-------+-------|
+| Title | Add an upstream differential fuzz regime |
+| State | Open draft |
+| Base | =dangduc/fzf-native:main= |
+| Head | =fastducduc:codex/fzf-upstream-parity-fuzz= |
+| Reviewed code commit | =13b2365b61f5b1d4375c29d7cdae442125c76acb= |
+| Merge state | Mergeable and clean |
+| Maintainer edits | Enabled |
+| CI for reviewed code | All jobs passed |
+
+The local branch has no changes and matches the fork branch.
+The reviewed code change contains 26 files, 5,215 insertions, and 199 deletions.
+
+Five inline review threads remain open.
+Each thread has a fix and a reply.
+No requested reviewer or formal approval exists.
+
+The author has read access to =dangduc/fzf-native= and write access to the fork.
+Thus, =@dangduc= must mark the PR ready, resolve threads, and merge it.
+
+* Change summary
+
+The PR adds a differential-test system that uses junegunn/fzf as the oracle.
+The oracle uses [[https://github.com/junegunn/fzf/tree/1372d04f79bde0daa3bab4b96a068baafa808e67][fzf commit =1372d04f79bde0daa3bab4b96a068baafa808e67=]] and Go =1.27.1=.
+
+The PR adds these test lanes:
+
+- A raw C and Go algorithm lane with persistent framed peers.
+- A parsed-query lane with stable candidate identities.
+- Native libFuzzer targets with metamorphic relations.
+- Persistent-session state and reader targets.
+- An Emacs ABI lane for scalar, batch, and session calls.
+- ASan, UBSan, TSan, corpus replay, corpus merge, and scheduled CI jobs.
+
+Read [[file:README.org][fuzz/README.org]] for the complete test guide.
+Read [[file:oracle/README.org][fuzz/oracle/README.org]] for the raw protocol and oracle contract.
+Read [[https://github.com/dangduc/fzf-native/pull/46][PR 46]] for the implementation comparison.
+
+* File ownership
+
+| Path | Responsibility |
+|------+----------------|
+| =fzf.c= and =fzf-additions.c= | Production matcher behavior. |
+| =fuzz/oracle/= | The pinned Go oracle and wire protocol. |
+| =fuzz/differential/= | Structured generators and the exception policy. |
+| =fuzz/fzf-native-algo-driver.c= | The test-only native peer. |
+| =fuzz/fzf-native-session-fuzz.c= | Persistent-session libFuzzer targets. |
+| =fuzz/fzf-native-fuzz-test.el= | Deterministic public-ABI properties. |
+| =.github/workflows/fuzz.yaml= | Short PR jobs and longer weekly jobs. |
+
+Learned corpora are temporary.
+Add a permanent seed only after you identify a confirmed defect.
+Add a focused regression test with each permanent seed.
+
+* Commit map
+
+| Commit | Purpose |
+|--------+---------|
+| =f556840= | Add the upstream differential fuzz regime. |
+| =b565b1e= | Correct the CMake format job. |
+| =c614991= | Correct four defects from the code review. |
+| =13b2365= | Make the malformed-input exception fail closed. |
+
+* Code review
+
+Six independent reviewer personas completed three review rounds.
+The roles were John Ousterhout, Dan Luu, Linus Torvalds, Kyle Kingsbury, and two contrarian reviewers.
+
+Each reviewer wrote executable probes before the reviewer reported a finding.
+Actionable probes became permanent tests in this branch.
+
+The review found and corrected these defects:
+
+| Priority | Finding | Fix | Thread |
+|----------+---------+-----+--------|
+| P1 | Filter-only EqualMatch removed required edge spaces. | =c614991= | [[https://github.com/dangduc/fzf-native/pull/48#discussion_r3946625706][review thread]] |
+| P1 | One malformed decoy waived a valid membership loss. | =c614991= | [[https://github.com/dangduc/fzf-native/pull/48#discussion_r3946625948][review thread]] |
+| P2 | Go read stderr while =os/exec= wrote it. | =c614991= | [[https://github.com/dangduc/fzf-native/pull/48#discussion_r3946626344][review thread]] |
+| P2 | The reader fuzzer waited for an unreachable epoch. | =c614991= | [[https://github.com/dangduc/fzf-native/pull/48#discussion_r3946627242][review thread]] |
+| P1 | A malformed query waived a valid-candidate loss. | =13b2365= | [[https://github.com/dangduc/fzf-native/pull/48#discussion_r3946675126][review thread]] |
+
+Two malformed-input threads refer to old lines after =13b2365=.
+The replies in both threads describe the final rule.
+
+Review probes remain under =/private/tmp/pr48-review= on the author machine.
+The committed tests are the durable evidence.
+
+* Validation evidence
+
+The current head passed these local gates:
+
+- The C suite passed with ASan and UBSan.
+- The parser allocation tests passed at all 25 failure sites.
+- The scorer allocation tests passed across 36 injected failures.
+- Both session corpora passed with TSan.
+- The raw oracle passed 20,000 membership comparisons.
+- The parsed common profile passed 5,000 cases.
+- Those 5,000 cases contained 117 candidate-scoped malformed-input exceptions.
+- A separate 20,000-case audit found no valid or unknown identity waivers.
+- The long profile passed candidate lengths 999, 1000, and 1001.
+- The Emacs 30.2 suite passed 168 of 168 tests.
+- The Emacs ABI lane passed 500 generated cases and 100 interactive sessions.
+
+Short libFuzzer runs completed without a finding:
+
+| Target | Executions |
+|--------+------------|
+| Matcher | 68,540 |
+| Session state | 5,756 |
+| Session reader | 125 |
+
+GitHub Actions passed Linux, FreeBSD, Windows, macOS arm64, and macOS x86-64 jobs.
+The Emacs 30.1 and snapshot jobs passed on each configured platform.
+The format, fuzz, and Linux smoke jobs also passed.
+
+* Difference policy
+
+Only malformed UTF-8 decoder behavior is an accepted difference.
+The rule applies only to membership and position differences.
+
+Each differing identity must resolve to a candidate with malformed bytes.
+A malformed query does not waive a difference for a valid candidate.
+Valid UTF-8 differences always fail.
+
+Read [[file:differential/fzf-native-differential-exceptions.el][the exception policy]] before you change an exception.
+Do not broaden an exception to make a generated case pass.
+
+* Known parity debt
+
+This PR adds the parity test system.
+It does not give full result parity with upstream fzf.
+
+The strict full-result audit reports score, range, or position differences in 19,268 of 20,000 cases.
+Membership passes for the same raw matrix.
+
+These areas remain explicit parity debt:
+
+- Score values and ranges.
+- Position lists.
+- Result ranking.
+- Normalization.
+- Backward matching.
+- Path and history scoring schemes.
+- Boundary syntax.
+
+The strict full-result mode is red by design.
+Do not hide this debt with the malformed-input exception.
+
+If you want the expected-red parity audits, run these commands:
+
+#+begin_src sh
+make FUZZ_CC=clang FZF_SOURCE=/path/to/pinned/fzf \
+  FZF_RAW_MATRIX_FULL_RESULTS=1 fuzz-oracle-test-san
+
+make FZF_SOURCE=/path/to/pinned/fzf \
+  FZF_NATIVE_UPSTREAM_PROFILE=parity fuzz-upstream-pinned
+#+end_src
+
+* Coverage limits
+
+The end-to-end session lane compares completed rounds.
+It does not compare each partial result during producer input.
+
+The ABI lane uses deterministic ERT properties.
+It is not coverage-guided ABI fuzzing.
+
+[[file:../abi-fuzzing-plan.org][abi-fuzzing-plan.org]] does not show the completed state of PR 48.
+It does not add the planned ABI sanitizer runner, AFL++, or ABI source-coverage guidance.
+
+The raw oracle covers matcher algorithms.
+It does not cover the upstream parser, ranking system, or interactive state.
+
+* PR structure decision
+
+The current PR is much larger than the preferred 100-line review unit.
+An earlier request asked for a series of stacked PRs.
+
+The fork author cannot create stack branches in =dangduc/fzf-native=.
+GitHub native stacks work best with all stack branches in one repository.
+
+If you require a stack, create the stack branches in =dangduc/fzf-native=.
+Use each preceding branch as the base of the next PR.
+Preserve the oracle pin and exception policy in every buildable unit.
+
+If you keep PR 48 intact, request a maintainer review before you mark it ready.
+
+* Pickup procedure
+
+1. Create a local branch for the PR.
+
+   #+begin_src sh
+   gh pr checkout 48 --repo dangduc/fzf-native
+   #+end_src
+
+2. Make sure that the branch has no unexpected changes.
+
+   #+begin_src sh
+   git status --short --branch
+   #+end_src
+
+3. Make sure that the current-head jobs still pass.
+
+   #+begin_src sh
+   gh pr checks 48 --repo dangduc/fzf-native
+   #+end_src
+
+4. Read the five review threads in the review table.
+
+5. Decide whether to keep one PR or create an upstream stack.
+
+6. If you keep one PR, request review and mark the draft ready.
+
+   #+begin_src sh
+   gh pr ready 48 --repo dangduc/fzf-native
+   #+end_src
+
+7. Resolve each review thread after you accept its fix.
+
+8. Merge the PR with the repository merge method after the required review.
+
+* Minimum local gates
+
+Set a junegunn/fzf checkout to the pinned commit before you run the oracle gates.
+Use Go =1.27.1= for the raw oracle build.
+
+#+begin_src sh
+make FUZZ_CC=clang fuzz-replay
+
+make BUILD_DIR=/tmp/fzf-ctest CC=clang ctest-asan
+
+make BUILD_DIR=/tmp/fzf-tsan FUZZ_CC=clang fuzz-session-tsan
+
+make BUILD_DIR=/tmp/fzf-oracle FUZZ_CC=clang \
+  FZF_SOURCE=/path/to/pinned/fzf fuzz-oracle-test-san
+
+make FZF_SOURCE=/path/to/pinned/fzf \
+  FZF_NATIVE_UPSTREAM_CASES=5000 fuzz-upstream-pinned
+
+make fuzz-elisp
+make test
+#+end_src
+
+If Emacs reports stale bytecode, rebuild the bytecode before you interpret a failure.
+Use a fresh build directory for sanitizer and oracle runs.
+
+* Failure workflow
+
+1. Replay the exact seed and serial number.
+
+2. Reduce the input while you preserve the same failure.
+
+3. Identify a product defect or a documented implementation difference.
+
+4. If the product has a defect, correct it and add a permanent test.
+
+5. If an exception is necessary, give it an owner and a removal condition.
+
+6. Run the related sanitizer and differential gates again.
+
+* Next parity units
+
+The next work can use these independent units:
+
+1. Align raw scores, ranges, and positions.
+
+2. Align ranking and equal-score tie rules.
+
+3. Add path and history scoring schemes.
+
+4. Expose normalization, backward matching, and boundary syntax.
+
+5. Compare partial session results during producer input.
+
+6. Add coverage-guided fuzzing at the Emacs ABI boundary.
+
+* Handoff boundary
+
+The continuous native fuzz automation remains paused.
+No active fuzz campaign owns a corpus directory.
+The branch is clean, pushed, and ready for maintainer action.

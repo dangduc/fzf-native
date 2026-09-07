@@ -5,6 +5,8 @@
 These tests move fzf-native toward parity with junegunn/fzf.
 They use generated inputs, internal properties, and a pinned fzf oracle.
 
+Read [[file:upstream-parity-handoff.org][the PR 48 hand-off]] for the dated maintainer-transfer state.
+
 The tests keep crashes, hangs, data races, and unknown output as unconditional failures.
 They also fail on unclassified differences from the oracle.
 
