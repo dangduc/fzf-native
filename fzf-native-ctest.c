@@ -1739,6 +1739,39 @@ static void test_cache_exact_separates_case_and_fuzzy_modes(void) {
   cache_free(&c);
 }
 
+static void test_cache_exact_separates_score_schemes(void) {
+  Cache c;
+  cache_init(&c, 20);
+  ScoredStr default_top[1] = { make_top("default", 88) };
+  ScoredStr path_top[1] = { make_top("path", 84) };
+
+  cache_insert_for_request_with_scheme(
+      &c, "fzf", 2, CaseSmart, true, FZF_SCORE_SCHEME_DEFAULT, false,
+      default_top, 1, 1, NULL, 0);
+  cache_insert_for_request_with_scheme(
+      &c, "fzf", 2, CaseSmart, true, FZF_SCORE_SCHEME_PATH, false,
+      path_top, 1, 1, NULL, 0);
+  CHECK(c.count == 2);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0, matched_count = 0;
+  bool covered = false;
+  CHECK(cache_lookup_exact_for_request_with_scheme(
+      &c, "fzf", CaseSmart, true, FZF_SCORE_SCHEME_DEFAULT, false, 1,
+      &out, &out_count, &out_sidx, &out_gen, &matched_count, &covered));
+  CHECK(out_count == 1 && strcmp(out[0].str, "default") == 0 && covered);
+  free(out);
+
+  out = NULL;
+  CHECK(cache_lookup_exact_for_request_with_scheme(
+      &c, "fzf", CaseSmart, true, FZF_SCORE_SCHEME_PATH, false, 1,
+      &out, &out_count, &out_sidx, &out_gen, &matched_count, &covered));
+  CHECK(out_count == 1 && strcmp(out[0].str, "path") == 0 && covered);
+  free(out);
+  cache_free(&c);
+}
+
 static void test_cache_exact_requires_sufficient_result_capacity(void) {
   Cache c;
   cache_init(&c, 20);
@@ -2188,6 +2221,32 @@ static void test_batch_cache_selects_only_safe_query_ancestors(void) {
       &cache, "!foobar", CaseSmart, true);
   CHECK(source == NULL);
 
+  batch_cache_free(&cache);
+}
+
+static void test_batch_cache_separates_score_schemes(void) {
+  BatchCache cache;
+  batch_cache_init(&cache, 1024 * 1024);
+  BatchQuery *default_query = batch_cache_acquire_query_for_scheme(
+      &cache, "fzf", CaseSmart, true, FZF_SCORE_SCHEME_DEFAULT);
+  BatchQuery *path_query = batch_cache_acquire_query_for_scheme(
+      &cache, "fzf", CaseSmart, true, FZF_SCORE_SCHEME_PATH);
+  CHECK(default_query != NULL && path_query != NULL);
+  CHECK(default_query != path_query);
+  CHECK(cache.query_count == 2);
+
+  ScoredStr match = {.idx = 1};
+  batch_cache_insert(&cache, default_query, 0, &match, 1);
+  BatchQuery *source = batch_cache_select_source_for_scheme(
+      &cache, "fzf", CaseSmart, true, FZF_SCORE_SCHEME_PATH);
+  CHECK(source == NULL);
+  source = batch_cache_select_source_for_scheme(
+      &cache, "fzf", CaseSmart, true, FZF_SCORE_SCHEME_DEFAULT);
+  CHECK(source == default_query);
+  batch_cache_release_query(&cache, source);
+
+  batch_cache_release_query(&cache, path_query);
+  batch_cache_release_query(&cache, default_query);
   batch_cache_free(&cache);
 }
 
@@ -2671,6 +2730,9 @@ static void test_async_request_identity_includes_matching_options(void) {
                                "foo", 10, CaseSmart, true, 3, false));
   CHECK(!async_request_matches("foo", 10, CaseSmart, true, 2, false,
                                "foo", 10, CaseSmart, true, 2, true));
+  CHECK(!async_request_matches_for_scheme(
+      "foo", 10, CaseSmart, true, FZF_SCORE_SCHEME_DEFAULT, 2, false,
+      "foo", 10, CaseSmart, true, FZF_SCORE_SCHEME_PATH, 2, false));
 }
 
 static void test_async_submit_oom_does_not_publish_request(void) {
@@ -3684,6 +3746,7 @@ int main(void) {
   RUN(test_cache_disabled_skips_insert_work);
   RUN(test_cache_pool_gen_distinguishes_stale);
   RUN(test_cache_exact_separates_case_and_fuzzy_modes);
+  RUN(test_cache_exact_separates_score_schemes);
   RUN(test_cache_exact_requires_sufficient_result_capacity);
   RUN(test_cache_exact_caps_result_to_requested_limit);
   RUN(test_cache_exact_filter_only_requires_same_emit_window);
@@ -3710,6 +3773,7 @@ int main(void) {
   printf("--- stable batch membership cache ---\n");
   RUN(test_batch_cache_sparse_bitmap_and_selectivity_cutoff);
   RUN(test_batch_cache_selects_only_safe_query_ancestors);
+  RUN(test_batch_cache_separates_score_schemes);
   RUN(test_batch_cache_evicts_to_byte_budget);
   RUN(test_batch_cache_query_cap_evicts_complete_owners);
   RUN(test_batch_cache_source_scan_is_bounded_and_exact_is_hashed);
