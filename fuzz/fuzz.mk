@@ -98,6 +98,18 @@ fuzz-oracle-test: fuzz-algo-driver-build fuzz-oracle-build
 		FZF_NATIVE_EXPECTED_REVISION="$(FZF_NATIVE_REVISION)" \
 		./fuzz/oracle/test.sh "$(FZF_SOURCE)"
 
+.PHONY: fuzz-normalization-table-audit
+fuzz-normalization-table-audit:
+	test -n "$(FZF_SOURCE)"
+	test "$$(git -C "$(FZF_SOURCE)" rev-parse HEAD)" = \
+		"$(FUZZ_PINNED_FZF_REVISION)"
+	git -C "$(FZF_SOURCE)" diff --quiet \
+		"$(FUZZ_PINNED_FZF_REVISION)" -- src/algo/normalize.go
+	mkdir -p $(FUZZ_GO_CACHE)
+	cd fuzz/oracle && GOCACHE=$(FUZZ_GO_CACHE) go run ./tableaudit -- \
+		"$(abspath $(FZF_SOURCE))/src/algo/normalize.go" \
+		"$(abspath fzf-normalize.inc)"
+
 fuzz-oracle-test-san: fuzz-algo-driver-san-build fuzz-oracle-build
 	GOCACHE=$(FUZZ_GO_CACHE) \
 		FZF_NATIVE_ALGO_DRIVER=$(abspath $(FUZZ_ALGO_DRIVER_SAN)) \

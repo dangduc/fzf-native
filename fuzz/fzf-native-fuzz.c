@@ -263,12 +263,13 @@ static void check_term(const char *candidate, const fzf_term_t *term,
   if (!is_ascii_utf8proc(input.data, input.size))
     algorithm = utf8_variant(algorithm);
   fzf_result_t without_positions =
-      algorithm(term->case_sensitive, false, &input, pattern, NULL, slab);
+      algorithm(term->case_sensitive, term->normalize, &input, pattern, NULL,
+                slab);
   fzf_position_t *positions = fzf_pos_array(0);
   if (!positions)
     abort();
   fzf_result_t with_positions = algorithm(
-      term->case_sensitive, false, &input, pattern, positions, slab);
+      term->case_sensitive, term->normalize, &input, pattern, positions, slab);
 
   /* Fuzzy v2 may backtrack to a more precise START only when positions are
      requested.  Membership and score must not depend on observability. */
