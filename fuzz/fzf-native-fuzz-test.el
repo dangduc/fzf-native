@@ -247,5 +247,71 @@
                (text-property-not-all 0 (length candidate) 'face nil
                                       candidate)))))))))
 
+(ert-deftest fzf-native-fuzz-public-abi-rejects-invalid-values ()
+  "Generate invalid types and arities across public native entry points."
+  (let ((bad-strings
+         (vector nil t 17 1.5 'fzf-native-bad '("list") ["vector"]
+                 (make-hash-table)))
+        (bad-collections
+         (vector t 17 1.5 'fzf-native-bad '("valid" . "bad-tail")
+                 (make-hash-table)))
+        (bad-pointers
+         (vector t 17 1.5 'fzf-native-bad '("list") ["vector"]
+                 (make-hash-table)))
+        (bad-sizes
+         (vector nil t -1 1.5 'fzf-native-bad '("list") ["vector"]
+                 (make-hash-table))))
+    (fzf-native-fuzz--seed
+     (fzf-native-fuzz--env-integer "FZF_NATIVE_FUZZ_SEED" 12648430))
+    (dotimes (_ (fzf-native-fuzz--env-integer
+                 "FZF_NATIVE_FUZZ_ABI_CASES" 200))
+      (let ((bad-string
+             (aref bad-strings
+                   (fzf-native-fuzz--random (length bad-strings))))
+            (bad-collection
+             (aref bad-collections
+                   (fzf-native-fuzz--random (length bad-collections))))
+            (bad-pointer
+             (aref bad-pointers
+                   (fzf-native-fuzz--random (length bad-pointers))))
+            (bad-size
+             (aref bad-sizes
+                   (fzf-native-fuzz--random (length bad-sizes)))))
+        (pcase (fzf-native-fuzz--random 11)
+          (0 (should-error (fzf-native-score bad-string "a")))
+          (1 (should-error (fzf-native-score "a" bad-string)))
+          (2 (should-error (fzf-native-score "a" "a" bad-pointer)))
+          (3 (should-error (fzf-native-score-all bad-collection "a")))
+          (4 (should
+              (listp
+               (fzf-native-score-all (list "a" bad-string) "a"))))
+          (5 (should-error (fzf-native-make-slab bad-size 1)))
+          (6 (should-error (fzf-native-make-slab 1 bad-size)))
+          (7 (when (fboundp 'fzf-native-async-submit)
+               (should-error (fzf-native-async-submit bad-pointer "a" 1))))
+          (8 (when (fboundp 'fzf-native-async-status)
+               (should-error (fzf-native-async-status bad-pointer))))
+          (9 (when (fboundp 'fzf-native-async-start)
+               (should-error (fzf-native-async-start bad-string))))
+          (10 (when (fboundp 'fzf-native-async-submit)
+                (let ((handle
+                       (fzf-native-async-start "printf '%s\\n' value")))
+                  (unwind-protect
+                      (should-error
+                       (fzf-native-async-submit handle bad-string 1))
+                    (fzf-native-async-stop handle))))))))
+    (should-error (fzf-native-score "only-one-argument"))
+    (should-error (fzf-native-score "a" "a" nil nil))
+    (should-error (fzf-native-score-all '("a")))
+    (should-error (fzf-native-make-slab 1 2 3))))
+
+(ert-deftest fzf-native-fuzz-public-abi-rejects-embedded-nul ()
+  "Keep the public module's explicit embedded-NUL boundary fail-closed."
+  (let ((nul (concat "before" "\0" "after")))
+    (should-error (fzf-native-score nul "a"))
+    (should-error (fzf-native-score "a" nul))
+    (should-error (fzf-native-score-all (list nul) "a"))
+    (should-error (fzf-native-score-all '("a") nul))))
+
 (provide 'fzf-native-fuzz-test)
 ;;; fzf-native-fuzz-test.el ends here
