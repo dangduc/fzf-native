@@ -674,19 +674,6 @@ static void session_fuzz_wait_running(FuzzSession *fuzz) {
   }
 }
 
-static int session_fuzz_reference_cmp(const void *left, const void *right) {
-  const ScoredStr *a = left;
-  const ScoredStr *b = right;
-  if (a->rank.score != b->rank.score)
-    return a->rank.score > b->rank.score ? -1 : 1;
-  if (a->rank.first != b->rank.first)
-    return a->rank.first < b->rank.first ? -1 : 1;
-  if (a->rank.second != b->rank.second)
-    return a->rank.second < b->rank.second ? -1 : 1;
-  if (a->idx != b->idx) return a->idx < b->idx ? -1 : 1;
-  return 0;
-}
-
 static void session_fuzz_check_reference(FuzzSession *fuzz) {
   AsyncSession *s = fuzz->session;
   pthread_mutex_lock(&s->score_req_mu);
@@ -729,7 +716,7 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
                                ? fzf_parse_pattern(
                                      case_mode, false, pattern_query, fuzzy)
                                : NULL;
-  bool sortable = pattern && !pattern->only_inv;
+  bool sortable = pattern && pattern->has_positive_term;
   fzf_slab_t *slab = fzf_make_default_slab();
   if (!slab || !fzf_slab_set_score_scheme(slab, score_scheme)) {
     if (pattern) fzf_free_pattern(pattern);
@@ -746,8 +733,8 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
   for (size_t i = 0; i < pool; i++) {
     const char *candidate =
         s->cands_top[i >> CANDS_BLOCK_SHIFT][i & CANDS_BLOCK_MASK];
-    fzf_score_bounds_t bounds = {0};
     int score;
+    fzf_score_bounds_t bounds = {0};
     if (!pattern)
       score = 1;
     else if (filter_only)
@@ -755,12 +742,10 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
     else
       score = fzf_get_score_with_bounds(candidate, pattern, slab, &bounds);
     if (score > 0) {
-      ScoredStr value = {
-          .str = (char *)candidate, .score = score, .idx = (uint32_t)i};
-      if (pattern && !filter_only)
-        value.rank = fzf_rank_keys_preclassified(
-            candidate, strlen(candidate), false, &bounds, score_scheme);
-      reference[matched++] = value;
+      reference[matched++] = (ScoredStr){
+          .str = (char *)candidate, .score = score, .idx = (uint32_t)i,
+          .rank = fzf_rank_keys_preclassified(
+              candidate, strlen(candidate), false, &bounds, score_scheme)};
     }
   }
   pthread_mutex_unlock(&s->mu);
@@ -775,13 +760,20 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
           reference[i].str, strlen(reference[i].str), false, &bounds,
           score_scheme);
     }
-    qsort(reference, emit, sizeof *reference, session_fuzz_reference_cmp);
+    qsort(reference, emit, sizeof *reference, cmp_scored_desc);
   } else if (!filter_only && sortable && matched > 1) {
-    qsort(reference, matched, sizeof *reference, session_fuzz_reference_cmp);
+    qsort(reference, matched, sizeof *reference, cmp_scored_desc);
   }
 
   if (actual_count != emit)
     session_fuzz_fail(fuzz, "interactive and batch result counts differ");
+  if (sortable) {
+    for (size_t i = 1; i < actual_count; i++) {
+      if (cmp_scored_desc(&actual[i - 1], &actual[i]) > 0)
+        session_fuzz_fail(
+            fuzz, "published sortable candidates are not totally ordered");
+    }
+  }
   for (size_t i = 0; i < emit; i++) {
     if (actual[i].idx != reference[i].idx ||
         actual[i].score != reference[i].score ||
