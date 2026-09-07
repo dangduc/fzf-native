@@ -547,11 +547,15 @@ Each specification has the form (KEY VALUES)."
     (should-not
      (fzf-native-differential-classify
       candidate-case 'membership '(:differing-identities (1 2))))
-    ;; A malformed query can change how a known valid candidate is matched,
-    ;; but missing and unknown identity context must still fail closed.
-    (should
+    ;; A malformed query alone cannot attribute a valid-candidate difference
+    ;; to decoder policy.  A malformed differing candidate remains in scope,
+    ;; while missing and unknown identity context still fail closed.
+    (should-not
      (fzf-native-differential-classify
       query-case 'membership '(:differing-identities (1))))
+    (should
+     (fzf-native-differential-classify
+      query-case 'membership '(:differing-identities (2))))
     (should-not
      (fzf-native-differential-classify query-case 'membership))
     (should-not

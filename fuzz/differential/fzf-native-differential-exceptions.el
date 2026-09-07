@@ -134,13 +134,11 @@ CONTEXT is not applicable to this classifier."
   "Return non-nil if CONTEXT identifies malformed differences in CASE.
 
 CONTEXT must contain a nonempty `:differing-identities' list.  Every identity
-must name a candidate in CASE.  A malformed query can affect every candidate;
-otherwise, every differing candidate must itself contain malformed UTF-8."
+must name a candidate in CASE, and every differing candidate must itself
+contain malformed UTF-8.  A malformed query alone does not attribute an
+arbitrary valid-candidate difference to the decoder policy."
   (let ((identities (and (listp context)
                          (plist-get context :differing-identities)))
-        (query-malformed
-         (fzf-native-differential--malformed-utf8-string-p
-          (fzf-native-differential-case-rendered-query case)))
         (candidates (fzf-native-differential-case-candidates case)))
     (and (consp identities)
          (cl-every
@@ -150,10 +148,8 @@ otherwise, every differing candidate must itself contain malformed UTF-8."
                             :key #'fzf-native-differential-candidate-id
                             :test #'equal)))
               (and candidate
-                   (or query-malformed
-                       (fzf-native-differential--malformed-utf8-string-p
-                        (fzf-native-differential-candidate-text
-                         candidate))))))
+                   (fzf-native-differential--malformed-utf8-string-p
+                    (fzf-native-differential-candidate-text candidate)))))
           identities))))
 
 (defun fzf-native-differential--exception-malformed-utf8-p
