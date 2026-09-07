@@ -184,6 +184,24 @@ static void test_equal_preserves_pattern_edge_whitespace(void) {
   CHECK(utf8_leading.score > 0);
 }
 
+static void test_parsed_equal_preserves_escaped_edge_whitespace(void) {
+  /* Exercise the public parser and both fuzzy settings.  In either mode the
+     two anchors select EqualMatch; escaped spaces belong to the term and must
+     not be trimmed from the candidate before the cheap membership check. */
+  check_agreement("fuzzy equal escaped leading space", " -", "^\\ -$",
+                  CaseRespect, true, true);
+  check_agreement("fuzzy equal escaped trailing space", "- ", "^-\\ $",
+                  CaseRespect, true, true);
+  check_agreement("fuzzy equal escaped single space", " ", "^\\ $",
+                  CaseRespect, true, true);
+  check_agreement("exact equal escaped leading space", " -", "^\\ -$",
+                  CaseRespect, false, true);
+  check_agreement("exact equal escaped trailing space", "- ", "^-\\ $",
+                  CaseRespect, false, true);
+  check_agreement("exact equal escaped single space", " ", "^\\ $",
+                  CaseRespect, false, true);
+}
+
 static void test_negation_term_excludes(void) {
   /* "foo !bar" — must contain foo AND must NOT contain bar. */
   check_agreement("negation excludes", "src/foobar.c", "foo !bar",
@@ -543,6 +561,7 @@ int main(void) {
   RUN(test_equal_match);
   RUN(test_equal_no_match_different_string);
   RUN(test_equal_preserves_pattern_edge_whitespace);
+  RUN(test_parsed_equal_preserves_escaped_edge_whitespace);
   RUN(test_negation_term_excludes);
   RUN(test_and_across_term_sets);
   RUN(test_or_within_term_set);

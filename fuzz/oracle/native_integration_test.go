@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -26,7 +27,100 @@ type nativePeer struct {
 	command *exec.Cmd
 	input   io.WriteCloser
 	output  io.Reader
-	stderr  bytes.Buffer
+	stderr  synchronizedCapture
+}
+
+type synchronizedCapture struct {
+	mu       sync.Mutex
+	contents bytes.Buffer
+}
+
+func (c *synchronizedCapture) Write(data []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.contents.Write(data)
+}
+
+func (c *synchronizedCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.contents.String()
+}
+
+func TestSynchronizedCaptureConcurrentWriteAndString(t *testing.T) {
+	const (
+		writers    = 4
+		readers    = 4
+		iterations = 512
+		chunk      = "stderr\n"
+	)
+
+	var capture synchronizedCapture
+	start := make(chan struct{})
+	writersDone := make(chan struct{})
+	failures := make(chan error, writers+readers)
+
+	var writerGroup sync.WaitGroup
+	writerGroup.Add(writers)
+	for writer := 0; writer < writers; writer++ {
+		go func() {
+			defer writerGroup.Done()
+			<-start
+			for iteration := 0; iteration < iterations; iteration++ {
+				written, err := capture.Write([]byte(chunk))
+				if err != nil || written != len(chunk) {
+					failures <- fmt.Errorf("capture write = %d, %v", written, err)
+					return
+				}
+				runtime.Gosched()
+			}
+		}()
+	}
+	go func() {
+		writerGroup.Wait()
+		close(writersDone)
+	}()
+
+	var readerGroup sync.WaitGroup
+	readerGroup.Add(readers)
+	for reader := 0; reader < readers; reader++ {
+		go func() {
+			defer readerGroup.Done()
+			<-start
+			for {
+				snapshot := capture.String()
+				if len(snapshot)%len(chunk) != 0 {
+					failures <- fmt.Errorf("partial capture snapshot length %d", len(snapshot))
+					return
+				}
+				for offset := 0; offset < len(snapshot); offset += len(chunk) {
+					if snapshot[offset:offset+len(chunk)] != chunk {
+						failures <- fmt.Errorf("corrupt capture snapshot at byte %d", offset)
+						return
+					}
+				}
+				select {
+				case <-writersDone:
+					return
+				default:
+					runtime.Gosched()
+				}
+			}
+		}()
+	}
+
+	close(start)
+	<-writersDone
+	readerGroup.Wait()
+	close(failures)
+	for err := range failures {
+		t.Error(err)
+	}
+
+	wantLength := writers * iterations * len(chunk)
+	if got := len(capture.String()); got != wantLength {
+		t.Fatalf("final capture length = %d, want %d", got, wantLength)
+	}
 }
 
 type infoResponse struct {

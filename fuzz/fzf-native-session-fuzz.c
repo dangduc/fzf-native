@@ -284,6 +284,7 @@ static void session_fuzz_reader_probe(const uint8_t *data, size_t size) {
     for (size_t attempt = 0;
          atomic_load_explicit(&s->test_reader_poll_epoch,
                               memory_order_acquire) < target_epoch &&
+         !atomic_load_explicit(&s->reader_done, memory_order_acquire) &&
          attempt < 20000;
          attempt++)
       nanosleep(&pause, NULL);

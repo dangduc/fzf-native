@@ -130,16 +130,41 @@ CONTEXT is not applicable to this classifier."
        (fzf-native-differential-candidate-text candidate)))
     (fzf-native-differential-case-candidates case))))
 
-(defun fzf-native-differential--exception-malformed-utf8-p
-    (case facet _context)
-  "Recognize CASE decoder differences for FACET only with malformed input.
+(defun fzf-native-differential--malformed-difference-p (case context)
+  "Return non-nil if CONTEXT identifies malformed differences in CASE.
 
-CONTEXT is not applicable to this classifier."
+CONTEXT must contain a nonempty `:differing-identities' list.  Every identity
+must name a candidate in CASE.  A malformed query can affect every candidate;
+otherwise, every differing candidate must itself contain malformed UTF-8."
+  (let ((identities (and (listp context)
+                         (plist-get context :differing-identities)))
+        (query-malformed
+         (fzf-native-differential--malformed-utf8-string-p
+          (fzf-native-differential-case-rendered-query case)))
+        (candidates (fzf-native-differential-case-candidates case)))
+    (and (consp identities)
+         (cl-every
+          (lambda (identity)
+            (let ((candidate
+                   (cl-find identity candidates
+                            :key #'fzf-native-differential-candidate-id
+                            :test #'equal)))
+              (and candidate
+                   (or query-malformed
+                       (fzf-native-differential--malformed-utf8-string-p
+                        (fzf-native-differential-candidate-text
+                         candidate))))))
+          identities))))
+
+(defun fzf-native-differential--exception-malformed-utf8-p
+    (case facet context)
+  "Recognize malformed decoder differences for CASE, FACET, and CONTEXT."
   (and (memq facet '(membership positions))
        (not (plist-get
              (fzf-native-differential-case-dimensions case)
              :valid-utf8))
-       (fzf-native-differential--case-has-malformed-utf8-p case)))
+       (fzf-native-differential--case-has-malformed-utf8-p case)
+       (fzf-native-differential--malformed-difference-p case context)))
 
 (defconst fzf-native-differential-exceptions
   `((:name exact-boundary-syntax
@@ -175,7 +200,7 @@ CONTEXT is not applicable to this classifier."
      :disposition accepted
      :upstream-revision ,fzf-native-differential-upstream-revision
      :owner "fzf-native UTF-8 compatibility policy"
-     :scope "Only malformed-byte membership or positions with :valid-utf8 nil."
+     :scope "Only differing malformed inputs for membership or positions."
      :remove-when "Both oracles apply one documented malformed-byte policy."
      :predicate ,#'fzf-native-differential--exception-malformed-utf8-p))
   "Ordered, narrow predicates for known differential behavior.")

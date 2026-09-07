@@ -272,6 +272,13 @@ UPSTREAM-OUTPUT selects Go's malformed-byte output representation."
   "Return sorted membership for IDENTITIES."
   (sort (copy-sequence identities) #'<))
 
+(defun fzf-native-upstream--membership-difference (left right)
+  "Return sorted identities present in exactly one of LEFT and RIGHT."
+  (sort
+   (append (cl-set-difference left right :test #'=)
+           (cl-set-difference right left :test #'=))
+   #'<))
+
 (defun fzf-native-upstream--record-exception (table exception)
   "Record EXCEPTION in count TABLE."
   (let ((name (plist-get exception :name)))
@@ -435,6 +442,16 @@ Each specification has the form (KEY VALUES)."
                            :valid-utf8)
                    return case))
          (forged (copy-fzf-native-differential-case common))
+         (malformed-candidate
+          (cl-find-if
+           (lambda (candidate)
+             (fzf-native-differential--malformed-utf8-string-p
+              (fzf-native-differential-candidate-text candidate)))
+           (fzf-native-differential-case-candidates malformed)))
+         (malformed-identity
+          (fzf-native-differential-candidate-id
+           (or malformed-candidate
+               (car (fzf-native-differential-case-candidates malformed)))))
          boundary-exception ranking-exception malformed-exception)
     (setf (fzf-native-differential-case-dimensions forged)
           (plist-put
@@ -462,7 +479,9 @@ Each specification has the form (KEY VALUES)."
     (should (eq (plist-get ranking-exception :disposition)
                 'parity-debt))
     (setq malformed-exception
-          (fzf-native-differential-classify malformed 'membership))
+          (fzf-native-differential-classify
+           malformed 'membership
+           (list :differing-identities (list malformed-identity))))
     (should (eq (plist-get malformed-exception :name)
                 'malformed-utf8-decoder))
     (should (eq (plist-get malformed-exception :disposition)
@@ -483,7 +502,61 @@ Each specification has the form (KEY VALUES)."
       (should (stringp (plist-get entry :remove-when))))
     (should
      (equal (plist-get malformed-exception :scope)
-            "Only malformed-byte membership or positions with :valid-utf8 nil."))))
+            "Only differing malformed inputs for membership or positions."))))
+
+(ert-deftest fzf-native-fuzz-upstream-malformed-exceptions-are-difference-scoped ()
+  "Do not let an unrelated malformed candidate waive a valid difference."
+  (let* ((malformed-bytes (unibyte-string #xff))
+         (valid-candidate
+          (make-fzf-native-differential-candidate
+           :id 1 :text "valid" :role 'match))
+         (malformed-candidate
+          (make-fzf-native-differential-candidate
+           :id 2 :text malformed-bytes :role 'decoy))
+         (query
+          (make-fzf-native-differential-query
+           :sets nil :normalize nil :forward t))
+         (candidate-case
+          (make-fzf-native-differential-case
+           :query query
+           :rendered-query ""
+           :candidates (list valid-candidate malformed-candidate)
+           :dimensions '(:valid-utf8 nil)))
+         (query-case (copy-fzf-native-differential-case candidate-case))
+         exception)
+    (setf (fzf-native-differential-case-rendered-query query-case)
+          malformed-bytes)
+    ;; Candidate 2 is an unrelated malformed decoy when valid candidate 1 is
+    ;; the identity missing from one result.
+    (let ((difference
+           (fzf-native-upstream--membership-difference '(2) '(1 2))))
+      (should (equal difference '(1)))
+      (should-not
+       (fzf-native-differential-classify
+        candidate-case 'membership
+        (list :differing-identities difference))))
+    (setq exception
+          (fzf-native-differential-classify
+           candidate-case 'membership '(:differing-identities (2))))
+    (should (eq (plist-get exception :name) 'malformed-utf8-decoder))
+    (should-not
+     (fzf-native-differential-classify candidate-case 'membership))
+    (should-not
+     (fzf-native-differential-classify
+      candidate-case 'membership '(:differing-identities (99))))
+    (should-not
+     (fzf-native-differential-classify
+      candidate-case 'membership '(:differing-identities (1 2))))
+    ;; A malformed query can change how a known valid candidate is matched,
+    ;; but missing and unknown identity context must still fail closed.
+    (should
+     (fzf-native-differential-classify
+      query-case 'membership '(:differing-identities (1))))
+    (should-not
+     (fzf-native-differential-classify query-case 'membership))
+    (should-not
+     (fzf-native-differential-classify
+      query-case 'membership '(:differing-identities (99))))))
 
 (defconst fzf-native-upstream--session-candidate-bodies
   '("alpha"
@@ -759,7 +832,12 @@ Each specification has the form (KEY VALUES)."
             (should (memq 0 upstream-membership)))
           (unless membership-equal
             (let ((exception
-                   (fzf-native-differential-classify case 'membership)))
+                   (fzf-native-differential-classify
+                    case 'membership
+                    (list
+                     :differing-identities
+                     (fzf-native-upstream--membership-difference
+                      native-membership upstream-membership)))))
               (if exception
                   (progn
                     (fzf-native-upstream--record-exception exceptions exception)
