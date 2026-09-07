@@ -413,12 +413,15 @@ static void session_fuzz_append_special(FuzzSession *fuzz,
 
 static uint64_t session_fuzz_submit(FuzzSession *fuzz, FuzzInput *input) {
   uint8_t settings = fuzz_take(input);
+  uint8_t scheme_byte = fuzz_take(input);
   size_t query_len = fuzz_take(input) & 63;
   char *query = fuzz_copy_string(input, query_len, &query_len);
   if (!query) return 0;
 
   fzf_case_types case_mode = (fzf_case_types)(settings % 3);
   bool fuzzy = (settings & 4) != 0;
+  fzf_score_scheme_t score_scheme =
+      (fzf_score_scheme_t)(scheme_byte % 3);
   static const size_t filter_only_lengths[] = {0, 1, 3, 8};
   size_t fo_length = filter_only_lengths[(settings >> 3) & 3];
   bool fo_logic_and = (settings & 32) != 0;
@@ -434,9 +437,9 @@ static uint64_t session_fuzz_submit(FuzzSession *fuzz, FuzzInput *input) {
   default: limit = count > 1 ? count / 2 : 1; break;
   }
 
-  uint64_t request_id = async_submit_request_resolved(
-      fuzz->session, query, query_len, limit, case_mode, fuzzy, fo_length,
-      fo_logic_and);
+  uint64_t request_id = async_submit_request_resolved_for_scheme(
+      fuzz->session, query, query_len, limit, case_mode, fuzzy, score_scheme,
+      fo_length, fo_logic_and);
   if (request_id) fuzz->submitted = true;
   return request_id;
 }
@@ -522,9 +525,9 @@ static void session_fuzz_check_invariants(FuzzSession *fuzz) {
        query = query->lru_next) {
     if (query->lru_prev != query_previous)
       session_fuzz_fail(fuzz, "batch query LRU links disagree");
-    if (batch_cache_find_query_locked(
+    if (batch_cache_find_query_locked_for_scheme(
             batch_cache, query->query, query->case_mode,
-            query->fuzzy, query->hash) != query)
+            query->fuzzy, query->score_scheme, query->hash) != query)
       session_fuzz_fail(fuzz, "batch query hash lost an LRU record");
     size_t owner_entry_count = 0;
     BatchCacheEntry *owner_previous = NULL;
@@ -595,16 +598,20 @@ static void session_fuzz_check_invariants(FuzzSession *fuzz) {
   AsyncResultObservation copied_result = {0};
   char *copied_filter = NULL, *copied_error = NULL;
   fzf_case_types copied_case_mode = CaseSmart;
+  fzf_score_scheme_t copied_scheme = FZF_SCORE_SCHEME_DEFAULT;
   bool copied_fuzzy = true, copied_filter_only = false;
   bool copied_allocation_failed = false;
-  ScoredStr *copied = async_copy_public_result(
+  ScoredStr *copied = async_copy_public_result_with_scheme(
       s, true, &copied_count, &copied_result, &copied_filter, &copied_limit,
-      &copied_case_mode, &copied_fuzzy, &copied_filter_only,
+      &copied_case_mode, &copied_fuzzy, &copied_scheme, &copied_filter_only,
       &copied_generation, &copied_completed, &copied_total,
       &copied_error_id, &copied_error, &copied_filtered,
       &copied_source_total, &copied_allocation_failed);
   if (copied_allocation_failed)
     session_fuzz_fail(fuzz, "an owned result copy allocation failed");
+  if (copied_scheme < FZF_SCORE_SCHEME_DEFAULT ||
+      copied_scheme > FZF_SCORE_SCHEME_HISTORY)
+    session_fuzz_fail(fuzz, "an owned result copy has an invalid score scheme");
   if (copied_limit && copied_count > copied_limit)
     session_fuzz_fail(fuzz, "an owned result copy exceeds its limit");
   if (copied_completed > copied_total)
@@ -688,6 +695,7 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
   size_t limit = s->score_result_limit;
   fzf_case_types case_mode = s->score_result_case_mode;
   bool fuzzy = s->score_result_fuzzy;
+  fzf_score_scheme_t score_scheme = s->score_result_scheme;
   bool filter_only = s->score_result_filter_only;
   char *query = s->score_result_filter ? strdup(s->score_result_filter) : NULL;
   ScoredStr *actual = actual_count ? malloc(actual_count * sizeof *actual) : NULL;
@@ -717,6 +725,15 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
                                      case_mode, false, pattern_query, fuzzy)
                                : NULL;
   fzf_slab_t *slab = fzf_make_default_slab();
+  if (!slab || !fzf_slab_set_score_scheme(slab, score_scheme)) {
+    if (pattern) fzf_free_pattern(pattern);
+    if (slab) fzf_free_slab(slab);
+    free(pattern_query);
+    free(reference);
+    free(actual);
+    free(query);
+    return;
+  }
   size_t matched = 0;
 
   pthread_mutex_lock(&s->mu);
