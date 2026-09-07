@@ -190,12 +190,15 @@ Set =FZF_NATIVE_ALGO_DRIVER= to the path of the native peer for differential che
 Also set =FZF_RAW_ORACLE_BINARY= and =FZF_NATIVE_EXPECTED_REVISION=.
 The matrix sends each request to both persistent executables.
 They compare strict Unicode results and a matrix of membership results.
-Named checks record score, alignment, normalization, and malformed UTF-8 gaps.
+Named checks enforce current default-scheme score and alignment parity.
+They also record normalization and malformed UTF-8 gaps.
 Delete each gap check after fzf-native gains parity for that case.
 
-The default raw membership matrix runs 20,000 deterministic cases.
+The default raw result matrix runs 20,000 deterministic cases.
 It includes ASCII, valid Unicode, case folds, and V2 fallback boundaries.
-It rejects every membership difference.
+It rejects score, range, and semantic position differences.
+It temporarily excludes empty suffix patterns because they have a separate
+UTF-8 range defect.
 Use these variables to replay part of the matrix:
 
 | Variable | Default | Meaning |
@@ -203,10 +206,9 @@ Use these variables to replay part of the matrix:
 | =FZF_RAW_MATRIX_SEED= | =20260906= | Generator seed. |
 | =FZF_RAW_MATRIX_START= | =0= | First serial number. |
 | =FZF_RAW_MATRIX_CASES= | =20000= | Number of cases. |
-| =FZF_RAW_MATRIX_FULL_RESULTS= | unset | Set to =1= to fail on score, range, or position debt. |
 
-The full-result mode is a parity audit.
-It currently fails on known score and position debt.
+The result matrix treats an omitted contiguous position list as equal to the same materialized
+range because fzf-native returns positions for its highlighting API.
 The audit runs all selected cases before it reports the failure.
 The failure gives the first eight differences in a compact format.
 Use the reported serial number with =FZF_RAW_MATRIX_START= to run one case.

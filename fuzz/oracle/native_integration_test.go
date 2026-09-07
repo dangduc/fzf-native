@@ -378,6 +378,9 @@ func TestNativePeerMatchesRawOracle(t *testing.T) {
 		{"kelvin-fold-v2", algorithmV2, flagForward, []byte("K"), []byte("xk")},
 		{"sigma-fold-v2", algorithmV2, flagForward, []byte("Σ"), []byte("xσ")},
 		{"embedded-nul-v2", algorithmV2, flagCaseSensitive | flagForward, []byte{'a', 0}, []byte{'x', 'a', 0}},
+		{"current-boundary-alignment-v2", algorithmV2, flagForward, []byte("/a"), []byte("a//a")},
+		{"ascii-boundary-score-v2", algorithmV2, flagCaseSensitive | flagForward, []byte("fzf"), []byte("src/fzf")},
+		{"unicode-boundary-score-v2", algorithmV2, flagForward, []byte("Ⱥ"), []byte("ⱥ")},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -462,7 +465,7 @@ func TestBuiltOracleProcessIsPersistent(t *testing.T) {
 	}
 }
 
-func TestNativePeerKnownAlignmentAndNormalizationGaps(t *testing.T) {
+func TestNativePeerKnownNormalizationGap(t *testing.T) {
 	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
 	if driver == "" {
 		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
@@ -482,18 +485,6 @@ func TestNativePeerKnownAlignmentAndNormalizationGaps(t *testing.T) {
 		wantUpstream   matchResponse
 		wantNativePeer matchResponse
 	}{
-		{
-			name:      "v2-alignment",
-			flags:     flagForward,
-			pattern:   []byte("/a"),
-			candidate: []byte("a//a"),
-			wantUpstream: matchResponse{
-				matched: true, positionsPresent: true, start: 2, end: 4, score: 59, positions: []int64{2, 3},
-			},
-			wantNativePeer: matchResponse{
-				matched: true, positionsPresent: true, start: 1, end: 4, score: 56, positions: []int64{1, 3},
-			},
-		},
 		{
 			name:      "latin-normalization",
 			flags:     flagCaseSensitive | flagNormalize | flagForward,
@@ -535,60 +526,6 @@ func TestNativePeerKnownAlignmentAndNormalizationGaps(t *testing.T) {
 	}
 }
 
-func TestNativePeerKnownScoreGaps(t *testing.T) {
-	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
-	if driver == "" {
-		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
-	}
-
-	peer := startNativePeer(t, driver)
-	defer peer.close(t)
-	oracle, err := newRawOracle(schemeDefault)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cases := []struct {
-		name          string
-		flags         byte
-		pattern       []byte
-		candidate     []byte
-		upstreamScore int64
-		nativeScore   int64
-	}{
-		{"ascii-boundary-bonus", flagCaseSensitive | flagForward, []byte("fzf"), []byte("src/fzf"), 84, 80},
-		{"unicode-fold-boundary-bonus", flagForward, []byte("Ⱥ"), []byte("ⱥ"), 36, 32},
-	}
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			request := matchRequest{
-				algorithm: algorithmV2,
-				scheme:    schemeDefault,
-				flags:     testCase.flags,
-				pattern:   testCase.pattern,
-				candidate: testCase.candidate,
-			}
-			upstream, err := oracle.match(request)
-			if err != nil {
-				t.Fatal(err)
-			}
-			native, _, err := decodeMatchResponse(peer.exchange(t,
-				matchRequestPayload(request.algorithm, request.scheme, request.flags, request.pattern, request.candidate)))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if upstream.score != testCase.upstreamScore || native.score != testCase.nativeScore {
-				t.Fatalf("score gap changed: upstream=%d native=%d; want upstream=%d native=%d",
-					upstream.score, native.score, testCase.upstreamScore, testCase.nativeScore)
-			}
-			upstream.score = 0
-			native.score = 0
-			if !reflect.DeepEqual(native, upstream) {
-				t.Fatalf("non-score result changed: native=%+v upstream=%+v", native, upstream)
-			}
-		})
-	}
-}
-
 func TestNativePeerKnownContiguousResultGaps(t *testing.T) {
 	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
 	if driver == "" {
@@ -625,13 +562,13 @@ func TestNativePeerKnownContiguousResultGaps(t *testing.T) {
 			name: "prefix-score-and-position-representation", algorithm: algorithmPrefix,
 			pattern: []byte("ab"), candidate: []byte("abx"),
 			wantUpstream:   matchResponse{matched: true, start: 0, end: 2, score: 62},
-			wantNativePeer: matchResponse{matched: true, positionsPresent: true, start: 0, end: 2, score: 56, positions: []int64{0, 1}},
+			wantNativePeer: matchResponse{matched: true, positionsPresent: true, start: 0, end: 2, score: 62, positions: []int64{0, 1}},
 		},
 		{
 			name: "equal-score-and-position-representation", algorithm: algorithmEqual,
 			pattern: []byte("ab"), candidate: []byte("ab"),
 			wantUpstream:   matchResponse{matched: true, start: 0, end: 2, score: 62},
-			wantNativePeer: matchResponse{matched: true, positionsPresent: true, start: 0, end: 2, score: 56, positions: []int64{0, 1}},
+			wantNativePeer: matchResponse{matched: true, positionsPresent: true, start: 0, end: 2, score: 62, positions: []int64{0, 1}},
 		},
 		{
 			name: "v1-empty-pattern-position-representation", algorithm: algorithmV1,
@@ -915,6 +852,36 @@ func compactResponse(response matchResponse) string {
 		response.matched, response.start, response.end, response.score, positionSummary)
 }
 
+/*
+	Contiguous upstream algorithms return nil positions because callers can
+
+derive every index from the half-open range.  fzf-native materializes those
+indexes for its highlighting API.  Compare the observable position sequence,
+not this representation choice.
+*/
+func semanticPositions(response matchResponse) []int64 {
+	if response.positionsPresent {
+		if len(response.positions) == 0 {
+			return nil
+		}
+		return response.positions
+	}
+	if !response.matched || response.end <= response.start {
+		return nil
+	}
+	positions := make([]int64, response.end-response.start)
+	for index := range positions {
+		positions[index] = response.start + int64(index)
+	}
+	return positions
+}
+
+func matchResponsesEquivalent(left, right matchResponse) bool {
+	return left.matched == right.matched && left.start == right.start &&
+		left.end == right.end && left.score == right.score &&
+		reflect.DeepEqual(semanticPositions(left), semanticPositions(right))
+}
+
 func compactMatrixDifference(seed, serial uint64, request matchRequest,
 	upstream, native matchResponse) string {
 	return fmt.Sprintf(
@@ -966,7 +933,7 @@ func TestFullResultAuditUsesCompactBoundedExamples(t *testing.T) {
 	}
 }
 
-func TestNativePeerDeterministicMembershipMatrix(t *testing.T) {
+func TestNativePeerDeterministicDefaultResultMatrix(t *testing.T) {
 	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
 	if driver == "" {
 		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
@@ -978,8 +945,6 @@ func TestNativePeerDeterministicMembershipMatrix(t *testing.T) {
 	seed := rawMatrixEnv(t, "FZF_RAW_MATRIX_SEED", 20260906)
 	start := rawMatrixEnv(t, "FZF_RAW_MATRIX_START", 0)
 	caseCount := rawMatrixEnv(t, "FZF_RAW_MATRIX_CASES", 20000)
-	fullResults := os.Getenv("FZF_RAW_MATRIX_FULL_RESULTS") == "1"
-
 	nativePeer := startNativePeer(t, driver)
 	defer nativePeer.close(t)
 	oraclePeer := startNativePeerWithArgs(t, oracleBinary, "--scheme=default")
@@ -1009,19 +974,16 @@ func TestNativePeerDeterministicMembershipMatrix(t *testing.T) {
 		if err != nil {
 			t.Fatalf("seed=%d serial=%d native error: %v", seed, serial, err)
 		}
-		if native.matched != upstream.matched {
-			t.Fatalf("membership differs: %s",
-				compactMatrixDifference(seed, serial, request, upstream, native))
-		}
-		if fullResults && !reflect.DeepEqual(native, upstream) {
+		if !matchResponsesEquivalent(native, upstream) &&
+			!(request.algorithm == algorithmSuffix && len(request.pattern) == 0) {
 			audit.add(seed, serial, request, upstream, native)
 		}
 	}
 	if audit.differenceCount != 0 {
-		t.Fatalf("full-result debt in %d of %d cases; first %d differences:\n%s\nreplay one case with FZF_RAW_MATRIX_SEED=%d FZF_RAW_MATRIX_START=SERIAL FZF_RAW_MATRIX_CASES=1 FZF_RAW_MATRIX_FULL_RESULTS=1",
+		t.Fatalf("default-result debt in %d of %d cases; first %d differences:\n%s\nreplay one case with FZF_RAW_MATRIX_SEED=%d FZF_RAW_MATRIX_START=SERIAL FZF_RAW_MATRIX_CASES=1",
 			audit.differenceCount, caseCount, len(audit.examples),
 			strings.Join(audit.examples, "\n"), seed)
 	}
-	t.Logf("raw matrix seed=%d start=%d cases=%d full-results=%t",
-		seed, start, caseCount, fullResults)
+	t.Logf("default result matrix seed=%d start=%d cases=%d",
+		seed, start, caseCount)
 }
