@@ -363,10 +363,6 @@ static size_t min64u(size_t a, size_t b) {
   return (a < b) ? a : b;
 }
 
-static size_t index_at(size_t index, size_t max, bool forward) {
-  return forward ? index : max - index - 1;
-}
-
 fzf_position_t *fzf_pos_array(size_t len) {
   if (len > SIZE_MAX / sizeof(uint32_t)) {
     fzf_mark_allocation_failure();
@@ -1070,8 +1066,13 @@ static fzf_result_t fzf_fuzzy_match_v1_impl(
   size_t sidx = 0;
   size_t eidx = 0;
   bool started = false;
+  /* Select the scan direction once.  SIZE_MAX is -1 modulo size_t, so each
+     hot loop can advance its valid index without a direction branch. */
+  size_t scan_delta = forward ? 1 : SIZE_MAX;
+  size_t text_index = forward ? 0 : N - 1;
+  size_t pattern_index = forward ? 0 : M - 1;
   for (size_t step = 0; step < N; step++) {
-    char c = text->data[index_at(step, N, forward)];
+    char c = text->data[text_index];
     /* TODO(conni2461): Common pattern maybe a macro would be good here */
     if (!case_sensitive) {
       /* TODO(conni2461): He does some unicode stuff here, investigate */
@@ -1080,7 +1081,7 @@ static fzf_result_t fzf_fuzzy_match_v1_impl(
     if (normalize) {
       c = normalize_rune(c);
     }
-    if (c == pattern->data[index_at(pidx, M, forward)]) {
+    if (c == pattern->data[pattern_index]) {
       if (!started) {
         sidx = step;
         started = true;
@@ -1090,12 +1091,17 @@ static fzf_result_t fzf_fuzzy_match_v1_impl(
         eidx = step + 1;
         break;
       }
+      pattern_index += scan_delta;
     }
+    text_index += scan_delta;
   }
   if (started && eidx > 0) {
     size_t remaining = M;
+    size_t tighten_delta = forward ? SIZE_MAX : 1;
+    text_index = forward ? eidx - 1 : N - eidx;
+    pattern_index = forward ? M - 1 : 0;
     for (size_t step = eidx; step-- > sidx;) {
-      char c = text->data[index_at(step, N, forward)];
+      char c = text->data[text_index];
       if (!case_sensitive) {
         /* TODO(conni2461): He does some unicode stuff here, investigate */
         c = (char)tolower((uint8_t)c);
@@ -1103,13 +1109,15 @@ static fzf_result_t fzf_fuzzy_match_v1_impl(
       if (normalize) {
         c = normalize_rune(c);
       }
-      if (c == pattern->data[index_at(remaining - 1, M, forward)]) {
+      if (c == pattern->data[pattern_index]) {
         remaining--;
         if (remaining == 0) {
           sidx = step;
           break;
         }
+        pattern_index += tighten_delta;
       }
+      text_index += tighten_delta;
     }
 
     size_t start = forward ? sidx : N - eidx;
