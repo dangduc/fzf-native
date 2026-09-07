@@ -856,7 +856,7 @@ int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
 /* UTF-8 helper functions */
 
 // UTF-8 aware character comparison
-static bool utf8_char_equal(utf8proc_int32_t cp1, utf8proc_int32_t cp2, 
+static bool utf8_char_equal(utf8proc_int32_t cp1, utf8proc_int32_t cp2,
                            bool case_sensitive, bool normalize) {
   if (!case_sensitive) {
     cp1 = utf8proc_case_fold(cp1);
