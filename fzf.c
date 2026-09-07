@@ -1445,8 +1445,14 @@ fzf_result_t fzf_equal_match(bool case_sensitive, bool normalize,
     return (fzf_result_t){-1, -1, 0};
   }
 
-  size_t trimmed_len = leading_whitespaces(text);
-  size_t trimmed_end_len = trailing_whitespaces(text);
+  size_t trimmed_len = 0;
+  if (!fzf_unicode_is_space((uint8_t)pattern->data[0])) {
+    trimmed_len = leading_whitespaces(text);
+  }
+  size_t trimmed_end_len = 0;
+  if (!fzf_unicode_is_space((uint8_t)pattern->data[M - 1])) {
+    trimmed_end_len = trailing_whitespaces(text);
+  }
   size_t content_len = trimmed_len + trimmed_end_len >= text->size
                          ? 0
                          : text->size - trimmed_len - trimmed_end_len;
@@ -1813,8 +1819,27 @@ fzf_result_t fzf_equal_match_utf8(bool case_sensitive, bool normalize,
     return (fzf_result_t){-1, -1, 0};
   }
 
-  size_t trimmed_start = leading_whitespaces(text);
-  size_t trimmed_end_len = trailing_whitespaces(text);
+  utf8proc_int32_t first_pattern_cp = 0;
+  (void)utf8_iterate_lossy(
+      (const utf8proc_uint8_t *)pattern->data, M, &first_pattern_cp);
+  utf8proc_int32_t last_pattern_cp = first_pattern_cp;
+  for (size_t pattern_pos = 0; pattern_pos < M;) {
+    utf8proc_int32_t cp;
+    utf8proc_ssize_t width = utf8_iterate_lossy(
+        (const utf8proc_uint8_t *)pattern->data + pattern_pos,
+        (utf8proc_ssize_t)(M - pattern_pos), &cp);
+    last_pattern_cp = cp;
+    pattern_pos += (size_t)width;
+  }
+
+  size_t trimmed_start = 0;
+  if (!fzf_unicode_is_space(first_pattern_cp)) {
+    trimmed_start = leading_whitespaces(text);
+  }
+  size_t trimmed_end_len = 0;
+  if (!fzf_unicode_is_space(last_pattern_cp)) {
+    trimmed_end_len = trailing_whitespaces(text);
+  }
   /* Leading and trailing whitespace regions overlap when the candidate is
      entirely whitespace.  Clamp that case to an empty content slice instead
      of underflowing size_t and asking utf8_strlen to scan arbitrary memory. */
