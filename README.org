@@ -322,6 +322,13 @@ It documents the public API, session lifecycle, request ownership, caches, worke
 
 See [[file:multi-round-session-plan.org][multi-round-session-plan.org]] for the historical design record and verification results.
 
+** Licenses
+
+The project license is in [[file:LICENSE][LICENSE]] (GNU GPL). The MIT license for
+the fzf code derived from fzf and telescope-fzf-native.nvim is in
+[[file:LICENSE-MIT][LICENSE-MIT]]. Vendored utf8proc and Unicode data notices are in
+[[file:utf8proc-2.10.0/LICENSE.md][utf8proc-2.10.0/LICENSE.md]] and the corresponding source files.
+
 ** Credit
 All credit for fzf.c goes to the
 [[https://github.com/nvim-telescope/telescope-fzf-native.nvim][telescope-fzf-native.nvim]]
