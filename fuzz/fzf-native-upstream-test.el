@@ -279,6 +279,23 @@ UPSTREAM-OUTPUT selects Go's malformed-byte output representation."
            (cl-set-difference right left :test #'=))
    #'<))
 
+(defun fzf-native-upstream--record-exception (table exception)
+  "Record EXCEPTION in count TABLE."
+  (let ((name (plist-get exception :name)))
+    (puthash name (1+ (gethash name table 0)) table)))
+
+(defun fzf-native-upstream--accepted-exception-p (exception)
+  "Return non-nil only for a documented, accepted EXCEPTION."
+  (eq (plist-get exception :disposition) 'accepted))
+
+(defun fzf-native-upstream--exception-alist (table)
+  "Return sorted exception counts from TABLE."
+  (let (entries)
+    (maphash (lambda (name count) (push (cons name count) entries)) table)
+    (sort entries (lambda (left right)
+                    (string< (symbol-name (car left))
+                             (symbol-name (car right)))))))
+
 (defun fzf-native-upstream--dimension-value (case key)
   "Return dimension KEY from CASE, including query options."
   (let ((query (fzf-native-differential-case-query case))
