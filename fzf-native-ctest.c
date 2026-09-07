@@ -1705,13 +1705,21 @@ static void test_shared_membership_growth_reuses_immutable_prefix(void) {
   shared_idx_release(base);
 }
 
-static void test_shared_membership_growth_flattens_at_depth_limit(void) {
-  uint32_t first = 0;
-  SharedIdx *membership = shared_idx_alloc_abortable(&first, 1, NULL);
+static void test_shared_membership_growth_compacts_at_depth_limit(void) {
+  const uint32_t base_count = 4096;
+  uint32_t *base_values = malloc(base_count * sizeof *base_values);
+  CHECK(base_values != NULL);
+  if (!base_values) return;
+  for (uint32_t value = 0; value < base_count; value++)
+    base_values[value] = value;
+  SharedIdx *membership = shared_idx_alloc_abortable(
+      base_values, base_count, NULL);
+  free(base_values);
   CHECK(membership != NULL);
   if (!membership) return;
 
-  for (uint32_t value = 1; value <= SHARED_IDX_MAX_DEPTH; value++) {
+  for (uint32_t offset = 0; offset < SHARED_IDX_MAX_DEPTH - 1; offset++) {
+    uint32_t value = base_count + offset;
     SharedIdx *next = shared_idx_extend_abortable(
         membership, &value, 1, SIZE_MAX, NULL);
     CHECK(next != NULL);
@@ -1719,17 +1727,171 @@ static void test_shared_membership_growth_flattens_at_depth_limit(void) {
     membership = next;
     if (!membership) return;
   }
-  CHECK(membership->depth == 1);
-  CHECK(membership->count == SHARED_IDX_MAX_DEPTH + 1);
-  CHECK(membership->prefix == NULL);
+  CHECK(membership->depth == SHARED_IDX_MAX_DEPTH);
+
+  SharedIdxCursor before_cursor;
+  CHECK(shared_idx_cursor_init(&before_cursor, membership));
+  SharedIdx *retained = (SharedIdx *)
+      before_cursor.segments[SHARED_IDX_COMPACT_RETAIN_DEPTH - 1];
+  CHECK(retained != NULL);
+  CHECK(retained->depth == SHARED_IDX_COMPACT_RETAIN_DEPTH);
+  shared_idx_retain(retained);
+
+  uint32_t final_value = base_count + SHARED_IDX_MAX_DEPTH - 1;
+  size_t total_count = membership->count + 1;
+  size_t compacted_own_count = total_count - retained->count;
+  size_t compacted_budget = retained->storage_bytes + sizeof(SharedIdx) +
+      compacted_own_count * sizeof(uint32_t);
+  size_t full_budget = sizeof(SharedIdx) + total_count * sizeof(uint32_t);
+
+  /* Cancellation releases the temporary retained-prefix reference and leaves
+     the source chain unchanged. */
+  uint32_t refs_before = atomic_load_explicit(
+      &retained->refcount, memory_order_relaxed);
+  _Atomic bool stop = true;
+  CHECK(shared_idx_extend_abortable(
+            membership, &final_value, 1, compacted_budget, &stop) == NULL);
+  CHECK(atomic_load_explicit(&retained->refcount, memory_order_relaxed) ==
+        refs_before);
+
+  /* A byte cap that fits only the canonical flat representation keeps the
+     previous max-storage behavior as a fallback. */
+  SharedIdx *fully_flattened = shared_idx_extend_abortable(
+      membership, &final_value, 1, full_budget, NULL);
+  CHECK(fully_flattened != NULL);
+  if (fully_flattened) {
+    CHECK(fully_flattened->depth == 1);
+    CHECK(fully_flattened->prefix == NULL);
+    CHECK(fully_flattened->suffix_compactions_since_flatten == 0);
+    CHECK(fully_flattened->storage_bytes == full_budget);
+    shared_idx_release(fully_flattened);
+  }
+
+  SharedIdx *compacted = shared_idx_extend_abortable(
+      membership, &final_value, 1, compacted_budget, NULL);
+  CHECK(compacted != NULL);
+  if (!compacted) {
+    shared_idx_release(retained);
+    shared_idx_release(membership);
+    return;
+  }
+  CHECK(compacted->depth == SHARED_IDX_COMPACT_RETAIN_DEPTH + 1);
+  CHECK(compacted->suffix_compactions_since_flatten == 1);
+  CHECK(compacted->prefix == retained);
+  CHECK(compacted->count == total_count);
+  CHECK(compacted->own_count == compacted_own_count);
+  CHECK(compacted->storage_bytes == compacted_budget);
+  CHECK(compacted->storage_bytes <= compacted_budget);
+  /* The large base allocation remains shared; only newer values were copied
+     into the compacted node. */
+  CHECK(compacted->own_count < base_count / 100);
+
+  shared_idx_release(membership);
 
   SharedIdxCursor cursor;
-  CHECK(shared_idx_cursor_init(&cursor, membership));
-  for (uint32_t expected = 0; expected <= SHARED_IDX_MAX_DEPTH; expected++) {
+  CHECK(shared_idx_cursor_init(&cursor, compacted));
+  for (uint32_t expected = 0; expected < total_count; expected++) {
     uint32_t actual = UINT32_MAX;
     CHECK(shared_idx_cursor_next(&cursor, &actual));
     CHECK(actual == expected);
   }
+  uint32_t exhausted = 0;
+  CHECK(!shared_idx_cursor_next(&cursor, &exhausted));
+  shared_idx_release(retained);
+  shared_idx_release(compacted);
+}
+
+static void test_shared_membership_growth_bounds_suffix_compactions(void) {
+  const uint32_t base_count = 1024;
+  uint32_t *values = malloc(base_count * sizeof *values);
+  CHECK(values != NULL);
+  if (!values) return;
+  for (uint32_t value = 0; value < base_count; value++)
+    values[value] = value;
+  SharedIdx *membership = shared_idx_alloc_abortable(
+      values, base_count, NULL);
+  free(values);
+  CHECK(membership != NULL);
+  if (!membership) return;
+
+  uint32_t next_value = base_count;
+  /* Reach the first depth limit, then perform the two permitted suffix-only
+     compactions.  Each returns to depth 17, leaving 16 extensions until the
+     next depth-limit event. */
+  for (size_t i = 0; i < SHARED_IDX_MAX_DEPTH - 1; i++, next_value++) {
+    SharedIdx *next = shared_idx_extend_abortable(
+        membership, &next_value, 1, SIZE_MAX, NULL);
+    CHECK(next != NULL);
+    shared_idx_release(membership);
+    membership = next;
+    if (!membership) return;
+  }
+  CHECK(membership->depth == SHARED_IDX_MAX_DEPTH);
+
+  for (uint8_t expected_compactions = 1;
+       expected_compactions <= SHARED_IDX_SUFFIX_COMPACTION_LIMIT;
+       expected_compactions++) {
+    size_t extensions = expected_compactions == 1
+        ? 1 : SHARED_IDX_MAX_DEPTH - SHARED_IDX_COMPACT_RETAIN_DEPTH;
+    for (size_t i = 0; i < extensions; i++, next_value++) {
+      SharedIdx *next = shared_idx_extend_abortable(
+          membership, &next_value, 1, SIZE_MAX, NULL);
+      CHECK(next != NULL);
+      shared_idx_release(membership);
+      membership = next;
+      if (!membership) return;
+    }
+    CHECK(membership->depth == SHARED_IDX_COMPACT_RETAIN_DEPTH + 1);
+    CHECK(membership->suffix_compactions_since_flatten ==
+          expected_compactions);
+  }
+
+  /* The next depth-limit event must use the canonical full flatten and reset
+     the bound, rather than recopying the fixed-anchor suffix a third time. */
+  for (size_t i = 0;
+       i < SHARED_IDX_MAX_DEPTH - SHARED_IDX_COMPACT_RETAIN_DEPTH - 1;
+       i++, next_value++) {
+    SharedIdx *next = shared_idx_extend_abortable(
+        membership, &next_value, 1, SIZE_MAX, NULL);
+    CHECK(next != NULL);
+    shared_idx_release(membership);
+    membership = next;
+    if (!membership) return;
+  }
+  CHECK(membership->depth == SHARED_IDX_MAX_DEPTH);
+  CHECK(membership->suffix_compactions_since_flatten ==
+        SHARED_IDX_SUFFIX_COMPACTION_LIMIT);
+  uint32_t refs_before = atomic_load_explicit(
+      &membership->refcount, memory_order_relaxed);
+  _Atomic bool stop = true;
+  CHECK(shared_idx_extend_abortable(
+            membership, &next_value, 1, SIZE_MAX, &stop) == NULL);
+  CHECK(atomic_load_explicit(
+            &membership->refcount, memory_order_relaxed) == refs_before);
+
+  SharedIdx *flattened = shared_idx_extend_abortable(
+      membership, &next_value, 1, SIZE_MAX, NULL);
+  CHECK(flattened != NULL);
+  shared_idx_release(membership);
+  membership = flattened;
+  next_value++;
+  if (!membership) return;
+  CHECK(membership->depth == 1);
+  CHECK(membership->prefix == NULL);
+  CHECK(membership->suffix_compactions_since_flatten == 0);
+  CHECK(membership->count == next_value);
+  CHECK(membership->storage_bytes ==
+        sizeof *membership + membership->count * sizeof *membership->idx);
+
+  SharedIdxCursor cursor;
+  CHECK(shared_idx_cursor_init(&cursor, membership));
+  for (uint32_t expected = 0; expected < next_value; expected++) {
+    uint32_t actual = UINT32_MAX;
+    CHECK(shared_idx_cursor_next(&cursor, &actual));
+    CHECK(actual == expected);
+  }
+  uint32_t exhausted = 0;
+  CHECK(!shared_idx_cursor_next(&cursor, &exhausted));
   shared_idx_release(membership);
 }
 
@@ -4173,7 +4335,8 @@ int main(void) {
 
   printf("--- cache (phase 1: exact-match) ---\n");
   RUN(test_shared_membership_growth_reuses_immutable_prefix);
-  RUN(test_shared_membership_growth_flattens_at_depth_limit);
+  RUN(test_shared_membership_growth_compacts_at_depth_limit);
+  RUN(test_shared_membership_growth_bounds_suffix_compactions);
   RUN(test_shared_membership_growth_respects_storage_budget);
   RUN(test_cache_lookup_miss_on_empty);
   RUN(test_cache_insert_then_lookup_hit);

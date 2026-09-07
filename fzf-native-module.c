@@ -2014,14 +2014,20 @@ typedef struct {
    set + only the candidates that arrived since (delta scoring) instead of
    re-scanning the whole pool. */
 #define SHARED_IDX_MAX_DEPTH 32
+#define SHARED_IDX_COMPACT_RETAIN_DEPTH (SHARED_IDX_MAX_DEPTH / 2)
+#define SHARED_IDX_SUFFIX_COMPACTION_LIMIT 2
+_Static_assert(SHARED_IDX_SUFFIX_COMPACTION_LIMIT < UINT8_MAX,
+               "suffix compaction counter must not wrap");
 
 /* Immutable membership can be extended by producer growth without copying
    the already-cached prefix.  PREFIX owns one reference to the older
    membership and IDX contains only this node's suffix.  COUNT and
    STORAGE_BYTES describe the complete logical chain so cache limits retain
-   their previous whole-membership accounting.  Chains flatten at the depth
-   limit or before their storage exceeds the membership byte budget.  This
-   keeps later query-refinement traversal and cache storage bounded. */
+   their previous whole-membership accounting.  At the depth limit the newer
+   suffix is compacted while an older prefix remains shared; a full flatten is
+   still used when the compacted representation exceeds the membership byte
+   budget.  This keeps later query-refinement traversal and cache storage
+   bounded. */
 typedef struct SharedIdx {
   _Atomic uint32_t refcount;
   struct SharedIdx *prefix;
@@ -2032,6 +2038,7 @@ typedef struct SharedIdx {
   uint32_t         first_idx;
   uint32_t         last_idx;
   bool             ordered;
+  uint8_t          suffix_compactions_since_flatten;
   uint32_t         idx[];   /* this node's suffix */
 } SharedIdx;
 
@@ -2067,6 +2074,7 @@ static SharedIdx *shared_idx_alloc_abortable(const uint32_t *src, size_t n,
   p->first_idx = n ? src[0] : 0;
   p->last_idx = n ? src[n - 1] : 0;
   p->ordered = true;
+  p->suffix_compactions_since_flatten = 0;
   if (n && !async_copy_bytes_abortable(
                p->idx, src, n * sizeof *p->idx, stop)) {
     free(p);
@@ -2163,9 +2171,100 @@ static bool shared_idx_valid_for_boundary(const SharedIdx *membership,
          (membership->count == 0 || membership->last_idx < boundary);
 }
 
+/* Bound traversal depth without copying the oldest (and normally largest)
+   membership segment.  At the depth limit, retain the oldest half-chain and
+   combine only the newer suffix nodes plus DELTA into one immutable node.
+   This optimization is deliberately bounded: after a small fixed number of
+   suffix compactions the full-flatten fallback below resets the chain, so
+   long-running sessions cannot repeatedly copy an ever-growing fixed-anchor
+   suffix.  The full fallback also remains authoritative when this larger
+   representation does not fit MAX_STORAGE_BYTES or allocation fails. */
+static SharedIdx *shared_idx_compact_newer_suffix_abortable(
+    SharedIdx *membership, const uint32_t *delta, size_t delta_count,
+    size_t max_storage_bytes, _Atomic bool *stop) {
+  if (!membership ||
+      membership->depth < SHARED_IDX_MAX_DEPTH ||
+      SHARED_IDX_COMPACT_RETAIN_DEPTH == 0 ||
+      SHARED_IDX_COMPACT_RETAIN_DEPTH >= membership->depth ||
+      membership->suffix_compactions_since_flatten >=
+          SHARED_IDX_SUFFIX_COMPACTION_LIMIT ||
+      delta_count > SIZE_MAX - membership->count)
+    return NULL;
+
+  SharedIdxCursor cursor;
+  if (!shared_idx_cursor_init(&cursor, membership) ||
+      cursor.segment_count != membership->depth)
+    return NULL;
+  SharedIdx *retained = (SharedIdx *)
+      cursor.segments[SHARED_IDX_COMPACT_RETAIN_DEPTH - 1];
+  if (!retained ||
+      retained->depth != SHARED_IDX_COMPACT_RETAIN_DEPTH ||
+      retained->count > membership->count)
+    return NULL;
+
+  size_t retained_count = 0;
+  for (size_t i = 0; i < SHARED_IDX_COMPACT_RETAIN_DEPTH; i++) {
+    if (cursor.segments[i]->own_count > SIZE_MAX - retained_count)
+      return NULL;
+    retained_count += cursor.segments[i]->own_count;
+  }
+  if (retained_count != retained->count) return NULL;
+
+  size_t newer_count = membership->count - retained->count;
+  if (delta_count > SIZE_MAX - newer_count) return NULL;
+  size_t own_count = newer_count + delta_count;
+  if (own_count > (SIZE_MAX - sizeof(SharedIdx)) / sizeof *delta)
+    return NULL;
+  size_t own_bytes = sizeof(SharedIdx) + own_count * sizeof *delta;
+  if (retained->storage_bytes > max_storage_bytes ||
+      own_bytes > max_storage_bytes - retained->storage_bytes)
+    return NULL;
+
+  SharedIdx *compacted = malloc(own_bytes);
+  if (!compacted) return NULL;
+  atomic_init(&compacted->refcount, 1);
+  compacted->prefix = shared_idx_retain(retained);
+  compacted->count = membership->count + delta_count;
+  compacted->own_count = own_count;
+  compacted->depth = retained->depth + 1;
+  compacted->storage_bytes = retained->storage_bytes + own_bytes;
+  compacted->first_idx = membership->first_idx;
+  compacted->last_idx = delta_count
+                            ? delta[delta_count - 1]
+                            : membership->last_idx;
+  compacted->ordered = true;
+  compacted->suffix_compactions_since_flatten =
+      membership->suffix_compactions_since_flatten + 1;
+
+  /* Cursor initialization already validated the complete logical count.
+     Jump directly to the first unretained segment; do not walk the large
+     retained prefix merely to skip it. */
+  cursor.segment = SHARED_IDX_COMPACT_RETAIN_DEPTH;
+  cursor.offset = 0;
+  cursor.remaining = newer_count;
+  size_t copied = 0;
+  while (copied < newer_count) {
+    if ((copied & 0x3FFF) == 0 && async_stop_requested(stop)) {
+      shared_idx_release(compacted);
+      return NULL;
+    }
+    if (!shared_idx_cursor_next(&cursor, &compacted->idx[copied++])) {
+      shared_idx_release(compacted);
+      return NULL;
+    }
+  }
+  if (!async_copy_bytes_abortable(
+          compacted->idx + copied, delta,
+          delta_count * sizeof *delta, stop)) {
+    shared_idx_release(compacted);
+    return NULL;
+  }
+  return compacted;
+}
+
 /* Extend an immutable membership with a strictly later suffix.  Small growth
-   stores only DELTA.  The chain flattens at SHARED_IDX_MAX_DEPTH or before its
-   headers exceed MAX_STORAGE_BYTES. */
+   stores only DELTA.  At SHARED_IDX_MAX_DEPTH the newer suffix is compacted;
+   the full-flatten fallback handles tighter MAX_STORAGE_BYTES limits. */
 static SharedIdx *shared_idx_extend_abortable(
     SharedIdx *prefix, const uint32_t *delta, size_t delta_count,
     size_t max_storage_bytes, _Atomic bool *stop) {
@@ -2205,6 +2304,8 @@ static SharedIdx *shared_idx_extend_abortable(
     extended->first_idx = prefix->count ? prefix->first_idx : delta[0];
     extended->last_idx = delta[delta_count - 1];
     extended->ordered = true;
+    extended->suffix_compactions_since_flatten =
+        prefix->suffix_compactions_since_flatten;
     if (!async_copy_bytes_abortable(
             extended->idx, delta, delta_count * sizeof *delta, stop)) {
       shared_idx_release(extended);
@@ -2212,6 +2313,11 @@ static SharedIdx *shared_idx_extend_abortable(
     }
     return extended;
   }
+
+  SharedIdx *compacted = shared_idx_compact_newer_suffix_abortable(
+      prefix, delta, delta_count, max_storage_bytes, stop);
+  if (compacted) return compacted;
+  if (async_stop_requested(stop)) return NULL;
 
   if (total > (SIZE_MAX - sizeof(SharedIdx)) / sizeof *delta) return NULL;
   size_t flat_bytes = sizeof(SharedIdx) + total * sizeof *delta;
@@ -2228,6 +2334,7 @@ static SharedIdx *shared_idx_extend_abortable(
                                   : (delta_count ? delta[0] : 0);
   flat->last_idx = delta_count ? delta[delta_count - 1] : prefix->last_idx;
   flat->ordered = true;
+  flat->suffix_compactions_since_flatten = 0;
 
   SharedIdxCursor cursor;
   if (!shared_idx_cursor_init(&cursor, prefix)) {

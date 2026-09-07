@@ -498,7 +498,12 @@ A cached top K must also cover the requested limit.
 
 Complete membership uses a reference-counted =SharedIdx= chain.  Producer growth
 shares the immutable prior membership and stores only new matching indexes.
-Chains flatten after 32 nodes or before they exceed the membership byte budget.
+At 32 nodes, the chain can retain its oldest 16 nodes and compact the newer
+suffix into one immutable node.  After two suffix-only compactions, the next
+depth-limit event forces a full flatten and resets the counter.  This bound
+prevents a fixed retained prefix from causing unbounded repeated suffix copies.
+The chain also falls back to a full flatten when the suffix representation
+exceeds the membership byte budget.
 The builder stops before membership exceeds half of the whole-result byte budget.
 
 OR queries do not retain whole-result membership.
