@@ -98,29 +98,7 @@ jobs:
         emacs -Q --batch -L . -l fzf-native \
           -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
           -l fzf-native-utf8-test.el \
-          --eval "(ert-run-tests-batch-and-exit \
-            '(or fzf-native-session-abi-handshake-test \
-                 fzf-native-module-init-publication-is-reentry-safe-test \
-                 fzf-native-async-preserves-empty-line-candidates-test \
-                 fzf-native-async-public-results-own-strings-across-reentry-test \
-                 fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-stats-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-status-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-submit-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-cache-positive-quote-refinement-test \
-                 fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
-                 fzf-native-async-max-line-length-counts-characters-test \
-                 fzf-native-async-line-cap-streams-ansi-heavy-record-test \
-                 fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
-                 fzf-native-async-producer-uses-dynamic-process-environment-test \
-                 fzf-native-async-producer-honors-environment-removal-test \
-                 fzf-native-async-producer-honors-path-removal-test \
-                 fzf-native-async-producer-corrects-pwd-for-directory-test \
-                 fzf-native-async-producer-honors-pwd-removal-test \
-                 fzf-native-score-all-empty-string-candidate-test \
-                 fzf-native-utf8-case-ignore-length-changing-fold-test))"
+          --eval '(fzf-native-test-run-artifact-smoke)'
 
     - name: Clean stale binaries
       shell: bash
@@ -141,29 +119,7 @@ jobs:
         emacs -Q --batch -L . -l fzf-native \
           -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
           -l fzf-native-utf8-test.el \
-          --eval "(ert-run-tests-batch-and-exit \
-            '(or fzf-native-session-abi-handshake-test \
-                 fzf-native-module-init-publication-is-reentry-safe-test \
-                 fzf-native-async-preserves-empty-line-candidates-test \
-                 fzf-native-async-public-results-own-strings-across-reentry-test \
-                 fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-stats-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-status-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-submit-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-cache-positive-quote-refinement-test \
-                 fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
-                 fzf-native-async-max-line-length-counts-characters-test \
-                 fzf-native-async-line-cap-streams-ansi-heavy-record-test \
-                 fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
-                 fzf-native-async-producer-uses-dynamic-process-environment-test \
-                 fzf-native-async-producer-honors-environment-removal-test \
-                 fzf-native-async-producer-honors-path-removal-test \
-                 fzf-native-async-producer-corrects-pwd-for-directory-test \
-                 fzf-native-async-producer-honors-pwd-removal-test \
-                 fzf-native-score-all-empty-string-candidate-test \
-                 fzf-native-utf8-case-ignore-length-changing-fold-test))"
+          --eval '(fzf-native-test-run-artifact-smoke)'
 
     - name: Check Darwin export surface
       if: runner.os == 'macOS'
@@ -268,29 +224,7 @@ jobs:
         emacs -Q --batch -L . -l fzf-native \
           -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
           -l fzf-native-utf8-test.el \
-          --eval "(ert-run-tests-batch-and-exit \
-            '(or fzf-native-session-abi-handshake-test \
-                 fzf-native-module-init-publication-is-reentry-safe-test \
-                 fzf-native-async-preserves-empty-line-candidates-test \
-                 fzf-native-async-public-results-own-strings-across-reentry-test \
-                 fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-stats-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-status-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-submit-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-cache-positive-quote-refinement-test \
-                 fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
-                 fzf-native-async-max-line-length-counts-characters-test \
-                 fzf-native-async-line-cap-streams-ansi-heavy-record-test \
-                 fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
-                 fzf-native-async-producer-uses-dynamic-process-environment-test \
-                 fzf-native-async-producer-honors-environment-removal-test \
-                 fzf-native-async-producer-honors-path-removal-test \
-                 fzf-native-async-producer-corrects-pwd-for-directory-test \
-                 fzf-native-async-producer-honors-pwd-removal-test \
-                 fzf-native-score-all-empty-string-candidate-test \
-                 fzf-native-utf8-case-ignore-length-changing-fold-test))"
+          --eval '(fzf-native-test-run-artifact-smoke)'
 
     - uses: actions/download-artifact@v4
       with:
@@ -302,29 +236,7 @@ jobs:
         FZF_NATIVE_TEST_MODULE=${{github.workspace}}/fresh-bin/Linux/fzf-native-module.so \
           emacs -Q --batch -L . -l ert -l fzf-native-test.el \
           -l fzf-native-utf8-test.el \
-          --eval "(ert-run-tests-batch-and-exit \
-            '(or fzf-native-session-abi-handshake-test \
-                 fzf-native-module-init-publication-is-reentry-safe-test \
-                 fzf-native-async-preserves-empty-line-candidates-test \
-                 fzf-native-async-public-results-own-strings-across-reentry-test \
-                 fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-stats-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-status-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-submit-pins-session-across-lisp-reentry-test \
-                 fzf-native-async-cache-positive-quote-refinement-test \
-                 fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
-                 fzf-native-async-max-line-length-counts-characters-test \
-                 fzf-native-async-line-cap-streams-ansi-heavy-record-test \
-                 fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
-                 fzf-native-async-producer-uses-dynamic-process-environment-test \
-                 fzf-native-async-producer-honors-environment-removal-test \
-                 fzf-native-async-producer-honors-path-removal-test \
-                 fzf-native-async-producer-corrects-pwd-for-directory-test \
-                 fzf-native-async-producer-honors-pwd-removal-test \
-                 fzf-native-score-all-empty-string-candidate-test \
-                 fzf-native-utf8-case-ignore-length-changing-fold-test))"
+          --eval '(fzf-native-test-run-artifact-smoke)'
 
   build-freebsd:
     runs-on: ubuntu-latest
@@ -346,29 +258,7 @@ jobs:
             emacs -Q --batch -L . -l fzf-native \
               -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
               -l fzf-native-utf8-test.el \
-              --eval "(ert-run-tests-batch-and-exit \
-                '(or fzf-native-session-abi-handshake-test \
-                     fzf-native-module-init-publication-is-reentry-safe-test \
-                     fzf-native-async-preserves-empty-line-candidates-test \
-                     fzf-native-async-public-results-own-strings-across-reentry-test \
-                     fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
-                     fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
-                     fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
-                     fzf-native-async-stats-pins-session-across-lisp-reentry-test \
-                     fzf-native-async-status-pins-session-across-lisp-reentry-test \
-                     fzf-native-async-submit-pins-session-across-lisp-reentry-test \
-                     fzf-native-async-cache-positive-quote-refinement-test \
-                     fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
-                     fzf-native-async-max-line-length-counts-characters-test \
-                     fzf-native-async-line-cap-streams-ansi-heavy-record-test \
-                     fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
-                     fzf-native-async-producer-uses-dynamic-process-environment-test \
-                     fzf-native-async-producer-honors-environment-removal-test \
-                     fzf-native-async-producer-honors-path-removal-test \
-                     fzf-native-async-producer-corrects-pwd-for-directory-test \
-                     fzf-native-async-producer-honors-pwd-removal-test \
-                     fzf-native-score-all-empty-string-candidate-test \
-                     fzf-native-utf8-case-ignore-length-changing-fold-test))"
+              --eval '(fzf-native-test-run-artifact-smoke)'
           fi
           rm -rf bin
           cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
@@ -376,29 +266,7 @@ jobs:
           emacs -Q --batch -L . -l fzf-native \
             -f fzf-native-load-dyn -l ert -l fzf-native-test.el \
             -l fzf-native-utf8-test.el \
-            --eval "(ert-run-tests-batch-and-exit \
-              '(or fzf-native-session-abi-handshake-test \
-                   fzf-native-module-init-publication-is-reentry-safe-test \
-                   fzf-native-async-preserves-empty-line-candidates-test \
-                   fzf-native-async-public-results-own-strings-across-reentry-test \
-                   fzf-native-async-candidates-pins-session-across-lisp-reentry-test \
-                   fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test \
-                   fzf-native-async-snapshot-pins-session-across-lisp-reentry-test \
-                   fzf-native-async-stats-pins-session-across-lisp-reentry-test \
-                   fzf-native-async-status-pins-session-across-lisp-reentry-test \
-                   fzf-native-async-submit-pins-session-across-lisp-reentry-test \
-                   fzf-native-async-cache-positive-quote-refinement-test \
-                   fzf-native-async-cache-invalid-utf8-prefix-rescans-test \
-                   fzf-native-async-max-line-length-counts-characters-test \
-                   fzf-native-async-line-cap-streams-ansi-heavy-record-test \
-                   fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test \
-                   fzf-native-async-producer-uses-dynamic-process-environment-test \
-                   fzf-native-async-producer-honors-environment-removal-test \
-                   fzf-native-async-producer-honors-path-removal-test \
-                   fzf-native-async-producer-corrects-pwd-for-directory-test \
-                   fzf-native-async-producer-honors-pwd-removal-test \
-                   fzf-native-score-all-empty-string-candidate-test \
-                   fzf-native-utf8-case-ignore-length-changing-fold-test))"
+            --eval '(fzf-native-test-run-artifact-smoke)'
           actual=$(nm -D --defined-only -P bin/FreeBSD/fzf-native-module.so | awk '{print $1}' | sort)
           expected=$(printf '%s\n' emacs_module_init plugin_is_GPL_compatible | sort)
           printf 'defined dynamic symbols:\n%s\n' "$actual"
