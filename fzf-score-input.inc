@@ -14,7 +14,7 @@ if (pattern->only_inv) {
        the matching characters have a long gap.  Testing the score here made a
        small slab accept candidates that the default slab rejected. */
     fzf_result_t res = CALL_ALG(
-        term, false, input, input_is_ascii, NULL, slab);
+        term, false, input, input_is_ascii, pattern->forward, NULL, slab);
     if (fzf_allocation_failed()) return 0;
     if (res.start >= 0) return 0;
   }
@@ -29,7 +29,7 @@ for (size_t i = 0; i < pattern->size; i++) {
   for (size_t j = 0; j < term_set->size; j++) {
     fzf_term_t *term = &term_set->ptr[j];
     fzf_result_t res = CALL_ALG(
-        term, false, input, input_is_ascii, NULL, slab);
+        term, false, input, input_is_ascii, pattern->forward, NULL, slab);
     if (fzf_allocation_failed()) return 0;
     if (res.start >= 0) {
       if (term->inv) continue;

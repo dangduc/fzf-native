@@ -97,6 +97,9 @@ typedef struct {
   size_t size;
   size_t cap;
   bool only_inv;
+  /* fzf's match-scan direction.  Parsed patterns carry this setting so every
+     scorer and position query applies one immutable request policy. */
+  bool forward;
 } fzf_pattern_t;
 
 /* Scoring APIs use ordinary match/no-match return values, so allocation
@@ -145,6 +148,9 @@ fzf_result_t fzf_equal_match(bool case_sensitive, bool normalize,
 /* interface */
 fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
                                  char *pattern, bool fuzzy);
+fzf_pattern_t *fzf_parse_pattern_with_direction(
+    fzf_case_types case_mode, bool normalize, char *pattern, bool fuzzy,
+    bool forward);
 void fzf_free_pattern(fzf_pattern_t *pattern);
 
 int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,

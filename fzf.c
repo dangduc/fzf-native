@@ -2768,30 +2768,67 @@ static fzf_algo_t get_utf8_algo(fzf_algo_t ascii_algo) {
 
 static inline fzf_result_t call_alg_for_input(
     fzf_term_t *term, bool normalize, fzf_string_t *input,
-    bool input_is_ascii, fzf_position_t *pos, fzf_slab_t *slab) {
+    bool input_is_ascii, bool forward, fzf_position_t *pos,
+    fzf_slab_t *slab) {
   (void)normalize;
   fzf_algo_t algo = term->fn;
   if (!input_is_ascii) {
     /* Get UTF-8 version of the algorithm */
     algo = get_utf8_algo(algo);
   }
-  return algo(term->case_sensitive, term->normalize, input,
-              (fzf_string_t *)term->text, pos, slab);
+  fzf_string_t *pattern = (fzf_string_t *)term->text;
+  if (algo == fzf_fuzzy_match_v1)
+    return fzf_fuzzy_match_v1_with_direction(
+        term->case_sensitive, term->normalize, forward, input, pattern, pos,
+        slab);
+  if (algo == fzf_fuzzy_match_v2)
+    return fzf_fuzzy_match_v2_with_direction(
+        term->case_sensitive, term->normalize, forward, input, pattern, pos,
+        slab);
+  if (algo == fzf_exact_match_naive)
+    return fzf_exact_match_naive_with_direction(
+        term->case_sensitive, term->normalize, forward, input, pattern, pos,
+        slab);
+  if (algo == fzf_exact_match_boundary)
+    return fzf_exact_match_boundary_with_direction(
+        term->case_sensitive, term->normalize, forward, input, pattern, pos,
+        slab);
+  if (algo == fzf_fuzzy_match_v1_utf8)
+    return fzf_fuzzy_match_v1_utf8_with_direction(
+        term->case_sensitive, term->normalize, forward, input, pattern, pos,
+        slab);
+  if (algo == fzf_fuzzy_match_v2_utf8)
+    return fzf_fuzzy_match_v2_utf8_with_direction(
+        term->case_sensitive, term->normalize, forward, input, pattern, pos,
+        slab);
+  if (algo == fzf_exact_match_utf8)
+    return fzf_exact_match_utf8_with_direction(
+        term->case_sensitive, term->normalize, forward, input, pattern, pos,
+        slab);
+  if (algo == fzf_exact_match_boundary_utf8)
+    return fzf_exact_match_boundary_utf8_with_direction(
+        term->case_sensitive, term->normalize, forward, input, pattern, pos,
+        slab);
+  return algo(term->case_sensitive, term->normalize, input, pattern, pos,
+              slab);
 }
 
-#define CALL_ALG(term, normalize, input, input_is_ascii, pos, slab) \
-  call_alg_for_input(term, normalize, &(input), input_is_ascii, pos, slab)
+#define CALL_ALG(term, normalize, input, input_is_ascii, forward, pos, slab) \
+  call_alg_for_input(term, normalize, &(input), input_is_ascii, forward, pos, \
+                     slab)
 
 // TODO(conni2461): REFACTOR
 /* assumption (maybe i change that later)
  * - always v2 alg
  * - bool extended always true (thats the whole point of this isn't it)
  */
-fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
-                                 char *pattern, bool fuzzy) {
+fzf_pattern_t *fzf_parse_pattern_with_direction(
+    fzf_case_types case_mode, bool normalize, char *pattern, bool fuzzy,
+    bool forward) {
   if (!pattern) return NULL;
   fzf_pattern_t *pat_obj = calloc(1, sizeof *pat_obj);
   if (!pat_obj) return NULL;
+  pat_obj->forward = forward;
   char *pattern_copy = NULL;
   fzf_term_set_t *set = NULL;
 
@@ -2973,6 +3010,12 @@ parse_failure:
   return NULL;
 }
 
+fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
+                                 char *pattern, bool fuzzy) {
+  return fzf_parse_pattern_with_direction(
+      case_mode, normalize, pattern, fuzzy, true);
+}
+
 void fzf_free_pattern(fzf_pattern_t *pattern) {
   if (!pattern) return;
   if (pattern->ptr) {
@@ -3041,7 +3084,7 @@ fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
         // we are not interested in the positions (for highlights) so to speed
         // this up we can pass in NULL here and don't calculate the positions
         fzf_result_t res = CALL_ALG(
-            term, false, input, input_is_ascii, NULL, slab);
+            term, false, input, input_is_ascii, pattern->forward, NULL, slab);
         if (fzf_allocation_failed()) {
           fzf_free_positions(all_pos);
           return NULL;
@@ -3052,7 +3095,7 @@ fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
         continue;
       }
       fzf_result_t res = CALL_ALG(
-          term, false, input, input_is_ascii, all_pos, slab);
+          term, false, input, input_is_ascii, pattern->forward, all_pos, slab);
       if (fzf_allocation_failed()) {
         fzf_free_positions(all_pos);
         return NULL;
