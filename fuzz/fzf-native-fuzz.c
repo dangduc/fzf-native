@@ -115,6 +115,121 @@ static bool pattern_has_inverse(const fzf_pattern_t *pattern) {
   return false;
 }
 
+static bool extension_preserves_term(const fzf_term_t *term, bool prepend) {
+  if (term->inv || !term->fn || !term->text) return false;
+  const fzf_string_t *text = (const fzf_string_t *)term->text;
+  if (!valid_utf8(text->data, text->size)) return false;
+
+  if (term->fn == fzf_fuzzy_match_v1 ||
+      term->fn == fzf_fuzzy_match_v1_utf8 ||
+      term->fn == fzf_fuzzy_match_v2 ||
+      term->fn == fzf_fuzzy_match_v2_utf8 ||
+      term->fn == fzf_exact_match_naive ||
+      term->fn == fzf_exact_match_utf8)
+    return true;
+  if (prepend)
+    return term->fn == fzf_suffix_match ||
+           term->fn == fzf_suffix_match_utf8;
+  return term->fn == fzf_prefix_match ||
+         term->fn == fzf_prefix_match_utf8;
+}
+
+static bool extension_preserves_pattern(const fzf_pattern_t *pattern,
+                                        bool prepend) {
+  for (size_t i = 0; i < pattern->size; i++) {
+    const fzf_term_set_t *set = pattern->ptr[i];
+    for (size_t j = 0; j < set->size; j++)
+      if (!extension_preserves_term(&set->ptr[j], prepend)) return false;
+  }
+  return true;
+}
+
+static bool pattern_contains_codepoint(const fzf_pattern_t *pattern,
+                                       utf8proc_int32_t wanted) {
+  for (size_t i = 0; i < pattern->size; i++) {
+    const fzf_term_set_t *set = pattern->ptr[i];
+    for (size_t j = 0; j < set->size; j++) {
+      const fzf_string_t *text = (const fzf_string_t *)set->ptr[j].text;
+      size_t offset = 0;
+      while (text && offset < text->size) {
+        utf8proc_int32_t codepoint;
+        utf8proc_ssize_t width = utf8proc_iterate(
+            (const utf8proc_uint8_t *)text->data + offset,
+            (utf8proc_ssize_t)(text->size - offset), &codepoint);
+        if (width <= 0 || codepoint == wanted) return true;
+        offset += (size_t)width;
+      }
+    }
+  }
+  return false;
+}
+
+static bool extension_keeps_slab_path(const fzf_pattern_t *pattern,
+                                      size_t candidate_units,
+                                      size_t extended_units,
+                                      const fzf_slab_t *slab) {
+  if (!slab) return true;
+  for (size_t i = 0; i < pattern->size; i++) {
+    const fzf_term_set_t *set = pattern->ptr[i];
+    for (size_t j = 0; j < set->size; j++) {
+      const fzf_term_t *term = &set->ptr[j];
+      if (term->fn != fzf_fuzzy_match_v2 &&
+          term->fn != fzf_fuzzy_match_v2_utf8)
+        continue;
+      const fzf_string_t *text = (const fzf_string_t *)term->text;
+      size_t pattern_units = utf8_strlen(text->data, text->size);
+      bool old_fallback = candidate_units != 0 &&
+          pattern_units > slab->I16.cap / candidate_units;
+      bool new_fallback = extended_units != 0 &&
+          pattern_units > slab->I16.cap / extended_units;
+      if (old_fallback != new_fallback) return false;
+    }
+  }
+  return true;
+}
+
+static void check_candidate_extension(const char *candidate,
+                                      fzf_pattern_t *pattern,
+                                      int32_t score, fzf_slab_t *slab) {
+  static const char *extensions[] = {
+      "x", " ", "\xc3\xa9", "\xf0\x9f\x9a\x80",
+  };
+  size_t length = strlen(candidate);
+  if (score <= 0 || !valid_utf8(candidate, length)) return;
+  char *extended = malloc(length + 5);
+  if (!extended) abort();
+
+  bool append_safe = extension_preserves_pattern(pattern, false);
+  bool prepend_safe = extension_preserves_pattern(pattern, true);
+  for (size_t i = 0; i < sizeof extensions / sizeof extensions[0]; i++) {
+    size_t extension_len = strlen(extensions[i]);
+    if (append_safe) {
+      memcpy(extended, candidate, length);
+      memcpy(extended + length, extensions[i], extension_len + 1);
+      if (fzf_get_score(extended, pattern, slab) <= 0)
+        fuzz_fail("appending text destroyed a prefix-safe match");
+    }
+    if (prepend_safe) {
+      memcpy(extended, extensions[i], extension_len);
+      memcpy(extended + extension_len, candidate, length + 1);
+      if (fzf_get_score(extended, pattern, slab) <= 0)
+        fuzz_fail("prepending text destroyed a suffix-safe match");
+    }
+  }
+
+  static const char nonmatching_scalar[] = "\xf4\x8f\xbf\xbf";
+  if (append_safe && is_ascii_utf8proc(candidate, length) &&
+      !pattern_contains_codepoint(pattern, 0x10ffff) &&
+      extension_keeps_slab_path(pattern, length, length + 1, slab)) {
+    memcpy(extended, candidate, length);
+    memcpy(extended + length, nonmatching_scalar,
+           sizeof nonmatching_scalar);
+    if (fzf_get_score(extended, pattern, slab) != score)
+      fuzz_fail("ASCII-to-UTF-8 dispatch changed a prefix-safe score");
+  }
+  free(extended);
+}
+
 #ifndef FZF_NATIVE_UTF8_MATCHING
 static bool pattern_has_end_anchor(const fzf_pattern_t *pattern) {
   for (size_t i = 0; i < pattern->size; i++) {
@@ -250,7 +365,9 @@ static void check_whitespace_equivalence(const char *candidate,
       fuzz_fail("trailing query whitespace changed a score");
     free(trailing);
   }
+
 }
+
 
 static void check_bounded_entry_points(const char *candidate,
                                        size_t candidate_size,
@@ -364,6 +481,8 @@ static void run_one(const uint8_t *data, size_t size) {
   int32_t score = fzf_get_score(candidate, pattern, default_slab);
   if (score != fzf_get_score(candidate, pattern, default_slab))
     fuzz_fail("repeated scoring is not deterministic");
+
+  check_candidate_extension(candidate, pattern, score, default_slab);
 
   check_bounded_entry_points(candidate, candidate_size, pattern,
                              default_slab, score);
