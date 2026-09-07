@@ -8,6 +8,7 @@
 // UTF8PROC integration for Unicode support
 #include "utf8proc-2.10.0/utf8proc.h"
 #include "utf8_char_index.h"
+#include "fzf-normalize.inc"
 
 #ifdef _MSC_VER
 #define FZF_THREAD_LOCAL __declspec(thread)
@@ -572,17 +573,25 @@ static int16_t bonus_at(fzf_string_t *input, size_t idx,
                    char_class_of(input->data[idx], config));
 }
 
-/* TODO(conni2461): maybe just not do this */
+static utf8proc_int32_t fzf_normalize_codepoint(utf8proc_int32_t codepoint) {
+  size_t lo = 0;
+  size_t hi = sizeof fzf_normalized_runes / sizeof fzf_normalized_runes[0];
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    utf8proc_int32_t source = fzf_normalized_runes[mid].source;
+    if (source < codepoint)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  if (lo < sizeof fzf_normalized_runes / sizeof fzf_normalized_runes[0] &&
+      fzf_normalized_runes[lo].source == codepoint)
+    return fzf_normalized_runes[lo].target;
+  return codepoint;
+}
+
 static char normalize_rune(char r) {
-  // TODO(conni2461)
-  /* if (r < 0x00C0 || r > 0x2184) { */
-  /*   return r; */
-  /* } */
-  /* rune n = normalized[r]; */
-  /* if n > 0 { */
-  /*   return n; */
-  /* } */
-  return r;
+  return (char)fzf_normalize_codepoint((uint8_t)r);
 }
 
 static int32_t try_skip(fzf_string_t *input, bool case_sensitive, byte b,
@@ -775,46 +784,14 @@ int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
 // UTF-8 aware character comparison
 static bool utf8_char_equal(utf8proc_int32_t cp1, utf8proc_int32_t cp2, 
                            bool case_sensitive, bool normalize) {
-  if (normalize) {
-    // Apply NFC normalization
-    utf8proc_uint8_t buffer1[8], buffer2[8];
-    utf8proc_ssize_t len1 = utf8proc_encode_char(cp1, buffer1);
-    utf8proc_ssize_t len2 = utf8proc_encode_char(cp2, buffer2);
-    
-    if (len1 > 0 && len2 > 0) {
-      // Null-terminate the buffers for utf8proc_NFC
-      buffer1[len1] = 0;
-      buffer2[len2] = 0;
-      
-      utf8proc_uint8_t *norm1 = utf8proc_NFC(buffer1);
-      utf8proc_uint8_t *norm2 = utf8proc_NFC(buffer2);
-      
-      if (norm1 && norm2) {
-        utf8proc_int32_t norm_cp1, norm_cp2;
-        utf8proc_iterate(norm1, -1, &norm_cp1);
-        utf8proc_iterate(norm2, -1, &norm_cp2);
-        
-        if (!case_sensitive) {
-          norm_cp1 = utf8proc_case_fold(norm_cp1);
-          norm_cp2 = utf8proc_case_fold(norm_cp2);
-        }
-        
-        free(norm1);
-        free(norm2);
-        return norm_cp1 == norm_cp2;
-      }
-      
-      if (norm1) free(norm1);
-      if (norm2) free(norm2);
-    }
-  }
-  
-  // Fallback to simple comparison
   if (!case_sensitive) {
     cp1 = utf8proc_case_fold(cp1);
     cp2 = utf8proc_case_fold(cp2);
   }
-  
+  if (normalize) {
+    cp1 = fzf_normalize_codepoint(cp1);
+    cp2 = fzf_normalize_codepoint(cp2);
+  }
   return cp1 == cp2;
 }
 
@@ -1576,7 +1553,8 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
   if (utf8_strlen(text->data, N) < utf8_strlen(pattern->data, M)) {
     return (fzf_result_t){-1, -1, 0};
   }
-  if (utf8_fuzzy_index(text, pattern->data, M, case_sensitive) < 0) {
+  if (!normalize &&
+      utf8_fuzzy_index(text, pattern->data, M, case_sensitive) < 0) {
     return (fzf_result_t){-1, -1, 0};
   }
   
@@ -1981,7 +1959,8 @@ fzf_result_t fzf_fuzzy_match_v1_utf8(bool case_sensitive, bool normalize,
   }
   
   // Check if pattern exists in text using UTF-8 aware fuzzy index
-  if (utf8_fuzzy_index(text, pattern->data, M, case_sensitive) < 0) {
+  if (!normalize &&
+      utf8_fuzzy_index(text, pattern->data, M, case_sensitive) < 0) {
     return (fzf_result_t){-1, -1, 0};
   }
   
@@ -2095,7 +2074,7 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   }
 
   const size_t Nc = char_map->char_count;
-  bool cached_pattern_cps = pattern->codepoints != NULL &&
+  bool cached_pattern_cps = !normalize && pattern->codepoints != NULL &&
       pattern->codepoints_case_folded == !case_sensitive;
   const size_t Mc = cached_pattern_cps
                       ? pattern->codepoint_count
@@ -2115,7 +2094,10 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
   }
 
   // Check if pattern exists in text (returns byte position)
-  int32_t tmp_idx = utf8_fuzzy_index(text, pattern->data, M, case_sensitive);
+  int32_t tmp_idx = normalize
+                        ? 0
+                        : utf8_fuzzy_index(text, pattern->data, M,
+                                           case_sensitive);
   if (tmp_idx < 0) {
     utf8_free_char_map(char_map);
     return (fzf_result_t){-1, -1, 0};
@@ -2152,6 +2134,10 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
           &owned_pattern_cps[i]);
       if (!case_sensitive) {
         owned_pattern_cps[i] = utf8proc_case_fold(owned_pattern_cps[i]);
+      }
+      if (normalize) {
+        owned_pattern_cps[i] =
+            fzf_normalize_codepoint(owned_pattern_cps[i]);
       }
       p_pos += bytes;
     }
@@ -2218,6 +2204,9 @@ fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
     utf8proc_int32_t c = cp;
     if (!case_sensitive) {
       c = utf8proc_case_fold(cp);
+    }
+    if (normalize) {
+      c = fzf_normalize_codepoint(c);
     }
 
     t_sub.data[off] = c;
@@ -2551,12 +2540,13 @@ static fzf_algo_t get_utf8_algo(fzf_algo_t ascii_algo) {
 static inline fzf_result_t call_alg_for_input(
     fzf_term_t *term, bool normalize, fzf_string_t *input,
     bool input_is_ascii, fzf_position_t *pos, fzf_slab_t *slab) {
+  (void)normalize;
   fzf_algo_t algo = term->fn;
   if (!input_is_ascii) {
     /* Get UTF-8 version of the algorithm */
     algo = get_utf8_algo(algo);
   }
-  return algo(term->case_sensitive, normalize, input,
+  return algo(term->case_sensitive, term->normalize, input,
               (fzf_string_t *)term->text, pos, slab);
 }
 
@@ -2701,7 +2691,8 @@ fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
                                         .inv = inv,
                                         .ptr = og_str,
                                         .text = text_ptr,
-                                        .case_sensitive = case_sensitive})) {
+                                        .case_sensitive = case_sensitive,
+                                        .normalize = normalize})) {
         free(text_ptr);
         free(og_str);
         goto parse_failure;

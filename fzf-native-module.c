@@ -1970,6 +1970,7 @@ static bool term_equiv(const fzf_term_t *a, const fzf_term_t *b) {
   if (a->fn != b->fn) return false;
   if (a->inv != b->inv) return false;
   if (a->case_sensitive != b->case_sensitive) return false;
+  if (a->normalize != b->normalize) return false;
   return strcmp(a->ptr, b->ptr) == 0;
 }
 

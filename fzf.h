@@ -83,6 +83,7 @@ typedef struct {
   char *ptr;
   void *text;
   bool case_sensitive;
+  bool normalize;
 } fzf_term_t;
 
 typedef struct {

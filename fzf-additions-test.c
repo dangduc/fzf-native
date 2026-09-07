@@ -626,6 +626,64 @@ done:
   fzf_free_slab(slab);
 }
 
+static void check_normalized_algorithm(fzf_algo_t algorithm,
+                                       const char *candidate,
+                                       const char *query) {
+  fzf_string_t text = {.data = candidate, .size = strlen(candidate)};
+  fzf_string_t pattern = {.data = query, .size = strlen(query)};
+  fzf_position_t *positions = fzf_pos_array(0);
+  fzf_slab_t *slab = fzf_make_default_slab();
+  CHECK(positions != NULL);
+  CHECK(slab != NULL);
+  if (positions && slab) {
+    fzf_result_t plain = algorithm(
+        true, false, &text, &pattern, positions, slab);
+    positions->size = 0;
+    fzf_result_t normalized = algorithm(
+        true, true, &text, &pattern, positions, slab);
+    CHECK(plain.start < 0);
+    CHECK(normalized.start >= 0);
+    CHECK(normalized.end > normalized.start);
+  }
+  fzf_free_slab(slab);
+  fzf_free_positions(positions);
+}
+
+static void test_pinned_fzf_latin_normalization(void) {
+  check_normalized_algorithm(fzf_fuzzy_match_v1_utf8, "café", "cafe");
+  check_normalized_algorithm(fzf_fuzzy_match_v2_utf8, "café", "cafe");
+  check_normalized_algorithm(fzf_exact_match_utf8, "café", "cafe");
+  check_normalized_algorithm(fzf_prefix_match_utf8, "éclair", "ecl");
+  check_normalized_algorithm(fzf_suffix_match_utf8, "cafÉ", "cafE");
+  check_normalized_algorithm(fzf_equal_match_utf8, "ＦＺＦ", "FZF");
+  check_normalized_algorithm(fzf_exact_match_utf8, "ɐ", "a");
+  check_normalized_algorithm(fzf_exact_match_utf8, "Ấ", "A");
+  check_normalized_algorithm(fzf_exact_match_utf8, "Ờ", "O");
+  check_normalized_algorithm(fzf_exact_match_utf8, "ự", "u");
+
+  char normalized_query[] = "cafe";
+  fzf_pattern_t *normalized = fzf_parse_pattern(
+      CaseRespect, true, normalized_query, true);
+  char plain_query[] = "cafe";
+  fzf_pattern_t *plain = fzf_parse_pattern(
+      CaseRespect, false, plain_query, true);
+  fzf_slab_t *slab = fzf_make_default_slab();
+  CHECK(normalized != NULL);
+  CHECK(plain != NULL);
+  CHECK(slab != NULL);
+  if (normalized && plain && slab) {
+    CHECK(normalized->ptr[0]->ptr[0].normalize);
+    CHECK(!plain->ptr[0]->ptr[0].normalize);
+    CHECK(fzf_get_score("café", normalized, slab) > 0);
+    CHECK(fzf_has_match("café", normalized, slab));
+    CHECK(fzf_get_score("café", plain, slab) == 0);
+    CHECK(!fzf_has_match("café", plain, slab));
+  }
+  fzf_free_slab(slab);
+  fzf_free_pattern(plain);
+  fzf_free_pattern(normalized);
+}
+
 int main(void) {
   printf("--- fzf-additions: fzf_has_match ---\n");
   RUN(test_fuzzy_basic_match);
@@ -667,6 +725,7 @@ int main(void) {
   RUN(test_default_score_distinguishes_boundaries);
   RUN(test_score_schemes_are_slab_local);
   RUN(test_utf8_empty_suffix_trims_trailing_whitespace);
+  RUN(test_pinned_fzf_latin_normalization);
 
   if (failed == 0) {
     printf("\nAll fzf-additions tests passed.\n");

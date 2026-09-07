@@ -187,7 +187,8 @@ bool fzf_has_match_bytes_preclassified(
   for (size_t i = 0; i < pattern->size; i++) {
     fzf_term_set_t *set = pattern->ptr[i];
     for (size_t j = 0; j < set->size; j++)
-      if (!fzf_addn_is_ascii_algo(set->ptr[j].fn))
+      if (set->ptr[j].normalize ||
+          !fzf_addn_is_ascii_algo(set->ptr[j].fn))
         return fzf_get_score_bytes_preclassified(
                    text, tn, input_is_ascii, pattern, slab) > 0;
   }
