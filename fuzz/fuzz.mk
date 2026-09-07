@@ -327,5 +327,71 @@ fuzz-upstream: fuzz-module
 	command -v $(FZF_REFERENCE)
 	FZF_NATIVE_TEST_MODULE=$(FUZZ_MODULE) FZF_REFERENCE=$(FZF_REFERENCE) \
 		FZF_REFERENCE_VERSION=$(FZF_REFERENCE_VERSION) \
-		$(FUZZ_EMACS) -Q --batch -L . -l ./fuzz/fzf-native-upstream-test.el \
+		FZF_REFERENCE_REVISION=$(FZF_REFERENCE_REVISION) \
+		FZF_NATIVE_FUZZ_SEED=$(FZF_NATIVE_FUZZ_SEED) \
+		FZF_NATIVE_UPSTREAM_CASES=$(FZF_NATIVE_UPSTREAM_CASES) \
+		FZF_NATIVE_UPSTREAM_START=$(FZF_NATIVE_UPSTREAM_START) \
+		FZF_NATIVE_UPSTREAM_PROFILE=$(FZF_NATIVE_UPSTREAM_PROFILE) \
+		$(FUZZ_EMACS) -Q --batch -L . \
+		--eval '(setq load-prefer-newer t)' \
+		-l ./fuzz/fzf-native-upstream-test.el \
 		--eval '(ert-run-tests-batch-and-exit "^fzf-native-fuzz-upstream-")'
+
+# Replay one persistent native session from any seed/serial boundary with:
+# make fuzz-upstream-session FZF_NATIVE_FUZZ_SEED=N \
+#   FZF_NATIVE_UPSTREAM_SESSION_START=N FZF_NATIVE_UPSTREAM_SESSION_CASES=1
+FZF_NATIVE_UPSTREAM_SESSION_CASES ?= 4
+FZF_NATIVE_UPSTREAM_SESSION_START ?= 0
+FZF_REFERENCE_REVISION ?=
+FUZZ_PINNED_FZF_REVISION := 1372d04f79bde0daa3bab4b96a068baafa808e67
+FUZZ_PINNED_FZF := $(BUILD_DIR)/fzf-pinned
+
+.PHONY: fuzz-pinned-fzf-build
+fuzz-pinned-fzf-build:
+	test -n "$(FZF_SOURCE)"
+	mkdir -p $(BUILD_DIR) $(FUZZ_GO_CACHE)
+	GOCACHE=$(FUZZ_GO_CACHE) ./fuzz/differential/build-pinned-fzf.sh \
+		"$(FZF_SOURCE)" "$(abspath $(FUZZ_PINNED_FZF))"
+
+.PHONY: fuzz-upstream-pinned
+fuzz-upstream-pinned: fuzz-module fuzz-pinned-fzf-build
+	FZF_NATIVE_TEST_MODULE=$(FUZZ_MODULE) \
+		FZF_REFERENCE=$(abspath $(FUZZ_PINNED_FZF)) \
+		FZF_REFERENCE_REVISION=$(FUZZ_PINNED_FZF_REVISION) \
+		FZF_NATIVE_FUZZ_SEED=$(FZF_NATIVE_FUZZ_SEED) \
+		FZF_NATIVE_UPSTREAM_CASES=$(FZF_NATIVE_UPSTREAM_CASES) \
+		FZF_NATIVE_UPSTREAM_START=$(FZF_NATIVE_UPSTREAM_START) \
+		FZF_NATIVE_UPSTREAM_PROFILE=$(FZF_NATIVE_UPSTREAM_PROFILE) \
+		FZF_NATIVE_UPSTREAM_SESSION_CASES=$(FZF_NATIVE_UPSTREAM_SESSION_CASES) \
+		FZF_NATIVE_UPSTREAM_SESSION_START=$(FZF_NATIVE_UPSTREAM_SESSION_START) \
+		$(FUZZ_EMACS) -Q --batch -L . \
+		--eval '(setq load-prefer-newer t)' \
+		-l ./fuzz/fzf-native-upstream-test.el \
+		--eval '(ert-run-tests-batch-and-exit "^fzf-native-fuzz-upstream-")'
+
+.PHONY: fuzz-upstream-session
+fuzz-upstream-session: fuzz-module
+	command -v $(FZF_REFERENCE)
+	FZF_NATIVE_TEST_MODULE=$(FUZZ_MODULE) FZF_REFERENCE=$(FZF_REFERENCE) \
+		FZF_REFERENCE_VERSION=$(FZF_REFERENCE_VERSION) \
+		FZF_REFERENCE_REVISION=$(FZF_REFERENCE_REVISION) \
+		FZF_NATIVE_FUZZ_SEED=$(FZF_NATIVE_FUZZ_SEED) \
+		FZF_NATIVE_UPSTREAM_SESSION_CASES=$(FZF_NATIVE_UPSTREAM_SESSION_CASES) \
+		FZF_NATIVE_UPSTREAM_SESSION_START=$(FZF_NATIVE_UPSTREAM_SESSION_START) \
+		$(FUZZ_EMACS) -Q --batch -L . \
+		--eval '(setq load-prefer-newer t)' \
+		-l ./fuzz/fzf-native-upstream-test.el \
+		--eval '(ert-run-tests-batch-and-exit "fzf-native-fuzz-upstream-session-rounds")'
+
+.PHONY: fuzz-upstream-session-pinned
+fuzz-upstream-session-pinned: fuzz-module fuzz-pinned-fzf-build
+	FZF_NATIVE_TEST_MODULE=$(FUZZ_MODULE) \
+		FZF_REFERENCE=$(abspath $(FUZZ_PINNED_FZF)) \
+		FZF_REFERENCE_REVISION=$(FUZZ_PINNED_FZF_REVISION) \
+		FZF_NATIVE_FUZZ_SEED=$(FZF_NATIVE_FUZZ_SEED) \
+		FZF_NATIVE_UPSTREAM_SESSION_CASES=$(FZF_NATIVE_UPSTREAM_SESSION_CASES) \
+		FZF_NATIVE_UPSTREAM_SESSION_START=$(FZF_NATIVE_UPSTREAM_SESSION_START) \
+		$(FUZZ_EMACS) -Q --batch -L . \
+		--eval '(setq load-prefer-newer t)' \
+		-l ./fuzz/fzf-native-upstream-test.el \
+		--eval '(ert-run-tests-batch-and-exit "fzf-native-fuzz-upstream-session-rounds")'
