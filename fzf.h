@@ -121,11 +121,17 @@ fzf_result_t fzf_fuzzy_match_v2_with_direction(
 fzf_result_t fzf_exact_match_naive(bool case_sensitive, bool normalize,
                                    fzf_string_t *text, fzf_string_t *pattern,
                                    fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_exact_match_naive_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
 fzf_result_t fzf_exact_match_boundary(bool case_sensitive, bool normalize,
                                       fzf_string_t *text,
                                       fzf_string_t *pattern,
                                       fzf_position_t *pos,
                                       fzf_slab_t *slab);
+fzf_result_t fzf_exact_match_boundary_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
 fzf_result_t fzf_prefix_match(bool case_sensitive, bool normalize,
                               fzf_string_t *text, fzf_string_t *pattern,
                               fzf_position_t *pos, fzf_slab_t *slab);
