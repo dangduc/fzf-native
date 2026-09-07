@@ -108,6 +108,36 @@ static int exercise_positions(const char *label, const char *candidate,
   }
 }
 
+static int exercise_score_positions(const char *label, const char *candidate,
+                                    fzf_pattern_t *pattern, size_t *tested) {
+  for (fail_at = 0;; fail_at++) {
+    allocation_number = 0;
+    failure_injected = false;
+    fzf_position_t *positions = (fzf_position_t *)(uintptr_t)1;
+    int32_t score =
+        fzf_get_score_positions(candidate, pattern, NULL, &positions);
+    if (!failure_injected) {
+      if (score <= 0 || !positions || positions->size == 0) {
+        fzf_free_positions(positions);
+        return fail(label, fail_at, "successful run lost score or positions");
+      }
+      if (fzf_allocation_failed()) {
+        fzf_free_positions(positions);
+        return fail(label, fail_at, "successful run retained OOM flag");
+      }
+      fzf_free_positions(positions);
+      return 0;
+    }
+    if (score != 0 || positions != NULL) {
+      fzf_free_positions(positions);
+      return fail(label, fail_at, "injected OOM returned a partial result");
+    }
+    if (!fzf_allocation_failed())
+      return fail(label, fail_at, "injected OOM was reported as no-match");
+    (*tested)++;
+  }
+}
+
 int main(void) {
   size_t tested = 0;
   char ascii_query[] = "abc";
@@ -125,9 +155,13 @@ int main(void) {
                      &tested) ||
       exercise_positions("ASCII positions", "alphabet-bravo-charlie",
                          ascii_pattern, &tested) ||
+      exercise_score_positions("ASCII combined", "alphabet-bravo-charlie",
+                               ascii_pattern, &tested) ||
       exercise_score("UTF-8 score", "a你---界z", utf8_pattern, &tested) ||
       exercise_positions("UTF-8 positions", "a你---界z", utf8_pattern,
-                         &tested);
+                         &tested) ||
+      exercise_score_positions("UTF-8 combined", "a你---界z", utf8_pattern,
+                               &tested);
 
   fail_at = SIZE_MAX;
   fzf_free_pattern(ascii_pattern);

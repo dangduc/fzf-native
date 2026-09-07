@@ -197,6 +197,31 @@ benchmark-batch-cache-history:
 		FZF_NATIVE_TEST_MODULE=$(abspath $(BUILD_DIR)/bench-module/fzf-native-module.so) \
 		$(EMACS) -Q --batch -l etc/batch-cache-query-history-benchmark.el
 
+# Short, deterministic A/B probe for the legacy score+positions pair versus
+# the combined one-pass API.  Increase the two arguments for steadier local
+# measurements; defaults intentionally stay suitable for developer loops.
+BENCH_SCORE_POSITIONS_ROUNDS ?= 4000
+BENCH_SCORE_POSITIONS_SAMPLES ?= 9
+.PHONY: benchmark-score-positions
+benchmark-score-positions:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -O3 -DNDEBUG -I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/score-positions-benchmark \
+		etc/score-positions-benchmark.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/score-positions-benchmark \
+		$(BENCH_SCORE_POSITIONS_ROUNDS) $(BENCH_SCORE_POSITIONS_SAMPLES)
+
+# Short synthetic probe for the core matcher paths used by the Chromium,
+# Arabic, and Korean holdouts.  This isolates scoring and prints provisional
+# timings; it is not a replacement for the real-data benchmark.
+.PHONY: benchmark-core-hotpath-probe
+benchmark-core-hotpath-probe:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -O3 -DNDEBUG -I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/core-hotpath-probe \
+		benchmarks/core-hotpath-probe.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/core-hotpath-probe
+
 # Coverage-guided and differential test targets live in a separate include so
 # they do not alter the release build or the public module ABI.
 include fuzz/fuzz.mk

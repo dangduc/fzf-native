@@ -117,8 +117,8 @@ typedef struct {
 
 /* Scoring APIs use ordinary match/no-match return values, so allocation
    failure is reported separately.  The flag is thread-local: callers must
-   inspect it immediately after fzf_get_score/fzf_get_positions (or an
-   algorithm call) on the same thread. */
+   inspect it immediately after fzf_get_score, fzf_get_score_positions,
+   fzf_get_positions, or an algorithm call on the same thread. */
 void fzf_clear_allocation_failure(void);
 bool fzf_allocation_failed(void);
 
@@ -168,6 +168,15 @@ void fzf_free_pattern(fzf_pattern_t *pattern);
 
 int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
                       fzf_slab_t *slab);
+/* Compute the score and highlight positions together.  A single positive term
+   uses one matcher traversal.  Compound patterns retain score-first behavior
+   so a late rejection does not pay for unused position work.  On return,
+   *POSITIONS is owned by the caller and must be released with
+   fzf_free_positions.  A no-match or an allocation failure leaves *POSITIONS
+   NULL.  Passing NULL for POSITIONS is equivalent to fzf_get_score. */
+int32_t fzf_get_score_positions(const char *text, fzf_pattern_t *pattern,
+                                fzf_slab_t *slab,
+                                fzf_position_t **positions);
 /* Safe entry point for callers that own a bounded byte string.  TEXT must
    reference at least TEXT_LEN readable bytes.  Every byte in that range is
    candidate data, including embedded NUL bytes.  The legacy fzf_get_score

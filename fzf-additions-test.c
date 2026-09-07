@@ -550,6 +550,108 @@ static void test_invalid_utf8_fuzzy_fallback_returns_positions(void) {
   fzf_free_pattern(pattern);
 }
 
+static void check_score_positions_equivalence(const char *label,
+                                              const char *text,
+                                              const char *query,
+                                              fzf_case_types case_mode,
+                                              bool fuzzy,
+                                              fzf_slab_config_t config,
+                                              fzf_score_scheme_t scheme) {
+  char *query_copy = strdup(query);
+  fzf_pattern_t *pattern =
+      fzf_parse_pattern(case_mode, false, query_copy, fuzzy);
+  fzf_slab_t *legacy_slab = fzf_make_slab(config);
+  fzf_slab_t *combined_slab = fzf_make_slab(config);
+  CHECK(pattern != NULL);
+  CHECK(legacy_slab != NULL);
+  CHECK(combined_slab != NULL);
+  if (pattern && legacy_slab && combined_slab) {
+    CHECK(fzf_slab_set_score_scheme(legacy_slab, scheme));
+    CHECK(fzf_slab_set_score_scheme(combined_slab, scheme));
+    int32_t legacy_score = fzf_get_score(text, pattern, legacy_slab);
+    fzf_position_t *legacy_positions =
+        fzf_get_positions(text, pattern, legacy_slab);
+    fzf_position_t *combined_positions = (fzf_position_t *)(uintptr_t)1;
+    int32_t combined_score = fzf_get_score_positions(
+        text, pattern, combined_slab, &combined_positions);
+    if (legacy_score != combined_score) {
+      fprintf(stderr, "FAIL %s: score %d != %d\n", label,
+              legacy_score, combined_score);
+      failed++;
+    }
+    if (!!legacy_positions != !!combined_positions) {
+      fprintf(stderr, "FAIL %s: position presence differs\n", label);
+      failed++;
+    } else if (legacy_positions && combined_positions) {
+      if (legacy_positions->size != combined_positions->size) {
+        fprintf(stderr, "FAIL %s: position count %zu != %zu\n", label,
+                legacy_positions->size, combined_positions->size);
+        failed++;
+      } else if (legacy_positions->size > 0 &&
+                 memcmp(legacy_positions->data, combined_positions->data,
+                        legacy_positions->size * sizeof(uint32_t)) != 0) {
+        fprintf(stderr, "FAIL %s: position values differ\n", label);
+        failed++;
+      }
+    }
+    CHECK(fzf_get_score_positions(
+              text, pattern, combined_slab, NULL) == legacy_score);
+    fzf_free_positions(combined_positions);
+    fzf_free_positions(legacy_positions);
+  }
+  fzf_free_slab(combined_slab);
+  fzf_free_slab(legacy_slab);
+  fzf_free_pattern(pattern);
+  free(query_copy);
+}
+
+static void test_combined_score_positions_matches_legacy_calls(void) {
+  const fzf_slab_config_t normal = {100000, 2048};
+  const fzf_slab_config_t tiny = {1, 1};
+  check_score_positions_equivalence(
+      "ASCII fuzzy", "src/emacs-module.c", "emc", CaseIgnore, true, normal,
+      FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "ASCII miss", "src/emacs-module.c", "xyz", CaseIgnore, true, normal,
+      FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "empty query", "src/emacs-module.c", "", CaseIgnore, true, normal,
+      FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "extended", "src/foo/emacs-module.c", "foo | bar !test .c$",
+      CaseIgnore, true, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "inverse-only keep", "src/emacs-module.c", "!test",
+      CaseIgnore, true, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "inverse-only reject", "src/emacs-test.c", "!test",
+      CaseIgnore, true, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "UTF-8 fuzzy", "路径/组件-123", "组件", CaseSmart, true, normal,
+      FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "UTF-8 case fold", "CAFÉ", "café", CaseIgnore, true, normal,
+      FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "invalid UTF-8", "ca\xe9zzQR", "QR$", CaseRespect, true, normal,
+      FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "v1 fallback", "a----------------b", "ab", CaseRespect, true, tiny,
+      FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "default suffix", "src/foo/fzf  ", "fzf$", CaseRespect, true, normal,
+      FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "UTF-8 suffix", "σa你 \xe2\x80\x83", "你$", CaseRespect, true,
+      normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "path scheme", ":fzf", "fzf", CaseRespect, true, normal,
+      FZF_SCORE_SCHEME_PATH);
+  check_score_positions_equivalence(
+      "history scheme", " fzf", "fzf", CaseRespect, true, normal,
+      FZF_SCORE_SCHEME_HISTORY);
+}
+
 static void test_slab_allocation_failure_is_reported(void) {
   fzf_slab_t *slab =
       fzf_make_slab((fzf_slab_config_t){SIZE_MAX, SIZE_MAX});
@@ -961,6 +1063,7 @@ int main(void) {
   RUN(test_bounded_entry_points_need_no_terminator);
   RUN(test_invalid_utf8_exact_is_lossless);
   RUN(test_invalid_utf8_fuzzy_fallback_returns_positions);
+  RUN(test_combined_score_positions_matches_legacy_calls);
   RUN(test_slab_allocation_failure_is_reported);
   RUN(test_utf8_char_map_scratch_reuse_and_cap);
   RUN(test_default_score_distinguishes_boundaries);
