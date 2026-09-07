@@ -9,40 +9,108 @@ FUZZ_EMACS ?= $(or $(strip $(EMACS)),\
 	$(firstword $(wildcard $(HOME)/emacs/nextstep/Emacs.app/Contents/MacOS/Emacs \
 		/Applications/Emacs.app/Contents/MacOS/Emacs)))
 FUZZ_SECONDS ?= 30
+FZF_NATIVE_FUZZ_SEED ?= 12648430
+FZF_NATIVE_FUZZ_ABI_CASES ?= 200
+FZF_NATIVE_FUZZ_SESSION_CASES ?= 100
 FUZZ_MAX_LEN ?= 4096
 FUZZ_VERBOSITY ?= 0
 FUZZ_RSS_LIMIT_MB ?= 2048
 FUZZ_SEED_DIR ?= fuzz/corpus
 FUZZ_DICTIONARY ?= fuzz/fzf-native.dict
 FUZZ_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-corpus
+FUZZ_MERGED_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-corpus-merged
 FUZZ_ARTIFACT_DIR ?= $(BUILD_DIR)/fuzz-artifacts
 FUZZ_BINARY := $(BUILD_DIR)/fzf-native-fuzz
 FUZZ_REPLAY_BINARY := $(BUILD_DIR)/fzf-native-fuzz-replay
 FUZZ_SESSION_SECONDS ?= $(FUZZ_SECONDS)
+FUZZ_SESSION_READER_SECONDS ?= $(FUZZ_SESSION_SECONDS)
 FUZZ_SESSION_MAX_LEN ?= 8192
 FUZZ_SESSION_SEED_DIR ?= fuzz/session-corpus
+FUZZ_SESSION_READER_SEED_DIR ?= $(FUZZ_SESSION_SEED_DIR)
 FUZZ_SESSION_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-session-corpus
+FUZZ_SESSION_READER_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-session-reader-corpus
+FUZZ_SESSION_MERGED_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-session-corpus-merged
+FUZZ_SESSION_READER_MERGED_CORPUS_DIR ?= $(BUILD_DIR)/fuzz-session-reader-corpus-merged
 FUZZ_SESSION_ARTIFACT_DIR ?= $(BUILD_DIR)/fuzz-session-artifacts
+FUZZ_SESSION_READER_ARTIFACT_DIR ?= $(FUZZ_SESSION_ARTIFACT_DIR)/reader
 FUZZ_SESSION_BINARY := $(BUILD_DIR)/fzf-native-session-fuzz
+FUZZ_SESSION_READER_BINARY := $(BUILD_DIR)/fzf-native-session-reader-fuzz
 FUZZ_SESSION_REPLAY_BINARY := $(BUILD_DIR)/fzf-native-session-fuzz-replay
+FUZZ_SESSION_READER_REPLAY_BINARY := $(BUILD_DIR)/fzf-native-session-reader-fuzz-replay
 FUZZ_SESSION_TSAN_BINARY := $(BUILD_DIR)/fzf-native-session-fuzz-tsan
+FUZZ_SESSION_READER_TSAN_BINARY := $(BUILD_DIR)/fzf-native-session-reader-fuzz-tsan
 FUZZ_MODULE_DIR := $(BUILD_DIR)/fuzz-module
 FUZZ_MODULE := $(abspath $(FUZZ_MODULE_DIR)/fzf-native-module.so)
 FZF_REFERENCE ?= fzf
 FZF_REFERENCE_VERSION ?=
+FZF_SOURCE ?=
+FZF_NATIVE_UPSTREAM_CASES ?= 200
+FZF_NATIVE_UPSTREAM_START ?= 0
+FZF_NATIVE_UPSTREAM_PROFILE ?= common
+FZF_NATIVE_REVISION ?= $(shell git rev-parse --verify HEAD 2>/dev/null)$(shell \
+	test -z "$$(git status --porcelain --untracked-files=all 2>/dev/null)" || \
+	printf '%s' '-dirty')
+FUZZ_ALGO_DRIVER := $(BUILD_DIR)/fzf-native-algo-driver
+FUZZ_ALGO_DRIVER_SAN := $(BUILD_DIR)/fzf-native-algo-driver-san
+FUZZ_RAW_ORACLE := $(BUILD_DIR)/fzf-raw-oracle
+FUZZ_GO_CACHE := $(abspath $(BUILD_DIR)/go-cache)
 
 # The baseline matcher has no external runtime.  The stacked UTF-8 matcher
 # vendors utf8proc, so discover and link that source when it is present.  This
 # keeps the fuzz-infrastructure commit independently buildable while making
 # the exact PR40+PR41 composition build without branch-specific Makefile edits.
-FUZZ_UTF8PROC_SOURCE := $(firstword $(wildcard utf8proc-*/utf8proc.c))
+FUZZ_UTF8PROC_SOURCE := $(firstword $(wildcard $(UTF8PROC_SRC)))
 FUZZ_UTF8PROC_FLAGS := $(if $(FUZZ_UTF8PROC_SOURCE),-DUTF8PROC_STATIC,)
+
+# The raw differential lane uses two persistent peers with one framed binary
+# protocol.  FZF_SOURCE must point at the pinned source revision documented in
+# fuzz/oracle/README.org.  The oracle build script rejects any other revision.
+.PHONY: fuzz-algo-driver-build fuzz-algo-driver-san-build
+fuzz-algo-driver-build:
+	mkdir -p $(BUILD_DIR)
+	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O2 -g -I. \
+		$(FUZZ_UTF8PROC_FLAGS) \
+		-DFZF_NATIVE_REVISION=\"$(FZF_NATIVE_REVISION)\" \
+		-o $(FUZZ_ALGO_DRIVER) fuzz/fzf-native-algo-driver.c fzf.c \
+		$(FUZZ_UTF8PROC_SOURCE)
+
+fuzz-algo-driver-san-build:
+	mkdir -p $(BUILD_DIR)
+	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g -I. \
+		-fsanitize=address,undefined -fno-sanitize-recover=undefined \
+		-fno-omit-frame-pointer \
+		$(FUZZ_UTF8PROC_FLAGS) \
+		-DFZF_NATIVE_REVISION=\"$(FZF_NATIVE_REVISION)\" \
+		-o $(FUZZ_ALGO_DRIVER_SAN) fuzz/fzf-native-algo-driver.c fzf.c \
+		$(FUZZ_UTF8PROC_SOURCE)
+
+.PHONY: fuzz-oracle-build fuzz-oracle-test fuzz-oracle-test-san
+fuzz-oracle-build:
+	test -n "$(FZF_SOURCE)"
+	mkdir -p $(FUZZ_GO_CACHE)
+	GOCACHE=$(FUZZ_GO_CACHE) ./fuzz/oracle/build.sh \
+		"$(FZF_SOURCE)" "$(abspath $(FUZZ_RAW_ORACLE))"
+
+fuzz-oracle-test: fuzz-algo-driver-build fuzz-oracle-build
+	GOCACHE=$(FUZZ_GO_CACHE) \
+		FZF_NATIVE_ALGO_DRIVER=$(abspath $(FUZZ_ALGO_DRIVER)) \
+		FZF_RAW_ORACLE_BINARY=$(abspath $(FUZZ_RAW_ORACLE)) \
+		FZF_NATIVE_EXPECTED_REVISION="$(FZF_NATIVE_REVISION)" \
+		./fuzz/oracle/test.sh "$(FZF_SOURCE)"
+
+fuzz-oracle-test-san: fuzz-algo-driver-san-build fuzz-oracle-build
+	GOCACHE=$(FUZZ_GO_CACHE) \
+		FZF_NATIVE_ALGO_DRIVER=$(abspath $(FUZZ_ALGO_DRIVER_SAN)) \
+		FZF_RAW_ORACLE_BINARY=$(abspath $(FUZZ_RAW_ORACLE)) \
+		FZF_NATIVE_EXPECTED_REVISION="$(FZF_NATIVE_REVISION)" \
+		./fuzz/oracle/test.sh "$(FZF_SOURCE)"
 
 .PHONY: fuzz-build
 fuzz-build:
 	mkdir -p $(BUILD_DIR)
 	$(FUZZ_CC) -std=gnu11 -Wall -Wextra -O1 -g \
-		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
+		-fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
+		-fno-omit-frame-pointer \
 		-I. $(FUZZ_UTF8PROC_FLAGS) -o $(FUZZ_BINARY) \
 		fuzz/fzf-native-fuzz.c fzf.c fzf-additions.c \
 		$(FUZZ_UTF8PROC_SOURCE)
