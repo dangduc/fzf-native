@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-export EMACS ?= $(shell which emacs)
+export EMACS ?= emacs
 
 BUILD_DIR ?= build
 UNAME_S := $(shell uname -s)
