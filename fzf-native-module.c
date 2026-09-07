@@ -511,12 +511,11 @@ static FzfRankKeys fzf_rank_keys_preclassified(
     const fzf_score_bounds_t *bounds, fzf_score_scheme_t scheme) {
   FzfRankKeys keys = {0};
   keys.score = fzf_rank_score(bounds ? bounds->raw_score : 0);
+  if (scheme == FZF_SCORE_SCHEME_HISTORY) return keys;
 
   /* For ASCII, rune indexes are byte indexes and fzf's Unicode trim length
-     is the byte span after removing ASCII whitespace at the two edges.
-     PR29 adds history's no-scan return; until then, preserve PR28's generic
-     decoder path for that scheme. */
-  if (input_is_ascii && scheme != FZF_SCORE_SCHEME_HISTORY) {
+     is the byte span after removing ASCII whitespace at the two edges. */
+  if (input_is_ascii) {
     size_t first = 0, end = text_len;
     while (first < end &&
            fzf_rank_is_space((unsigned char)text[first]))

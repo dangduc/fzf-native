@@ -784,6 +784,12 @@ static void test_rank_keys_match_fzf_length_and_path_rules(void) {
   CHECK(default_keys.second == 0);
   CHECK(default_keys.score == UINT16_MAX);
 
+  /* History ranks by score alone and must not scan candidate bytes. */
+  FzfRankKeys history_keys = fzf_rank_keys_preclassified(
+      NULL, SIZE_MAX, false, &bounds, FZF_SCORE_SCHEME_HISTORY);
+  CHECK(history_keys.score == UINT16_MAX);
+  CHECK(history_keys.first == 0 && history_keys.second == 0);
+
   size_t long_length = (size_t)UINT16_MAX + 100;
   char *long_text = malloc(long_length);
   CHECK(long_text != NULL);
