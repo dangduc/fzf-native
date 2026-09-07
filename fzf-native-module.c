@@ -179,7 +179,8 @@ emacs_value Fsymbol_value;
 /* Cached defcustom name symbols — interned once at init, looked up via
    `defcustom_value' on each read.  The values themselves stay dynamic
    so user `setq' / `customize-set-variable' is respected. */
-emacs_value Qsym_case_mode, Qsym_fuzzy, Qsym_batch_highlight, Qsym_async_highlight;
+emacs_value Qsym_score_scheme, Qsym_case_mode, Qsym_fuzzy;
+emacs_value Qsym_batch_highlight, Qsym_async_highlight;
 emacs_value Qsym_max_line_length, Qsym_async_cache_size;
 emacs_value Qsym_async_cache_bytes;
 emacs_value Qsym_async_batch_cache_bytes, Qsym_filter_only_min_pool;
@@ -188,7 +189,7 @@ emacs_value Qsym_shell_file_name, Qsym_shell_command_switch, Qsym_exec_path;
 emacs_value Qsym_process_environment;
 emacs_value Qsym_highlight_fn;
 /* Cached value symbols for `type-of' comparisons and signal/error names. */
-emacs_value Qvector, Qstring, Qignore, Qrespect;
+emacs_value Qvector, Qstring, Qdefault, Qpath, Qhistory, Qignore, Qrespect;
 emacs_value Qor, Qand;
 emacs_value Qstringp, Qwrong_type_argument, Qerror;
 
@@ -533,6 +534,7 @@ struct Batch {
 struct Shared {
   fzf_pattern_t *pattern;
   struct Batch *const batches;
+  fzf_score_scheme_t score_scheme;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
   _Atomic ssize_t remaining;
 #else
@@ -595,10 +597,14 @@ static bool shared_worker_should_stop(struct Shared *shared) {
 static void *worker_routine(void *ptr) {
   fzf_block_all_signals();
   /* printf("-----\nStarting Worker Routine\n-----\n"); */
+  struct Shared *shared = ptr;
   // Create a one-time use slab.
   fzf_slab_t *slab = fzf_make_default_slab();
-
-  struct Shared *shared = ptr;
+  if (!slab || !fzf_slab_set_score_scheme(slab, shared->score_scheme)) {
+    shared_set_allocation_failed(shared);
+    fzf_free_slab(slab);
+    return NULL;
+  }
   fzf_pattern_t *pattern = shared->pattern;
   bool filter_only = shared->filter_only;
   ssize_t batch_idx;
@@ -876,6 +882,26 @@ static fzf_case_types resolve_fzf_native_case_mode(emacs_env *env) {
   return CaseSmart;
 }
 
+/* Resolve `fzf-native-score-scheme'.  Unlike historical matching settings,
+   an invalid value is an input error: silently falling back could publish a
+   result under the wrong cache identity. */
+static bool resolve_fzf_native_score_scheme(
+    emacs_env *env, fzf_score_scheme_t *out) {
+  emacs_value v = defcustom_value(env, Qsym_score_scheme, Qdefault);
+  if (env->eq(env, v, Qdefault))
+    *out = FZF_SCORE_SCHEME_DEFAULT;
+  else if (env->eq(env, v, Qpath))
+    *out = FZF_SCORE_SCHEME_PATH;
+  else if (env->eq(env, v, Qhistory))
+    *out = FZF_SCORE_SCHEME_HISTORY;
+  else {
+    async_signal_error(
+        env, "fzf-native-score-scheme must be default, path, or history");
+    return false;
+  }
+  return true;
+}
+
 /* Read `fzf-native-fuzzy' via symbol-value and resolve to a bool.
    Returns false only for an explicit nil; defaults to true on any read
    failure so the historical fuzzy-on behaviour is preserved. */
@@ -1041,6 +1067,8 @@ emacs_value fzf_native_score_all(emacs_env *env,
 
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+  fzf_score_scheme_t score_scheme;
+  if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto err;
 
   /* Decide filter-only mode from the two thresholds and the logic knob.
      Evaluated once before the workers spawn; the result rides on `shared'.
@@ -1064,6 +1092,7 @@ emacs_value fzf_native_score_all(emacs_env *env,
   struct Shared shared = {
     .pattern = pattern,
     .batches = batches,
+    .score_scheme = score_scheme,
     .remaining = batch_idx + 1,
     .filter_only = filter_only_mode,
     .allocation_failed = false,
@@ -1150,6 +1179,10 @@ err_join_threads:
   if (hl_cap > 0) {
     hl_pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
     if (hl_pattern) hl_slab = fzf_make_default_slab();
+    if (hl_slab && !fzf_slab_set_score_scheme(hl_slab, score_scheme)) {
+      fzf_free_slab(hl_slab);
+      hl_slab = NULL;
+    }
     if (!hl_slab) {
       if (hl_pattern) { fzf_free_pattern(hl_pattern); hl_pattern = NULL; }
       hl_cap = 0;
@@ -1301,6 +1334,8 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
   if (!clear_only) {
     fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
     bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+    fzf_score_scheme_t score_scheme;
+    if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto done;
     pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
     if (!pattern) {
       async_signal_error(
@@ -1308,7 +1343,13 @@ emacs_value fzf_native_highlight_all(emacs_env *env,
       goto done;
     }
     slab = fzf_make_default_slab();
-    if (!slab) goto done;
+    if (!slab || !fzf_slab_set_score_scheme(slab, score_scheme)) {
+      if (slab) fzf_free_slab(slab);
+      slab = NULL;
+      async_signal_error(
+          env, "fzf-native: matcher could not configure scoring slab");
+      goto done;
+    }
     hook = defcustom_value(env, Qsym_highlight_fn, Qnil);
     hl_scratch_init(&hl_scratch, query.len > 0 ? query.len : 1);
   }
@@ -1423,6 +1464,8 @@ emacs_value fzf_native_highlight_one(emacs_env *env,
 
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+  fzf_score_scheme_t score_scheme;
+  if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto done;
   pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
   if (!pattern) {
     async_signal_error(
@@ -1430,7 +1473,13 @@ emacs_value fzf_native_highlight_one(emacs_env *env,
     goto done;
   }
   slab = fzf_make_default_slab();
-  if (!slab) goto done;
+  if (!slab || !fzf_slab_set_score_scheme(slab, score_scheme)) {
+    if (slab) fzf_free_slab(slab);
+    slab = NULL;
+    async_signal_error(
+        env, "fzf-native: matcher could not configure scoring slab");
+    goto done;
+  }
   emacs_value hook = defcustom_value(env, Qsym_highlight_fn, Qnil);
   hl_scratch_init(&hl_scratch, query.len);
 
@@ -1511,6 +1560,8 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
    */
   fzf_case_types case_mode = resolve_fzf_native_case_mode(env);
   bool           fuzzy     = resolve_fzf_native_fuzzy(env);
+  fzf_score_scheme_t score_scheme;
+  if (!resolve_fzf_native_score_scheme(env, &score_scheme)) goto err;
   pattern = fzf_parse_pattern(case_mode, false, query.b, fuzzy);
   if (!pattern) {
     async_signal_error(
@@ -1532,6 +1583,12 @@ emacs_value fzf_native_score(emacs_env *env, ptrdiff_t nargs, emacs_value args[]
           env, "fzf-native: matcher could not allocate scoring slab");
       goto err;
     }
+  }
+
+  if (!fzf_slab_set_score_scheme(slab, score_scheme)) {
+    async_signal_error(
+        env, "fzf-native: matcher could not configure scoring slab");
+    goto err;
   }
 
   int score = fzf_get_score(str.b, pattern, slab);
@@ -7445,6 +7502,7 @@ int emacs_module_init(struct emacs_runtime *rt) {
   Fsetcar = env->make_global_ref(env, env->intern(env, "setcar"));
   Faset = env->make_global_ref(env, env->intern(env, "aset"));
   Fsymbol_value = env->make_global_ref(env, env->intern(env, "symbol-value"));
+  Qsym_score_scheme          = env->make_global_ref(env, env->intern(env, "fzf-native-score-scheme"));
   Qsym_case_mode            = env->make_global_ref(env, env->intern(env, "fzf-native-case-mode"));
   Qsym_fuzzy                = env->make_global_ref(env, env->intern(env, "fzf-native-fuzzy"));
   Qsym_batch_highlight      = env->make_global_ref(env, env->intern(env, "fzf-native-batch-highlight"));
@@ -7468,6 +7526,9 @@ int emacs_module_init(struct emacs_runtime *rt) {
       env, env->intern(env, "process-environment"));
   Qvector  = env->make_global_ref(env, env->intern(env, "vector"));
   Qstring  = env->make_global_ref(env, env->intern(env, "string"));
+  Qdefault = env->make_global_ref(env, env->intern(env, "default"));
+  Qpath    = env->make_global_ref(env, env->intern(env, "path"));
+  Qhistory = env->make_global_ref(env, env->intern(env, "history"));
   Qignore  = env->make_global_ref(env, env->intern(env, "ignore"));
   Qrespect = env->make_global_ref(env, env->intern(env, "respect"));
   Qstringp = env->make_global_ref(env, env->intern(env, "stringp"));
