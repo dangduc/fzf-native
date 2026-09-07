@@ -677,7 +677,12 @@ static void session_fuzz_wait_running(FuzzSession *fuzz) {
 static int session_fuzz_reference_cmp(const void *left, const void *right) {
   const ScoredStr *a = left;
   const ScoredStr *b = right;
-  if (a->score != b->score) return a->score > b->score ? -1 : 1;
+  if (a->rank.score != b->rank.score)
+    return a->rank.score > b->rank.score ? -1 : 1;
+  if (a->rank.first != b->rank.first)
+    return a->rank.first < b->rank.first ? -1 : 1;
+  if (a->rank.second != b->rank.second)
+    return a->rank.second < b->rank.second ? -1 : 1;
   if (a->idx != b->idx) return a->idx < b->idx ? -1 : 1;
   return 0;
 }
@@ -724,6 +729,7 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
                                ? fzf_parse_pattern(
                                      case_mode, false, pattern_query, fuzzy)
                                : NULL;
+  bool sortable = pattern && !pattern->only_inv;
   fzf_slab_t *slab = fzf_make_default_slab();
   if (!slab || !fzf_slab_set_score_scheme(slab, score_scheme)) {
     if (pattern) fzf_free_pattern(pattern);
@@ -740,25 +746,37 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
   for (size_t i = 0; i < pool; i++) {
     const char *candidate =
         s->cands_top[i >> CANDS_BLOCK_SHIFT][i & CANDS_BLOCK_MASK];
+    fzf_score_bounds_t bounds = {0};
     int score;
     if (!pattern)
       score = 1;
     else if (filter_only)
       score = fzf_has_match(candidate, pattern, slab) ? 1 : 0;
     else
-      score = fzf_get_score(candidate, pattern, slab);
-    if (score > 0)
-      reference[matched++] = (ScoredStr){
+      score = fzf_get_score_with_bounds(candidate, pattern, slab, &bounds);
+    if (score > 0) {
+      ScoredStr value = {
           .str = (char *)candidate, .score = score, .idx = (uint32_t)i};
+      if (pattern && !filter_only)
+        value.rank = fzf_rank_keys_preclassified(
+            candidate, strlen(candidate), false, &bounds, score_scheme);
+      reference[matched++] = value;
+    }
   }
   pthread_mutex_unlock(&s->mu);
 
   size_t emit = limit && limit < matched ? limit : matched;
-  if (filter_only && pattern && emit > 1) {
-    for (size_t i = 0; i < emit; i++)
-      reference[i].score = fzf_get_score(reference[i].str, pattern, slab);
+  if (filter_only && sortable && emit > 1) {
+    for (size_t i = 0; i < emit; i++) {
+      fzf_score_bounds_t bounds = {0};
+      reference[i].score = fzf_get_score_with_bounds(
+          reference[i].str, pattern, slab, &bounds);
+      reference[i].rank = fzf_rank_keys_preclassified(
+          reference[i].str, strlen(reference[i].str), false, &bounds,
+          score_scheme);
+    }
     qsort(reference, emit, sizeof *reference, session_fuzz_reference_cmp);
-  } else if (!filter_only && matched > 1) {
+  } else if (!filter_only && sortable && matched > 1) {
     qsort(reference, matched, sizeof *reference, session_fuzz_reference_cmp);
   }
 
