@@ -313,5 +313,90 @@
     (should-error (fzf-native-score-all (list nul) "a"))
     (should-error (fzf-native-score-all '("a") nul))))
 
+(defun fzf-native-fuzz--wait-for-producer (handle)
+  "Return the terminal producer status for HANDLE, or signal on timeout."
+  (let ((deadline (+ (float-time) 10.0)) status)
+    (while (and (< (float-time) deadline)
+                (progn
+                  (setq status (fzf-native-async-status handle))
+                  (not (plist-get status :reader-done))))
+      (sleep-for 0.01))
+    (unless (plist-get status :reader-done)
+      (error "Timed out while waiting for the generated producer"))
+    status))
+
+(defun fzf-native-fuzz--wait-for-request (handle request-id)
+  "Return the terminal snapshot for REQUEST-ID on HANDLE."
+  (let ((deadline (+ (float-time) 10.0)) snapshot)
+    (while (and (< (float-time) deadline)
+                (progn
+                  (setq snapshot
+                        (fzf-native-async-snapshot handle request-id))
+                  (memq (plist-get snapshot :state) '(queued running))))
+      (sleep-for 0.01))
+    (unless (eq (plist-get snapshot :state) 'complete)
+      (error "Request %S did not complete: %S" request-id snapshot))
+    snapshot))
+
+(ert-deftest fzf-native-fuzz-interactive-abi-matches-batch-membership ()
+  "Compare generated persistent-session rounds with the batch native API."
+  (skip-unless (fzf-native--session-platform-p))
+  (should (fzf-native--verify-session-abi))
+  (let* ((seed (fzf-native-fuzz--env-integer
+                "FZF_NATIVE_FUZZ_SEED" 12648430))
+         (rounds (fzf-native-fuzz--env-integer
+                  "FZF_NATIVE_FUZZ_SESSION_CASES" 100))
+         (fzf-native-fuzz--allow-malformed nil)
+         collection
+         (input (make-temp-file "fzf-native-abi-fuzz-"))
+         handle)
+    (fzf-native-fuzz--seed (logxor seed #x51a7e))
+    (setq collection (cl-loop repeat 128
+                              collect (fzf-native-fuzz--candidate)))
+    (unwind-protect
+        (progn
+          (let ((coding-system-for-write 'utf-8-unix))
+            (write-region (concat (mapconcat #'identity collection "\n") "\n")
+                          nil input nil 'silent))
+          (setq handle
+                (fzf-native-async-start
+                 (concat "cat " (shell-quote-argument input))))
+          (let ((producer (fzf-native-fuzz--wait-for-producer handle)))
+            (should (eq (plist-get producer :producer-state) 'complete))
+            (should (= (plist-get producer :pool-generation)
+                       (length collection))))
+          (dotimes (iteration rounds)
+            (let* ((fzf-native-case-mode
+                    (aref [smart ignore respect]
+                          (fzf-native-fuzz--random 3)))
+                   (fzf-native-fuzzy
+                    (not (zerop (fzf-native-fuzz--random 2))))
+                   (fzf-native-async-highlight nil)
+                   (fzf-native-filter-only-min-pool nil)
+                   (fzf-native-filter-only-length nil)
+                   (query (fzf-native-fuzz--query))
+                   (expected
+                    (fzf-native-fuzz--keys
+                     (fzf-native-fuzz--score-all
+                      (fzf-native-fuzz--copies collection) query nil)))
+                   (request-id (fzf-native-async-submit handle query 0))
+                   (snapshot
+                    (fzf-native-fuzz--wait-for-request handle request-id))
+                   (actual
+                    (fzf-native-fuzz--keys
+                     (plist-get snapshot :candidates))))
+              (ert-info ((format
+                          "seed=%d round=%d mode=%S fuzzy=%S query=%S"
+                          seed iteration fzf-native-case-mode
+                          fzf-native-fuzzy query))
+                (should-not (plist-get snapshot :stale))
+                (should (equal expected actual)))))
+          (fzf-native-async-stop handle)
+          (setq handle nil))
+      (when handle
+        (ignore-errors (fzf-native-async-stop handle)))
+      (when (file-exists-p input)
+        (delete-file input)))))
+
 (provide 'fzf-native-fuzz-test)
 ;;; fzf-native-fuzz-test.el ends here
