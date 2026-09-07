@@ -519,7 +519,7 @@ func TestNativePeerScoringSchemesMatchRawOracle(t *testing.T) {
 	}
 }
 
-func TestNativePeerKnownNormalizationGap(t *testing.T) {
+func TestNativePeerPinnedNormalizationScore(t *testing.T) {
 	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
 	if driver == "" {
 		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
@@ -532,23 +532,19 @@ func TestNativePeerKnownNormalizationGap(t *testing.T) {
 	}
 
 	cases := []struct {
-		name           string
-		flags          byte
-		pattern        []byte
-		candidate      []byte
-		wantUpstream   matchResponse
-		wantNativePeer matchResponse
+		name      string
+		flags     byte
+		pattern   []byte
+		candidate []byte
+		want      matchResponse
 	}{
 		{
 			name:      "latin-normalization",
 			flags:     flagCaseSensitive | flagNormalize | flagForward,
 			pattern:   []byte("cafe"),
 			candidate: []byte("café"),
-			wantUpstream: matchResponse{
+			want: matchResponse{
 				matched: true, positionsPresent: true, start: 0, end: 4, score: 114, positions: []int64{0, 1, 2, 3},
-			},
-			wantNativePeer: matchResponse{
-				matched: true, positionsPresent: true, start: 0, end: 4, score: 104, positions: []int64{0, 1, 2, 3},
 			},
 		},
 	}
@@ -570,11 +566,11 @@ func TestNativePeerKnownNormalizationGap(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(upstream, testCase.wantUpstream) {
-				t.Fatalf("upstream gap shape changed: got %+v; want %+v", upstream, testCase.wantUpstream)
+			if !reflect.DeepEqual(upstream, testCase.want) {
+				t.Fatalf("upstream result changed: got %+v; want %+v", upstream, testCase.want)
 			}
-			if !reflect.DeepEqual(native, testCase.wantNativePeer) {
-				t.Fatalf("native gap shape changed: got %+v; want %+v", native, testCase.wantNativePeer)
+			if !reflect.DeepEqual(native, upstream) {
+				t.Fatalf("normalization result differs: native=%+v upstream=%+v", native, upstream)
 			}
 		})
 	}
