@@ -62,7 +62,9 @@ static struct Candidate make_candidate(int score, size_t tag) {
   struct Candidate c;
   memset(&c, 0, sizeof c);
   c.score = score;
+  c.rank.score = fzf_rank_score(score);
   c.s.len = tag;
+  c.idx = tag;
   return c;
 }
 
@@ -690,7 +692,7 @@ static void test_small_n_stability(void) {
 }
 
 static void test_large_n_correctness(void) {
-  /* n=1000 takes the counting-sort path. Verify descending order. */
+  /* n=1000 takes the radix path. Verify descending order. */
   enum { N = 1000 };
   struct Candidate *xs = malloc(N * sizeof *xs);
   CHECK(xs != NULL);
@@ -704,9 +706,7 @@ static void test_large_n_correctness(void) {
 }
 
 static void test_stability_with_ties(void) {
-  /* Counting sort must be stable: same-score candidates retain input order.
-     Use n>=64 so we go through the counting-sort path (qsort isn't stable
-     and this property doesn't hold for the fallback). */
+  /* The radix path must keep producer order for equal rank keys. */
   enum { N = 200 };
   struct Candidate xs[N];
   for (size_t i = 0; i < N; i++) {
@@ -728,8 +728,7 @@ static void test_stability_with_ties(void) {
 }
 
 static void test_all_same_score(void) {
-  /* All candidates same nonzero score -- single bucket. Verify stability:
-     output order matches input order. */
+  /* Equal rank keys retain producer order. */
   enum { N = 128 };
   struct Candidate xs[N];
   for (size_t i = 0; i < N; i++) xs[i] = make_candidate(7, i);
@@ -741,8 +740,7 @@ static void test_all_same_score(void) {
 }
 
 static void test_all_zero_score(void) {
-  /* score=0 is the only edge that touches max_score=0 -> count[1] alloc.
-     The contract says callers ensure score >= 0; zero is allowed. */
+  /* Zero is a valid rank key and retains producer order. */
   enum { N = 100 };
   struct Candidate xs[N];
   for (size_t i = 0; i < N; i++) xs[i] = make_candidate(0, i);
@@ -754,8 +752,8 @@ static void test_all_zero_score(void) {
 }
 
 static void test_matches_qsort(void) {
-  /* For the same input, counting_sort and qsort should produce the same
-     sequence of *scores* (the tags may diverge because qsort isn't stable). */
+  /* The radix path and allocation-failure comparator implement one total
+     order, including the producer-index fallback. */
   enum { N = 500 };
   struct Candidate a[N], b[N];
   unsigned seed = 1234;
@@ -766,7 +764,146 @@ static void test_matches_qsort(void) {
   }
   counting_sort_candidates(a, N);
   qsort(b, N, sizeof *b, cmp_candidate);
-  for (size_t i = 0; i < N; i++) CHECK(a[i].score == b[i].score);
+  for (size_t i = 0; i < N; i++) {
+    CHECK(a[i].score == b[i].score);
+    CHECK(a[i].idx == b[i].idx);
+  }
+}
+
+static void test_rank_keys_match_fzf_length_and_path_rules(void) {
+  const char unicode_space_text[] =
+      "\xe3\x80\x80" "ab" "\xc2\xa0";
+  fzf_score_bounds_t bounds = {
+    .min_begin = 1, .min_end = 3, .max_end = 3,
+    .raw_score = 70000, .valid = true,
+  };
+  FzfRankKeys default_keys = fzf_rank_keys_preclassified(
+      unicode_space_text, sizeof unicode_space_text - 1, false, &bounds,
+      FZF_SCORE_SCHEME_DEFAULT);
+  CHECK(default_keys.first == 2);
+  CHECK(default_keys.second == 0);
+  CHECK(default_keys.score == UINT16_MAX);
+
+  size_t long_length = (size_t)UINT16_MAX + 100;
+  char *long_text = malloc(long_length);
+  CHECK(long_text != NULL);
+  memset(long_text, 'x', long_length);
+  default_keys = fzf_rank_keys_preclassified(
+      long_text, long_length, false, &bounds, FZF_SCORE_SCHEME_DEFAULT);
+  CHECK(default_keys.first == UINT16_MAX);
+  free(long_text);
+
+  const char path[] = "src/lib/file.c";
+  bounds.min_begin = 8;
+  FzfRankKeys path_keys = fzf_rank_keys_preclassified(
+      path, sizeof path - 1, false, &bounds, FZF_SCORE_SCHEME_PATH);
+  CHECK(path_keys.first == 1);
+  CHECK(path_keys.second == sizeof path - 1);
+
+  bounds.min_begin = 2;
+  path_keys = fzf_rank_keys_preclassified(
+      path, sizeof path - 1, false, &bounds, FZF_SCORE_SCHEME_PATH);
+  CHECK(path_keys.first == UINT16_MAX);
+  CHECK(fzf_rank_u16((size_t)UINT16_MAX + 100) == UINT16_MAX);
+}
+
+static void test_ascii_rank_fast_path_matches_unicode_decoder(void) {
+  char text[257];
+  unsigned seed = 0xA5C11u;
+  for (size_t iteration = 0; iteration < 4096; iteration++) {
+    size_t length = rand_r(&seed) % sizeof text;
+    for (size_t i = 0; i < length; i++)
+      text[i] = (char)(rand_r(&seed) & 0x7f);
+    fzf_score_bounds_t bounds = {
+      .min_begin = (int32_t)(rand_r(&seed) % (length + 1)),
+      .min_end = 0,
+      .max_end = (int32_t)length,
+      .raw_score = (int32_t)(rand_r(&seed) % 200001) - 100000,
+      .valid = (rand_r(&seed) & 1) != 0,
+    };
+    for (fzf_score_scheme_t scheme = FZF_SCORE_SCHEME_DEFAULT;
+         scheme <= FZF_SCORE_SCHEME_HISTORY; scheme++) {
+      FzfRankKeys expected = fzf_rank_keys_preclassified(
+          text, length, false, &bounds, scheme);
+      FzfRankKeys actual = fzf_rank_keys_preclassified(
+          text, length, true, &bounds, scheme);
+      CHECK(actual.score == expected.score);
+      CHECK(actual.first == expected.first);
+      CHECK(actual.second == expected.second);
+    }
+  }
+}
+
+static void test_ranked_score_fast_path_preserves_raw_score(void) {
+  char query[] = "t";
+  fzf_pattern_t *pattern = fzf_parse_pattern(
+      CaseRespect, false, query, true);
+  fzf_slab_t *actual_slab = fzf_make_default_slab();
+  fzf_slab_t *expected_slab = fzf_make_default_slab();
+  const char *text = "candidate-test-file";
+  size_t length = strlen(text);
+  FzfRankKeys actual_rank = {0};
+  fzf_score_bounds_t expected_bounds = {0};
+  CHECK(pattern != NULL && actual_slab != NULL && expected_slab != NULL);
+  CHECK(fzf_rank_can_reuse_public_score(
+      pattern, FZF_SCORE_SCHEME_DEFAULT));
+  int actual_score = fzf_score_and_rank(
+      text, length, true, pattern, actual_slab,
+      FZF_SCORE_SCHEME_DEFAULT, true, &actual_rank);
+  int expected_score = fzf_get_score_with_bounds_bytes_preclassified(
+      text, length, true, pattern, expected_slab, &expected_bounds);
+  FzfRankKeys expected_rank = fzf_rank_keys_preclassified(
+      text, length, true, &expected_bounds, FZF_SCORE_SCHEME_DEFAULT);
+  CHECK(actual_score > 1 && actual_score == expected_score);
+  CHECK(actual_rank.score == expected_rank.score);
+  CHECK(actual_rank.first == expected_rank.first);
+  fzf_free_slab(actual_slab);
+  fzf_free_slab(expected_slab);
+  fzf_free_pattern(pattern);
+
+  const char *long_gap =
+      "s........................................................................|";
+  char long_query[] = "s|";
+  pattern = fzf_parse_pattern(CaseRespect, false, long_query, true);
+  actual_slab = fzf_make_slab((fzf_slab_config_t){64, 64});
+  expected_slab = fzf_make_slab((fzf_slab_config_t){64, 64});
+  length = strlen(long_gap);
+  actual_rank = (FzfRankKeys){0};
+  expected_bounds = (fzf_score_bounds_t){0};
+  CHECK(pattern != NULL && actual_slab != NULL && expected_slab != NULL);
+  actual_score = fzf_score_and_rank(
+      long_gap, length, true, pattern, actual_slab,
+      FZF_SCORE_SCHEME_DEFAULT, true, &actual_rank);
+  expected_score = fzf_get_score_with_bounds_bytes_preclassified(
+      long_gap, length, true, pattern, expected_slab, &expected_bounds);
+  expected_rank = fzf_rank_keys_preclassified(
+      long_gap, length, true, &expected_bounds,
+      FZF_SCORE_SCHEME_DEFAULT);
+  CHECK(actual_score == 1 && actual_score == expected_score);
+  CHECK(expected_bounds.raw_score <= 0);
+  CHECK(actual_rank.score == expected_rank.score);
+  CHECK(actual_rank.first == expected_rank.first);
+  fzf_free_slab(actual_slab);
+  fzf_free_slab(expected_slab);
+  fzf_free_pattern(pattern);
+}
+
+static void test_score_bounds_aggregate_positive_terms(void) {
+  char query[] = "'ab | 'yy 'cd";
+  fzf_pattern_t *pattern = fzf_parse_pattern(
+      CaseRespect, false, query, true);
+  fzf_slab_t *slab = fzf_make_default_slab();
+  fzf_score_bounds_t bounds = {0};
+  CHECK(pattern != NULL && slab != NULL);
+  int score = fzf_get_score_with_bounds(
+      "xxab yycdzz", pattern, slab, &bounds);
+  CHECK(score > 0);
+  CHECK(bounds.valid);
+  CHECK(bounds.min_begin == 2);
+  CHECK(bounds.min_end == 4);
+  CHECK(bounds.max_end == 9);
+  fzf_free_slab(slab);
+  fzf_free_pattern(pattern);
 }
 
 /* =====================================================================
@@ -776,9 +913,10 @@ static void test_matches_qsort(void) {
 /* Abuse the str pointer as an order tag; counting_sort_scored never
    dereferences str, only copies it, so this is safe for tests. */
 static ScoredStr make_scored(int score, size_t tag) {
-  ScoredStr s;
+  ScoredStr s = {0};
   s.str   = (char *)(uintptr_t)tag;
   s.score = score;
+  s.rank.score = fzf_rank_score(score);
   s.idx   = (uint32_t)tag;
   return s;
 }
@@ -2592,7 +2730,7 @@ static void test_async_batch_window_bounds_preparation_memory(void) {
   size_t batches = (candidates + BATCH_SIZE - 1) / BATCH_SIZE;
   size_t window = MIN(batches, (size_t)ASYNC_BATCH_WINDOW);
   CHECK(window == ASYNC_BATCH_WINDOW);
-  CHECK(window * sizeof(struct AsyncScoringBatch) < 3 * 1024 * 1024);
+  CHECK(window * sizeof(struct AsyncScoringBatch) < 4 * 1024 * 1024);
   CHECK(batches * sizeof(struct AsyncScoringBatch) > 900 * 1024 * 1024);
 
   ScoredStr *values = NULL;
@@ -3697,6 +3835,10 @@ int main(void) {
   RUN(test_all_same_score);
   RUN(test_all_zero_score);
   RUN(test_matches_qsort);
+  RUN(test_rank_keys_match_fzf_length_and_path_rules);
+  RUN(test_ascii_rank_fast_path_matches_unicode_decoder);
+  RUN(test_ranked_score_fast_path_preserves_raw_score);
+  RUN(test_score_bounds_aggregate_positive_terms);
 
   printf("--- counting_sort_scored ---\n");
   RUN(test_scored_n_zero);
