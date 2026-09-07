@@ -1598,9 +1598,10 @@ fzf_result_t fzf_equal_match(bool case_sensitive, bool normalize,
 
 /* UTF-8 aware matching algorithms */
 
-fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
-                                  fzf_string_t *text, fzf_string_t *pattern,
-                                  fzf_position_t *pos, fzf_slab_t *slab) {
+static fzf_result_t fzf_exact_match_utf8_impl(
+    bool case_sensitive, bool normalize, bool boundary_check,
+    fzf_string_t *text, fzf_string_t *pattern, fzf_position_t *pos,
+    fzf_slab_t *slab) {
   const size_t M = pattern->size;
   const size_t N = text->size;
   const score_scheme_config_t *config = score_scheme_config(slab);
@@ -1660,22 +1661,9 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
         if (text_pos == 0) {
           bonus = config->boundary_white;
         } else {
-          // Get previous character's class
           utf8proc_int32_t prev_cp;
-          // Walk forward from start to find the character just before text_pos
-          size_t prev_pos = 0;
-          size_t last_prev_pos = 0;
-          utf8proc_int32_t last_prev_cp = 0;
-          while (prev_pos < text_pos) {
-            utf8proc_ssize_t pb = utf8proc_iterate(
-              (const utf8proc_uint8_t*)(text->data + prev_pos),
-              text_pos - prev_pos, &prev_cp);
-            if (pb <= 0) break;
-            last_prev_pos = prev_pos;
-            last_prev_cp = prev_cp;
-            prev_pos += pb;
-          }
-          int32_t prev_class = char_class_of_codepoint(last_prev_cp, config);
+          utf8_lossy_previous_char(text->data, text_pos, &prev_cp);
+          int32_t prev_class = char_class_of_codepoint(prev_cp, config);
           bonus = bonus_for(config, prev_class, cur_class);
         }
       }
@@ -1684,11 +1672,28 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
       text_pos += text_bytes;
 
       if (pidx == pattern_cp_count) { // All pattern characters matched
-        if (bonus > best_bonus) {
+        bool boundary_match = true;
+        if (boundary_check) {
+          if (match_start_byte > 0) {
+            utf8proc_int32_t prev_cp;
+            utf8_lossy_previous_char(text->data, match_start_byte, &prev_cp);
+            boundary_match = !char_class_is_word(
+                char_class_of_codepoint(prev_cp, config));
+          }
+          if (boundary_match && text_pos < N) {
+            utf8proc_int32_t next_cp;
+            utf8_iterate_lossy(
+                (const utf8proc_uint8_t *)(text->data + text_pos),
+                N - text_pos, &next_cp);
+            boundary_match = !char_class_is_word(
+                char_class_of_codepoint(next_cp, config));
+          }
+        }
+        if (boundary_match && bonus > best_bonus) {
           best_pos = (int32_t)match_start_byte;
           best_bonus = bonus;
         }
-        if (bonus >= BonusBoundary) {
+        if (boundary_match && bonus >= BonusBoundary) {
           break;
         }
         // Reset for next potential match — advance by first matched char's byte length
@@ -1731,8 +1736,21 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
       pattern_pos += pb;
     }
 
-    int32_t score = calculate_score_utf8(case_sensitive, normalize, text,
-                                         pattern, sidx, eidx, NULL, slab);
+    int32_t score;
+    if (boundary_check) {
+      score = (int32_t)best_bonus +
+              ScoreMatch * (int32_t)pattern_cp_count +
+              config->boundary_white * ((int32_t)pattern_cp_count + 1);
+      int32_t deduct = (int32_t)best_bonus - BonusBoundary + 1;
+      if (sidx > 0 && text->data[sidx - 1] == '_') {
+        score -= deduct + 1;
+        deduct = 1;
+      }
+      if (eidx < N && text->data[eidx] == '_') score -= deduct;
+    } else {
+      score = calculate_score_utf8(case_sensitive, normalize, text, pattern,
+                                   sidx, eidx, NULL, slab);
+    }
 
     // Convert byte positions to character positions
     size_t char_start = utf8_byte_to_char(char_map, sidx);
@@ -1745,6 +1763,20 @@ fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
   }
   utf8_free_char_map(char_map);
   return (fzf_result_t){-1, -1, 0};
+}
+
+fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
+                                  fzf_string_t *text, fzf_string_t *pattern,
+                                  fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_exact_match_utf8_impl(case_sensitive, normalize, false, text,
+                                   pattern, pos, slab);
+}
+
+fzf_result_t fzf_exact_match_boundary_utf8(
+    bool case_sensitive, bool normalize, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+  return fzf_exact_match_utf8_impl(case_sensitive, normalize, true, text,
+                                   pattern, pos, slab);
 }
 
 fzf_result_t fzf_prefix_match_utf8(bool case_sensitive, bool normalize,
