@@ -408,5 +408,101 @@ Each specification has the form (KEY VALUES)."
                     (length
                      (fzf-native-differential-term-literal primary)))))))
 
+(ert-deftest fzf-native-fuzz-upstream-exceptions-are-narrow ()
+  "Reject broad exceptions for ordinary common-profile membership."
+  (let* ((seed 73)
+         (common
+          (cl-loop for serial below 100
+                   for case = (fzf-native-upstream--generated-case
+                               seed serial 'common)
+                   when (plist-get
+                         (fzf-native-differential-case-dimensions case)
+                         :valid-utf8)
+                   return case))
+         (boundary
+          (cl-loop for serial below 1000
+                   for case = (fzf-native-upstream--generated-case
+                               seed serial 'parity)
+                   when (fzf-native-differential--case-has-kind-p
+                         case 'boundary-exact)
+                   return case))
+         (ranking
+          (cl-loop for serial below 1000
+                   for case = (fzf-native-upstream--generated-case
+                               seed serial 'parity)
+                   when (eq (fzf-native-differential-case-comparison case)
+                            'ranking)
+                   return case))
+         (malformed
+          (cl-loop for serial below 1000
+                   for case = (fzf-native-upstream--generated-case
+                               seed serial 'common)
+                   unless (plist-get
+                           (fzf-native-differential-case-dimensions case)
+                           :valid-utf8)
+                   return case))
+         (forged (copy-fzf-native-differential-case common))
+         (malformed-candidate
+          (cl-find-if
+           (lambda (candidate)
+             (fzf-native-differential--malformed-utf8-string-p
+              (fzf-native-differential-candidate-text candidate)))
+           (fzf-native-differential-case-candidates malformed)))
+         (malformed-identity
+          (fzf-native-differential-candidate-id
+           (or malformed-candidate
+               (car (fzf-native-differential-case-candidates malformed)))))
+         boundary-exception ranking-exception malformed-exception)
+    (setf (fzf-native-differential-case-dimensions forged)
+          (plist-put
+           (copy-sequence
+            (fzf-native-differential-case-dimensions forged))
+           :valid-utf8 nil))
+    (should-not
+     (fzf-native-differential-classify common 'membership))
+    (should-not
+     (fzf-native-differential-classify forged 'membership))
+    (setq boundary-exception
+          (fzf-native-differential-classify boundary 'membership))
+    (should (eq (plist-get boundary-exception :name)
+                'exact-boundary-syntax))
+    (should (eq (plist-get boundary-exception :disposition)
+                'parity-debt))
+    (should-not
+     (fzf-native-differential-classify
+      ranking 'ranking '(:membership-equal nil)))
+    (setq ranking-exception
+          (fzf-native-differential-classify
+           ranking 'ranking '(:membership-equal t)))
+    (should (eq (plist-get ranking-exception :name)
+                'score-ranking-revision))
+    (should (eq (plist-get ranking-exception :disposition)
+                'parity-debt))
+    (setq malformed-exception
+          (fzf-native-differential-classify
+           malformed 'membership
+           (list :differing-identities (list malformed-identity))))
+    (should (eq (plist-get malformed-exception :name)
+                'malformed-utf8-decoder))
+    (should (eq (plist-get malformed-exception :disposition)
+                'accepted))
+    (should
+     (equal
+      (mapcar (lambda (entry) (plist-get entry :name))
+              (cl-remove-if-not
+               (lambda (entry)
+                 (eq (plist-get entry :disposition) 'accepted))
+               fzf-native-differential-exceptions))
+      '(malformed-utf8-decoder)))
+    (dolist (entry fzf-native-differential-exceptions)
+      (should
+       (equal (plist-get entry :upstream-revision)
+              fzf-native-differential-upstream-revision))
+      (should (stringp (plist-get entry :owner)))
+      (should (stringp (plist-get entry :remove-when))))
+    (should
+     (equal (plist-get malformed-exception :scope)
+            "Only differing malformed inputs for membership or positions."))))
+
 (provide 'fzf-native-upstream-test)
 ;;; fzf-native-upstream-test.el ends here
