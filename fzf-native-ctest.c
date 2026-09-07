@@ -1909,10 +1909,12 @@ static void test_cache_exact_separates_score_schemes(void) {
   ScoredStr path_top[1] = { make_top("path", 84) };
 
   cache_insert_for_request_with_scheme(
-      &c, "fzf", 2, CaseSmart, true, FZF_SCORE_SCHEME_DEFAULT, false,
+      &c, "fzf", 2, CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_DEFAULT, false,
       default_top, 1, 1, NULL, 0);
   cache_insert_for_request_with_scheme(
-      &c, "fzf", 2, CaseSmart, true, FZF_SCORE_SCHEME_PATH, false,
+      &c, "fzf", 2, CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_PATH, false,
       path_top, 1, 1, NULL, 0);
   CHECK(c.count == 2);
 
@@ -1921,16 +1923,57 @@ static void test_cache_exact_separates_score_schemes(void) {
   size_t out_count = 0, out_gen = 0, matched_count = 0;
   bool covered = false;
   CHECK(cache_lookup_exact_for_request_with_scheme(
-      &c, "fzf", CaseSmart, true, FZF_SCORE_SCHEME_DEFAULT, false, 1,
+      &c, "fzf", CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_DEFAULT, false, 1,
       &out, &out_count, &out_sidx, &out_gen, &matched_count, &covered));
   CHECK(out_count == 1 && strcmp(out[0].str, "default") == 0 && covered);
   free(out);
 
   out = NULL;
   CHECK(cache_lookup_exact_for_request_with_scheme(
-      &c, "fzf", CaseSmart, true, FZF_SCORE_SCHEME_PATH, false, 1,
+      &c, "fzf", CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_PATH, false, 1,
       &out, &out_count, &out_sidx, &out_gen, &matched_count, &covered));
   CHECK(out_count == 1 && strcmp(out[0].str, "path") == 0 && covered);
+  free(out);
+  cache_free(&c);
+}
+
+static void test_cache_exact_separates_normalization_and_direction(void) {
+  Cache c;
+  cache_init(&c, 20);
+  ScoredStr plain_top[1] = { make_top("plain", 90) };
+  ScoredStr normalized_top[1] = { make_top("normalized", 89) };
+  ScoredStr backward_top[1] = { make_top("backward", 88) };
+
+  cache_insert_for_request_with_scheme(
+      &c, "cafe", 2, CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_DEFAULT, false, plain_top, 1, 1, NULL, 0);
+  cache_insert_for_request_with_scheme(
+      &c, "cafe", 2, CaseSmart, true, true, true,
+      FZF_SCORE_SCHEME_DEFAULT, false, normalized_top, 1, 1, NULL, 0);
+  cache_insert_for_request_with_scheme(
+      &c, "cafe", 2, CaseSmart, true, false, false,
+      FZF_SCORE_SCHEME_DEFAULT, false, backward_top, 1, 1, NULL, 0);
+  CHECK(c.count == 3);
+
+  ScoredStr *out = NULL;
+  SharedIdx *out_sidx = NULL;
+  size_t out_count = 0, out_gen = 0, matched_count = 0;
+  bool covered = false;
+  CHECK(cache_lookup_exact_for_request_with_scheme(
+      &c, "cafe", CaseSmart, true, true, true,
+      FZF_SCORE_SCHEME_DEFAULT, false, 1, &out, &out_count, &out_sidx,
+      &out_gen, &matched_count, &covered));
+  CHECK(out_count == 1 && strcmp(out[0].str, "normalized") == 0 && covered);
+  free(out);
+
+  out = NULL;
+  CHECK(cache_lookup_exact_for_request_with_scheme(
+      &c, "cafe", CaseSmart, true, false, false,
+      FZF_SCORE_SCHEME_DEFAULT, false, 1, &out, &out_count, &out_sidx,
+      &out_gen, &matched_count, &covered));
+  CHECK(out_count == 1 && strcmp(out[0].str, "backward") == 0 && covered);
   free(out);
   cache_free(&c);
 }
@@ -2102,8 +2145,10 @@ static void test_byte_prefix_rejects_invalid_utf8_transition(void) {
 
 static void test_subsumes_pattern_adding_term_at_end(void) {
   /* "fo" → "fo bar": both rules agree.  Verify term-set path. */
-  fzf_pattern_t *p1 = parse_query_for_cache("fo", CaseSmart, true);
-  fzf_pattern_t *p2 = parse_query_for_cache("fo bar", CaseSmart, true);
+  fzf_pattern_t *p1 = parse_query_for_cache(
+      "fo", CaseSmart, true, false, true);
+  fzf_pattern_t *p2 = parse_query_for_cache(
+      "fo bar", CaseSmart, true, false, true);
   CHECK(p1 && p2);
   CHECK(subsumes_pattern(p1, p2) == true);
   CHECK(subsumes_pattern(p2, p1) == false);
@@ -2114,8 +2159,10 @@ static void test_subsumes_pattern_adding_term_at_end(void) {
 static void test_subsumes_pattern_adding_term_at_start(void) {
   /* "fo" → "x fo": v2-only case.  Byte-prefix says NO (fo not prefix of
      x fo), term-set says YES (fo's terms ⊆ x fo's terms). */
-  fzf_pattern_t *p1 = parse_query_for_cache("fo", CaseSmart, true);
-  fzf_pattern_t *p2 = parse_query_for_cache("x fo", CaseSmart, true);
+  fzf_pattern_t *p1 = parse_query_for_cache(
+      "fo", CaseSmart, true, false, true);
+  fzf_pattern_t *p2 = parse_query_for_cache(
+      "x fo", CaseSmart, true, false, true);
   CHECK(p1 && p2);
   CHECK(subsumes("fo", "x fo") == false);            /* v1 misses */
   CHECK(subsumes_pattern(p1, p2) == true);           /* v2 catches */
@@ -2128,8 +2175,10 @@ static void test_subsumes_pattern_term_reorder(void) {
   /* "foo bar" and "bar foo" are semantically equivalent in fzf — same
      term set, different textual order.  Term-set rule sees mutual
      subsumption; byte-prefix rule sees neither. */
-  fzf_pattern_t *p1 = parse_query_for_cache("foo bar", CaseSmart, true);
-  fzf_pattern_t *p2 = parse_query_for_cache("bar foo", CaseSmart, true);
+  fzf_pattern_t *p1 = parse_query_for_cache(
+      "foo bar", CaseSmart, true, false, true);
+  fzf_pattern_t *p2 = parse_query_for_cache(
+      "bar foo", CaseSmart, true, false, true);
   CHECK(p1 && p2);
   CHECK(subsumes("foo bar", "bar foo") == false);
   CHECK(subsumes("bar foo", "foo bar") == false);
@@ -2142,8 +2191,10 @@ static void test_subsumes_pattern_term_reorder(void) {
 static void test_subsumes_pattern_negation_at_start(void) {
   /* "fo" → "!x fo": adding a negation term in non-prefix position.
      Term-set rule catches it; byte-prefix doesn't. */
-  fzf_pattern_t *p1 = parse_query_for_cache("fo", CaseSmart, true);
-  fzf_pattern_t *p2 = parse_query_for_cache("!x fo", CaseSmart, true);
+  fzf_pattern_t *p1 = parse_query_for_cache(
+      "fo", CaseSmart, true, false, true);
+  fzf_pattern_t *p2 = parse_query_for_cache(
+      "!x fo", CaseSmart, true, false, true);
   CHECK(p1 && p2);
   CHECK(subsumes_pattern(p1, p2) == true);
   fzf_free_pattern(p1);
@@ -2154,8 +2205,10 @@ static void test_subsumes_pattern_or_query_rejected(void) {
   /* "fo | bar" parses as ONE term-set with TWO terms (within a set =
      OR; across sets = AND).  subsumes_pattern rejects any term-set with
      >1 term — it can never serve as a refinement source. */
-  fzf_pattern_t *p1 = parse_query_for_cache("fo", CaseSmart, true);
-  fzf_pattern_t *p2 = parse_query_for_cache("fo | bar", CaseSmart, true);
+  fzf_pattern_t *p1 = parse_query_for_cache(
+      "fo", CaseSmart, true, false, true);
+  fzf_pattern_t *p2 = parse_query_for_cache(
+      "fo | bar", CaseSmart, true, false, true);
   CHECK(p1 && p2);
   CHECK(p1->size == 1 && p1->ptr[0]->size == 1);  /* "fo": 1 set, 1 term */
   CHECK(p2->size == 1 && p2->ptr[0]->size == 2);  /* "fo|bar": 1 set, 2 terms */
@@ -2167,8 +2220,10 @@ static void test_subsumes_pattern_or_query_rejected(void) {
 
 static void test_subsumes_pattern_distinct_terms(void) {
   /* "foo" and "bar" share no terms; neither subsumes the other. */
-  fzf_pattern_t *p1 = parse_query_for_cache("foo", CaseSmart, true);
-  fzf_pattern_t *p2 = parse_query_for_cache("bar", CaseSmart, true);
+  fzf_pattern_t *p1 = parse_query_for_cache(
+      "foo", CaseSmart, true, false, true);
+  fzf_pattern_t *p2 = parse_query_for_cache(
+      "bar", CaseSmart, true, false, true);
   CHECK(p1 && p2);
   CHECK(subsumes_pattern(p1, p2) == false);
   CHECK(subsumes_pattern(p2, p1) == false);
@@ -2391,9 +2446,11 @@ static void test_batch_cache_separates_score_schemes(void) {
   BatchCache cache;
   batch_cache_init(&cache, 1024 * 1024);
   BatchQuery *default_query = batch_cache_acquire_query_for_scheme(
-      &cache, "fzf", CaseSmart, true, FZF_SCORE_SCHEME_DEFAULT);
+      &cache, "fzf", CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_DEFAULT);
   BatchQuery *path_query = batch_cache_acquire_query_for_scheme(
-      &cache, "fzf", CaseSmart, true, FZF_SCORE_SCHEME_PATH);
+      &cache, "fzf", CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_PATH);
   CHECK(default_query != NULL && path_query != NULL);
   CHECK(default_query != path_query);
   CHECK(cache.query_count == 2);
@@ -2401,15 +2458,50 @@ static void test_batch_cache_separates_score_schemes(void) {
   ScoredStr match = {.idx = 1};
   batch_cache_insert(&cache, default_query, 0, &match, 1);
   BatchQuery *source = batch_cache_select_source_for_scheme(
-      &cache, "fzf", CaseSmart, true, FZF_SCORE_SCHEME_PATH);
+      &cache, "fzf", CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_PATH);
   CHECK(source == NULL);
   source = batch_cache_select_source_for_scheme(
-      &cache, "fzf", CaseSmart, true, FZF_SCORE_SCHEME_DEFAULT);
+      &cache, "fzf", CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_DEFAULT);
   CHECK(source == default_query);
   batch_cache_release_query(&cache, source);
 
   batch_cache_release_query(&cache, path_query);
   batch_cache_release_query(&cache, default_query);
+  batch_cache_free(&cache);
+}
+
+static void test_batch_cache_separates_normalization_and_direction(void) {
+  BatchCache cache;
+  batch_cache_init(&cache, 1024 * 1024);
+  BatchQuery *plain = batch_cache_acquire_query_for_scheme(
+      &cache, "cafe", CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_DEFAULT);
+  BatchQuery *normalized = batch_cache_acquire_query_for_scheme(
+      &cache, "cafe", CaseSmart, true, true, true,
+      FZF_SCORE_SCHEME_DEFAULT);
+  BatchQuery *backward = batch_cache_acquire_query_for_scheme(
+      &cache, "cafe", CaseSmart, true, false, false,
+      FZF_SCORE_SCHEME_DEFAULT);
+  CHECK(plain != NULL && normalized != NULL && backward != NULL);
+  CHECK(plain != normalized && plain != backward && normalized != backward);
+  CHECK(cache.query_count == 3);
+
+  ScoredStr match = {.idx = 1};
+  batch_cache_insert(&cache, plain, 0, &match, 1);
+  BatchQuery *source = batch_cache_select_source_for_scheme(
+      &cache, "cafe", CaseSmart, true, true, true,
+      FZF_SCORE_SCHEME_DEFAULT);
+  CHECK(source == NULL);
+  source = batch_cache_select_source_for_scheme(
+      &cache, "cafe", CaseSmart, true, false, false,
+      FZF_SCORE_SCHEME_DEFAULT);
+  CHECK(source == NULL);
+
+  batch_cache_release_query(&cache, backward);
+  batch_cache_release_query(&cache, normalized);
+  batch_cache_release_query(&cache, plain);
   batch_cache_free(&cache);
 }
 
@@ -2894,8 +2986,20 @@ static void test_async_request_identity_includes_matching_options(void) {
   CHECK(!async_request_matches("foo", 10, CaseSmart, true, 2, false,
                                "foo", 10, CaseSmart, true, 2, true));
   CHECK(!async_request_matches_for_scheme(
-      "foo", 10, CaseSmart, true, FZF_SCORE_SCHEME_DEFAULT, 2, false,
-      "foo", 10, CaseSmart, true, FZF_SCORE_SCHEME_PATH, 2, false));
+      "foo", 10, CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_DEFAULT, 2, false,
+      "foo", 10, CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_PATH, 2, false));
+  CHECK(!async_request_matches_for_scheme(
+      "foo", 10, CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_DEFAULT, 2, false,
+      "foo", 10, CaseSmart, true, true, true,
+      FZF_SCORE_SCHEME_DEFAULT, 2, false));
+  CHECK(!async_request_matches_for_scheme(
+      "foo", 10, CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_DEFAULT, 2, false,
+      "foo", 10, CaseSmart, true, false, false,
+      FZF_SCORE_SCHEME_DEFAULT, 2, false));
 }
 
 static void test_async_submit_oom_does_not_publish_request(void) {
@@ -2948,6 +3052,7 @@ static void test_async_running_request_reuse_requires_latest_slot(void) {
   s.score_current_limit = 10;
   s.score_current_case_mode = CaseSmart;
   s.score_current_fuzzy = true;
+  s.score_current_forward = true;
   s.score_current_filter_only_length = 2;
   s.score_current_filter_only_logic_and = false;
 
@@ -3915,6 +4020,7 @@ int main(void) {
   RUN(test_cache_pool_gen_distinguishes_stale);
   RUN(test_cache_exact_separates_case_and_fuzzy_modes);
   RUN(test_cache_exact_separates_score_schemes);
+  RUN(test_cache_exact_separates_normalization_and_direction);
   RUN(test_cache_exact_requires_sufficient_result_capacity);
   RUN(test_cache_exact_caps_result_to_requested_limit);
   RUN(test_cache_exact_filter_only_requires_same_emit_window);
@@ -3942,6 +4048,7 @@ int main(void) {
   RUN(test_batch_cache_sparse_bitmap_and_selectivity_cutoff);
   RUN(test_batch_cache_selects_only_safe_query_ancestors);
   RUN(test_batch_cache_separates_score_schemes);
+  RUN(test_batch_cache_separates_normalization_and_direction);
   RUN(test_batch_cache_evicts_to_byte_budget);
   RUN(test_batch_cache_query_cap_evicts_complete_owners);
   RUN(test_batch_cache_source_scan_is_bounded_and_exact_is_hashed);
