@@ -284,6 +284,36 @@ static void test_or_satisfied_only_by_inverse_term(void) {
                   CaseIgnore, true, true);
 }
 
+static void test_inverse_only_or_is_not_sortable(void) {
+  char inverse_or_query[] = "!z | !q";
+  fzf_pattern_t *inverse_or = fzf_parse_pattern(
+      CaseRespect, false, inverse_or_query, true);
+  char singleton_query[] = "!z";
+  fzf_pattern_t *singleton = fzf_parse_pattern(
+      CaseRespect, false, singleton_query, true);
+  char mixed_query[] = "foo | !q";
+  fzf_pattern_t *mixed = fzf_parse_pattern(
+      CaseRespect, false, mixed_query, true);
+  CHECK(inverse_or != NULL);
+  CHECK(singleton != NULL);
+  CHECK(mixed != NULL);
+  if (inverse_or) {
+    CHECK(!inverse_or->only_inv);
+    CHECK(!inverse_or->has_positive_term);
+  }
+  if (singleton) {
+    CHECK(singleton->only_inv);
+    CHECK(!singleton->has_positive_term);
+  }
+  if (mixed) {
+    CHECK(!mixed->only_inv);
+    CHECK(mixed->has_positive_term);
+  }
+  fzf_free_pattern(mixed);
+  fzf_free_pattern(singleton);
+  fzf_free_pattern(inverse_or);
+}
+
 static void test_small_slab_long_gap_preserves_match(void) {
   const char *text =
       "s........................................................................|";
@@ -899,6 +929,7 @@ int main(void) {
   RUN(test_and_across_term_sets);
   RUN(test_or_within_term_set);
   RUN(test_or_satisfied_only_by_inverse_term);
+  RUN(test_inverse_only_or_is_not_sortable);
   RUN(test_small_slab_long_gap_preserves_match);
   RUN(test_small_slab_inverse_long_gap_preserves_membership);
   RUN(test_utf8_v1_reverse_scan_tightens_match);

@@ -2988,18 +2988,19 @@ fzf_pattern_t *fzf_parse_pattern_with_direction(
     set = NULL;
   }
   bool only = true;
+  bool has_positive_term = false;
   for (size_t i = 0; i < pat_obj->size; i++) {
     fzf_term_set_t *term_set = pat_obj->ptr[i];
-    if (term_set->size > 1) {
-      only = false;
-      break;
-    }
-    if (term_set->ptr[0].inv == false) {
-      only = false;
-      break;
+    if (term_set->size > 1) only = false;
+    for (size_t j = 0; j < term_set->size; j++) {
+      if (!term_set->ptr[j].inv) {
+        only = false;
+        has_positive_term = true;
+      }
     }
   }
   pat_obj->only_inv = only;
+  pat_obj->has_positive_term = has_positive_term;
   SFREE(pattern_copy);
   return pat_obj;
 

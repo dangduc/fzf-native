@@ -107,6 +107,9 @@ typedef struct {
   size_t size;
   size_t cap;
   bool only_inv;
+  /* True when at least one term contributes a positive match score.
+     fzf preserves producer order when every term is inverse, including OR. */
+  bool has_positive_term;
   /* fzf's match-scan direction.  Parsed patterns carry this setting so every
      scorer and position query applies one immutable request policy. */
   bool forward;
