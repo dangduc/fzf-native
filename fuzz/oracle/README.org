@@ -213,3 +213,17 @@ range because fzf-native returns positions for its highlighting API.
 The audit runs all selected cases before it reports the failure.
 The failure gives the first eight differences in a compact format.
 Use the reported serial number with =FZF_RAW_MATRIX_START= to run one case.
+
+The native normalization table contains all 556 mappings from the pinned source.
+Audit all source and target code points with this command:
+
+#+begin_src sh
+make FZF_SOURCE=/path/to/pinned/fzf fuzz-normalization-table-audit
+#+end_src
+
+To regenerate the include, run the audited generator directly:
+
+#+begin_src sh
+cd fuzz/oracle
+go run ./tableaudit -write /path/to/pinned/fzf/src/algo/normalize.go ../../fzf-normalize.inc
+#+end_src
