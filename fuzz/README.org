@@ -50,8 +50,7 @@ make FUZZ_CC=clang FZF_SOURCE=/path/to/pinned/fzf fuzz-oracle-test-san
 
 The default run compares 20,000 generated membership cases.
 Set =FZF_RAW_MATRIX_SEED=, =FZF_RAW_MATRIX_START=, and =FZF_RAW_MATRIX_CASES= for replay.
-Set =FZF_RAW_MATRIX_FULL_RESULTS=1= to expose score, range, and position debt.
-The full-result audit currently fails on known parity debt.
+The raw lane always compares score, range, and positions for successful matches.
 
 The protocol and current parity cases are in [[file:oracle/README.org][oracle/README.org]].
 
@@ -78,8 +77,7 @@ make FZF_SOURCE=/path/to/pinned/fzf \
 #+end_src
 
 Set =FZF_NATIVE_UPSTREAM_PROFILE=long= to test lengths 999, 1000, and 1001.
-Set =FZF_NATIVE_UPSTREAM_PROFILE=parity= to expose known parity debt.
-The parity profile fails until the related behavior has parity.
+Set =FZF_NATIVE_UPSTREAM_PROFILE=parity= to test strict public parity behavior.
 
 ** Native matcher lane
 
@@ -139,8 +137,11 @@ make FZF_NATIVE_FUZZ_CASES=2000 \
 The parsed generator selects these dimensions independently when possible:
 
 - query tree: empty, one term, AND, OR, inverse, or mixed
-- term kind: fuzzy, exact, prefix, suffix, or equal
+- term kind: fuzzy, exact, exact-boundary, prefix, suffix, or equal
 - case mode: smart, ignore, or respect
+- normalization: fzf default or literal
+- search direction: auto, forward, or backward
+- score scheme: default, path, or history
 - text: ASCII, Unicode, case-fold pair, or malformed bytes
 - layout: front, middle, tail, ambiguous, near miss, or distractor
 - multiplicity: distinct candidates and duplicate occurrences
@@ -158,11 +159,9 @@ The only accepted difference is malformed UTF-8 decoder behavior.
 Go and utf8proc replace malformed byte sequences differently.
 The exception applies only to membership and position differences for malformed input.
 
-Raw algorithms use the pinned fzf Latin-fold table and support both search
-directions.
-The Emacs API does not expose normalization or backward search yet.
-Scoring, ranking, and those API gaps are parity debt.
-The exception file names these differences, but it does not make them pass.
+Raw algorithms use the pinned fzf Latin-fold table and both search directions.
+The public API exposes normalization, direction, and all three score schemes.
+The strict parity profile compares supported ranking behavior without an exception.
 Crashes, hangs, races, unknown candidates, and valid UTF-8 differences always fail.
 
 Review [[file:differential/fzf-native-differential-exceptions.el][the exception policy]] when a result differs.

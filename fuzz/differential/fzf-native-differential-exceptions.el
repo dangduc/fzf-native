@@ -33,31 +33,6 @@
    (fzf-native-differential-query-sets
     (fzf-native-differential-case-query case))))
 
-(defun fzf-native-differential--exception-ranking-p
-    (case facet context)
-  "Return non-nil for CASE and FACET after CONTEXT confirms membership."
-  (and (eq facet 'ranking)
-       (eq (fzf-native-differential-case-comparison case) 'ranking)
-       (plist-get context :membership-equal)))
-
-(defun fzf-native-differential--exception-normalization-p
-    (case facet _context)
-  "Recognize CASE normalization for FACET only when the query enables it.
-
-CONTEXT is not applicable to this classifier."
-  (and (eq facet 'membership)
-       (fzf-native-differential-query-normalize
-        (fzf-native-differential-case-query case))))
-
-(defun fzf-native-differential--exception-backward-p
-    (case facet _context)
-  "Recognize CASE backward search for FACET only when the query requests it.
-
-CONTEXT is not applicable to this classifier."
-  (and (memq facet '(membership positions ranking))
-       (not (fzf-native-differential-query-forward
-             (fzf-native-differential-case-query case)))))
-
 (defun fzf-native-differential--utf8-continuation-p (byte)
   "Return non-nil when BYTE is a UTF-8 continuation byte."
   (and (<= #x80 byte) (<= byte #xbf)))
@@ -155,28 +130,7 @@ arbitrary valid-candidate difference to the decoder policy."
        (fzf-native-differential--malformed-difference-p case context)))
 
 (defconst fzf-native-differential-exceptions
-  `((:name score-ranking-revision
-     :reason "Current fzf and fzf-native use different score and rank rules."
-     :disposition parity-debt
-     :upstream-revision ,fzf-native-differential-upstream-revision
-     :owner "fzf-native scoring implementation"
-     :remove-when "Ordered identities match pinned fzf when membership agrees."
-     :predicate ,#'fzf-native-differential--exception-ranking-p)
-    (:name normalization-policy
-     :reason "The public Emacs API does not enable fzf normalization."
-     :disposition parity-debt
-     :upstream-revision ,fzf-native-differential-upstream-revision
-     :owner "fzf-native Emacs binding"
-     :remove-when "Normalized-query membership matches the pinned fzf revision."
-     :predicate ,#'fzf-native-differential--exception-normalization-p)
-    (:name backward-search-capability
-     :reason "The public Emacs API does not expose fzf's backward matcher direction."
-     :disposition parity-debt
-     :upstream-revision ,fzf-native-differential-upstream-revision
-     :owner "fzf-native Emacs binding"
-     :remove-when "Backward membership, positions, and ranking match pinned fzf."
-     :predicate ,#'fzf-native-differential--exception-backward-p)
-    (:name malformed-utf8-decoder
+  `((:name malformed-utf8-decoder
      :reason "Go and utf8proc preserve malformed input differently."
      :disposition accepted
      :upstream-revision ,fzf-native-differential-upstream-revision
