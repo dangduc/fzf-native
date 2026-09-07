@@ -180,6 +180,104 @@
      (mapcar #'copy-sequence (fzf-native-upstream--candidate-texts case))
      (fzf-native-differential-case-rendered-query case))))
 
+(defun fzf-native-upstream--utf8-sequence-length (string index)
+  "Return valid UTF-8 sequence length in unibyte STRING at INDEX, or nil."
+  (let* ((size (length string))
+         (first (aref string index))
+         (second (and (< (1+ index) size) (aref string (1+ index)))))
+    (cond
+     ((<= first #x7f) 1)
+     ((and (<= #xc2 first) (<= first #xdf)
+           second (fzf-native-differential--utf8-continuation-p second))
+      2)
+     ((and (<= #xe0 first) (<= first #xef)
+           (< (+ index 2) size)
+           (cond
+            ((= first #xe0) (and (<= #xa0 second) (<= second #xbf)))
+            ((= first #xed) (and (<= #x80 second) (<= second #x9f)))
+            (t (fzf-native-differential--utf8-continuation-p second)))
+           (fzf-native-differential--utf8-continuation-p
+            (aref string (+ index 2))))
+      3)
+     ((and (<= #xf0 first) (<= first #xf4)
+           (< (+ index 3) size)
+           (cond
+            ((= first #xf0) (and (<= #x90 second) (<= second #xbf)))
+            ((= first #xf4) (and (<= #x80 second) (<= second #x8f)))
+            (t (fzf-native-differential--utf8-continuation-p second)))
+           (fzf-native-differential--utf8-continuation-p
+            (aref string (+ index 2)))
+           (fzf-native-differential--utf8-continuation-p
+            (aref string (+ index 3))))
+      4))))
+
+(defun fzf-native-upstream--go-output-bytes (string)
+  "Return Go range/output bytes for possibly malformed unibyte STRING."
+  (let ((string (if (multibyte-string-p string)
+                    (encode-coding-string string 'raw-text t)
+                  string)))
+    (let ((index 0)
+          (size (length string))
+          (replacement (unibyte-string #xef #xbf #xbd))
+          pieces)
+      (while (< index size)
+        (let ((sequence-length
+               (fzf-native-upstream--utf8-sequence-length string index)))
+          (if sequence-length
+              (progn
+                (push (substring string index (+ index sequence-length))
+                      pieces)
+                (setq index (+ index sequence-length)))
+            (push replacement pieces)
+            (setq index (1+ index)))))
+      (apply #'concat (nreverse pieces)))))
+
+(defun fzf-native-upstream--identity-table (case &optional upstream-output)
+  "Return a text-to-identity-queue table for CASE.
+
+When UPSTREAM-OUTPUT is non-nil, key malformed input by Go's output bytes."
+  (let ((table (make-hash-table :test #'equal)))
+    (dolist (candidate (fzf-native-differential-case-candidates case))
+      (let* ((raw (fzf-native-differential-candidate-text candidate))
+             (text (if (and upstream-output
+                            (not (plist-get
+                                  (fzf-native-differential-case-dimensions
+                                   case)
+                                  :valid-utf8)))
+                       (fzf-native-upstream--go-output-bytes raw)
+                     raw))
+             (identities (gethash text table)))
+        (puthash text
+                 (append identities
+                         (list (fzf-native-differential-candidate-id
+                                candidate)))
+                 table)))
+    table))
+
+(defun fzf-native-upstream--identities (case strings &optional upstream-output)
+  "Map returned STRINGS to stable candidate identities from CASE.
+
+UPSTREAM-OUTPUT selects Go's malformed-byte output representation."
+  (let ((table (fzf-native-upstream--identity-table case upstream-output))
+        result)
+    (dolist (string (append strings nil) (nreverse result))
+      (let* ((plain (substring-no-properties string))
+             (queue (gethash plain table)))
+        (unless queue
+          (error "Matcher returned an unknown candidate: %S" plain))
+        (puthash plain (cdr queue) table)
+        (push (car queue) result)))))
+
+(defun fzf-native-upstream--membership (identities)
+  "Return sorted membership for IDENTITIES."
+  (sort (copy-sequence identities) #'<))
+
+(defun fzf-native-upstream--membership-difference (left right)
+  "Return sorted identities present in exactly one of LEFT and RIGHT."
+  (sort
+   (append (cl-set-difference left right :test #'=)
+           (cl-set-difference right left :test #'=))
+   #'<))
 
 (defun fzf-native-upstream--dimension-value (case key)
   "Return dimension KEY from CASE, including query options."
