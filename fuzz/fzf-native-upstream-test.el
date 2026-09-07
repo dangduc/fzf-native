@@ -504,5 +504,63 @@ Each specification has the form (KEY VALUES)."
      (equal (plist-get malformed-exception :scope)
             "Only differing malformed inputs for membership or positions."))))
 
+(ert-deftest fzf-native-fuzz-upstream-malformed-exceptions-are-difference-scoped ()
+  "Do not let an unrelated malformed candidate waive a valid difference."
+  (let* ((malformed-bytes (unibyte-string #xff))
+         (valid-candidate
+          (make-fzf-native-differential-candidate
+           :id 1 :text "valid" :role 'match))
+         (malformed-candidate
+          (make-fzf-native-differential-candidate
+           :id 2 :text malformed-bytes :role 'decoy))
+         (query
+          (make-fzf-native-differential-query
+           :sets nil :normalize nil :forward t))
+         (candidate-case
+          (make-fzf-native-differential-case
+           :query query
+           :rendered-query ""
+           :candidates (list valid-candidate malformed-candidate)
+           :dimensions '(:valid-utf8 nil)))
+         (query-case (copy-fzf-native-differential-case candidate-case))
+         exception)
+    (setf (fzf-native-differential-case-rendered-query query-case)
+          malformed-bytes)
+    ;; Candidate 2 is an unrelated malformed decoy when valid candidate 1 is
+    ;; the identity missing from one result.
+    (let ((difference
+           (fzf-native-upstream--membership-difference '(2) '(1 2))))
+      (should (equal difference '(1)))
+      (should-not
+       (fzf-native-differential-classify
+        candidate-case 'membership
+        (list :differing-identities difference))))
+    (setq exception
+          (fzf-native-differential-classify
+           candidate-case 'membership '(:differing-identities (2))))
+    (should (eq (plist-get exception :name) 'malformed-utf8-decoder))
+    (should-not
+     (fzf-native-differential-classify candidate-case 'membership))
+    (should-not
+     (fzf-native-differential-classify
+      candidate-case 'membership '(:differing-identities (99))))
+    (should-not
+     (fzf-native-differential-classify
+      candidate-case 'membership '(:differing-identities (1 2))))
+    ;; A malformed query alone cannot attribute a valid-candidate difference
+    ;; to decoder policy.  A malformed differing candidate remains in scope,
+    ;; while missing and unknown identity context still fail closed.
+    (should-not
+     (fzf-native-differential-classify
+      query-case 'membership '(:differing-identities (1))))
+    (should
+     (fzf-native-differential-classify
+      query-case 'membership '(:differing-identities (2))))
+    (should-not
+     (fzf-native-differential-classify query-case 'membership))
+    (should-not
+     (fzf-native-differential-classify
+      query-case 'membership '(:differing-identities (99))))))
+
 (provide 'fzf-native-upstream-test)
 ;;; fzf-native-upstream-test.el ends here
