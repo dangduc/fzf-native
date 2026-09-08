@@ -294,6 +294,8 @@ Signature: (CAND POSITIONS) → ignored.
   POSITIONS  Vector of alternating character-offset start/end pairs
              describing contiguous fzf match runs:
                [s0 e0 s1 e1 …]
+             An empty vector means this highlight operation found no match;
+             handlers can use it to remove state from an earlier match.
 
 Set to nil to suppress highlight application entirely (scoring still
 happens).  Let-binding around a call swaps policy for that call.

@@ -644,6 +644,7 @@ A reentrant highlight hook can stop the handle without freeing an active outer c
 * Highlight contract
 
 =fzf-native-highlight-fn= receives a string and a vector of start/end character pairs.
+It receives an empty vector when a highlight operation finds no match.
 The default function applies =completions-common-part=.
 
 The default function removes only an earlier =completions-common-part= face.

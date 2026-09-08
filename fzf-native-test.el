@@ -2775,6 +2775,44 @@ The face covers the matched position; the caller's original is unmutated."
     (should-not (eq ret orig))
     (should-not (text-property-not-all 0 (length ret) 'face nil ret))))
 
+(ert-deftest fzf-native-highlight-one-policy-change-clears-stale-face-test ()
+  "A no-match clears only stale completion faces after a policy change."
+  (skip-unless (fboundp 'fzf-native-highlight-one))
+  (let ((candidate (copy-sequence "café")))
+    (put-text-property 0 (length candidate) 'face 'my-user-face candidate)
+    (let* ((fzf-native-normalize t)
+           (highlighted (fzf-native-highlight-one candidate "cafe")))
+      (should
+       (cl-loop for i below (length highlighted)
+                thereis
+                (let ((face (get-text-property i 'face highlighted)))
+                  (or (eq face 'completions-common-part)
+                      (and (listp face)
+                           (memq 'completions-common-part face))))))
+      (let* ((fzf-native-normalize nil)
+             (after (fzf-native-highlight-one highlighted "cafe")))
+        (should (equal (fzf-native-score highlighted "cafe") '(0)))
+        (dotimes (i (length after))
+          (let ((face (get-text-property i 'face after)))
+            (should-not (eq face 'completions-common-part))
+            (should-not (and (listp face)
+                             (memq 'completions-common-part face)))
+            (should (or (eq face 'my-user-face)
+                        (and (listp face)
+                             (memq 'my-user-face face))))))))))
+
+(ert-deftest fzf-native-highlight-one-no-match-calls-custom-hook-test ()
+  "A custom highlight hook receives an empty vector for a no-match."
+  (skip-unless (fboundp 'fzf-native-highlight-one))
+  (let (seen-candidate seen-positions)
+    (let* ((fzf-native-highlight-fn
+            (lambda (candidate positions)
+              (setq seen-candidate candidate
+                    seen-positions positions)))
+           (result (fzf-native-highlight-one "abc" "z")))
+      (should (eq seen-candidate result))
+      (should (equal seen-positions [])))))
+
 (ert-deftest fzf-native-highlight-one-fuzzy-test ()
   "Multi-character fuzzy match attaches face at the matched positions."
   (skip-unless (fboundp 'fzf-native-highlight-one))

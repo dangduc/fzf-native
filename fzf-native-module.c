@@ -897,7 +897,8 @@ static void hl_scratch_free(HlScratch *s) {
    into ascending contiguous runs, mapped back to byte offsets when STR is
    unibyte, packed into
    [s0 e0 s1 e1 …] vector, and passed as (funcall HOOK STR positions).
-   No-op if POS is NULL/empty or HOOK is nil.
+   A NULL/empty POS is dispatched as an empty vector so the hook can remove
+   highlights left by an earlier matching policy.  No-op only when HOOK is nil.
 
    SCRATCH provides reusable buffers sized at the start of the score call;
    when NULL or undersized, falls back to a per-call malloc/free pair. */
@@ -905,8 +906,21 @@ static void dispatch_highlight_runs(emacs_env *env, const char *cstr,
                                     fzf_position_t *pos,
                                     emacs_value str, emacs_value hook,
                                     HlScratch *scratch) {
-  if (!pos || pos->size == 0) return;
   if (env->eq(env, hook, Qnil)) return;
+
+  if (!pos || pos->size == 0) {
+    emacs_value positions = env->funcall(env, Qvector, 0, NULL);
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+      env->non_local_exit_clear(env);
+      return;
+    }
+    /* The hook owns highlight mutation, including clear-only handling. */
+    env->funcall(env, hook, 2, (emacs_value[]){ str, positions });
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+      env->non_local_exit_clear(env);
+    }
+    return;
+  }
 
   size_t plen = pos->size;
   size_t *starts;
