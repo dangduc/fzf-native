@@ -25,7 +25,8 @@ Then minimize the case and add a permanent regression test.
 * Oracle pin
 
 The oracle uses fzf commit =1372d04f79bde0daa3bab4b96a068baafa808e67=.
-The raw oracle requires Go =1.27.1=.
+The raw oracle requires Go =1.27.1= with Unicode =17.0.0= tables.
+The native peer vendors utf8proc =2.10.0= with Unicode =16.0.0= tables.
 
 Use the same fzf commit and Go version for one campaign.
 Record both versions with every saved failure.
@@ -182,9 +183,16 @@ Every ordinary case also has one candidate that must match upstream fzf.
 An accepted difference needs a narrow executable predicate.
 The entry must include an owner, an upstream revision, and a removal condition.
 
-The only accepted difference is malformed UTF-8 decoder behavior.
+The parsed lane accepts only malformed UTF-8 decoder behavior.
 Go and utf8proc replace malformed byte sequences differently.
 The exception applies only to membership and position differences for malformed input.
+
+The raw lane also has one version-scoped Unicode table exception.  Go 1.27.1
+knows the Unicode 17 lowercase mappings U+A7CE, U+A7D2, U+A7D4, and
+U+16EA0--U+16EB8; utf8proc's Unicode 16 tables do not.  The exhaustive audit
+checks all 1,488 Go lowercase pairs and accepts exactly those 28 misses.  A
+toolchain, table, result-shape, or exception-count change fails the audit and
+requires an explicit pin review.
 
 Raw algorithms use the pinned fzf Latin-fold table and both search directions.
 The public API exposes normalization, direction, and all three score schemes.

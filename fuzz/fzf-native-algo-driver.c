@@ -113,10 +113,17 @@ static bool send_error(uint8_t opcode, uint8_t status, const char *message) {
 static bool send_info(void) {
   const char *revision = FZF_NATIVE_REVISION;
   const char *compiler = __VERSION__;
+  const char *utf8proc = utf8proc_version();
+  const char *unicode = utf8proc_unicode_version();
+  char runtime[512];
+  int runtime_size = snprintf(runtime, sizeof runtime,
+                              "%s; utf8proc=%s; unicode=%s", compiler,
+                              utf8proc, unicode);
+  if (runtime_size < 0 || (size_t)runtime_size >= sizeof runtime) return false;
   size_t revision_len = strlen(revision);
-  size_t compiler_len = strlen(compiler);
-  if (revision_len > UINT32_MAX || compiler_len > UINT32_MAX) return false;
-  size_t size = 3 + 4 + revision_len + 4 + compiler_len;
+  size_t runtime_len = (size_t)runtime_size;
+  if (revision_len > UINT32_MAX || runtime_len > UINT32_MAX) return false;
+  size_t size = 3 + 4 + revision_len + 4 + runtime_len;
   uint8_t *payload = malloc(size);
   if (!payload) return false;
   size_t offset = 0;
@@ -127,9 +134,9 @@ static bool send_info(void) {
   offset += 4;
   memcpy(payload + offset, revision, revision_len);
   offset += revision_len;
-  write_u32(payload + offset, (uint32_t)compiler_len);
+  write_u32(payload + offset, (uint32_t)runtime_len);
   offset += 4;
-  memcpy(payload + offset, compiler, compiler_len);
+  memcpy(payload + offset, runtime, runtime_len);
   bool ok = send_frame(payload, size);
   free(payload);
   return ok;

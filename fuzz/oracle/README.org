@@ -9,7 +9,9 @@ It does not copy or reimplement the upstream algorithms.
 The pinned upstream commit is =1372d04f79bde0daa3bab4b96a068baafa808e67=.
 The =go.mod= file also pins the corresponding Go pseudo-version.
 The INFO response reports the Go version.
-The build and test scripts require Go =1.27.1=.
+The toolchain directive and build scripts require Go =1.27.1=, whose standard
+library embeds Unicode =17.0.0= tables.  The native peer vendors utf8proc
+=2.10.0= with Unicode =16.0.0= tables.
 
 This oracle covers raw matching only.
 It does not cover the fzf query parser, result ranking, or interactive state.
@@ -191,8 +193,11 @@ Also set =FZF_RAW_ORACLE_BINARY= and =FZF_NATIVE_EXPECTED_REVISION=.
 The matrix sends each request to both persistent executables.
 The native driver also accepts =--scheme=default=, =--scheme=path=, or
 =--scheme=history= and keeps that choice for its process lifetime.
-The checks compare strict Unicode results and full result matrices for all
-three scoring schemes.
+The checks compare Unicode results and full result matrices for all three
+scoring schemes.  An exhaustive lowercase audit checks all 1,488 mappings in
+the pinned Go tables.  It accepts exactly 28 version differences: U+A7CE,
+U+A7D2, U+A7D4, and U+16EA0--U+16EB8.  Any other difference, or any change to
+that set, fails the audit.
 Named checks enforce scheme score and alignment parity.
 They also record normalization and malformed UTF-8 gaps.
 Delete each gap check after fzf-native gains parity for that case.
