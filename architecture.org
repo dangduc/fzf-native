@@ -369,7 +369,12 @@ The decoder still scans discarded bytes.
 It therefore detects a NUL after a retained prefix or inside discarded ANSI data.
 
 Candidate strings live in 4 MiB arena chunks.
+Each ordinary arena record carries a two-byte packed byte-length and ASCII tag.
+Long records use a sentinel and are classified again when a worker scores them.
 The reader appends their pointers to fixed pointer blocks.
+
+The incremental decoder derives the ASCII tag while it validates producer bytes.
+Interactive scoring therefore does not repeat =strlen= and ASCII classification for each edit.
 
 One pointer block holds 262,144 entries.
 The fixed top-level table permits at most 1,073,741,824 candidates.
