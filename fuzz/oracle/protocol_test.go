@@ -51,6 +51,81 @@ func testServer(t *testing.T, scheme schemeID) *server {
 	return &server{oracle: oracle}
 }
 
+func TestLiteralWireIdentifiers(t *testing.T) {
+	algorithms := []struct {
+		name string
+		id   algorithmID
+		wire byte
+	}{
+		{"FuzzyMatchV1", algorithmV1, 0},
+		{"FuzzyMatchV2", algorithmV2, 1},
+		{"ExactMatchNaive", algorithmExact, 2},
+		{"ExactMatchBoundary", algorithmExactBoundary, 3},
+		{"PrefixMatch", algorithmPrefix, 4},
+		{"SuffixMatch", algorithmSuffix, 5},
+		{"EqualMatch", algorithmEqual, 6},
+	}
+	for _, algorithm := range algorithms {
+		if byte(algorithm.id) != algorithm.wire {
+			t.Errorf("%s wire ID = %d; want literal %d",
+				algorithm.name, algorithm.id, algorithm.wire)
+		}
+	}
+
+	schemes := []struct {
+		name string
+		id   schemeID
+		wire byte
+	}{
+		{"default", schemeDefault, 0},
+		{"path", schemePath, 1},
+		{"history", schemeHistory, 2},
+	}
+	for _, scheme := range schemes {
+		if byte(scheme.id) != scheme.wire {
+			t.Errorf("%s scheme wire ID = %d; want literal %d",
+				scheme.name, scheme.id, scheme.wire)
+		}
+	}
+
+	flags := []struct {
+		name string
+		got  byte
+		wire byte
+	}{
+		{"case-sensitive", flagCaseSensitive, 0x01},
+		{"normalize", flagNormalize, 0x02},
+		{"forward", flagForward, 0x04},
+		{"valid mask", validMatchFlags, 0x07},
+	}
+	for _, flag := range flags {
+		if flag.got != flag.wire {
+			t.Errorf("%s flag = 0x%02x; want literal 0x%02x",
+				flag.name, flag.got, flag.wire)
+		}
+	}
+}
+
+func TestLiteralMatchRequestWireFixture(t *testing.T) {
+	payload := []byte{
+		0x01, 0x01, // Protocol version and MATCH opcode.
+		0x01, 0x02, 0x07, // V2, history scheme, and every match flag.
+		0x00, 0x00, 0x00, 0x02, // Pattern length.
+		0x00, 0x00, 0x00, 0x03, // Candidate length.
+		'a', 'b', 'a', '/', 'b',
+	}
+	request, err := decodeMatchRequest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.algorithm != algorithmV2 || request.scheme != schemeHistory ||
+		request.flags != flagCaseSensitive|flagNormalize|flagForward ||
+		!bytes.Equal(request.pattern, []byte("ab")) ||
+		!bytes.Equal(request.candidate, []byte("a/b")) {
+		t.Fatalf("literal MATCH fixture decoded as %+v", request)
+	}
+}
+
 func TestPersistentInfoAndMatch(t *testing.T) {
 	server := testServer(t, schemeDefault)
 	input := append(requestFrame([]byte{protocolVersion, opcodeInfo}), requestFrame(
