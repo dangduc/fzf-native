@@ -1,11 +1,33 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * Coverage-guided state-machine fuzzer for fzf-native interactive sessions.
+ * Coverage-guided fuzzers for fzf-native interactive sessions.
  *
  * This target includes the real native module implementation through the same
- * plain-C path as fzf-native-ctest.c.  A compact bytecode drives candidate
- * growth, request submission, cancellation, polling, cache reuse, worker
- * scoring, publication, and teardown without requiring an Emacs process.
+ * plain-C path as fzf-native-ctest.c.  State mode uses a compact bytecode to
+ * drive candidate growth, request submission, cancellation, polling, cache
+ * reuse, worker scoring, publication, and teardown without requiring an Emacs
+ * process.  Reader mode separately exercises the real blocking producer path.
+ * Keeping the modes separate lets libFuzzer mutate session state at high
+ * throughput without paying for a pipe, reader thread, and blocking teardown
+ * on every input.
  */
+
+#define FZF_SESSION_FUZZ_MODE_STATE 1
+#define FZF_SESSION_FUZZ_MODE_READER 2
+
+#ifndef FZF_SESSION_FUZZ_MODE
+#define FZF_SESSION_FUZZ_MODE FZF_SESSION_FUZZ_MODE_STATE
+#endif
+
+#if FZF_SESSION_FUZZ_MODE != FZF_SESSION_FUZZ_MODE_STATE && \
+    FZF_SESSION_FUZZ_MODE != FZF_SESSION_FUZZ_MODE_READER
+#error "FZF_SESSION_FUZZ_MODE must be STATE (1) or READER (2)"
+#endif
+
+#if FZF_SESSION_FUZZ_MODE == FZF_SESSION_FUZZ_MODE_READER
+#define FZF_SESSION_FUZZ_MODE_NAME "reader"
+#else
+#define FZF_SESSION_FUZZ_MODE_NAME "state"
+#endif
 
 #define FZF_NATIVE_CTEST 1
 #include "../fzf-native-module.c"
@@ -19,11 +41,13 @@ enum {
   SESSION_FUZZ_MAX_CANDIDATES = 4097,
 };
 
+#if FZF_SESSION_FUZZ_MODE == FZF_SESSION_FUZZ_MODE_STATE
 typedef struct {
   const uint8_t *data;
   size_t size;
   size_t offset;
 } FuzzInput;
+#endif
 
 typedef struct {
   AsyncSession *session;
@@ -64,6 +88,7 @@ static void session_fuzz_check_candidate_analyzer(
     session_fuzz_fail(NULL, "candidate classification disagrees with scalar oracle");
 }
 
+#if FZF_SESSION_FUZZ_MODE == FZF_SESSION_FUZZ_MODE_STATE
 static uint8_t fuzz_take(FuzzInput *input) {
   return input->offset < input->size ? input->data[input->offset++] : 0;
 }
@@ -71,6 +96,7 @@ static uint8_t fuzz_take(FuzzInput *input) {
 static size_t fuzz_remaining(const FuzzInput *input) {
   return input->offset < input->size ? input->size - input->offset : 0;
 }
+#endif
 
 static AsyncSession *session_fuzz_create(uint8_t options) {
   AsyncSession *s = calloc(1, sizeof *s);
@@ -119,6 +145,7 @@ static AsyncSession *session_fuzz_create(uint8_t options) {
   return s;
 }
 
+#if FZF_SESSION_FUZZ_MODE == FZF_SESSION_FUZZ_MODE_READER
 static bool session_fuzz_write_all(int fd, const uint8_t *data, size_t size) {
   size_t offset = 0;
   while (offset < size) {
@@ -257,6 +284,7 @@ static void session_fuzz_reader_probe(const uint8_t *data, size_t size) {
     for (size_t attempt = 0;
          atomic_load_explicit(&s->test_reader_poll_epoch,
                               memory_order_acquire) < target_epoch &&
+         !atomic_load_explicit(&s->reader_done, memory_order_acquire) &&
          attempt < 20000;
          attempt++)
       nanosleep(&pause, NULL);
@@ -298,7 +326,9 @@ static void session_fuzz_reader_probe(const uint8_t *data, size_t size) {
   session_fuzz_reader_reference_free(&reference);
   async_session_destroy(s);
 }
+#endif
 
+#if FZF_SESSION_FUZZ_MODE == FZF_SESSION_FUZZ_MODE_STATE
 static char *fuzz_copy_string(FuzzInput *input, size_t requested,
                               size_t *out_len) {
   size_t len = requested < fuzz_remaining(input)
@@ -383,12 +413,17 @@ static void session_fuzz_append_special(FuzzSession *fuzz,
 
 static uint64_t session_fuzz_submit(FuzzSession *fuzz, FuzzInput *input) {
   uint8_t settings = fuzz_take(input);
+  uint8_t scheme_byte = fuzz_take(input);
   size_t query_len = fuzz_take(input) & 63;
   char *query = fuzz_copy_string(input, query_len, &query_len);
   if (!query) return 0;
 
   fzf_case_types case_mode = (fzf_case_types)(settings % 3);
   bool fuzzy = (settings & 4) != 0;
+  bool normalize = (scheme_byte & 4) != 0;
+  bool forward = (scheme_byte & 8) == 0;
+  fzf_score_scheme_t score_scheme =
+      (fzf_score_scheme_t)((scheme_byte & 3) % 3);
   static const size_t filter_only_lengths[] = {0, 1, 3, 8};
   size_t fo_length = filter_only_lengths[(settings >> 3) & 3];
   bool fo_logic_and = (settings & 32) != 0;
@@ -404,9 +439,9 @@ static uint64_t session_fuzz_submit(FuzzSession *fuzz, FuzzInput *input) {
   default: limit = count > 1 ? count / 2 : 1; break;
   }
 
-  uint64_t request_id = async_submit_request_resolved(
-      fuzz->session, query, query_len, limit, case_mode, fuzzy, fo_length,
-      fo_logic_and);
+  uint64_t request_id = async_submit_request_resolved_for_scheme(
+      fuzz->session, query, query_len, limit, case_mode, fuzzy, normalize,
+      forward, score_scheme, fo_length, fo_logic_and);
   if (request_id) fuzz->submitted = true;
   return request_id;
 }
@@ -492,9 +527,10 @@ static void session_fuzz_check_invariants(FuzzSession *fuzz) {
        query = query->lru_next) {
     if (query->lru_prev != query_previous)
       session_fuzz_fail(fuzz, "batch query LRU links disagree");
-    if (batch_cache_find_query_locked(
+    if (batch_cache_find_query_locked_for_scheme(
             batch_cache, query->query, query->case_mode,
-            query->fuzzy, query->hash) != query)
+            query->fuzzy, query->normalize, query->forward,
+            query->score_scheme, query->hash) != query)
       session_fuzz_fail(fuzz, "batch query hash lost an LRU record");
     size_t owner_entry_count = 0;
     BatchCacheEntry *owner_previous = NULL;
@@ -565,16 +601,22 @@ static void session_fuzz_check_invariants(FuzzSession *fuzz) {
   AsyncResultObservation copied_result = {0};
   char *copied_filter = NULL, *copied_error = NULL;
   fzf_case_types copied_case_mode = CaseSmart;
-  bool copied_fuzzy = true, copied_filter_only = false;
+  fzf_score_scheme_t copied_scheme = FZF_SCORE_SCHEME_DEFAULT;
+  bool copied_fuzzy = true, copied_normalize = false, copied_forward = true;
+  bool copied_filter_only = false;
   bool copied_allocation_failed = false;
-  ScoredStr *copied = async_copy_public_result(
+  ScoredStr *copied = async_copy_public_result_with_scheme(
       s, true, &copied_count, &copied_result, &copied_filter, &copied_limit,
-      &copied_case_mode, &copied_fuzzy, &copied_filter_only,
+      &copied_case_mode, &copied_fuzzy, &copied_normalize, &copied_forward,
+      &copied_scheme, &copied_filter_only,
       &copied_generation, &copied_completed, &copied_total,
       &copied_error_id, &copied_error, &copied_filtered,
       &copied_source_total, &copied_allocation_failed);
   if (copied_allocation_failed)
     session_fuzz_fail(fuzz, "an owned result copy allocation failed");
+  if (copied_scheme < FZF_SCORE_SCHEME_DEFAULT ||
+      copied_scheme > FZF_SCORE_SCHEME_HISTORY)
+    session_fuzz_fail(fuzz, "an owned result copy has an invalid score scheme");
   if (copied_limit && copied_count > copied_limit)
     session_fuzz_fail(fuzz, "an owned result copy exceeds its limit");
   if (copied_completed > copied_total)
@@ -586,6 +628,8 @@ static void session_fuzz_check_invariants(FuzzSession *fuzz) {
       session_fuzz_fail(fuzz, "an owned result copy has an invalid index");
   (void)copied_case_mode;
   (void)copied_fuzzy;
+  (void)copied_normalize;
+  (void)copied_forward;
   (void)copied_filter_only;
   (void)copied_generation;
   (void)copied_error_id;
@@ -637,14 +681,6 @@ static void session_fuzz_wait_running(FuzzSession *fuzz) {
   }
 }
 
-static int session_fuzz_reference_cmp(const void *left, const void *right) {
-  const ScoredStr *a = left;
-  const ScoredStr *b = right;
-  if (a->score != b->score) return a->score > b->score ? -1 : 1;
-  if (a->idx != b->idx) return a->idx < b->idx ? -1 : 1;
-  return 0;
-}
-
 static void session_fuzz_check_reference(FuzzSession *fuzz) {
   AsyncSession *s = fuzz->session;
   pthread_mutex_lock(&s->score_req_mu);
@@ -658,6 +694,9 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
   size_t limit = s->score_result_limit;
   fzf_case_types case_mode = s->score_result_case_mode;
   bool fuzzy = s->score_result_fuzzy;
+  bool normalize = s->score_result_normalize;
+  bool forward = s->score_result_forward;
+  fzf_score_scheme_t score_scheme = s->score_result_scheme;
   bool filter_only = s->score_result_filter_only;
   char *query = s->score_result_filter ? strdup(s->score_result_filter) : NULL;
   ScoredStr *actual = actual_count ? malloc(actual_count * sizeof *actual) : NULL;
@@ -683,10 +722,21 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
   }
   char *pattern_query = *query ? strdup(query) : NULL;
   fzf_pattern_t *pattern = pattern_query
-                               ? fzf_parse_pattern(
-                                     case_mode, false, pattern_query, fuzzy)
+                               ? fzf_parse_pattern_with_direction(
+                                     case_mode, normalize, pattern_query,
+                                     fuzzy, forward)
                                : NULL;
+  bool sortable = pattern && pattern->has_positive_term;
   fzf_slab_t *slab = fzf_make_default_slab();
+  if (!slab || !fzf_slab_set_score_scheme(slab, score_scheme)) {
+    if (pattern) fzf_free_pattern(pattern);
+    if (slab) fzf_free_slab(slab);
+    free(pattern_query);
+    free(reference);
+    free(actual);
+    free(query);
+    return;
+  }
   size_t matched = 0;
 
   pthread_mutex_lock(&s->mu);
@@ -694,29 +744,46 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
     const char *candidate =
         s->cands_top[i >> CANDS_BLOCK_SHIFT][i & CANDS_BLOCK_MASK];
     int score;
+    fzf_score_bounds_t bounds = {0};
     if (!pattern)
       score = 1;
     else if (filter_only)
       score = fzf_has_match(candidate, pattern, slab) ? 1 : 0;
     else
-      score = fzf_get_score(candidate, pattern, slab);
-    if (score > 0)
+      score = fzf_get_score_with_bounds(candidate, pattern, slab, &bounds);
+    if (score > 0) {
       reference[matched++] = (ScoredStr){
-          .str = (char *)candidate, .score = score, .idx = (uint32_t)i};
+          .str = (char *)candidate, .score = score, .idx = (uint32_t)i,
+          .rank = fzf_rank_keys_preclassified(
+              candidate, strlen(candidate), false, &bounds, score_scheme)};
+    }
   }
   pthread_mutex_unlock(&s->mu);
 
   size_t emit = limit && limit < matched ? limit : matched;
-  if (filter_only && pattern && emit > 1) {
-    for (size_t i = 0; i < emit; i++)
-      reference[i].score = fzf_get_score(reference[i].str, pattern, slab);
-    qsort(reference, emit, sizeof *reference, session_fuzz_reference_cmp);
-  } else if (!filter_only && matched > 1) {
-    qsort(reference, matched, sizeof *reference, session_fuzz_reference_cmp);
+  if (filter_only && sortable && emit > 1) {
+    for (size_t i = 0; i < emit; i++) {
+      fzf_score_bounds_t bounds = {0};
+      reference[i].score = fzf_get_score_with_bounds(
+          reference[i].str, pattern, slab, &bounds);
+      reference[i].rank = fzf_rank_keys_preclassified(
+          reference[i].str, strlen(reference[i].str), false, &bounds,
+          score_scheme);
+    }
+    qsort(reference, emit, sizeof *reference, cmp_scored_desc);
+  } else if (!filter_only && sortable && matched > 1) {
+    qsort(reference, matched, sizeof *reference, cmp_scored_desc);
   }
 
   if (actual_count != emit)
     session_fuzz_fail(fuzz, "interactive and batch result counts differ");
+  if (sortable) {
+    for (size_t i = 1; i < actual_count; i++) {
+      if (cmp_scored_desc(&actual[i - 1], &actual[i]) > 0)
+        session_fuzz_fail(
+            fuzz, "published sortable candidates are not totally ordered");
+    }
+  }
   for (size_t i = 0; i < emit; i++) {
     if (actual[i].idx != reference[i].idx ||
         actual[i].score != reference[i].score ||
@@ -806,12 +873,16 @@ static void session_fuzz_run(const uint8_t *data, size_t size) {
   }
   async_session_destroy(session);
 }
+#endif
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   session_fuzz_check_candidate_analyzer(data, size);
+#if FZF_SESSION_FUZZ_MODE == FZF_SESSION_FUZZ_MODE_READER
   if (size <= SESSION_FUZZ_MAX_INPUT)
     session_fuzz_reader_probe(data, size);
+#else
   session_fuzz_run(data, size);
+#endif
   return 0;
 }
 
@@ -849,7 +920,8 @@ int main(int argc, char **argv) {
   if (argc < 2) return 2;
   for (int i = 1; i < argc; i++)
     if (session_fuzz_replay_file(argv[i]) != 0) return 1;
-  printf("Replayed %d interactive session corpus files.\n", argc - 1);
+  printf("Replayed %d interactive session %s corpus files.\n", argc - 1,
+         FZF_SESSION_FUZZ_MODE_NAME);
   return 0;
 }
 #endif

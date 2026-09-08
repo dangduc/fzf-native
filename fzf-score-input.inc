@@ -5,6 +5,15 @@
    This statement include keeps each exported entry point in its own hot frame.
    It avoids compiler-specific inline attributes and preserves legacy scorer
    performance when link-time optimization is unavailable. */
+#ifndef FZF_SCORE_RECORD_BOUNDS
+#define FZF_SCORE_RECORD_BOUNDS(result) ((void)(result))
+#define FZF_SCORE_RECORD_BOUNDS_WAS_DEFAULTED 1
+#endif
+#ifndef FZF_SCORE_COMMIT_BOUNDS
+#define FZF_SCORE_COMMIT_BOUNDS() ((void)0)
+#define FZF_SCORE_COMMIT_BOUNDS_WAS_DEFAULTED 1
+#endif
+
 if (pattern->only_inv) {
   for (size_t i = 0; i < pattern->size; i++) {
     fzf_term_set_t *term_set = pattern->ptr[i];
@@ -14,7 +23,7 @@ if (pattern->only_inv) {
        the matching characters have a long gap.  Testing the score here made a
        small slab accept candidates that the default slab rejected. */
     fzf_result_t res = CALL_ALG(
-        term, false, input, input_is_ascii, NULL, slab);
+        term, false, input, input_is_ascii, pattern->forward, NULL, slab);
     if (fzf_allocation_failed()) return 0;
     if (res.start >= 0) return 0;
   }
@@ -29,10 +38,11 @@ for (size_t i = 0; i < pattern->size; i++) {
   for (size_t j = 0; j < term_set->size; j++) {
     fzf_term_t *term = &term_set->ptr[j];
     fzf_result_t res = CALL_ALG(
-        term, false, input, input_is_ascii, NULL, slab);
+        term, false, input, input_is_ascii, pattern->forward, NULL, slab);
     if (fzf_allocation_failed()) return 0;
     if (res.start >= 0) {
       if (term->inv) continue;
+      FZF_SCORE_RECORD_BOUNDS(res);
       /* Score zero is the public no-match sentinel.  Some valid v1 matches
          with long gaps can have a non-positive raw score.  This can happen
          when v2 falls back because a slab is small.  Preserve membership and
@@ -53,5 +63,19 @@ for (size_t i = 0; i < pattern->size; i++) {
   if (!matched) return 0;
   total_score += current_score;
 }
+
+/* Bounds are useful only for a complete match.  The bounds-enabled caller
+   accumulates them privately and publishes them here, after every AND term
+   set has matched. */
+FZF_SCORE_COMMIT_BOUNDS();
+
+#ifdef FZF_SCORE_RECORD_BOUNDS_WAS_DEFAULTED
+#undef FZF_SCORE_RECORD_BOUNDS_WAS_DEFAULTED
+#undef FZF_SCORE_RECORD_BOUNDS
+#endif
+#ifdef FZF_SCORE_COMMIT_BOUNDS_WAS_DEFAULTED
+#undef FZF_SCORE_COMMIT_BOUNDS_WAS_DEFAULTED
+#undef FZF_SCORE_COMMIT_BOUNDS
+#endif
 
 return total_score > 0 ? total_score : 1;

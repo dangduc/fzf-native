@@ -62,11 +62,12 @@ Query updates reuse that producer, its candidate pool, and the process-wide work
 | FreeBSD | x86-64 | yes | yes |
 | Windows | x86-64 | yes | no |
 
-macOS, Linux, and FreeBSD expose session ABI version 1.
-Windows keeps batch-only support.
+Every platform exposes module ABI version 2.
+Windows keeps batch-only support, but the scoring scheme changes its batch results.
 
-=fzf-native.el= checks =fzf-native-session-abi-version= after a POSIX module loads.
-The loader rejects a missing or incompatible session ABI.
+=fzf-native.el= checks =fzf-native-abi-version= after a module loads.
+The loader rejects a missing or incompatible module ABI.
+It repeats this check when =fzf-native-loaded= is already non-nil.
 
 Emacs does not unload an initialized dynamic module.
 After an ABI failure, replace or rebuild the module and restart Emacs.
@@ -87,6 +88,7 @@ Use =M-x fzf-native-load-own-build-dyn= on another architecture.
 | =(fzf-native-make-default-slab)= | A default matcher slab handle. |
 | =(fzf-native-make-slab SIZE16 SIZE32)= | A configured matcher slab handle. |
 | =(fzf-native-filter-only-p QUERY-LENGTH POOL-SIZE)= | Non-nil for the current filter-only configuration. |
+| =(fzf-native-abi-version)= | The module ABI version on every platform. |
 | =(fzf-native-session-abi-version)= | The POSIX session ABI version. |
 
 =fzf-native-score= no longer returns match positions.
@@ -146,6 +148,7 @@ Each term set contains one or more OR alternatives.
 |--------+---------|
 | =foo= | Fuzzy match in fuzzy mode. |
 | ='foo= | Exact match in fuzzy mode. |
+| ='foo'= | Exact match with word boundaries. |
 | =^foo= | Prefix match. |
 | =foo$= | Suffix match. |
 | =^foo$= | Equal match. |
@@ -158,6 +161,16 @@ In that mode, a leading quote selects fuzzy matching for that term.
 
 =fzf-native-case-mode= selects =smart=, =ignore=, or =respect=.
 Smart mode ignores case for a lowercase query and respects case after uppercase input.
+
+=fzf-native-normalize= uses fzf's Latin normalization by default.
+Set it to nil for the behavior of fzf's =--literal= option.
+
+Normalization depends on the query term.
+An ASCII term can match its normalized Latin forms.
+An accented term stays literal when normalization would change its lowercase form.
+
+=fzf-native-search-direction= selects =auto=, =forward=, or =backward=.
+Auto uses backward search for the path scheme and forward search otherwise.
 
 ** Unicode and raw bytes
 
@@ -189,15 +202,26 @@ It rejects a handle of the wrong kind.
 A positive score means that the candidate matched.
 A zero score means that it did not match.
 
-Normal batch ranking uses stable insertion sort or stable counting sort.
-The synchronous emergency allocation fallback can change equal-score order.
+The default scheme uses this total order:
 
-Session ranking uses this total order:
+1. Higher score.
+2. Shorter trimmed character length.
+3. Earlier producer index.
 
-1. Higher score first.
-2. Earlier producer index first.
+For scoring, the path scheme treats slash as a delimiter on every host and
+backslash as an additional delimiter on Windows.
 
-This order stays deterministic across worker completion order.
+The path scheme adds pathname distance before character length.
+Pathname distance starts after the last slash or backslash before the match.
+
+The history scheme uses score and producer index only.
+Inverse-only patterns preserve producer order for every scheme.
+
+Length counts decoded characters after Unicode-space trimming.
+It saturates at 65,535, as fzf does.
+
+Batch and session paths use the same total order.
+The order stays deterministic across worker completion order.
 
 * Synchronous paths
 
@@ -361,6 +385,9 @@ One request signature contains these values:
 - result limit
 - case mode
 - fuzzy mode
+- normalization mode
+- resolved search direction
+- score scheme
 - query-length filter-only configuration
 - filter-only composition rule
 
@@ -438,6 +465,7 @@ This rule prevents one large session from excluding another session.
 
 Every persistent worker owns one matcher slab.
 It reuses that slab across requests and sessions.
+The worker sets the request score scheme before it uses the slab.
 
 * Cache and refinement model
 
@@ -452,7 +480,7 @@ Its default limits are 40 entries and 64 MiB.
 Each entry records these values:
 
 - literal query
-- case mode and fuzzy mode
+- case mode, fuzzy mode, normalization mode, resolved direction, and score scheme
 - filter-only mode
 - completed pool boundary
 - total match count
@@ -499,7 +527,8 @@ They write it before the coordinator checks whole-request authority.
 A cancelled request therefore keeps evidence from completed batches.
 The mutable final partial batch never enters this cache.
 
-The key contains query bytes, case mode, fuzzy mode, and stable batch ID.
+The key contains query bytes and all matching options.
+It also contains the stable batch ID.
 Filter-only and full scoring share membership because their match sets agree.
 
 The value uses local 16-bit indexes for at most 128 matches.
@@ -569,6 +598,9 @@ Progress belongs to the inspected request, not the retained candidate list.
 | =:limit= | The retained result limit. |
 | =:case-mode= | The retained result case mode. |
 | =:fuzzy= | The retained result fuzzy mode. |
+| =:normalize= | The retained result normalization mode. |
+| =:search-direction= | The retained result resolved direction. |
+| =:score-scheme= | The retained result score scheme. |
 | =:filter-only= | The retained result filter-only mode. |
 | =:filtered= | The full match count. |
 | =:total= | The scored pool size. |
@@ -615,6 +647,8 @@ A reentrant highlight hook can stop the handle without freeing an active outer c
 * Highlight contract
 
 =fzf-native-highlight-fn= receives a string and a vector of start/end character pairs.
+It receives an empty vector when there are no positive highlight positions.
+That vector does not encode membership: inverse-only matches and misses both produce it.
 The default function applies =completions-common-part=.
 
 The default function removes only an earlier =completions-common-part= face.
@@ -690,8 +724,11 @@ This rule prevents finalization from blocking the Emacs main thread.
 
 | Variable | Read point |
 |----------+------------|
+| =fzf-native-score-scheme= | Each match, score, or highlight call. |
 | =fzf-native-case-mode= | Every scoring request. |
 | =fzf-native-fuzzy= | Every scoring request. |
+| =fzf-native-normalize= | Every scoring request. |
+| =fzf-native-search-direction= | Every scoring request. |
 | =fzf-native-batch-highlight= | Every synchronous score call. |
 | =fzf-native-async-highlight= | Every candidate snapshot build. |
 | =fzf-native-highlight-fn= | Every highlight operation. |
@@ -705,6 +742,9 @@ This rule prevents finalization from blocking the Emacs main thread.
 
 Higher-level packages bind these module variables at their native call sites.
 Unless your code calls fzf-native directly, use the higher-level package configuration.
+
+An fzfa bridge must bind normalization, direction, and scheme together.
+Its request key must contain their effective values.
 
 * Logging
 

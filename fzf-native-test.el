@@ -57,6 +57,7 @@
                   (handle query))
 (declare-function fzf-native-filter-only-p "fzf-native-module"
                   (query-length pool-size))
+(declare-function fzf-native-abi-version "fzf-native-module" ())
 (declare-function fzf-native-session-abi-version "fzf-native-module" ())
 
 (defconst fzf-native-test--directory
@@ -107,16 +108,152 @@
          (_result (fzf-native-score "abcdefghi" "acef" slab)))
     (should
      (equal (fzf-native-score "abcdefghi" "acef" slab)
-            '(78)))
+            '(82)))
     (should
      (equal (fzf-native-score "abc" "acef" slab)
             '(0)))
     (should
      (equal (fzf-native-score "zzzzzabc" "z" slab)
-            '(32)))
+            '(36)))
     (should
      (equal (fzf-native-score "sfsjoc" "jo" slab)
             '(36)))))
+
+(ert-deftest fzf-native-score-scheme-public-batch-test ()
+  "Batch calls apply the selected fzf score scheme on every slab."
+  (let ((slab (fzf-native-make-default-slab)))
+    (dolist (case '((default ":fzf" 84)
+                    (path ":fzf" 80)
+                    (history ":fzf" 80)))
+      (let ((fzf-native-score-scheme (nth 0 case)))
+        (should (= (car (fzf-native-score (nth 1 case) "fzf" slab))
+                   (nth 2 case)))))
+    (let ((fzf-native-score-scheme 'default))
+      (should (equal (fzf-native-score-all '(" fzf" "src/fzf") "fzf")
+                     '(" fzf" "src/fzf"))))
+    (let ((fzf-native-score-scheme 'path))
+      (should (equal (fzf-native-score-all '(" fzf" "src/fzf") "fzf")
+                     '("src/fzf" " fzf"))))))
+
+(ert-deftest fzf-native-score-scheme-ranking-parity-test ()
+  "Each score scheme applies the secondary rank keys from fzf."
+  (let ((candidates '("foo/a" "fooXXXXXXXXXXXXXXXX" "foo\\a"
+                      "foo/zz" "foo😀😀😀")))
+    (dolist
+        (case
+         '((default ("foo/a" "foo\\a" "foo/zz"
+                     "foo😀😀😀" "fooXXXXXXXXXXXXXXXX"))
+           (path ("foo😀😀😀" "fooXXXXXXXXXXXXXXXX" "foo/a"
+                  "foo\\a" "foo/zz"))
+           (history ("foo/a" "fooXXXXXXXXXXXXXXXX" "foo\\a"
+                      "foo/zz" "foo😀😀😀"))))
+      (let ((fzf-native-score-scheme (car case)))
+        (should (equal (fzf-native-score-all candidates "^foo")
+                       (cadr case))))))
+  ;; Suffix scores exercise UTF-8 rune length, saturated score ties, and the
+  ;; stable producer-index fallback in the same order as pinned fzf.
+  (let ((candidates '("zλ" "longλ" "😀λ" "bλ" "λ")))
+    (dolist
+        (case
+         '((default ("λ" "😀λ" "zλ" "bλ" "longλ"))
+           (path ("λ" "😀λ" "zλ" "bλ" "longλ"))
+           (history ("😀λ" "λ" "zλ" "longλ" "bλ"))))
+      (let ((fzf-native-score-scheme (car case)))
+        (should (equal (fzf-native-score-all candidates "λ$")
+                       (cadr case)))))))
+
+(ert-deftest fzf-native-path-delimiter-platform-parity-test ()
+  "The path scheme follows the module host's path separators."
+  (let ((fzf-native-score-scheme 'path)
+        (fzf-native-case-mode 'respect))
+    (let ((slash-score (car (fzf-native-score "src/fzf" "fzf")))
+          (backslash-score (car (fzf-native-score "src\\fzf" "fzf"))))
+      (should (> slash-score 0))
+      (if (eq system-type 'windows-nt)
+          (should (= backslash-score slash-score))
+        (should (< backslash-score slash-score))))))
+
+(ert-deftest fzf-native-inverse-only-or-preserves-producer-order-test ()
+  "Inverse-only OR terms do not activate fzf ranking."
+  (let ((candidates '("longer" "x" "path/to/value")))
+    (dolist (scheme '(default path history))
+      (let ((fzf-native-score-scheme scheme))
+        (should (equal (fzf-native-score-all candidates "!z | !q")
+                       candidates))))))
+
+(ert-deftest fzf-native-score-scheme-invalid-value-test ()
+  "An invalid scheme signals before batch or highlight work is published."
+  (let ((fzf-native-score-scheme 'not-a-scheme)
+        (fzf-native-batch-highlight t))
+    (should-error (fzf-native-score "src/fzf" "fzf"))
+    (should-error (fzf-native-score-all '("src/fzf") "fzf"))
+    (should-error (fzf-native-highlight-one "src/fzf" "fzf"))
+    (should-error (fzf-native-highlight-all (list "src/fzf") "fzf"))))
+
+(ert-deftest fzf-native-normalize-public-batch-test ()
+  "Batch scoring and highlighting apply fzf Latin normalization."
+  (should (eq (default-value 'fzf-native-normalize) t))
+  (let ((fzf-native-normalize nil))
+    (should (equal (fzf-native-score "café" "cafe") '(0))))
+  (let ((fzf-native-normalize t))
+    (should (> (car (fzf-native-score "café" "cafe")) 0))
+    (should (equal (fzf-native-score-all '("café" "tea") "cafe")
+                   '("café")))
+    (let ((fzf-native-case-mode 'respect))
+      (should (> (car (fzf-native-score "Ờ" "O")) 0))
+      (should (equal (fzf-native-score "O" "Ờ") '(0)))
+      (should (equal (fzf-native-score-all '("A" "Ā" "ā") "Ā")
+                     '("Ā"))))))
+
+(ert-deftest fzf-native-v2-titlecase-candidate-does-not-fold-test ()
+  "Fuzzy V2 folds uppercase candidates, but not titlecase candidates."
+  (let ((fzf-native-case-mode 'ignore)
+        (fzf-native-fuzzy t)
+        (fzf-native-normalize t))
+    (should (equal (fzf-native-score "ǅ" "ǆ") '(0)))
+    (should (> (car (fzf-native-score "Ǆ" "ǆ")) 0))))
+
+(ert-deftest fzf-native-search-direction-public-batch-test ()
+  "The direction option selects earlier or later equal-score occurrences."
+  (should (eq (default-value 'fzf-native-search-direction) 'auto))
+  (let* ((fzf-native-score-scheme 'default)
+         (fzf-native-search-direction 'auto)
+         (default-auto (fzf-native-highlight-one "-ab-ab-" "ab"))
+         (fzf-native-score-scheme 'path)
+         (path-auto (fzf-native-highlight-one "-ab-ab-" "ab"))
+         (fzf-native-search-direction 'forward)
+         (forward (fzf-native-highlight-one "-ab-ab-" "ab"))
+         (fzf-native-search-direction 'backward)
+         (backward (fzf-native-highlight-one "-ab-ab-" "ab"))
+         (faced-p
+          (lambda (string index)
+            (let ((face (get-text-property index 'face string)))
+              (or (eq face 'completions-common-part)
+                  (and (listp face)
+                       (memq 'completions-common-part face)))))))
+    (should (funcall faced-p default-auto 1))
+    (should-not (funcall faced-p default-auto 4))
+    (should-not (funcall faced-p path-auto 1))
+    (should (funcall faced-p path-auto 4))
+    (should (funcall faced-p forward 1))
+    (should-not (funcall faced-p forward 4))
+    (should-not (funcall faced-p backward 1))
+    (should (funcall faced-p backward 4))))
+
+(ert-deftest fzf-native-exact-boundary-public-batch-test ()
+  "A paired trailing quote requires exact word boundaries."
+  (let ((fzf-native-fuzzy t))
+    (should (equal (fzf-native-score-all
+                    '("xyz" "/xyz/" "xxyz" "xyzz") "'xyz'")
+                   '("xyz" "/xyz/")))))
+
+(ert-deftest fzf-native-search-direction-invalid-value-test ()
+  "An invalid direction signals before batch work is published."
+  (let ((fzf-native-search-direction 'sideways))
+    (should-error (fzf-native-score "-ab-ab-" "ab"))
+    (should-error (fzf-native-score-all '("-ab-ab-") "ab"))
+    (should-error (fzf-native-highlight-one "-ab-ab-" "ab"))
+    (should-error (fzf-native-highlight-all (list "-ab-ab-") "ab"))))
 
 (ert-deftest fzf-native-score-with-slab-test ()
   "Test slab can be reused."
@@ -124,13 +261,13 @@
          (_result (fzf-native-score "abcdefghi" "acef" slab)))
     (should
      (equal (fzf-native-score "abcdefghi" "acef" slab)
-            '(78)))
+            '(82)))
     (should
      (equal (fzf-native-score "abc" "acef" slab)
             '(0)))
     (should
      (equal (fzf-native-score "zzzzzabc" "z" slab)
-            '(32)))
+            '(36)))
     (should
      (equal (fzf-native-score "sfsjoc" "jo" slab)
             '(36)))))
@@ -187,26 +324,26 @@
 Any uppercase query character makes matching case-sensitive."
   (should (eq fzf-native-case-mode 'smart))
   ;; Lowercase query → insensitive: matches uppercase target.
-  (should (equal (fzf-native-score "Foo" "foo") '(80)))
+  (should (equal (fzf-native-score "Foo" "foo") '(88)))
   ;; Uppercase query → sensitive: lowercase target no longer matches.
   (should (equal (fzf-native-score "foo" "Foo") '(0))))
 
 (ert-deftest fzf-native-score-case-mode-ignore-test ()
   "`fzf-native-case-mode' = ignore matches regardless of case."
   (let ((fzf-native-case-mode 'ignore))
-    (should (equal (fzf-native-score "foo" "Foo") '(80)))
-    (should (equal (fzf-native-score "Foo" "foo") '(80)))))
+    (should (equal (fzf-native-score "foo" "Foo") '(88)))
+    (should (equal (fzf-native-score "Foo" "foo") '(88)))))
 
 (ert-deftest fzf-native-score-case-mode-respect-test ()
   "`fzf-native-case-mode' = respect requires exact case."
   (let ((fzf-native-case-mode 'respect))
     (should (equal (fzf-native-score "Foo" "foo") '(0)))
-    (should (equal (fzf-native-score "foo" "foo") '(80)))))
+    (should (equal (fzf-native-score "foo" "foo") '(88)))))
 
 (ert-deftest fzf-native-score-fuzzy-default-test ()
   "Default `fzf-native-fuzzy' is t: non-contiguous query matches."
   (should (eq fzf-native-fuzzy t))
-  (should (equal (fzf-native-score "src/foo.c" "sfc") '(70))))
+  (should (equal (fzf-native-score "src/foo.c" "sfc") '(75))))
 
 (ert-deftest fzf-native-score-fuzzy-disabled-no-fuzzy-test ()
   "`fzf-native-fuzzy' = nil: non-contiguous query no longer matches."
@@ -216,22 +353,22 @@ Any uppercase query character makes matching case-sensitive."
 (ert-deftest fzf-native-score-fuzzy-disabled-substring-still-matches-test ()
   "`fzf-native-fuzzy' = nil: contiguous substring still matches."
   (let ((fzf-native-fuzzy nil))
-    (should (equal (fzf-native-score "src/foo.c" "foo") '(80)))))
+    (should (equal (fzf-native-score "src/foo.c" "foo") '(84)))))
 
 (ert-deftest fzf-native-score-fuzzy-disabled-quote-prefix-inverts-test ()
   "`fzf-native-fuzzy' = nil: ' prefix re-enables fuzzy for that term."
   (let ((fzf-native-fuzzy nil))
-    (should (equal (fzf-native-score "src/foo.c" "'sfc") '(70)))))
+    (should (equal (fzf-native-score "src/foo.c" "'sfc") '(75)))))
 
 (ert-deftest fzf-native-score-fuzzy-disabled-operators-still-work-test ()
   "`fzf-native-fuzzy' = nil: ^, !, and AND tokenization keep working."
   (let ((fzf-native-fuzzy nil))
     ;; ^ prefix anchor matches at start.
-    (should (equal (fzf-native-score "src/foo.c" "^src") '(80)))
+    (should (equal (fzf-native-score "src/foo.c" "^src") '(88)))
     ;; ! negation excludes a term and the bare term still matches.
-    (should (equal (fzf-native-score "src/foo.c" "!xyz foo") '(80)))
+    (should (equal (fzf-native-score "src/foo.c" "!xyz foo") '(84)))
     ;; Space-separated AND: both substrings must match.
-    (should (equal (fzf-native-score "src/foo.c" "src foo") '(160)))))
+    (should (equal (fzf-native-score "src/foo.c" "src foo") '(172)))))
 
 ;;
 ;; Exact-value oracle tests for the operators that the rest of the
@@ -252,11 +389,12 @@ Any uppercase query character makes matching case-sensitive."
 ;;   doubled (BonusFirstCharMultiplier).
 ;;
 ;; Two closed forms used repeatedly:
-;;   * contiguous run of M chars whose first char sits at a word boundary:
-;;       (ScoreMatch + 2*BonusBoundary) + (M-1)*(ScoreMatch + BonusBoundary)
-;;       = 32 + 24*(M-1) = 24*M + 8.
-;;   * equal match (^X$): hardcoded (ScoreMatch+BonusBoundary)*M +
-;;       (BonusFirstCharMultiplier-1)*BonusBoundary = 24*M + 8 (fzf.c:1280).
+;;   * contiguous run of M chars whose first char starts the candidate:
+;;       (ScoreMatch + 2*BonusBoundaryWhite)
+;;         + (M-1)*(ScoreMatch + BonusBoundaryWhite)
+;;       = 36 + 26*(M-1) = 26*M + 10.
+;;   * equal match (^X$): hardcoded (ScoreMatch+BonusBoundaryWhite)*M +
+;;       (BonusFirstCharMultiplier-1)*BonusBoundaryWhite = 26*M + 10.
 
 (ert-deftest fzf-native-score-suffix-operator-test ()
   "Suffix ($) exact scores; boundary vs non-boundary first char.
@@ -279,16 +417,16 @@ General form (no opening boundary): 16*M + 4*(M-1) = 16*3 + 4*2 = 56.
   (should (equal (fzf-native-score "barfoo"  "bar$") '(0))))
 
 (ert-deftest fzf-native-score-equal-operator-test ()
-  "Equal (^...$) exact scores: closed form 24*M + 8, length-exact.
+  "Equal (^...$) exact scores: closed form 26*M + 10, length-exact.
 
-equal_match returns (ScoreMatch+BonusBoundary)*M +
-\(BonusFirstCharMultiplier-1)*BonusBoundary = 24*M + 8 (fzf.c:1280).
-  M=3 \"^abc$\"  -> 24*3 + 8 = 80
-  M=4 \"^abcd$\" -> 24*4 + 8 = 104
+equal_match returns (ScoreMatch+BonusBoundaryWhite)*M +
+\(BonusFirstCharMultiplier-1)*BonusBoundaryWhite = 26*M + 10.
+  M=3 \"^abc$\"  -> 26*3 + 10 = 88
+  M=4 \"^abcd$\" -> 26*4 + 10 = 114
 The candidate length must equal the pattern length exactly, so a
 shorter pattern against a longer candidate scores 0."
-  (should (equal (fzf-native-score "abc"  "^abc$")  '(80)))
-  (should (equal (fzf-native-score "abcd" "^abcd$") '(104)))
+  (should (equal (fzf-native-score "abc"  "^abc$")  '(88)))
+  (should (equal (fzf-native-score "abcd" "^abcd$") '(114)))
   ;; Length mismatch -> no equal match.
   (should (equal (fzf-native-score "foobar" "^foo$")    '(0)))
   (should (equal (fzf-native-score "abc"    "^abcd$")  '(0))))
@@ -302,26 +440,26 @@ the same two terms reordered give different totals.
 
 text \"abcdef\":
   \"^abc | ^abcdef$\": term 1 is prefix \"abc\" -> contiguous run of 3 at
-     the start boundary = 24*3 + 8 = 80.  Matches first, so total 80
-     even though equal \"^abcdef$\" (24*6+8=152) would score higher.
-  \"^abcdef$ | ^abc\": term 1 is equal \"abcdef\" = 24*6 + 8 = 152.
-     Matches first -> total 152.
+     the start boundary = 26*3 + 10 = 88.  Matches first, so total 88
+     even though equal \"^abcdef$\" (26*6+10=166) would score higher.
+  \"^abcdef$ | ^abc\": term 1 is equal \"abcdef\" = 26*6 + 10 = 166.
+     Matches first -> total 166.
   \"zzz | ^abc\": term 1 \"zzz\" does not match; falls through to prefix
-     \"abc\" = 80.
+     \"abc\" = 88.
   \"zzz | qqq\": neither term matches -> 0."
-  (should (equal (fzf-native-score "abcdef" "^abc | ^abcdef$") '(80)))
-  (should (equal (fzf-native-score "abcdef" "^abcdef$ | ^abc") '(152)))
-  (should (equal (fzf-native-score "abcdef" "zzz | ^abc")      '(80)))
+  (should (equal (fzf-native-score "abcdef" "^abc | ^abcdef$") '(88)))
+  (should (equal (fzf-native-score "abcdef" "^abcdef$ | ^abc") '(166)))
+  (should (equal (fzf-native-score "abcdef" "zzz | ^abc")      '(88)))
   (should (equal (fzf-native-score "abcdef" "zzz | qqq")       '(0))))
 
 (ert-deftest fzf-native-score-and-sum-of-operators-test ()
   "AND (space) sums the per-term-set scores; combine new operators.
 
 text \"foo.bar\", query \"^foo bar$\" = two term-sets ANDed:
-  prefix \"foo\" : contiguous run of 3 at start boundary = 24*3 + 8 = 80.
+  prefix \"foo\" : starts the candidate, so its score is 26*3 + 10 = 88.
   suffix \"bar\" : opens after '.' (boundary)            = 24*3 + 8 = 80.
-Sum = 160."
-  (should (equal (fzf-native-score "foo.bar" "^foo bar$") '(160)))
+Sum = 168."
+  (should (equal (fzf-native-score "foo.bar" "^foo bar$") '(168)))
   ;; If either ANDed term fails, the whole pattern scores 0.
   (should (equal (fzf-native-score "foo.bar" "^foo zzz$") '(0))))
 
@@ -693,8 +831,13 @@ Reentry tests use this option because their callback needs one candidate."
         (should (fzf-native-test--wait-for-data handle))
       (fzf-native-async-stop handle))))
 
+(ert-deftest fzf-native-module-abi-handshake-test ()
+  "The loaded module and Elisp public ABI must agree on every platform."
+  (should (= (fzf-native-abi-version) fzf-native-abi-required))
+  (should (fzf-native--verify-abi)))
+
 (ert-deftest fzf-native-session-abi-handshake-test ()
-  "The loaded module and Elisp session contracts must agree exactly."
+  "The loaded POSIX session ABI must agree with the public module ABI."
   (skip-unless (fboundp 'fzf-native-session-abi-version))
   (should (= (fzf-native-session-abi-version)
              fzf-native-session-abi-required))
@@ -1235,6 +1378,240 @@ for i in range(40): print(f\"b{i}\", flush=True)
             (should (eq (plist-get respect :state) 'complete))
             (should (eq (plist-get respect :case-mode) 'respect))
             (should (equal (plist-get respect :candidates) '("FOO")))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-cache-separates-score-schemes-test ()
+  "One query has distinct request, cache, ranking, and metadata per scheme."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' ' fzf' 'src/fzf'; seq 1 100000"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle)
+                             :reader-done))
+          (let* ((fzf-native-score-scheme 'default)
+                 (default-id (fzf-native-async-submit handle "fzf" 10))
+                 (default-result
+                  (fzf-native-test--wait-for-request handle default-id)))
+            (should (eq (plist-get default-result :score-scheme) 'default))
+            (should (equal (plist-get default-result :candidates)
+                           '(" fzf" "src/fzf")))
+            (let ((fzf-native-score-scheme 'path))
+              (should-not (fzf-native-async-result-fresh-p handle "fzf"))
+              (let* ((path-id (fzf-native-async-submit handle "fzf" 10))
+                     (pending (fzf-native-async-snapshot handle path-id))
+                     (path-result
+                      (fzf-native-test--wait-for-request handle path-id)))
+                (should (> path-id default-id))
+                (should (memq (plist-get pending :state) '(queued running)))
+                (should (plist-get pending :stale))
+                (should (eq (plist-get pending :score-scheme) 'default))
+                (should (eq (plist-get path-result :score-scheme) 'path))
+                (should (equal (plist-get path-result :candidates)
+                               '("src/fzf" " fzf")))))
+            (let ((fzf-native-score-scheme 'default))
+              (should (fzf-native-async-result-fresh-p handle "fzf"))
+              (let* ((again-id (fzf-native-async-submit handle "fzf" 10))
+                     (again
+                      (fzf-native-test--wait-for-request handle again-id)))
+                (should (> again-id default-id))
+                (should (eq (plist-get again :score-scheme) 'default))
+                (should (equal (plist-get again :candidates)
+                               '(" fzf" "src/fzf"))))))
+          (let* ((before (fzf-native-async-status handle))
+                 (before-id (plist-get before :latest-request-id))
+                 (fzf-native-score-scheme 'not-a-scheme))
+            (should-error (fzf-native-async-submit handle "fzf" 10))
+            (should-error (fzf-native-async-result-fresh-p handle "fzf"))
+            (should (= (plist-get (fzf-native-async-status handle)
+                                  :latest-request-id)
+                       before-id))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-score-scheme-ranking-parity-test ()
+  "One session applies all score-scheme rank keys to the same candidates."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle
+        (fzf-native-async-start
+          (concat "printf '%s\\n' 'foo/a' 'fooXXXXXXXXXXXXXXXX' 'foo\\a' "
+                  "'foo/zz' 'foo😀😀😀' 'zλ' 'longλ' '😀λ' 'bλ' 'λ'")))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle)
+                             :reader-done))
+          (dolist
+              (case
+               '((default ("foo/a" "foo\\a" "foo/zz"
+                           "foo😀😀😀" "fooXXXXXXXXXXXXXXXX"))
+                 (path ("foo😀😀😀" "fooXXXXXXXXXXXXXXXX" "foo/a"
+                        "foo\\a" "foo/zz"))
+                 (history ("foo/a" "fooXXXXXXXXXXXXXXXX" "foo\\a"
+                            "foo/zz" "foo😀😀😀"))))
+            (let* ((fzf-native-score-scheme (car case))
+                   (request-id (fzf-native-async-submit handle "^foo" 0))
+                   (snapshot (fzf-native-test--wait-for-request
+                              handle request-id)))
+              (should (equal (plist-get snapshot :candidates)
+                             (cadr case)))))
+          ;; A repeated suffix query must keep the pinned order after the
+          ;; first result has entered both asynchronous caches.
+          (dolist
+              (case
+               '((default ("λ" "😀λ" "zλ" "bλ" "longλ"))
+                 (path ("λ" "😀λ" "zλ" "bλ" "longλ"))
+                 (history ("😀λ" "λ" "zλ" "longλ" "bλ"))))
+            (let* ((fzf-native-score-scheme (car case))
+                   (request-id (fzf-native-async-submit handle "λ$" 0))
+                   (snapshot (fzf-native-test--wait-for-request
+                              handle request-id)))
+              (should (equal (plist-get snapshot :candidates)
+                             (cadr case))))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-inverse-only-or-preserves-order-test ()
+  "Full and filter-only session paths preserve inverse-only producer order."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle
+         (fzf-native-async-start
+          "printf '%s\\n' longer x path/to/value"))
+        (fzf-native-async-highlight nil)
+        (expected '("longer" "x" "path/to/value")))
+    (unwind-protect
+        (progn
+          (should (plist-get (fzf-native-test--wait-for-producer handle)
+                             :reader-done))
+          (dolist (scheme '(default path history))
+            (dolist (filter-only-length '(nil 100))
+              (let* ((fzf-native-score-scheme scheme)
+                     (fzf-native-filter-only-min-pool nil)
+                     (fzf-native-filter-only-length filter-only-length)
+                     (request-id
+                      (fzf-native-async-submit handle "!z | !q" 0))
+                     (snapshot
+                      (fzf-native-test--wait-for-request handle request-id)))
+                (should
+                 (eq (plist-get snapshot :filter-only)
+                     (and filter-only-length t)))
+                (should (equal (plist-get snapshot :candidates)
+                               expected))))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-inverse-only-or-growth-preserves-order-test ()
+  "A growth retry appends inverse-only matches in producer order."
+  (skip-unless (and (fboundp 'fzf-native-async-submit)
+                    (executable-find "python3")))
+  (let* ((gate (make-temp-file "fzf-native-inverse-growth-"))
+         (command
+          (format "python3 -u -c 'import os, sys, time
+gate = sys.argv[1]
+print(\"longer\", flush=True)
+print(\"x\", flush=True)
+while os.path.exists(gate): time.sleep(0.01)
+print(\"path/to/value\", flush=True)
+' %s" (shell-quote-argument gate)))
+         (handle (fzf-native-async-start command))
+         (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((request-id
+                  (fzf-native-async-submit handle "!z | !q" 0))
+                 (first
+                  (fzf-native-test--wait-for-request handle request-id)))
+            (should (equal (plist-get first :candidates)
+                           '("longer" "x")))
+            (delete-file gate)
+            (let ((deadline (+ (float-time) 10.0))
+                  snapshot)
+              (while (and (< (float-time) deadline)
+                          (progn
+                            (setq snapshot
+                                  (fzf-native-async-snapshot
+                                   handle request-id))
+                            (not (and
+                                  (eq (plist-get snapshot :state) 'complete)
+                                  (= (plist-get snapshot :pool-generation) 3)
+                                  (not (plist-get snapshot :stale))))))
+                (sleep-for 0.01))
+              (should (equal (plist-get snapshot :candidates)
+                             '("longer" "x" "path/to/value"))))))
+      (when (file-exists-p gate) (delete-file gate))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-cache-separates-normalization-test ()
+  "Normalization is part of async request identity and result metadata."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start
+                 "printf '%s\\n' cafe 'café' tea"))
+        (fzf-native-async-highlight nil))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((fzf-native-normalize nil)
+                 (plain-id (fzf-native-async-submit handle "cafe" 10))
+                 (plain (fzf-native-test--wait-for-request handle plain-id)))
+            (should-not (plist-get plain :normalize))
+            (should (equal (plist-get plain :candidates) '("cafe")))
+            (let ((fzf-native-normalize t))
+              (should-not (fzf-native-async-result-fresh-p handle "cafe"))
+              (let* ((normalized-id
+                      (fzf-native-async-submit handle "cafe" 10))
+                     (normalized
+                      (fzf-native-test--wait-for-request
+                       handle normalized-id)))
+                (should (> normalized-id plain-id))
+                (should (plist-get normalized :normalize))
+                (should (member "cafe" (plist-get normalized :candidates)))
+                (should (member "café" (plist-get normalized :candidates)))))
+            (let ((fzf-native-normalize nil))
+              (should (fzf-native-async-result-fresh-p handle "cafe")))))
+      (fzf-native-async-stop handle))))
+
+(ert-deftest fzf-native-async-cache-separates-search-direction-test ()
+  "Direction is retained across async scoring, cache reuse, and highlighting."
+  (skip-unless (fboundp 'fzf-native-async-submit))
+  (let ((handle (fzf-native-async-start "printf '%s\\n' '-ab-ab-'"))
+        (fzf-native-async-highlight t))
+    (unwind-protect
+        (progn
+          (should (fzf-native-test--wait-for-data handle))
+          (let* ((fzf-native-score-scheme 'default)
+                 (fzf-native-search-direction 'auto)
+                 (forward-id (fzf-native-async-submit handle "ab" 10))
+                 (forward
+                  (fzf-native-test--wait-for-request handle forward-id))
+                 (forward-candidate (car (plist-get forward :candidates))))
+            (should (eq (plist-get forward :search-direction) 'forward))
+            (should (get-text-property 1 'face forward-candidate))
+            (should-not (get-text-property 4 'face forward-candidate))
+            (let ((fzf-native-score-scheme 'path)
+                  (fzf-native-search-direction 'auto))
+              (should-not (fzf-native-async-result-fresh-p handle "ab"))
+              (let* ((backward-id (fzf-native-async-submit handle "ab" 10))
+                     (backward
+                      (fzf-native-test--wait-for-request handle backward-id))
+                     (backward-candidate
+                      (car (plist-get backward :candidates))))
+                (should (> backward-id forward-id))
+                (should (eq (plist-get backward :search-direction)
+                            'backward))
+                (should-not (get-text-property 1 'face backward-candidate))
+                (should (get-text-property 4 'face backward-candidate))
+                (let ((fzf-native-search-direction 'forward))
+                  (should-not
+                   (fzf-native-async-result-fresh-p handle "ab")))
+                (should (fzf-native-async-result-fresh-p handle "ab"))))
+            (should (fzf-native-async-result-fresh-p handle "ab"))
+            (let* ((before (fzf-native-async-status handle))
+                   (before-id (plist-get before :latest-request-id))
+                   (fzf-native-search-direction 'sideways))
+              (should-error (fzf-native-async-submit handle "ab" 10))
+              (should-error (fzf-native-async-result-fresh-p handle "ab"))
+              (should (= (plist-get (fzf-native-async-status handle)
+                                    :latest-request-id)
+                         before-id)))))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-bounded-top-k-crosses-coordinator-window-test ()
@@ -2044,7 +2421,7 @@ sys.stdout.buffer.write(b\"\\xe4\\xbd\\xa0\\xe9x\\n\")
           ;; three memberships but ranks only the producer-order emit window;
           ;; full scoring would select the later, higher-scoring exact
           ;; candidate "你".  Excluding it proves the one-character threshold
-          ;; fired without relying on the display order within that window.
+          ;; fired.  Pinned fzf's default length key orders the retained pair.
           (let ((deadline (+ (float-time) 5.0)))
             (while (and (not (fzf-native-async-result-fresh-p handle "你"))
                         (< (float-time) deadline))
@@ -2052,7 +2429,7 @@ sys.stdout.buffer.write(b\"\\xe4\\xbd\\xa0\\xe9x\\n\")
               (sleep-for 0.05)))
           (should (fzf-native-async-result-fresh-p handle "你"))
           (should (equal (fzf-native-async-candidates handle "你" 2)
-                         '("zzz你" "zz你"))))
+                         '("zz你" "zzz你"))))
       (fzf-native-async-stop handle))))
 
 (ert-deftest fzf-native-async-long-line-whole-test ()
@@ -2122,7 +2499,7 @@ needed.  No `async-stop' here on purpose — we want the finalizer path."
     (garbage-collect))
   ;; If we got here without aborting Emacs, the finalizer survived
   ;; the race for this run.  Confirm the module is still usable.
-  (should (equal (fzf-native-score "abcdefghi" "acef") '(78))))
+  (should (equal (fzf-native-score "abcdefghi" "acef") '(82))))
 
 (ert-deftest fzf-native-async-stop-returns-fast-test ()
   "`fzf-native-async-stop' returns quickly on Emacs's main thread.
@@ -2417,6 +2794,51 @@ The face covers the matched position; the caller's original is unmutated."
     (should-not (eq ret orig))
     (should-not (text-property-not-all 0 (length ret) 'face nil ret))))
 
+(ert-deftest fzf-native-highlight-one-policy-change-clears-stale-face-test ()
+  "A no-match clears only stale completion faces after a policy change."
+  (skip-unless (fboundp 'fzf-native-highlight-one))
+  (let ((candidate (copy-sequence "café")))
+    (put-text-property 0 (length candidate) 'face 'my-user-face candidate)
+    (let* ((fzf-native-normalize t)
+           (highlighted (fzf-native-highlight-one candidate "cafe")))
+      (should
+       (cl-loop for i below (length highlighted)
+                thereis
+                (let ((face (get-text-property i 'face highlighted)))
+                  (or (eq face 'completions-common-part)
+                      (and (listp face)
+                           (memq 'completions-common-part face))))))
+      (let* ((fzf-native-normalize nil)
+             (after (fzf-native-highlight-one highlighted "cafe")))
+        (should (equal (fzf-native-score highlighted "cafe") '(0)))
+        (dotimes (i (length after))
+          (let ((face (get-text-property i 'face after)))
+            (should-not (eq face 'completions-common-part))
+            (should-not (and (listp face)
+                             (memq 'completions-common-part face)))
+            (should (or (eq face 'my-user-face)
+                        (and (listp face)
+                             (memq 'my-user-face face))))))))))
+
+(ert-deftest fzf-native-highlight-one-empty-positions-contract-test ()
+  "Empty hook positions do not encode match membership."
+  (skip-unless (fboundp 'fzf-native-highlight-one))
+  (let ((matched-score (fzf-native-score "abc" "!z"))
+        (missed-score (fzf-native-score "abc" "z"))
+        calls matched-result missed-result)
+    (let ((fzf-native-highlight-fn
+           (lambda (candidate positions)
+             (push (list candidate (copy-sequence positions)) calls))))
+      (setq matched-result (fzf-native-highlight-one "abc" "!z")
+            missed-result (fzf-native-highlight-one "abc" "z")))
+    (setq calls (nreverse calls))
+    (should (equal matched-score '(1)))
+    (should (equal missed-score '(0)))
+    (should (= (length calls) 2))
+    (should (eq (caar calls) matched-result))
+    (should (eq (caadr calls) missed-result))
+    (should (equal (mapcar #'cadr calls) '([] [])))))
+
 (ert-deftest fzf-native-highlight-one-fuzzy-test ()
   "Multi-character fuzzy match attaches face at the matched positions."
   (skip-unless (fboundp 'fzf-native-highlight-one))
@@ -2510,23 +2932,34 @@ the uninitialised scratch."
       (should-error (fzf-native--bundled-module-relative-path)
                     :type 'user-error))))
 
-(ert-deftest fzf-native-session-abi-platform-matches-bundled-freebsd-test ()
-  "The ABI handshake and bundled loader must agree on FreeBSD support."
+(ert-deftest fzf-native-abi-handshake-runs-on-every-platform-test ()
+  "Batch APIs require the ABI handshake even without POSIX sessions."
   (let ((calls 0))
-    (cl-letf (((symbol-function 'fzf-native-session-abi-version)
+    (cl-letf (((symbol-function 'fzf-native-abi-version)
                (lambda ()
                  (cl-incf calls)
-                 fzf-native-session-abi-required)))
+                 fzf-native-abi-required)))
       (let ((system-type 'berkeley-unix)
             (system-configuration "amd64-portbld-freebsd13.2"))
         (should (fzf-native--session-platform-p))
-        (should (fzf-native--verify-session-abi))
+        (should (fzf-native--verify-abi))
         (should (= calls 1)))
-      (let ((system-type 'berkeley-unix)
-            (system-configuration "x86_64-unknown-netbsd10.0"))
+      (let ((system-type 'windows-nt))
         (should-not (fzf-native--session-platform-p))
-        (should (fzf-native--verify-session-abi))
-        (should (= calls 1))))))
+        (should (fzf-native--verify-abi))
+        (should (= calls 2))))))
+
+(ert-deftest fzf-native-ensure-loaded-rechecks-existing-module-abi-test ()
+  "An already-loaded flag must not bypass a stale-module check."
+  (let ((fzf-native-loaded t)
+        (loads 0))
+    (cl-letf (((symbol-function 'fzf-native--verify-abi)
+               (lambda () (error "stale module")))
+              ((symbol-function 'fzf-native-load-dyn)
+               (lambda () (cl-incf loads))))
+      (should-error (fzf-native-ensure-loaded))
+      (should (= loads 0))
+      (should-not fzf-native-loaded))))
 
 ;;; Review regression gates (PR #39 multi-agent review)
 
@@ -2538,7 +2971,7 @@ the uninitialised scratch."
     (cl-letf (((symbol-function 'featurep)
                (lambda (feature)
                  (eq feature 'fzf-native-module)))
-              ((symbol-function 'fzf-native--verify-session-abi)
+              ((symbol-function 'fzf-native--verify-abi)
                (lambda ()
                  (error "Module has ABI 2, Elisp requires ABI 1")))
               ((symbol-function 'fzf-native-module-compile)
@@ -2561,7 +2994,7 @@ the uninitialised scratch."
                (lambda (_feature) nil))
               ((symbol-function 'module-load)
                (lambda (_path) (cl-incf module-loads)))
-              ((symbol-function 'fzf-native--verify-session-abi)
+              ((symbol-function 'fzf-native--verify-abi)
                (lambda ()
                  (error "Module has ABI 2, Elisp requires ABI 1"))))
       (let ((message
@@ -2582,7 +3015,7 @@ the uninitialised scratch."
                (lambda () "stale-module.so"))
               ((symbol-function 'module-load)
                (lambda (_path) (cl-incf module-loads)))
-              ((symbol-function 'fzf-native--verify-session-abi)
+              ((symbol-function 'fzf-native--verify-abi)
                (lambda ()
                  (error "Module has ABI 2, Elisp requires ABI 1"))))
       (let ((message
@@ -2604,8 +3037,10 @@ the uninitialised scratch."
         (progn
           (should (plist-get (fzf-native-test--wait-for-producer handle)
                              :reader-done))
-          (dolist (query '("" "!x"))
-            (let* ((request-id (fzf-native-async-submit handle query 20))
+          (dolist (case `(("" ,expected) ("!x" ,expected)))
+            (let* ((query (car case))
+                   (expected-order (cadr case))
+                   (request-id (fzf-native-async-submit handle query 20))
                    (snapshot (fzf-native-test--wait-for-request
                               handle request-id))
                    (actual
@@ -2616,7 +3051,9 @@ the uninitialised scratch."
                             (fzf-native-score-all expected query))))
               (should (eq (plist-get snapshot :state) 'complete))
               (should-not (plist-get snapshot :stale))
-              (should (equal actual expected))
+              ;; Pinned fzf keeps producer order for empty and inverse-only
+              ;; patterns because neither pattern has a sortable positive term.
+              (should (equal actual expected-order))
               (should (equal actual batch)))))
       (fzf-native-async-stop handle))))
 
@@ -2976,6 +3413,57 @@ the bad byte."
     (should-error (fzf-native-score candidate "a"))
     (should-error (fzf-native-score-all (list candidate) "a"))
     (should-error (fzf-native-highlight-one candidate "a"))))
+
+(defconst fzf-native-test--artifact-smoke-tests
+  '(fzf-native-module-abi-handshake-test
+    fzf-native-session-abi-handshake-test
+    fzf-native-module-init-publication-is-reentry-safe-test
+    fzf-native-score-scheme-public-batch-test
+    fzf-native-score-scheme-ranking-parity-test
+    fzf-native-path-delimiter-platform-parity-test
+    fzf-native-inverse-only-or-preserves-producer-order-test
+    fzf-native-score-scheme-invalid-value-test
+    fzf-native-normalize-public-batch-test
+    fzf-native-v2-titlecase-candidate-does-not-fold-test
+    fzf-native-search-direction-public-batch-test
+    fzf-native-exact-boundary-public-batch-test
+    fzf-native-search-direction-invalid-value-test
+    fzf-native-async-preserves-empty-line-candidates-test
+    fzf-native-async-public-results-own-strings-across-reentry-test
+    fzf-native-async-candidates-pins-session-across-lisp-reentry-test
+    fzf-native-async-result-fresh-pins-session-across-lisp-reentry-test
+    fzf-native-async-snapshot-pins-session-across-lisp-reentry-test
+    fzf-native-async-stats-pins-session-across-lisp-reentry-test
+    fzf-native-async-status-pins-session-across-lisp-reentry-test
+    fzf-native-async-submit-pins-session-across-lisp-reentry-test
+    fzf-native-async-cache-positive-quote-refinement-test
+    fzf-native-async-cache-invalid-utf8-prefix-rescans-test
+    fzf-native-async-cache-separates-score-schemes-test
+    fzf-native-async-score-scheme-ranking-parity-test
+    fzf-native-async-inverse-only-or-preserves-order-test
+    fzf-native-async-inverse-only-or-growth-preserves-order-test
+    fzf-native-async-cache-separates-normalization-test
+    fzf-native-async-cache-separates-search-direction-test
+    fzf-native-async-max-line-length-counts-characters-test
+    fzf-native-async-line-cap-streams-ansi-heavy-record-test
+    fzf-native-async-line-cap-rejects-nul-after-truncated-prefix-test
+    fzf-native-async-producer-uses-dynamic-process-environment-test
+    fzf-native-async-producer-honors-environment-removal-test
+    fzf-native-async-producer-honors-path-removal-test
+    fzf-native-async-producer-corrects-pwd-for-directory-test
+    fzf-native-async-producer-honors-pwd-removal-test
+    fzf-native-score-all-empty-string-candidate-test
+    fzf-native-highlight-one-policy-change-clears-stale-face-test
+    fzf-native-utf8-case-ignore-length-changing-fold-test)
+  "Public ABI tests run against tracked and freshly built release modules.")
+
+(defun fzf-native-test-run-artifact-smoke ()
+  "Run the maintained release-module smoke suite and exit Emacs."
+  (dolist (test fzf-native-test--artifact-smoke-tests)
+    (unless (ert-test-boundp test)
+      (error "Artifact smoke test is not registered: %S" test)))
+  (ert-run-tests-batch-and-exit
+   (cons 'member fzf-native-test--artifact-smoke-tests)))
 
 (provide 'fzf-native-test)
 ;;; fzf-native-test.el ends here

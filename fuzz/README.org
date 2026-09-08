@@ -1,0 +1,267 @@
+#+title: Fuzz and differential test guide
+
+* Purpose
+
+These tests move fzf-native toward parity with junegunn/fzf.
+They use generated inputs, internal properties, and a pinned fzf oracle.
+
+The tests keep crashes, hangs, data races, and unknown output as unconditional failures.
+They also fail on unclassified differences from the oracle.
+
+* Test design
+
+The raw lane compares independently implemented Go and C matchers.
+The parsed lane compares both public parsers through a pinned fzf executable.
+Sanitizer and metamorphic checks can expose crashes or weak differential assumptions.
+
+Each generator records its seed and serial number.
+The generators vary input dimensions independently and check their cross-product.
+Permanent regression seeds preserve each confirmed failure.
+
+Do not treat one difference as proof that fzf-native is wrong.
+First verify the oracle revision, input contract, and documented difference policy.
+Then minimize the case and add a permanent regression test.
+
+* Oracle pin
+
+The oracle uses fzf commit =1372d04f79bde0daa3bab4b96a068baafa808e67=.
+The raw oracle requires Go =1.27.1= with Unicode =17.0.0= tables.
+The native peer vendors utf8proc =2.10.0= with Unicode =16.0.0= tables.
+
+Use the same fzf commit and Go version for one campaign.
+Record both versions with every saved failure.
+
+Update the pin in one reviewable change.
+Run all differential profiles before you accept a new pin.
+Do not change an exception to make a new pin pass.
+
+* Test lanes
+
+** Raw algorithm lane
+
+This lane compares one native algorithm result with the corresponding Go result.
+It compares membership, range, score, and positions.
+Both peers stay active across many framed requests.
+
+Run the sanitizer checks:
+
+#+begin_src sh
+make FUZZ_CC=clang FZF_SOURCE=/path/to/pinned/fzf fuzz-oracle-test-san
+#+end_src
+
+The default run compares 20,000 generated membership cases.
+Set =FZF_RAW_MATRIX_SEED=, =FZF_RAW_MATRIX_START=, and =FZF_RAW_MATRIX_CASES= for replay.
+The raw lane always compares score, range, and positions for successful matches.
+
+The protocol and current parity cases are in [[file:oracle/README.org][oracle/README.org]].
+
+** Parsed query lane
+
+This lane generates a query tree and a candidate collection.
+It renders the same query for the native module and the fzf executable.
+It compares stable candidate identities instead of candidate text.
+
+Run the common profile:
+
+#+begin_src sh
+make FZF_SOURCE=/path/to/pinned/fzf \
+  FZF_NATIVE_UPSTREAM_CASES=1000 fuzz-upstream-pinned
+#+end_src
+
+Replay one range with a fixed seed:
+
+#+begin_src sh
+make FZF_SOURCE=/path/to/pinned/fzf \
+  FZF_NATIVE_FUZZ_SEED=12648430 \
+  FZF_NATIVE_UPSTREAM_START=400 \
+  FZF_NATIVE_UPSTREAM_CASES=20 fuzz-upstream-pinned
+#+end_src
+
+Set =FZF_NATIVE_UPSTREAM_PROFILE=long= to test lengths 999, 1000, and 1001.
+Set =FZF_NATIVE_UPSTREAM_PROFILE=parity= to test strict public parity behavior.
+Pull-request CI runs 1,000 parity cases.  That bound includes ranking comparisons
+and every normalize, direction, and score-scheme control tuple.
+
+** Native matcher lane
+
+This lane uses libFuzzer with AddressSanitizer and UndefinedBehaviorSanitizer.
+It checks result invariants and metamorphic relations inside the C matcher.
+
+The checks cover query transformations, Unicode, slab fallback, and candidate extension.
+They also compare V1 and V2 membership where both algorithms apply.
+
+Run and replay this lane:
+
+#+begin_src sh
+make FUZZ_SECONDS=60 fuzz-matcher
+make fuzz-matcher-replay
+#+end_src
+
+** Interactive session lane
+
+This lane drives the real persistent session core with generated operation traces.
+The state target covers worker, cache, request, cancellation, and teardown behavior.
+The reader target covers blocking producer input and child-process ownership.
+
+Run the session targets:
+
+#+begin_src sh
+make FUZZ_SESSION_SECONDS=60 FUZZ_SESSION_READER_SECONDS=30 fuzz-session
+make fuzz-session-replay
+make fuzz-session-tsan
+#+end_src
+
+For a three-hour reader campaign, run six bounded process epochs:
+
+#+begin_src sh
+make FUZZ_SESSION_READER_EPOCHS=6 fuzz-session-reader-continuous
+#+end_src
+
+Each epoch runs for 30 minutes by default. After a clean epoch, a new process
+starts and a coverage merge keeps the useful inputs. The restart releases
+libFuzzer and sanitizer allocator state.
+
+Set =FUZZ_SESSION_READER_EPOCH_SECONDS=SECONDS= to change the epoch duration.
+Set =FUZZ_SESSION_READER_EPOCHS=0= to run until a signal or a failure stops the
+campaign.
+
+Do not classify a libFuzzer RSS-guard artifact as a product failure. First,
+replay the artifact without libFuzzer:
+
+#+begin_src sh
+make fuzz-session-reader-replay-build
+build/fzf-native-session-reader-fuzz-replay /path/to/artifact
+#+end_src
+
+If target memory increases during replay, classify the artifact as a product
+failure.
+
+The end-to-end session check loads the native module in Emacs.
+It compares completed session rounds with fresh fzf results.
+It keeps one native handle for broad, narrow, repeated, and Unicode queries.
+
+Run it with a source-pinned fzf executable:
+
+#+begin_src sh
+make FZF_SOURCE=/path/to/pinned/fzf fuzz-upstream-session-pinned
+#+end_src
+
+** Emacs ABI lane
+
+This lane loads the built native module in Emacs 30.2.
+It generates values at the Lisp and native-module boundary.
+It checks scalar, batch, highlight, type, and session behavior.
+
+Run this lane:
+
+#+begin_src sh
+make FZF_NATIVE_FUZZ_CASES=2000 \
+  FZF_NATIVE_FUZZ_ABI_CASES=2000 \
+  FZF_NATIVE_FUZZ_SESSION_CASES=250 fuzz-elisp
+#+end_src
+
+* Generator dimensions
+
+The parsed generator selects these dimensions independently when possible:
+
+- query tree: empty, one term, AND, OR, inverse, or mixed
+- term kind: fuzzy, exact, exact-boundary, prefix, suffix, or equal
+- case mode: smart, ignore, or respect
+- normalization: fzf default or literal
+- search direction: auto, forward, or backward
+- score scheme: default, path, or history
+- text: ASCII, Unicode, case-fold pair, or malformed bytes
+- layout: front, middle, tail, ambiguous, near miss, or distractor
+- multiplicity: distinct candidates and duplicate occurrences
+- length: 1, 2, 7, 31, 32, 63, 64, 999, 1000, or 1001
+
+Every generated occurrence has a unique numeric identity.
+Every ordinary case also has one candidate that must match upstream fzf.
+
+* Difference policy
+
+An accepted difference needs a narrow executable predicate.
+The entry must include an owner, an upstream revision, and a removal condition.
+
+The parsed lane accepts malformed UTF-8 decoder behavior and one pinned
+Unicode table-version expectation.
+Go and utf8proc replace malformed byte sequences differently.
+The exception applies only when a nonempty malformed query or candidate has an
+exact membership change predicted by running the native matcher on Go-decoded
+input.  Empty-query losses and incomplete predictions always fail.
+
+The parsed Unicode expectation requires the exact fzf revision, Go =1.27.1=
+and Unicode =17.0.0=, plus utf8proc =2.10.0= and Unicode =16.0.0=.  Its
+deterministic 336-case grid covers the 28 enumerated lowercase pairs in both
+pattern/candidate orientations and all six parsed matcher kinds.  The
+classifier accepts only upstream-only membership for the mapped one-rune peer
+in a single positive, case-ignore term.  A missing identity or broader case
+shape fails closed.
+
+The raw lane also has one version-scoped Unicode table exception.  Go 1.27.1
+knows the Unicode 17 lowercase mappings U+A7CE, U+A7D2, U+A7D4, and
+U+16EA0--U+16EB8; utf8proc's Unicode 16 tables do not.  The exhaustive raw
+audit checks all 1,488 Go lowercase pairs in both orientations through all
+seven algorithms: 20,832 requests with exactly 28 misses in each of the 14
+orientation/algorithm cells.  A toolchain, table, result-shape, or count change
+fails the audit and requires an explicit pin review.
+
+Raw algorithms use the pinned fzf Latin-fold table and both search directions.
+The public API exposes normalization, direction, and all three score schemes.
+The parity profile compares supported ranking behavior and applies only the
+exact parsed Unicode expectation above.
+Crashes, hangs, races, unknown candidates, and all other valid UTF-8
+differences always fail.
+
+Review [[file:differential/fzf-native-differential-exceptions.el][the exception policy]] when a result differs.
+Reduce the input before you change this policy.
+
+* Corpus management
+
+Permanent seeds live in =fuzz/corpus= and =fuzz/session-corpus=.
+Learned inputs live below the selected build directory.
+
+Merge learned inputs after a clean run:
+
+#+begin_src sh
+make fuzz-merge
+#+end_src
+
+The merge keeps inputs that add coverage for each target.
+Add a readable permanent seed for every confirmed defect.
+Also add a focused regression test for that defect.
+
+* Failure record
+
+Keep this data for each failure:
+
+- fzf-native commit
+- pinned fzf commit and Go version
+- target name and sanitizer
+- generator seed, start value, and serial number
+- exact query, options, candidate bytes, and operation trace
+- native result, oracle result, and accepted-difference classification
+- minimized artifact path and replay command
+
+First replay the exact input without a time limit.
+Then reduce it while you preserve the same failure.
+Treat an isolated RSS-limit artifact as test infrastructure until replay confirms target growth.
+
+* CI cadence
+
+Pull requests run short sanitizer, replay, ABI, and differential gates.
+The weekly job runs longer libFuzzer epochs and more differential cases.
+CI merges and caches each learned corpus after a clean run.
+
+Run the complete local replay set before you submit a matcher change:
+
+#+begin_src sh
+make fuzz-replay
+make fuzz-session-tsan
+make FZF_SOURCE=/path/to/pinned/fzf fuzz-oracle-test-san
+make FZF_SOURCE=/path/to/pinned/fzf fuzz-upstream-pinned
+make FZF_SOURCE=/path/to/pinned/fzf \
+  FZF_NATIVE_UPSTREAM_PROFILE=long \
+  FZF_NATIVE_UPSTREAM_CASES=3 fuzz-upstream-pinned
+make fuzz-elisp
+#+end_src

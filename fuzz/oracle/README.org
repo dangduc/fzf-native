@@ -1,0 +1,236 @@
+#+title: Raw fzf oracle
+
+* Purpose
+
+This program runs the raw matching algorithms from a pinned junegunn/fzf source tree.
+It keeps one process active for many requests.
+It does not copy or reimplement the upstream algorithms.
+
+The pinned upstream commit is =1372d04f79bde0daa3bab4b96a068baafa808e67=.
+The =go.mod= file also pins the corresponding Go pseudo-version.
+The INFO response reports the Go version.
+The toolchain directive and build scripts require Go =1.27.1=, whose standard
+library embeds Unicode =17.0.0= tables.  The native peer vendors utf8proc
+=2.10.0= with Unicode =16.0.0= tables.
+
+This oracle covers raw matching only.
+It does not cover the fzf query parser, result ranking, or interactive state.
+
+* Build
+
+Check out the pinned fzf commit in a separate directory.
+Then run this command:
+
+#+begin_src sh
+./fuzz/oracle/build.sh /path/to/fzf /tmp/fzf-raw-oracle
+#+end_src
+
+The build script checks the commit of the source tree.
+It archives that commit into a temporary directory.
+It copies the required Go modules into a temporary vendor directory.
+It removes local paths and Go build identifiers from the executable.
+It copies the dependency checksums from the pinned source tree.
+Dirty source files cannot change the oracle.
+Two builds in the same build environment produce identical executable files.
+The script does not change the source tree or the committed =go.mod= file.
+
+* Run
+
+Start one process for each scoring scheme that the client uses:
+
+#+begin_src sh
+/tmp/fzf-raw-oracle --scheme=default
+/tmp/fzf-raw-oracle --scheme=path
+/tmp/fzf-raw-oracle --scheme=history
+#+end_src
+
+The upstream initialization function changes package-global scoring data.
+Thus, one process accepts only the scheme that its =--scheme= option selects.
+
+The process reads framed requests from standard input.
+It writes one framed response to standard output for each complete request.
+A bad request produces an error response and does not stop the process.
+A truncated frame or an input error stops the process.
+
+* Frame format
+
+All integers use network byte order.
+Each message starts with an unsigned 32-bit payload length.
+The payload follows this length immediately.
+The maximum payload length is 64 MiB.
+
+Every request starts with these fields:
+
+| Size | Field |
+|------+-------|
+| 1 | Protocol version. The value is =1=. |
+| 1 | Operation code. |
+
+** INFO request
+
+The INFO operation code is =0=.
+The request contains only the common two-byte prefix.
+
+A successful INFO response contains these fields:
+
+| Size | Field |
+|------+-------|
+| 1 | Protocol version. |
+| 1 | Operation code =0=. |
+| 1 | Status =0=. |
+| 4 | Implementation-revision length. |
+| variable | The ASCII implementation revision. |
+| 4 | Build-runtime string length. |
+| variable | The UTF-8 build-runtime string. |
+
+** MATCH request
+
+The MATCH operation code is =1=.
+The request contains these fields:
+
+| Size | Field |
+|------+-------|
+| 1 | Protocol version =1=. |
+| 1 | Operation code =1=. |
+| 1 | Algorithm identifier. |
+| 1 | Scheme identifier. |
+| 1 | Match flags. |
+| 4 | Pattern length. |
+| 4 | Candidate length. |
+| variable | Pattern bytes. |
+| variable | Candidate bytes. |
+
+The algorithm identifiers have these values:
+
+| Value | Algorithm |
+|-------+-----------|
+| 0 | =FuzzyMatchV1= |
+| 1 | =FuzzyMatchV2= |
+| 2 | =ExactMatchNaive= |
+| 3 | =ExactMatchBoundary= |
+| 4 | =PrefixMatch= |
+| 5 | =SuffixMatch= |
+| 6 | =EqualMatch= |
+
+The scheme identifiers are =0= for default, =1= for path, and =2= for history.
+The request scheme must match the process scheme.
+
+The match flags use these bits:
+
+| Bit | Meaning |
+|-----+---------|
+| 0 | Use a case-sensitive match. |
+| 1 | Normalize the pattern and candidate. |
+| 2 | Search in the forward direction. |
+
+All other flag bits must be zero.
+The oracle converts a case-insensitive pattern to lowercase before the match.
+If bit 1 is set, the oracle also normalizes the pattern.
+These operations satisfy the upstream algorithm contract.
+
+A successful MATCH response contains these fields:
+
+| Size | Field |
+|------+-------|
+| 1 | Protocol version =1=. |
+| 1 | Operation code =1=. |
+| 1 | Status =0=. |
+| 1 | Membership. The value is =0= or =1=. |
+| 1 | Position presence. The value is =0= or =1=. |
+| 8 | Signed match-start index. |
+| 8 | Signed match-end index. |
+| 8 | Signed score. |
+| 4 | Position count. |
+| 8 each | Signed position indexes in ascending order. |
+
+Indexes count decoded Go code points, not UTF-8 bytes or grapheme clusters.
+Malformed UTF-8 bytes decode according to =utf8.DecodeRune= in Go.
+Different malformed bytes can therefore compare as the same replacement code point.
+
+The position-presence field distinguishes a nil upstream position list from an empty list.
+Some contiguous match algorithms return a nil list.
+Clients can derive those positions from the half-open match range.
+
+** Error response
+
+An error response contains these fields:
+
+| Size | Field |
+|------+-------|
+| 1 | Protocol version =1=. |
+| 1 | The request operation code. The fallback value is =255=. |
+| 1 | Status. The value is =1= for a bad request, =2= for an unsupported request, or =3= for an internal error. |
+| 4 | Error-string length. |
+| variable | The UTF-8 error string. |
+
+* Checks
+
+Run the complete sanitizer check from the repository root:
+
+#+begin_src sh
+make FZF_SOURCE=/path/to/fzf FUZZ_CC=clang fuzz-oracle-test-san
+#+end_src
+
+The Make target builds both persistent executables.
+It supplies the executable paths and the expected native revision to the checks.
+
+Run the oracle-only checks with this command:
+
+#+begin_src sh
+./fuzz/oracle/test.sh /path/to/fzf
+#+end_src
+
+The direct command skips native differential checks by default.
+
+The checks include a persistent two-request exchange and exact wire-byte comparisons.
+They also cover V2 alignment, nil positions, malformed UTF-8, bad requests, and frame limits.
+Each exchange has a five-second time limit.
+The process also has a five-second exit time limit.
+The checks compare two separate oracle builds for identical bytes.
+
+Set =FZF_NATIVE_ALGO_DRIVER= to the path of the native peer for differential checks.
+Also set =FZF_RAW_ORACLE_BINARY= and =FZF_NATIVE_EXPECTED_REVISION=.
+The matrix sends each request to both persistent executables.
+The native driver also accepts =--scheme=default=, =--scheme=path=, or
+=--scheme=history= and keeps that choice for its process lifetime.
+The checks compare Unicode results and full result matrices for all three
+scoring schemes.  An exhaustive lowercase audit checks all 1,488 mappings in
+the pinned Go tables in both pattern/candidate orientations through all seven
+raw algorithms.  Its 20,832 requests accept exactly 28 version differences in
+each of the 14 orientation/algorithm cells: U+A7CE, U+A7D2, U+A7D4, and
+U+16EA0--U+16EB8.  Any other difference, or any change to those counts, fails
+the audit.
+Named checks enforce scheme score and alignment parity.
+They also record normalization and malformed UTF-8 gaps.
+Delete each gap check after fzf-native gains parity for that case.
+
+Each raw result matrix runs 20,000 deterministic cases.
+It includes ASCII, valid Unicode, case folds, and V2 fallback boundaries.
+It rejects score, range, and semantic position differences.
+Use these variables to replay part of the matrix:
+
+| Variable | Default | Meaning |
+|----------+---------+---------|
+| =FZF_RAW_MATRIX_SEED= | =20260906= | Generator seed. |
+| =FZF_RAW_MATRIX_START= | =0= | First serial number. |
+| =FZF_RAW_MATRIX_CASES= | =20000= | Number of cases. |
+
+The result matrix treats an omitted contiguous position list as equal to the same materialized
+range because fzf-native returns positions for its highlighting API.
+The audit runs all selected cases before it reports the failure.
+The failure gives the first eight differences in a compact format.
+Use the reported serial number with =FZF_RAW_MATRIX_START= to run one case.
+
+The native normalization table contains all 556 mappings from the pinned source.
+Audit all source and target code points with this command:
+
+#+begin_src sh
+make FZF_SOURCE=/path/to/pinned/fzf fuzz-normalization-table-audit
+#+end_src
+
+To regenerate the include, run the audited generator directly:
+
+#+begin_src sh
+cd fuzz/oracle
+go run ./tableaudit -write /path/to/pinned/fzf/src/algo/normalize.go ../../fzf-normalize.inc
+#+end_src

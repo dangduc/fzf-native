@@ -4,7 +4,7 @@
 ;; Author: Duc Dang <me@dangduc.com>
 ;; Assisted-by: Claude:claude-opus-4-7
 ;; Assisted-by: Codex:gpt-5
-;; Version: 2.9
+;; Version: 3.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: matching
 ;; Homepage: https://github.com/dangduc/fzf-native
@@ -55,6 +55,7 @@
 (declare-function fzf-native-async-stats "fzf-native-module" (handle))
 (declare-function fzf-native-async-result-fresh-p "fzf-native-module" (handle query))
 (declare-function fzf-native-filter-only-p "fzf-native-module" (query-length pool-size))
+(declare-function fzf-native-abi-version "fzf-native-module" ())
 (declare-function fzf-native-session-abi-version "fzf-native-module" ())
 
 (defconst fzf-native--dyn-name "fzf-native-module"
@@ -67,8 +68,11 @@ Set by `fzf-native-load-dyn', `fzf-native-load-own-build-dyn', and
 points can call `fzf-native-ensure-loaded' to guarantee the module
 is available without tracking load state themselves.")
 
-(defconst fzf-native-session-abi-required 1
-  "Interactive-session ABI required by this version of fzf-native.el.")
+(defconst fzf-native-abi-required 2
+  "Native module ABI required by this version of fzf-native.el.")
+
+(defconst fzf-native-session-abi-required fzf-native-abi-required
+  "Compatibility name for `fzf-native-abi-required'.")
 
 (defun fzf-native--freebsd-target-p ()
   "Return non-nil when Emacs targets FreeBSD specifically.
@@ -86,24 +90,24 @@ FreeBSD module's libc and kernel ABI from the other BSD targets."
   (or (memq system-type '(darwin gnu/linux))
       (fzf-native--freebsd-target-p)))
 
-(defun fzf-native--verify-session-abi ()
-  "Fail if the loaded POSIX module has a stale session ABI.
-Windows modules retain batch-only support and do not implement the session
-entry points, so this handshake applies only where the native session API is
-available."
-  (when (fzf-native--session-platform-p)
-    (unless (fboundp 'fzf-native-session-abi-version)
-      (error (concat "Stale fzf-native module: interactive-session ABI "
-                     "entry point is missing (need ABI %d); rebuild or "
-                     "replace the bundled native module")
-             fzf-native-session-abi-required))
-    (let ((actual (fzf-native-session-abi-version)))
-      (unless (equal actual fzf-native-session-abi-required)
-        (error (concat "Incompatible fzf-native interactive-session ABI: "
-                       "module has %S, Elisp requires %d; rebuild or "
-                       "replace the bundled native module")
-               actual fzf-native-session-abi-required))))
+(defun fzf-native--verify-abi ()
+  "Fail if the loaded native module has a stale public ABI."
+  (unless (fboundp 'fzf-native-abi-version)
+    (error (concat "Stale fzf-native module: ABI entry point is missing "
+                   "(need ABI %d); rebuild or replace the bundled native "
+                   "module")
+           fzf-native-abi-required))
+  (let ((actual (fzf-native-abi-version)))
+    (unless (equal actual fzf-native-abi-required)
+      (error (concat "Incompatible fzf-native ABI: module has %S, Elisp "
+                     "requires %d; rebuild or replace the bundled native "
+                     "module")
+             actual fzf-native-abi-required)))
   t)
+
+(defun fzf-native--verify-session-abi ()
+  "Compatibility wrapper for `fzf-native--verify-abi'."
+  (fzf-native--verify-abi))
 
 (defun fzf-native--verify-initialized-module ()
   "Verify the initialized module, or report the required safe recovery.
@@ -111,9 +115,9 @@ available."
 Emacs does not unload a dynamic module when its feature is removed.  Loading a
 second ABI over live user pointers and worker callbacks is unsafe.  Therefore,
 after an incompatible initializer has run, recovery requires replacing or
-rebuilding the artifact and restarting Emacs."
+  rebuilding the artifact and restarting Emacs."
   (condition-case err
-      (fzf-native--verify-session-abi)
+      (fzf-native--verify-abi)
     (error
      (setq fzf-native-loaded nil)
      (error (concat "%s.  The incompatible native module is already loaded "
@@ -149,6 +153,20 @@ confirmation before compiling."
 ;; explicit dynamic bindings at fzfa-owned call sites (timer-driven,
 ;; cross-buffer).
 
+(defcustom fzf-native-score-scheme 'default
+  "Scoring scheme used by native matching and highlighting.
+default  Prefer word starts after whitespace and common delimiters.
+path     Prefer path components.  Slash is a delimiter on every host;
+         backslash is also a delimiter on Windows.
+history  Give all word boundaries the same weight.
+
+The module reads this value for each matching or highlighting call.
+A scheme change creates a distinct asynchronous request and cache identity."
+  :type '(choice (const :tag "Default" default)
+                 (const :tag "Path" path)
+                 (const :tag "History" history))
+  :group 'fzf-native)
+
 (defcustom fzf-native-case-mode 'smart
   "How fzf-native treats letter case when matching queries.
 smart    Case-insensitive when the query is all lowercase; case-sensitive
@@ -173,6 +191,32 @@ If nil, prefixing a term with ' switches that term to fuzzy matching.
 
 Read at the start of every scoring call."
   :type 'boolean
+  :group 'fzf-native)
+
+(defcustom fzf-native-normalize t
+  "Whether to normalize Latin characters when matching.
+When non-nil, matching follows fzf's Latin normalization table.  For
+example, the query `cafe' can match `café'.
+
+Set this option to nil for the behavior of fzf's `--literal' option.
+
+The module reads this value for each matching or highlighting call.
+A value change creates a distinct asynchronous request and cache identity."
+  :type 'boolean
+  :group 'fzf-native)
+
+(defcustom fzf-native-search-direction 'auto
+  "Direction used to select among equally ranked match occurrences.
+`auto' uses backward matching for the `path' score scheme and forward
+matching for the `default' and `history' schemes.  This is fzf's behavior.
+`forward' selects the earlier occurrence.  `backward' selects the later one.
+
+The module reads this value for each matching or highlighting call.
+A resolved direction change creates a distinct asynchronous request and cache
+identity."
+  :type '(choice (const :tag "Match score scheme" auto)
+                 (const :tag "Forward" forward)
+                 (const :tag "Backward" backward))
   :group 'fzf-native)
 
 (defcustom fzf-native-batch-highlight 25
@@ -251,6 +295,10 @@ Signature: (CAND POSITIONS) → ignored.
   POSITIONS  Vector of alternating character-offset start/end pairs
              describing contiguous fzf match runs:
                [s0 e0 s1 e1 …]
+             An empty vector means there are no positive highlight positions.
+             It does not encode match membership: an inverse-only match and a
+             genuine miss both produce [].  Handlers can use it to remove
+             state from an earlier match.
 
 Set to nil to suppress highlight application entirely (scoring still
 happens).  Let-binding around a call swaps policy for that call.
@@ -544,10 +592,12 @@ restart-required error.  Replacing a loaded dynamic module in place is unsafe."
 ;;;###autoload
 (defun fzf-native-ensure-loaded ()
   "Load the fzf-native dynamic module if it isn't loaded yet.
-Calls `fzf-native-load-dyn' on first use and is a no-op on
-subsequent calls.  Intended for library code that needs the C
-entry points available before invoking them."
-  (unless fzf-native-loaded
+Calls `fzf-native-load-dyn' on first use.  Subsequent calls verify
+that the loaded module still has the ABI required by this Elisp.
+Intended for library code that needs the C entry points available
+before invoking them."
+  (if fzf-native-loaded
+      (fzf-native--verify-initialized-module)
     (fzf-native-load-dyn)))
 
 (provide 'fzf-native)

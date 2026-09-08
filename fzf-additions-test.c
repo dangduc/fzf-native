@@ -100,6 +100,57 @@ static void test_exact_no_match(void) {
                   CaseIgnore, true, false);
 }
 
+static void test_pinned_fzf_exact_boundary(void) {
+  const char *matching[] = {
+      "xyz", "/xyz/", "-xyz-", "_xyz_", "x xyz y"};
+  for (size_t i = 0; i < sizeof matching / sizeof matching[0]; i++) {
+    check_agreement("paired quote boundary fuzzy", matching[i], "'xyz'",
+                    CaseRespect, true, true);
+    check_agreement("paired quote boundary exact", matching[i], "'xyz'",
+                    CaseRespect, false, true);
+  }
+  check_agreement("paired quote rejects word neighbors", "xxyzx", "'xyz'",
+                  CaseRespect, true, false);
+  check_agreement("paired quote inverse rejects", "/xyz/", "!'xyz'",
+                  CaseRespect, true, false);
+  check_agreement("paired quote inverse keeps", "xxyzx", "!'xyz'",
+                  CaseRespect, true, true);
+  check_agreement("paired quote before suffix", "/xyz/", "'xyz'$",
+                  CaseRespect, true, true);
+  check_agreement("two quotes are literal", "'", "''",
+                  CaseRespect, true, true);
+  check_agreement("three quotes bound literal", "-'_", "'''",
+                  CaseRespect, true, true);
+  check_agreement("paired quote escaped space", "-foo bar-", "'foo\\ bar'",
+                  CaseRespect, true, true);
+  check_agreement("unicode delimiter boundary", "界/组件-界", "'组件'",
+                  CaseRespect, true, true);
+  check_agreement("unicode word neighbor rejects", "界组件界", "'组件'",
+                  CaseRespect, true, false);
+
+  fzf_string_t query = {.data = "xyz", .size = 3};
+  fzf_string_t plain = {.data = "xyz", .size = 3};
+  fzf_string_t slash = {.data = "/xyz/", .size = 5};
+  fzf_string_t dash = {.data = "-xyz-", .size = 5};
+  fzf_string_t underscore = {.data = "_xyz_", .size = 5};
+  fzf_result_t plain_result = fzf_exact_match_boundary(
+      true, false, &plain, &query, NULL, NULL);
+  fzf_result_t slash_result = fzf_exact_match_boundary(
+      true, false, &slash, &query, NULL, NULL);
+  fzf_result_t dash_result = fzf_exact_match_boundary(
+      true, false, &dash, &query, NULL, NULL);
+  fzf_result_t underscore_result = fzf_exact_match_boundary(
+      true, false, &underscore, &query, NULL, NULL);
+  CHECK(plain_result.start == 0 && plain_result.end == 3);
+  CHECK(slash_result.start == 1 && slash_result.end == 4);
+  CHECK(dash_result.start == 1 && dash_result.end == 4);
+  CHECK(underscore_result.start == 1 && underscore_result.end == 4);
+  CHECK(plain_result.score > 0);
+  CHECK(slash_result.score > 0);
+  CHECK(dash_result.score > 0);
+  CHECK(dash_result.score > underscore_result.score);
+}
+
 static void test_prefix_match(void) {
   check_agreement("prefix ^pat", "fzf-native", "^fzf",
                   CaseIgnore, true, true);
@@ -140,6 +191,68 @@ static void test_equal_no_match_different_string(void) {
                   CaseIgnore, true, false);
 }
 
+static void test_equal_preserves_pattern_edge_whitespace(void) {
+  fzf_string_t ascii_text = {.data = "- ", .size = 2};
+  fzf_string_t ascii_pattern = {.data = "- ", .size = 2};
+  fzf_result_t ascii = fzf_equal_match(
+      false, false, &ascii_text, &ascii_pattern, NULL, NULL);
+  CHECK(ascii.start == 0);
+  CHECK(ascii.end == 2);
+  CHECK(ascii.score > 0);
+
+  fzf_string_t ascii_leading_text = {.data = " -", .size = 2};
+  fzf_string_t ascii_leading_pattern = {.data = " -", .size = 2};
+  fzf_result_t ascii_leading = fzf_equal_match(
+      false, false, &ascii_leading_text, &ascii_leading_pattern, NULL, NULL);
+  CHECK(ascii_leading.start == 0);
+  CHECK(ascii_leading.end == 2);
+  CHECK(ascii_leading.score > 0);
+
+  fzf_string_t space_text = {.data = " ", .size = 1};
+  fzf_string_t space_pattern = {.data = " ", .size = 1};
+  fzf_result_t space = fzf_equal_match(
+      false, false, &space_text, &space_pattern, NULL, NULL);
+  CHECK(space.start == 0);
+  CHECK(space.end == 1);
+  CHECK(space.score > 0);
+
+  fzf_string_t utf8_text = {.data = "你 ", .size = strlen("你 ")};
+  fzf_string_t utf8_pattern = {.data = "你 ", .size = strlen("你 ")};
+  fzf_result_t utf8 = fzf_equal_match_utf8(
+      false, false, &utf8_text, &utf8_pattern, NULL, NULL);
+  CHECK(utf8.start == 0);
+  CHECK(utf8.end == 2);
+  CHECK(utf8.score > 0);
+
+  fzf_string_t utf8_leading_text = {
+      .data = " 你", .size = strlen(" 你")};
+  fzf_string_t utf8_leading_pattern = {
+      .data = " 你", .size = strlen(" 你")};
+  fzf_result_t utf8_leading = fzf_equal_match_utf8(
+      false, false, &utf8_leading_text, &utf8_leading_pattern, NULL, NULL);
+  CHECK(utf8_leading.start == 0);
+  CHECK(utf8_leading.end == 2);
+  CHECK(utf8_leading.score > 0);
+}
+
+static void test_parsed_equal_preserves_escaped_edge_whitespace(void) {
+  /* Exercise the public parser and both fuzzy settings.  In either mode the
+     two anchors select EqualMatch; escaped spaces belong to the term and must
+     not be trimmed from the candidate before the cheap membership check. */
+  check_agreement("fuzzy equal escaped leading space", " -", "^\\ -$",
+                  CaseRespect, true, true);
+  check_agreement("fuzzy equal escaped trailing space", "- ", "^-\\ $",
+                  CaseRespect, true, true);
+  check_agreement("fuzzy equal escaped single space", " ", "^\\ $",
+                  CaseRespect, true, true);
+  check_agreement("exact equal escaped leading space", " -", "^\\ -$",
+                  CaseRespect, false, true);
+  check_agreement("exact equal escaped trailing space", "- ", "^-\\ $",
+                  CaseRespect, false, true);
+  check_agreement("exact equal escaped single space", " ", "^\\ $",
+                  CaseRespect, false, true);
+}
+
 static void test_negation_term_excludes(void) {
   /* "foo !bar" — must contain foo AND must NOT contain bar. */
   check_agreement("negation excludes", "src/foobar.c", "foo !bar",
@@ -169,6 +282,36 @@ static void test_or_satisfied_only_by_inverse_term(void) {
                   CaseRespect, false, true);
   check_agreement("OR inverse branch with text", "quux", "!foo | bar",
                   CaseIgnore, true, true);
+}
+
+static void test_inverse_only_or_is_not_sortable(void) {
+  char inverse_or_query[] = "!z | !q";
+  fzf_pattern_t *inverse_or = fzf_parse_pattern(
+      CaseRespect, false, inverse_or_query, true);
+  char singleton_query[] = "!z";
+  fzf_pattern_t *singleton = fzf_parse_pattern(
+      CaseRespect, false, singleton_query, true);
+  char mixed_query[] = "foo | !q";
+  fzf_pattern_t *mixed = fzf_parse_pattern(
+      CaseRespect, false, mixed_query, true);
+  CHECK(inverse_or != NULL);
+  CHECK(singleton != NULL);
+  CHECK(mixed != NULL);
+  if (inverse_or) {
+    CHECK(!inverse_or->only_inv);
+    CHECK(!inverse_or->has_positive_term);
+  }
+  if (singleton) {
+    CHECK(singleton->only_inv);
+    CHECK(!singleton->has_positive_term);
+  }
+  if (mixed) {
+    CHECK(!mixed->only_inv);
+    CHECK(mixed->has_positive_term);
+  }
+  fzf_free_pattern(mixed);
+  fzf_free_pattern(singleton);
+  fzf_free_pattern(inverse_or);
 }
 
 static void test_small_slab_long_gap_preserves_match(void) {
@@ -276,6 +419,15 @@ static void test_utf8_terms(void) {
      transformed pattern length under ASan/UBSan. */
   check_agreement("utf8 shrinking case-fold", "k", "K", CaseIgnore, true, true);
   check_agreement("utf8 shrinking candidate-fold", "K", "k", CaseIgnore, true, true);
+  /* V2 mirrors unicode.IsUpper rather than lowercasing every rune that has a
+     simple lowercase mapping.  U+01C5 is titlecase and U+2160 is a number, so
+     neither candidate folds; the Lu counterpart U+01C4 still must fold. */
+  check_agreement("utf8 v2 titlecase does not fold", "ǅ", "ǆ",
+                  CaseIgnore, true, false);
+  check_agreement("utf8 v2 cased number does not fold", "Ⅰ", "ⅰ",
+                  CaseIgnore, true, false);
+  check_agreement("utf8 v2 uppercase still folds", "Ǆ", "ǆ",
+                  CaseIgnore, true, true);
   /* U+023A LATIN CAPITAL LETTER A WITH STROKE lowercases to U+2C65.
      The candidate encoding is two bytes and the folded pattern encoding is
      three, so byte-count feasibility guards incorrectly reject a match. */
@@ -483,6 +635,294 @@ static void test_utf8_char_map_scratch_reuse_and_cap(void) {
   fzf_free_slab(slab);
 }
 
+static int32_t fuzzy_score_with_slab(const char *candidate, fzf_slab_t *slab) {
+  fzf_string_t text = {.data = candidate, .size = strlen(candidate)};
+  fzf_string_t pattern = {.data = "fzf", .size = 3};
+  fzf_position_t *positions = fzf_pos_array(0);
+  CHECK(positions != NULL);
+  if (!positions) {
+    fzf_free_positions(positions);
+    return -1;
+  }
+  fzf_result_t result = fzf_fuzzy_match_v2(
+      true, false, &text, &pattern, positions, slab);
+  fzf_free_positions(positions);
+  return result.score;
+}
+
+static void test_default_score_distinguishes_boundaries(void) {
+  fzf_slab_t *slab = fzf_make_default_slab();
+  CHECK(slab != NULL);
+  if (!slab) return;
+  /* Pinned fzf gives a larger boundary bonus to whitespace and a distinct
+     bonus to delimiters. */
+  CHECK(fuzzy_score_with_slab("src/fzf", slab) == 84);
+  CHECK(fuzzy_score_with_slab(":fzf", slab) == 84);
+  CHECK(fuzzy_score_with_slab(" fzf", slab) == 88);
+  CHECK(fuzzy_score_with_slab("_fzf", slab) == 80);
+  fzf_free_slab(slab);
+}
+
+static void test_score_schemes_are_slab_local(void) {
+  fzf_slab_t *default_slab = fzf_make_default_slab();
+  fzf_slab_t *path_slab = fzf_make_default_slab();
+  fzf_slab_t *history_slab = fzf_make_default_slab();
+  CHECK(default_slab != NULL);
+  CHECK(path_slab != NULL);
+  CHECK(history_slab != NULL);
+  if (!default_slab || !path_slab || !history_slab) goto done;
+
+  CHECK(fzf_slab_set_score_scheme(path_slab, FZF_SCORE_SCHEME_PATH));
+  CHECK(fzf_slab_set_score_scheme(history_slab, FZF_SCORE_SCHEME_HISTORY));
+  CHECK(!fzf_slab_set_score_scheme(NULL, FZF_SCORE_SCHEME_DEFAULT));
+  CHECK(!fzf_slab_set_score_scheme(default_slab,
+                                   (fzf_score_scheme_t)99));
+
+  CHECK(fuzzy_score_with_slab("src/fzf", default_slab) == 84);
+  CHECK(fuzzy_score_with_slab("src\\fzf", default_slab) == 80);
+  CHECK(fuzzy_score_with_slab("src/fzf", path_slab) == 84);
+#if defined(_WIN32) || defined(FZF_TEST_WINDOWS_PATH_SCORING)
+  CHECK(fuzzy_score_with_slab("src\\fzf", path_slab) ==
+        fuzzy_score_with_slab("src/fzf", path_slab));
+#else
+  CHECK(fuzzy_score_with_slab("src\\fzf", path_slab) == 80);
+#endif
+  CHECK(fuzzy_score_with_slab("src/fzf", history_slab) == 80);
+  CHECK(fuzzy_score_with_slab(":fzf", default_slab) == 84);
+  CHECK(fuzzy_score_with_slab(":fzf", path_slab) == 80);
+  CHECK(fuzzy_score_with_slab(":fzf", history_slab) == 80);
+  CHECK(fuzzy_score_with_slab(" fzf", default_slab) == 88);
+  CHECK(fuzzy_score_with_slab(" fzf", path_slab) == 80);
+  CHECK(fuzzy_score_with_slab(" fzf", history_slab) == 80);
+
+done:
+  fzf_free_slab(default_slab);
+  fzf_free_slab(path_slab);
+  fzf_free_slab(history_slab);
+}
+
+static void test_utf8_empty_suffix_trims_trailing_whitespace(void) {
+  const char *candidate = "σa你 " "\xe2\x80\x83"; /* U+2003 EM SPACE */
+  fzf_string_t text = {.data = candidate, .size = strlen(candidate)};
+  fzf_string_t pattern = {.data = "", .size = 0};
+  fzf_slab_t *slab = fzf_make_default_slab();
+  fzf_position_t *positions = fzf_pos_array(0);
+  CHECK(slab != NULL);
+  CHECK(positions != NULL);
+  if (!slab || !positions) goto done;
+
+  fzf_result_t result =
+      fzf_suffix_match_utf8(true, false, &text, &pattern, positions, slab);
+  CHECK(result.start == 3);
+  CHECK(result.end == 3);
+  CHECK(result.score == 0);
+  CHECK(positions->size == 0);
+
+done:
+  fzf_free_positions(positions);
+  fzf_free_slab(slab);
+}
+
+static void check_normalized_algorithm(fzf_algo_t algorithm,
+                                       const char *candidate,
+                                       const char *query) {
+  fzf_string_t text = {.data = candidate, .size = strlen(candidate)};
+  fzf_string_t pattern = {.data = query, .size = strlen(query)};
+  fzf_position_t *positions = fzf_pos_array(0);
+  fzf_slab_t *slab = fzf_make_default_slab();
+  CHECK(positions != NULL);
+  CHECK(slab != NULL);
+  if (positions && slab) {
+    fzf_result_t plain = algorithm(
+        true, false, &text, &pattern, positions, slab);
+    positions->size = 0;
+    fzf_result_t normalized = algorithm(
+        true, true, &text, &pattern, positions, slab);
+    CHECK(plain.start < 0);
+    CHECK(normalized.start >= 0);
+    CHECK(normalized.end > normalized.start);
+  }
+  fzf_free_slab(slab);
+  fzf_free_positions(positions);
+}
+
+static void test_pinned_fzf_latin_normalization(void) {
+  check_normalized_algorithm(fzf_fuzzy_match_v1_utf8, "café", "cafe");
+  check_normalized_algorithm(fzf_fuzzy_match_v2_utf8, "café", "cafe");
+  check_normalized_algorithm(fzf_exact_match_utf8, "café", "cafe");
+  check_normalized_algorithm(fzf_prefix_match_utf8, "éclair", "ecl");
+  check_normalized_algorithm(fzf_suffix_match_utf8, "cafÉ", "cafE");
+  check_normalized_algorithm(fzf_equal_match_utf8, "ＦＺＦ", "FZF");
+  check_normalized_algorithm(fzf_exact_match_utf8, "ɐ", "a");
+  check_normalized_algorithm(fzf_exact_match_utf8, "Ấ", "A");
+  check_normalized_algorithm(fzf_exact_match_utf8, "Ờ", "O");
+  check_normalized_algorithm(fzf_exact_match_utf8, "ự", "u");
+
+  char normalized_query[] = "cafe";
+  fzf_pattern_t *normalized = fzf_parse_pattern(
+      CaseRespect, true, normalized_query, true);
+  char plain_query[] = "cafe";
+  fzf_pattern_t *plain = fzf_parse_pattern(
+      CaseRespect, false, plain_query, true);
+  fzf_slab_t *slab = fzf_make_default_slab();
+  CHECK(normalized != NULL);
+  CHECK(plain != NULL);
+  CHECK(slab != NULL);
+  if (normalized && plain && slab) {
+    CHECK(normalized->ptr[0]->ptr[0].normalize);
+    CHECK(!plain->ptr[0]->ptr[0].normalize);
+    CHECK(fzf_get_score("café", normalized, slab) > 0);
+    CHECK(fzf_has_match("café", normalized, slab));
+    CHECK(fzf_get_score("café", plain, slab) == 0);
+    CHECK(!fzf_has_match("café", plain, slab));
+  }
+  fzf_free_slab(slab);
+  fzf_free_pattern(plain);
+  fzf_free_pattern(normalized);
+
+  char accented_query[] = "Ờ";
+  fzf_pattern_t *accented = fzf_parse_pattern(
+      CaseRespect, true, accented_query, true);
+  slab = fzf_make_default_slab();
+  CHECK(accented != NULL);
+  CHECK(slab != NULL);
+  if (accented && slab) {
+    CHECK(!accented->ptr[0]->ptr[0].normalize);
+    CHECK(fzf_get_score("O", accented, slab) == 0);
+    CHECK(fzf_get_score("Ờ", accented, slab) > 0);
+    CHECK(fzf_get_score("Ổ", accented, slab) == 0);
+    CHECK(!fzf_has_match("O", accented, slab));
+    CHECK(fzf_has_match("Ờ", accented, slab));
+    CHECK(!fzf_has_match("Ổ", accented, slab));
+  }
+  fzf_free_slab(slab);
+  fzf_free_pattern(accented);
+
+  char uppercase_query[] = "Ā";
+  fzf_pattern_t *uppercase = fzf_parse_pattern(
+      CaseRespect, true, uppercase_query, true);
+  slab = fzf_make_default_slab();
+  CHECK(uppercase != NULL);
+  CHECK(slab != NULL);
+  if (uppercase && slab) {
+    CHECK(!uppercase->ptr[0]->ptr[0].normalize);
+    CHECK(fzf_get_score("A", uppercase, slab) == 0);
+    CHECK(fzf_get_score("Ā", uppercase, slab) > 0);
+    CHECK(fzf_get_score("ā", uppercase, slab) == 0);
+  }
+  fzf_free_slab(slab);
+  fzf_free_pattern(uppercase);
+}
+
+static void test_pinned_fzf_backward_direction(void) {
+  fzf_string_t ascii_text = {.data = "ab/ab", .size = 5};
+  fzf_string_t ascii_v2_text = {.data = "-ab-ab-", .size = 7};
+  fzf_string_t ascii_pattern = {.data = "ab", .size = 2};
+  fzf_string_t ascii_boundary_text = {.data = "/ab/ab/", .size = 7};
+  fzf_position_t *positions = fzf_pos_array(0);
+  fzf_result_t result;
+  CHECK(positions != NULL);
+  if (!positions) return;
+
+  result = fzf_fuzzy_match_v1_with_direction(
+      true, false, true, &ascii_text, &ascii_pattern, NULL, NULL);
+  CHECK(result.start == 0 && result.end == 2 && result.score > 0);
+  result = fzf_fuzzy_match_v1_with_direction(
+      true, false, false, &ascii_text, &ascii_pattern, NULL, NULL);
+  CHECK(result.start == 3 && result.end == 5 && result.score > 0);
+
+  result = fzf_fuzzy_match_v2_with_direction(
+      true, false, true, &ascii_v2_text, &ascii_pattern, positions, NULL);
+  CHECK(result.start == 1 && result.end == 3 && result.score > 0);
+  positions->size = 0;
+  result = fzf_fuzzy_match_v2_with_direction(
+      true, false, false, &ascii_v2_text, &ascii_pattern, positions, NULL);
+  CHECK(result.start == 4 && result.end == 6 && result.score > 0);
+
+  result = fzf_exact_match_naive_with_direction(
+      true, false, true, &ascii_text, &ascii_pattern, NULL, NULL);
+  CHECK(result.start == 0 && result.end == 2 && result.score > 0);
+  result = fzf_exact_match_naive_with_direction(
+      true, false, false, &ascii_text, &ascii_pattern, NULL, NULL);
+  CHECK(result.start == 3 && result.end == 5 && result.score > 0);
+
+  result = fzf_exact_match_boundary_with_direction(
+      true, false, true, &ascii_boundary_text, &ascii_pattern, NULL, NULL);
+  CHECK(result.start == 1 && result.end == 3 && result.score > 0);
+  result = fzf_exact_match_boundary_with_direction(
+      true, false, false, &ascii_boundary_text, &ascii_pattern, NULL, NULL);
+  CHECK(result.start == 4 && result.end == 6 && result.score > 0);
+
+  fzf_string_t utf8_text = {
+      .data = "组件/组件", .size = strlen("组件/组件")};
+  fzf_string_t utf8_pattern = {.data = "组件", .size = strlen("组件")};
+  fzf_string_t utf8_v2_text = {
+      .data = "-组件-组件-", .size = strlen("-组件-组件-")};
+  fzf_string_t utf8_boundary_text = {
+      .data = "/组件/组件/", .size = strlen("/组件/组件/")};
+
+  result = fzf_fuzzy_match_v1_utf8_with_direction(
+      true, false, false, &utf8_text, &utf8_pattern, NULL, NULL);
+  CHECK(result.start == 3 && result.end == 5 && result.score > 0);
+  positions->size = 0;
+  result = fzf_fuzzy_match_v2_utf8_with_direction(
+      true, false, false, &utf8_v2_text, &utf8_pattern, positions, NULL);
+  CHECK(result.start == 4 && result.end == 6 && result.score > 0);
+  result = fzf_exact_match_utf8_with_direction(
+      true, false, false, &utf8_text, &utf8_pattern, NULL, NULL);
+  CHECK(result.start == 3 && result.end == 5 && result.score > 0);
+  result = fzf_exact_match_boundary_utf8_with_direction(
+      true, false, false, &utf8_boundary_text, &utf8_pattern, NULL, NULL);
+  CHECK(result.start == 4 && result.end == 6 && result.score > 0);
+
+  fzf_string_t normalized_text = {
+      .data = "café/café", .size = strlen("café/café")};
+  fzf_string_t normalized_pattern = {.data = "cafe", .size = 4};
+  result = fzf_fuzzy_match_v1_utf8_with_direction(
+      true, true, false, &normalized_text, &normalized_pattern, NULL, NULL);
+  CHECK(result.start == 5 && result.end == 9 && result.score > 0);
+
+  fzf_result_t legacy = fzf_fuzzy_match_v2(
+      true, false, &ascii_text, &ascii_pattern, NULL, NULL);
+  fzf_result_t explicit_forward = fzf_fuzzy_match_v2_with_direction(
+      true, false, true, &ascii_text, &ascii_pattern, NULL, NULL);
+  CHECK(legacy.start == explicit_forward.start);
+  CHECK(legacy.end == explicit_forward.end);
+  CHECK(legacy.score == explicit_forward.score);
+
+  char forward_query[] = "ab";
+  char backward_query[] = "ab";
+  fzf_pattern_t *forward_pattern = fzf_parse_pattern_with_direction(
+      CaseRespect, false, forward_query, true, true);
+  fzf_pattern_t *backward_pattern = fzf_parse_pattern_with_direction(
+      CaseRespect, false, backward_query, true, false);
+  CHECK(forward_pattern != NULL);
+  CHECK(backward_pattern != NULL);
+  if (forward_pattern && backward_pattern) {
+    CHECK(forward_pattern->forward);
+    CHECK(!backward_pattern->forward);
+    positions->size = 0;
+    CHECK(fzf_get_score("-ab-ab-", forward_pattern, NULL) > 0);
+    fzf_position_t *forward_positions = fzf_get_positions(
+        "-ab-ab-", forward_pattern, NULL);
+    fzf_position_t *backward_positions = fzf_get_positions(
+        "-ab-ab-", backward_pattern, NULL);
+    CHECK(forward_positions != NULL && forward_positions->size == 2);
+    CHECK(backward_positions != NULL && backward_positions->size == 2);
+    if (forward_positions && forward_positions->size == 2)
+      CHECK(forward_positions->data[0] == 2 &&
+            forward_positions->data[1] == 1);
+    if (backward_positions && backward_positions->size == 2)
+      CHECK(backward_positions->data[0] == 5 &&
+            backward_positions->data[1] == 4);
+    fzf_free_positions(forward_positions);
+    fzf_free_positions(backward_positions);
+  }
+  fzf_free_pattern(forward_pattern);
+  fzf_free_pattern(backward_pattern);
+  fzf_free_positions(positions);
+}
+
 int main(void) {
   printf("--- fzf-additions: fzf_has_match ---\n");
   RUN(test_fuzzy_basic_match);
@@ -491,6 +931,7 @@ int main(void) {
   RUN(test_fuzzy_pattern_longer_than_text);
   RUN(test_exact_match);
   RUN(test_exact_no_match);
+  RUN(test_pinned_fzf_exact_boundary);
   RUN(test_prefix_match);
   RUN(test_prefix_no_match);
   RUN(test_suffix_match);
@@ -498,10 +939,13 @@ int main(void) {
   RUN(test_anchored_matches_trim_candidate_whitespace);
   RUN(test_equal_match);
   RUN(test_equal_no_match_different_string);
+  RUN(test_equal_preserves_pattern_edge_whitespace);
+  RUN(test_parsed_equal_preserves_escaped_edge_whitespace);
   RUN(test_negation_term_excludes);
   RUN(test_and_across_term_sets);
   RUN(test_or_within_term_set);
   RUN(test_or_satisfied_only_by_inverse_term);
+  RUN(test_inverse_only_or_is_not_sortable);
   RUN(test_small_slab_long_gap_preserves_match);
   RUN(test_small_slab_inverse_long_gap_preserves_membership);
   RUN(test_utf8_v1_reverse_scan_tightens_match);
@@ -519,6 +963,11 @@ int main(void) {
   RUN(test_invalid_utf8_fuzzy_fallback_returns_positions);
   RUN(test_slab_allocation_failure_is_reported);
   RUN(test_utf8_char_map_scratch_reuse_and_cap);
+  RUN(test_default_score_distinguishes_boundaries);
+  RUN(test_score_schemes_are_slab_local);
+  RUN(test_utf8_empty_suffix_trims_trailing_whitespace);
+  RUN(test_pinned_fzf_latin_normalization);
+  RUN(test_pinned_fzf_backward_direction);
 
   if (failed == 0) {
     printf("\nAll fzf-additions tests passed.\n");

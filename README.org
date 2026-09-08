@@ -144,6 +144,8 @@ Use it after =:snapshot-generation= changes.
 
 The =:result-request-id= field owns the retained list.
 The =:stale= field is non-nil for another request or an older pool boundary.
+The =:score-scheme= field identifies the scheme for the retained list.
+The =:normalize= and =:search-direction= fields identify its matching policy.
 
 The =:state= field is =queued=, =running=, =complete=, =failed=, =superseded=, =idle=, or =unknown=.
 The progress fields describe the inspected request, not the retained result.
@@ -157,8 +159,9 @@ The session coalesces growth events and retries the same request ID.
 All sessions share one lazy process-wide worker pool.
 Query updates do not start a new producer or create new scoring threads.
 
-On POSIX platforms, =fzf-native.el= checks =fzf-native-session-abi-version= during module loading.
+On every platform, =fzf-native.el= checks =fzf-native-abi-version= during module loading.
 A stale module fails with a rebuild and restart instruction.
+This release needs ABI 2 artifacts for every supported platform.
 
 =fzf-native-async-candidates= remains the combined compatibility API.
 New integrations need the request-aware API for exact result ownership.
@@ -172,8 +175,11 @@ Set the higher-level package option unless your code calls fzf-native directly.
 
 | Variable | Default | Read point | Purpose |
 |----------+---------+------------+---------|
+| =fzf-native-score-scheme= | =default= | Each match, score, or highlight call | Select =default=, =path=, or =history= bonuses. |
 | =fzf-native-case-mode= | =smart= | Every scoring request | Select smart, ignored, or respected case. |
 | =fzf-native-fuzzy= | t | Every scoring request | Select fuzzy or exact default matching. |
+| =fzf-native-normalize= | t | Every scoring request | Use fzf Latin normalization.  Nil matches fzf =--literal=. |
+| =fzf-native-search-direction= | =auto= | Every scoring request | Use backward search for =path= and forward search for other schemes. |
 | =fzf-native-batch-highlight= | 25 | Every synchronous score call | Limit synchronous highlighting. |
 | =fzf-native-async-highlight= | 200 | Every asynchronous candidate build | Limit session-result highlighting. |
 | =fzf-native-highlight-fn= | default function | Every highlight operation | Apply match ranges to one string. |
@@ -184,6 +190,25 @@ Set the higher-level package option unless your code calls fzf-native directly.
 | =fzf-native-filter-only-min-pool= | 10,000,000 | Session start or each batch call | Set the pool-size filter-only trigger. |
 | =fzf-native-filter-only-length= | nil | Every scoring request | Set the query-length filter-only trigger. |
 | =fzf-native-filter-only-logic= | =or= | Every scoring request | Combine enabled filter-only triggers. |
+
+The =default= scheme gives the largest bonus to a match after whitespace.
+The =path= scheme gives the largest bonus to a match after a slash on every
+host and after a backslash on Windows.
+The =history= scheme gives equal bonuses to whitespace and delimiters.
+
+The default scheme ranks by score, trimmed character length, and producer order.
+The path scheme also ranks by the distance from the last slash or backslash.
+The history scheme ranks by score and producer order.
+
+Normalization is directional, as it is in fzf.
+For example, =e= can match =é=, but =é= remains a literal query.
+
+The scheme, normalization setting, and resolved direction are request identities.
+They are also part of both cache identities.
+Thus, one query can keep separate cached results for each matching policy.
+
+An fzfa integration must bind all three options at each native call site.
+It must also include their effective values in its asynchronous request key.
 
 *** Filter-only mode
 

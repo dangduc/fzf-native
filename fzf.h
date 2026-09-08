@@ -38,12 +38,31 @@ typedef struct {
   int32_t score;
 } fzf_result_t;
 
+/* Aggregate positive-term bounds for fzf result ranking.  Inverse-only and
+   empty patterns have no valid bounds. */
+typedef struct {
+  int32_t min_begin;
+  int32_t min_end;
+  int32_t max_end;
+  int64_t raw_score;
+  bool valid;
+} fzf_score_bounds_t;
+
+typedef enum {
+  FZF_SCORE_SCHEME_DEFAULT = 0,
+  FZF_SCORE_SCHEME_PATH,
+  FZF_SCORE_SCHEME_HISTORY,
+} fzf_score_scheme_t;
+
 typedef struct {
   fzf_i16_t I16;
   fzf_i32_t I32;
   /* Thread-confined high-water scratch.  As with I16/I32, a slab must not be
      used by overlapping scoring calls; fzf_free_slab owns its allocation. */
   utf8_char_map_scratch_t UTF8;
+  /* Scoring configuration is slab-local, like the scratch space.  This lets
+     independent callers use different schemes in one process. */
+  fzf_score_scheme_t score_scheme;
 } fzf_slab_t;
 
 typedef struct {
@@ -74,6 +93,7 @@ typedef struct {
   char *ptr;
   void *text;
   bool case_sensitive;
+  bool normalize;
 } fzf_term_t;
 
 typedef struct {
@@ -87,6 +107,12 @@ typedef struct {
   size_t size;
   size_t cap;
   bool only_inv;
+  /* True when at least one term contributes a positive match score.
+     fzf preserves producer order when every term is inverse, including OR. */
+  bool has_positive_term;
+  /* fzf's match-scan direction.  Parsed patterns carry this setting so every
+     scorer and position query applies one immutable request policy. */
+  bool forward;
 } fzf_pattern_t;
 
 /* Scoring APIs use ordinary match/no-match return values, so allocation
@@ -99,12 +125,29 @@ bool fzf_allocation_failed(void);
 fzf_result_t fzf_fuzzy_match_v1(bool case_sensitive, bool normalize,
                                 fzf_string_t *text, fzf_string_t *pattern,
                                 fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_fuzzy_match_v1_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
 fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
                                 fzf_string_t *text, fzf_string_t *pattern,
                                 fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_fuzzy_match_v2_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
 fzf_result_t fzf_exact_match_naive(bool case_sensitive, bool normalize,
                                    fzf_string_t *text, fzf_string_t *pattern,
                                    fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_exact_match_naive_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_exact_match_boundary(bool case_sensitive, bool normalize,
+                                      fzf_string_t *text,
+                                      fzf_string_t *pattern,
+                                      fzf_position_t *pos,
+                                      fzf_slab_t *slab);
+fzf_result_t fzf_exact_match_boundary_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
 fzf_result_t fzf_prefix_match(bool case_sensitive, bool normalize,
                               fzf_string_t *text, fzf_string_t *pattern,
                               fzf_position_t *pos, fzf_slab_t *slab);
@@ -118,6 +161,9 @@ fzf_result_t fzf_equal_match(bool case_sensitive, bool normalize,
 /* interface */
 fzf_pattern_t *fzf_parse_pattern(fzf_case_types case_mode, bool normalize,
                                  char *pattern, bool fuzzy);
+fzf_pattern_t *fzf_parse_pattern_with_direction(
+    fzf_case_types case_mode, bool normalize, char *pattern, bool fuzzy,
+    bool forward);
 void fzf_free_pattern(fzf_pattern_t *pattern);
 
 int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
@@ -130,6 +176,16 @@ int32_t fzf_get_score(const char *text, fzf_pattern_t *pattern,
    are otherwise identical to fzf_get_score. */
 int32_t fzf_get_score_bytes(const char *text, size_t text_len,
                             fzf_pattern_t *pattern, fzf_slab_t *slab);
+/* Score one byte string and retain the positive-term bounds from the same
+   matcher pass.  The bounds use logical character indexes. */
+int32_t fzf_get_score_with_bounds_bytes_preclassified(
+    const char *text, size_t text_len, bool input_is_ascii,
+    fzf_pattern_t *pattern, fzf_slab_t *slab,
+    fzf_score_bounds_t *bounds);
+int32_t fzf_get_score_with_bounds(const char *text,
+                                  fzf_pattern_t *pattern,
+                                  fzf_slab_t *slab,
+                                  fzf_score_bounds_t *bounds);
 
 fzf_position_t *fzf_pos_array(size_t len);
 fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
@@ -138,6 +194,8 @@ void fzf_free_positions(fzf_position_t *pos);
 
 fzf_slab_t *fzf_make_slab(fzf_slab_config_t config);
 fzf_slab_t *fzf_make_default_slab(void);
+bool fzf_slab_set_score_scheme(fzf_slab_t *slab,
+                               fzf_score_scheme_t score_scheme);
 void fzf_free_slab(fzf_slab_t *slab);
 
 /* UTF-8 utility functions for testing */
@@ -151,6 +209,15 @@ int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
 fzf_result_t fzf_exact_match_utf8(bool case_sensitive, bool normalize,
                                   fzf_string_t *text, fzf_string_t *pattern,
                                   fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_exact_match_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_exact_match_boundary_utf8(
+    bool case_sensitive, bool normalize, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_exact_match_boundary_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
 fzf_result_t fzf_prefix_match_utf8(bool case_sensitive, bool normalize,
                                    fzf_string_t *text, fzf_string_t *pattern,
                                    fzf_position_t *pos, fzf_slab_t *slab);
@@ -163,8 +230,14 @@ fzf_result_t fzf_equal_match_utf8(bool case_sensitive, bool normalize,
 fzf_result_t fzf_fuzzy_match_v1_utf8(bool case_sensitive, bool normalize,
                                      fzf_string_t *text, fzf_string_t *pattern,
                                      fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_fuzzy_match_v1_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
 fzf_result_t fzf_fuzzy_match_v2_utf8(bool case_sensitive, bool normalize,
                                      fzf_string_t *text, fzf_string_t *pattern,
                                      fzf_position_t *pos, fzf_slab_t *slab);
+fzf_result_t fzf_fuzzy_match_v2_utf8_with_direction(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab);
 
 #endif // FZF_H_

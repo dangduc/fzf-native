@@ -25,6 +25,24 @@ static void fuzz_fail(const char *property) {
   abort();
 }
 
+static bool valid_utf8(const char *text, size_t len) {
+  size_t offset = 0;
+  while (offset < len) {
+    utf8proc_int32_t codepoint;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)text + offset,
+        (utf8proc_ssize_t)(len - offset), &codepoint);
+    if (width <= 0) return false;
+    offset += (size_t)width;
+  }
+  return true;
+}
+
+static size_t visible_character_count(const char *text) {
+  size_t bytes = strlen(text);
+  return valid_utf8(text, bytes) ? utf8_strlen(text, bytes) : bytes;
+}
+
 static fzf_slab_t *make_selected_slab(uint8_t options) {
   static const size_t caps16[] = {1, 8, 64, 1024, 8192, 100 * 1024};
   static const size_t caps32[] = {1, 8, 64, 256, 1024, 2048};
@@ -34,11 +52,12 @@ static fzf_slab_t *make_selected_slab(uint8_t options) {
 
 static void check_positions(const char *candidate, bool matched,
                             const fzf_position_t *positions) {
-  (void)matched;
+  if (!matched && positions && positions->size != 0)
+    fuzz_fail("a failed match returned highlight positions");
   if (!positions)
     return;
 
-  size_t limit = strlen(candidate);
+  size_t limit = visible_character_count(candidate);
   for (size_t i = 0; i < positions->size; i++) {
     if (positions->data[i] >= limit)
       fuzz_fail("a highlight position is outside the candidate");
@@ -59,6 +78,37 @@ static void check_position_order(const fzf_position_t *positions) {
   }
 }
 
+static fzf_algo_t utf8_variant(fzf_algo_t algorithm) {
+  if (algorithm == fzf_fuzzy_match_v2) return fzf_fuzzy_match_v2_utf8;
+  if (algorithm == fzf_fuzzy_match_v1) return fzf_fuzzy_match_v1_utf8;
+  if (algorithm == fzf_exact_match_naive) return fzf_exact_match_utf8;
+  if (algorithm == fzf_exact_match_boundary)
+    return fzf_exact_match_boundary_utf8;
+  if (algorithm == fzf_prefix_match) return fzf_prefix_match_utf8;
+  if (algorithm == fzf_suffix_match) return fzf_suffix_match_utf8;
+  if (algorithm == fzf_equal_match) return fzf_equal_match_utf8;
+  return algorithm;
+}
+
+static const char *algo_name(fzf_algo_t algorithm) {
+  if (algorithm == fzf_fuzzy_match_v2) return "fuzzy-v2";
+  if (algorithm == fzf_fuzzy_match_v2_utf8) return "fuzzy-v2-utf8";
+  if (algorithm == fzf_fuzzy_match_v1) return "fuzzy-v1";
+  if (algorithm == fzf_fuzzy_match_v1_utf8) return "fuzzy-v1-utf8";
+  if (algorithm == fzf_exact_match_naive) return "exact";
+  if (algorithm == fzf_exact_match_utf8) return "exact-utf8";
+  if (algorithm == fzf_exact_match_boundary) return "exact-boundary";
+  if (algorithm == fzf_exact_match_boundary_utf8)
+    return "exact-boundary-utf8";
+  if (algorithm == fzf_prefix_match) return "prefix";
+  if (algorithm == fzf_prefix_match_utf8) return "prefix-utf8";
+  if (algorithm == fzf_suffix_match) return "suffix";
+  if (algorithm == fzf_suffix_match_utf8) return "suffix-utf8";
+  if (algorithm == fzf_equal_match) return "equal";
+  if (algorithm == fzf_equal_match_utf8) return "equal-utf8";
+  return "unknown";
+}
+
 static bool pattern_has_inverse(const fzf_pattern_t *pattern) {
   for (size_t i = 0; i < pattern->size; i++) {
     const fzf_term_set_t *set = pattern->ptr[i];
@@ -68,6 +118,121 @@ static bool pattern_has_inverse(const fzf_pattern_t *pattern) {
     }
   }
   return false;
+}
+
+static bool extension_preserves_term(const fzf_term_t *term, bool prepend) {
+  if (term->inv || !term->fn || !term->text) return false;
+  const fzf_string_t *text = (const fzf_string_t *)term->text;
+  if (!valid_utf8(text->data, text->size)) return false;
+
+  if (term->fn == fzf_fuzzy_match_v1 ||
+      term->fn == fzf_fuzzy_match_v1_utf8 ||
+      term->fn == fzf_fuzzy_match_v2 ||
+      term->fn == fzf_fuzzy_match_v2_utf8 ||
+      term->fn == fzf_exact_match_naive ||
+      term->fn == fzf_exact_match_utf8)
+    return true;
+  if (prepend)
+    return term->fn == fzf_suffix_match ||
+           term->fn == fzf_suffix_match_utf8;
+  return term->fn == fzf_prefix_match ||
+         term->fn == fzf_prefix_match_utf8;
+}
+
+static bool extension_preserves_pattern(const fzf_pattern_t *pattern,
+                                        bool prepend) {
+  for (size_t i = 0; i < pattern->size; i++) {
+    const fzf_term_set_t *set = pattern->ptr[i];
+    for (size_t j = 0; j < set->size; j++)
+      if (!extension_preserves_term(&set->ptr[j], prepend)) return false;
+  }
+  return true;
+}
+
+static bool pattern_contains_codepoint(const fzf_pattern_t *pattern,
+                                       utf8proc_int32_t wanted) {
+  for (size_t i = 0; i < pattern->size; i++) {
+    const fzf_term_set_t *set = pattern->ptr[i];
+    for (size_t j = 0; j < set->size; j++) {
+      const fzf_string_t *text = (const fzf_string_t *)set->ptr[j].text;
+      size_t offset = 0;
+      while (text && offset < text->size) {
+        utf8proc_int32_t codepoint;
+        utf8proc_ssize_t width = utf8proc_iterate(
+            (const utf8proc_uint8_t *)text->data + offset,
+            (utf8proc_ssize_t)(text->size - offset), &codepoint);
+        if (width <= 0 || codepoint == wanted) return true;
+        offset += (size_t)width;
+      }
+    }
+  }
+  return false;
+}
+
+static bool extension_keeps_slab_path(const fzf_pattern_t *pattern,
+                                      size_t candidate_units,
+                                      size_t extended_units,
+                                      const fzf_slab_t *slab) {
+  if (!slab) return true;
+  for (size_t i = 0; i < pattern->size; i++) {
+    const fzf_term_set_t *set = pattern->ptr[i];
+    for (size_t j = 0; j < set->size; j++) {
+      const fzf_term_t *term = &set->ptr[j];
+      if (term->fn != fzf_fuzzy_match_v2 &&
+          term->fn != fzf_fuzzy_match_v2_utf8)
+        continue;
+      const fzf_string_t *text = (const fzf_string_t *)term->text;
+      size_t pattern_units = utf8_strlen(text->data, text->size);
+      bool old_fallback = candidate_units != 0 &&
+          pattern_units > slab->I16.cap / candidate_units;
+      bool new_fallback = extended_units != 0 &&
+          pattern_units > slab->I16.cap / extended_units;
+      if (old_fallback != new_fallback) return false;
+    }
+  }
+  return true;
+}
+
+static void check_candidate_extension(const char *candidate,
+                                      fzf_pattern_t *pattern,
+                                      int32_t score, fzf_slab_t *slab) {
+  static const char *extensions[] = {
+      "x", " ", "\xc3\xa9", "\xf0\x9f\x9a\x80",
+  };
+  size_t length = strlen(candidate);
+  if (score <= 0 || !valid_utf8(candidate, length)) return;
+  char *extended = malloc(length + 5);
+  if (!extended) abort();
+
+  bool append_safe = extension_preserves_pattern(pattern, false);
+  bool prepend_safe = extension_preserves_pattern(pattern, true);
+  for (size_t i = 0; i < sizeof extensions / sizeof extensions[0]; i++) {
+    size_t extension_len = strlen(extensions[i]);
+    if (append_safe) {
+      memcpy(extended, candidate, length);
+      memcpy(extended + length, extensions[i], extension_len + 1);
+      if (fzf_get_score(extended, pattern, slab) <= 0)
+        fuzz_fail("appending text destroyed a prefix-safe match");
+    }
+    if (prepend_safe) {
+      memcpy(extended, extensions[i], extension_len);
+      memcpy(extended + extension_len, candidate, length + 1);
+      if (fzf_get_score(extended, pattern, slab) <= 0)
+        fuzz_fail("prepending text destroyed a suffix-safe match");
+    }
+  }
+
+  static const char nonmatching_scalar[] = "\xf4\x8f\xbf\xbf";
+  if (append_safe && is_ascii_utf8proc(candidate, length) &&
+      !pattern_contains_codepoint(pattern, 0x10ffff) &&
+      extension_keeps_slab_path(pattern, length, length + 1, slab)) {
+    memcpy(extended, candidate, length);
+    memcpy(extended + length, nonmatching_scalar,
+           sizeof nonmatching_scalar);
+    if (fzf_get_score(extended, pattern, slab) != score)
+      fuzz_fail("ASCII-to-UTF-8 dispatch changed a prefix-safe score");
+  }
+  free(extended);
 }
 
 #ifndef FZF_NATIVE_UTF8_MATCHING
@@ -99,13 +264,17 @@ static void check_term(const char *candidate, const fzf_term_t *term,
 
   fzf_string_t input = {.data = candidate, .size = strlen(candidate)};
   fzf_string_t *pattern = (fzf_string_t *)term->text;
+  fzf_algo_t algorithm = term->fn;
+  if (!is_ascii_utf8proc(input.data, input.size))
+    algorithm = utf8_variant(algorithm);
   fzf_result_t without_positions =
-      term->fn(term->case_sensitive, false, &input, pattern, NULL, slab);
+      algorithm(term->case_sensitive, term->normalize, &input, pattern, NULL,
+                slab);
   fzf_position_t *positions = fzf_pos_array(0);
   if (!positions)
     abort();
-  fzf_result_t with_positions = term->fn(term->case_sensitive, false, &input,
-                                         pattern, positions, slab);
+  fzf_result_t with_positions = algorithm(
+      term->case_sensitive, term->normalize, &input, pattern, positions, slab);
 
   /* Fuzzy v2 may backtrack to a more precise START only when positions are
      requested.  Membership and score must not depend on observability. */
@@ -116,12 +285,26 @@ static void check_term(const char *candidate, const fzf_term_t *term,
     fuzz_fail("a failed term returned highlight positions");
   check_positions(candidate, with_positions.start >= 0, positions);
   check_position_order(positions);
+  if (with_positions.start >= 0 && valid_utf8(input.data, input.size) &&
+      valid_utf8(pattern->data, pattern->size)) {
+    size_t pattern_characters = utf8_strlen(pattern->data, pattern->size);
+    if (positions->size != pattern_characters) {
+      fprintf(stderr,
+              "%s returned %zu positions for a %zu-character pattern\n",
+              algo_name(algorithm), positions->size, pattern_characters);
+      fuzz_fail("a matched term returned the wrong position count");
+    }
+  }
   fzf_free_positions(positions);
 
-  if (term->fn == fzf_fuzzy_match_v2) {
-    fzf_result_t v1 = fzf_fuzzy_match_v1(
+  if (algorithm == fzf_fuzzy_match_v2 ||
+      algorithm == fzf_fuzzy_match_v2_utf8) {
+    fzf_algo_t v1 = algorithm == fzf_fuzzy_match_v2_utf8
+                        ? fzf_fuzzy_match_v1_utf8
+                        : fzf_fuzzy_match_v1;
+    fzf_result_t v1_result = v1(
         term->case_sensitive, false, &input, pattern, NULL, slab);
-    if ((v1.start >= 0) != (with_positions.start >= 0))
+    if ((v1_result.start >= 0) != (with_positions.start >= 0))
       fuzz_fail("fuzzy v1 and v2 disagree on match membership");
   }
 }
@@ -146,6 +329,9 @@ static int32_t score_query(const char *candidate, const char *query,
 
 static void check_case_monotonicity(const char *candidate, const char *query,
                                     bool fuzzy, fzf_slab_t *slab) {
+  if (!valid_utf8(candidate, strlen(candidate)) ||
+      !valid_utf8(query, strlen(query)))
+    return;
   bool inverse = false;
   int32_t respect = score_query(candidate, query, CaseRespect, fuzzy, slab,
                                 &inverse);
@@ -185,6 +371,205 @@ static void check_whitespace_equivalence(const char *candidate,
       fuzz_fail("trailing query whitespace changed a score");
     free(trailing);
   }
+
+  for (size_t i = 0; i < len; i++) {
+    if (query[i] != ' ' || (i > 0 && query[i - 1] == '\\')) continue;
+    char *expanded = malloc(len + 3);
+    if (!expanded) abort();
+    memcpy(expanded, query, i);
+    memcpy(expanded + i, "   ", 3);
+    memcpy(expanded + i + 3, query + i + 1, len - i);
+    if (score_query(candidate, expanded, case_mode, fuzzy, slab, NULL) !=
+        expected_score)
+      fuzz_fail("expanding query whitespace changed a score");
+    free(expanded);
+    break;
+  }
+}
+
+typedef struct {
+  const char *data;
+  size_t size;
+} fuzz_query_token_t;
+
+static bool split_simple_query(const char *query, fuzz_query_token_t **tokens,
+                               size_t *count) {
+  *tokens = NULL;
+  *count = 0;
+  if (strstr(query, "\\ ")) return false;
+  size_t len = strlen(query);
+  size_t token_count = 0;
+  for (size_t pos = 0; pos < len;) {
+    while (pos < len && query[pos] == ' ') pos++;
+    if (pos == len) break;
+    token_count++;
+    while (pos < len && query[pos] != ' ') pos++;
+  }
+  if (token_count == 0) return true;
+
+  fuzz_query_token_t *result = malloc(token_count * sizeof *result);
+  if (!result) abort();
+  size_t index = 0;
+  for (size_t pos = 0; pos < len;) {
+    while (pos < len && query[pos] == ' ') pos++;
+    if (pos == len) break;
+    size_t start = pos;
+    while (pos < len && query[pos] != ' ') pos++;
+    if (query[pos - 1] == '\\') {
+      free(result);
+      return false;
+    }
+    result[index++] =
+        (fuzz_query_token_t){.data = query + start, .size = pos - start};
+  }
+  *tokens = result;
+  *count = token_count;
+  return true;
+}
+
+static bool token_is_bar(const fuzz_query_token_t *token) {
+  return token->size == 1 && token->data[0] == '|';
+}
+
+static void copy_token(char *output, size_t *offset,
+                       const fuzz_query_token_t *token) {
+  memcpy(output + *offset, token->data, token->size);
+  *offset += token->size;
+}
+
+static bool pattern_is_simple_and(const fzf_pattern_t *pattern,
+                                  const fuzz_query_token_t *tokens,
+                                  size_t count) {
+  if (count < 2 || pattern->size != count) return false;
+  for (size_t i = 0; i < count; i++)
+    if (token_is_bar(&tokens[i]) || pattern->ptr[i]->size != 1) return false;
+  return true;
+}
+
+static bool pattern_is_simple_or(const fzf_pattern_t *pattern,
+                                 const fuzz_query_token_t *tokens,
+                                 size_t count) {
+  if (count < 3 || count % 2 == 0 || pattern->size != 1 ||
+      pattern->ptr[0]->size != (count + 1) / 2)
+    return false;
+  for (size_t i = 0; i < count; i++)
+    if (token_is_bar(&tokens[i]) != (i % 2 == 1)) return false;
+  return true;
+}
+
+static bool token_is_plain_literal(const fuzz_query_token_t *token) {
+  if (token->size == 0 || token_is_bar(token)) return false;
+  char first = token->data[0];
+  char last = token->data[token->size - 1];
+  /* Prefixing a trailing quote would create exact-boundary syntax. */
+  return first != '!' && first != '\'' && first != '^' && last != '$' &&
+         last != '\'';
+}
+
+static void require_score(const char *candidate, const char *query,
+                          fzf_case_types case_mode, bool fuzzy,
+                          fzf_slab_t *slab, int32_t expected,
+                          const char *property) {
+  if (score_query(candidate, query, case_mode, fuzzy, slab, NULL) != expected)
+    fuzz_fail(property);
+}
+
+static void require_membership(const char *candidate, const char *query,
+                               fzf_case_types case_mode, bool fuzzy,
+                               fzf_slab_t *slab, bool expected,
+                               const char *property) {
+  int32_t score = score_query(candidate, query, case_mode, fuzzy, slab, NULL);
+  if ((score > 0) != expected) fuzz_fail(property);
+}
+
+static void check_query_structure(const char *candidate, const char *query,
+                                  fzf_case_types case_mode, bool fuzzy,
+                                  const fzf_pattern_t *pattern,
+                                  fzf_slab_t *slab, int32_t score) {
+  fuzz_query_token_t *tokens = NULL;
+  size_t count = 0;
+  if (!split_simple_query(query, &tokens, &count)) return;
+
+  if (pattern_is_simple_and(pattern, tokens, count)) {
+    size_t output_len = count - 1;
+    for (size_t i = 0; i < count; i++) output_len += tokens[i].size;
+    char *reversed = malloc(output_len + 1);
+    if (!reversed) abort();
+    size_t offset = 0;
+    for (size_t i = count; i-- > 0;) {
+      if (offset) reversed[offset++] = ' ';
+      copy_token(reversed, &offset, &tokens[i]);
+    }
+    reversed[offset] = '\0';
+    require_score(candidate, reversed, case_mode, fuzzy, slab, score,
+                  "reordering AND terms changed a score");
+    free(reversed);
+  }
+
+  if (pattern_is_simple_or(pattern, tokens, count)) {
+    size_t branches = (count + 1) / 2;
+    size_t output_len = (branches - 1) * 3;
+    for (size_t i = 0; i < count; i += 2) output_len += tokens[i].size;
+    char *reversed = malloc(output_len + 1);
+    if (!reversed) abort();
+    size_t offset = 0;
+    for (size_t branch = branches; branch-- > 0;) {
+      if (offset) {
+        memcpy(reversed + offset, " | ", 3);
+        offset += 3;
+      }
+      copy_token(reversed, &offset, &tokens[branch * 2]);
+    }
+    reversed[offset] = '\0';
+    require_membership(candidate, reversed, case_mode, fuzzy, slab, score > 0,
+                       "reordering OR branches changed membership");
+    free(reversed);
+  }
+
+  if (count == 1 && pattern->size == 1 && pattern->ptr[0]->size == 1 &&
+      !token_is_bar(&tokens[0])) {
+    size_t token_len = tokens[0].size;
+    char *duplicate_or = malloc(token_len * 2 + 4);
+    char *duplicate_and = malloc(token_len * 2 + 2);
+    if (!duplicate_or || !duplicate_and) abort();
+    memcpy(duplicate_or, tokens[0].data, token_len);
+    memcpy(duplicate_or + token_len, " | ", 3);
+    memcpy(duplicate_or + token_len + 3, tokens[0].data, token_len);
+    duplicate_or[token_len * 2 + 3] = '\0';
+    memcpy(duplicate_and, tokens[0].data, token_len);
+    duplicate_and[token_len] = ' ';
+    memcpy(duplicate_and + token_len + 1, tokens[0].data, token_len);
+    duplicate_and[token_len * 2 + 1] = '\0';
+    require_score(candidate, duplicate_or, case_mode, fuzzy, slab, score,
+                  "duplicating an OR branch changed a score");
+    require_membership(candidate, duplicate_and, case_mode, fuzzy, slab,
+                       score > 0,
+                       "duplicating an AND term changed membership");
+    free(duplicate_and);
+    free(duplicate_or);
+
+    if (token_is_plain_literal(&tokens[0])) {
+      char *literal = malloc(token_len + 1);
+      char *quoted = malloc(token_len + 2);
+      if (!literal || !quoted) abort();
+      memcpy(literal, tokens[0].data, token_len);
+      literal[token_len] = '\0';
+      quoted[0] = '\'';
+      memcpy(quoted + 1, tokens[0].data, token_len);
+      quoted[token_len + 1] = '\0';
+      int32_t exact = score_query(candidate, literal, case_mode, false, slab,
+                                  NULL);
+      require_score(candidate, quoted, case_mode, true, slab, exact,
+                    "quoted exact and global exact scores differ");
+      int32_t fuzzy_score = score_query(candidate, literal, case_mode, true,
+                                        slab, NULL);
+      require_score(candidate, quoted, case_mode, false, slab, fuzzy_score,
+                    "quoted fuzzy and global fuzzy scores differ");
+      free(quoted);
+      free(literal);
+    }
+  }
+  free(tokens);
 }
 
 static void check_bounded_entry_points(const char *candidate,
@@ -300,6 +685,10 @@ static void run_one(const uint8_t *data, size_t size) {
   if (score != fzf_get_score(candidate, pattern, default_slab))
     fuzz_fail("repeated scoring is not deterministic");
 
+  check_candidate_extension(candidate, pattern, score, default_slab);
+  check_query_structure(candidate, query, case_mode, fuzzy, pattern,
+                        default_slab, score);
+
   check_bounded_entry_points(candidate, candidate_size, pattern,
                              default_slab, score);
 
@@ -308,20 +697,19 @@ static void run_one(const uint8_t *data, size_t size) {
   check_positions(candidate, score > 0, positions);
   fzf_free_positions(positions);
 
-  /* Exercise the filter-only matcher as part of the public C surface.  The
-     baseline implementation intentionally has historical whitespace/anchor
-     differences from the scorer; this test-only layer must not redefine
-     those semantics. */
+  /* Filtering and scoring implement the same match predicate. */
 #ifdef FZF_NATIVE_HAS_MATCH_SLAB
-  (void)fzf_has_match(candidate, pattern, default_slab);
+  bool fast_match = fzf_has_match(candidate, pattern, default_slab);
 #else
-  (void)fzf_has_match(candidate, pattern);
+  bool fast_match = fzf_has_match(candidate, pattern);
 #endif
+  if (fast_match != (score > 0))
+    fuzz_fail("fzf_has_match disagrees with fzf_get_score");
 
-  /* Exercise the documented small-slab fallback under sanitizers.  The base
-     implementation has historical score differences between algorithms, so
-     this additive layer deliberately asserts safety rather than score parity. */
+  /* A slab can select a different algorithm, but not different membership. */
   int32_t selected_score = fzf_get_score(candidate, pattern, selected_slab);
+  if ((selected_score > 0) != (score > 0))
+    fuzz_fail("slab fallback changed match membership");
   positions = fzf_get_positions(candidate, pattern, selected_slab);
   check_positions(candidate, selected_score > 0, positions);
   fzf_free_positions(positions);

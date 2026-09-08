@@ -9,12 +9,16 @@ on:
     - cron: "17 9 * * 1"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 env:
-  FZF_VERSION: 0.74.3
-  FZF_LINUX_AMD64_SHA256: 3501a595e4b5c40a6b047340a0e8f805c46fd4e61ef95ef8a136ba8c61cf6f22
+  FZF_ORACLE_REVISION: 1372d04f79bde0daa3bab4b96a068baafa808e67
+  EMACS_CI_REVISION: 159c450a1f054908e54114899556f82ddcfeaf60
+  GO_VERSION: 1.27.1
+  FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '1800' || '60' }}
+  FUZZ_SESSION_READER_SECONDS: ${{ github.event_name == 'schedule' && '300' || '30' }}
+  FZF_NATIVE_UPSTREAM_CASES: ${{ github.event_name == 'schedule' && '10000' || '1000' }}
 
 jobs:
   fuzz:
@@ -22,21 +26,49 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
-      - name: Install pinned upstream fzf reference
+      - name: Check out the pinned upstream fzf oracle
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: junegunn/fzf
+          ref: ${{ env.FZF_ORACLE_REVISION }}
+          path: build/fzf-oracle-source
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Restore learned fuzz corpora
+        id: fuzz-corpus-cache
+        uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            build/fuzz-corpus
+            build/fuzz-session-corpus
+            build/fuzz-session-reader-corpus
+          key: fzf-native-fuzz-${{ runner.os }}-${{ hashFiles('fzf.c', 'fzf-additions.c', 'fzf-native-module.c', 'fuzz/**/*.c', 'fuzz/corpus/**', 'fuzz/session-corpus/**') }}-${{ github.run_id }}
+          restore-keys: |
+            fzf-native-fuzz-${{ runner.os }}-${{ hashFiles('fzf.c', 'fzf-additions.c', 'fzf-native-module.c', 'fuzz/**/*.c', 'fuzz/corpus/**', 'fuzz/session-corpus/**') }}-
+            fzf-native-fuzz-${{ runner.os }}-
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Install the pinned Emacs 30.2 toolchain
         shell: bash
         run: |
-          curl -fsSL -o "$RUNNER_TEMP/fzf.tar.gz" \
-            "https://github.com/junegunn/fzf/releases/download/v${FZF_VERSION}/fzf-${FZF_VERSION}-linux_amd64.tar.gz"
-          echo "${FZF_LINUX_AMD64_SHA256}  $RUNNER_TEMP/fzf.tar.gz" | sha256sum --check
-          mkdir -p "$RUNNER_TEMP/fzf-reference"
-          tar -xzf "$RUNNER_TEMP/fzf.tar.gz" -C "$RUNNER_TEMP/fzf-reference"
-          echo "$RUNNER_TEMP/fzf-reference" >> "$GITHUB_PATH"
+          nix profile install --accept-flake-config \
+            "github:purcell/nix-emacs-ci/${EMACS_CI_REVISION}#emacs-30-2"
+          test "$(emacs --batch --eval '(princ emacs-version)')" = "30.2"
 
-      - uses: jcs090218/setup-emacs@master
-        with:
-          version: 30.1
+      - name: Compare raw matcher results with pinned fzf code
+        env:
+          FZF_SOURCE: ${{ github.workspace }}/build/fzf-oracle-source
+        run: make FUZZ_CC=clang fuzz-oracle-test-san
 
       - name: Replay the permanent ASan/UBSan corpus
         run: make FUZZ_CC=clang fuzz-replay
@@ -45,22 +77,49 @@ jobs:
         run: make FUZZ_CC=clang fuzz-session-tsan
 
       - name: Run a bounded coverage-guided campaign
-        run: make FUZZ_CC=clang FUZZ_SECONDS=60 fuzz
+        run: make FUZZ_CC=clang fuzz
 
-      - name: Exercise the unchanged Emacs module ABI
+      - name: Merge learned corpora by target coverage
+        run: make FUZZ_CC=clang fuzz-merge
+
+      - name: Save learned fuzz corpora
+        uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            build/fuzz-corpus
+            build/fuzz-session-corpus
+            build/fuzz-session-reader-corpus
+          key: ${{ steps.fuzz-corpus-cache.outputs.cache-primary-key }}
+
+      - name: Fuzz the Emacs module ABI and session API
         env:
           FZF_NATIVE_FUZZ_CASES: 2000
+          FZF_NATIVE_FUZZ_ABI_CASES: 2000
+          FZF_NATIVE_FUZZ_SESSION_CASES: ${{ github.event_name == 'schedule' && '1000' || '250' }}
         run: make fuzz-elisp
 
-      - name: Compare ASCII match sets with pinned upstream fzf
+      - name: Compare structured and persistent-session results with pinned fzf
         env:
-          FZF_REFERENCE_VERSION: ${{ env.FZF_VERSION }}
+          FZF_SOURCE: ${{ github.workspace }}/build/fzf-oracle-source
+        run: make fuzz-upstream-pinned
+
+      - name: Compare strict structured parity with pinned fzf
+        env:
+          FZF_SOURCE: ${{ github.workspace }}/build/fzf-oracle-source
+          FZF_NATIVE_UPSTREAM_PROFILE: parity
           FZF_NATIVE_UPSTREAM_CASES: 1000
-        run: make fuzz-upstream
+        run: make fuzz-upstream-pinned
+
+      - name: Compare V2 fallback length boundaries
+        env:
+          FZF_SOURCE: ${{ github.workspace }}/build/fzf-oracle-source
+          FZF_NATIVE_UPSTREAM_PROFILE: long
+          FZF_NATIVE_UPSTREAM_CASES: 3
+        run: make fuzz-upstream-pinned
 
       - name: Upload reproducible crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: fzf-native-fuzz-artifacts
           path: |

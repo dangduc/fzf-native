@@ -57,9 +57,14 @@ static bool fzf_addn_fuzzy(bool case_sensitive,
 
 /* Exact: PATTERN appears as a contiguous substring of TEXT.  No memmem
    — not portable — so use a hand-rolled scan. */
-static bool fzf_addn_exact(bool case_sensitive,
-                           const char *text, size_t tn,
-                           const char *pat,  size_t pn) {
+static inline bool fzf_addn_word(unsigned char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9');
+}
+
+static bool fzf_addn_exact_impl(bool case_sensitive, bool boundary_check,
+                                const char *text, size_t tn,
+                                const char *pat, size_t pn) {
   if (pn == 0) return true;
   if (tn < pn) return false;
   for (size_t i = 0; i + pn <= tn; i++) {
@@ -72,9 +77,26 @@ static bool fzf_addn_exact(bool case_sensitive,
           eq = false; break;
         }
     }
-    if (eq) return true;
+    if (eq &&
+        (!boundary_check ||
+         ((i == 0 || !fzf_addn_word((unsigned char)text[i - 1])) &&
+          (i + pn == tn ||
+           !fzf_addn_word((unsigned char)text[i + pn])))))
+      return true;
   }
   return false;
+}
+
+static bool fzf_addn_exact(bool case_sensitive,
+                           const char *text, size_t tn,
+                           const char *pat, size_t pn) {
+  return fzf_addn_exact_impl(case_sensitive, false, text, tn, pat, pn);
+}
+
+static bool fzf_addn_exact_boundary(bool case_sensitive,
+                                    const char *text, size_t tn,
+                                    const char *pat, size_t pn) {
+  return fzf_addn_exact_impl(case_sensitive, true, text, tn, pat, pn);
 }
 
 static bool fzf_addn_prefix(bool case_sensitive,
@@ -112,10 +134,13 @@ static bool fzf_addn_suffix(bool case_sensitive,
 static bool fzf_addn_equal(bool case_sensitive,
                            const char *text, size_t tn,
                            const char *pat,  size_t pn) {
+  if (pn == 0) return false;
   size_t start = 0;
   size_t end = tn;
-  while (start < end && fzf_addn_space((unsigned char)text[start])) start++;
-  while (end > start && fzf_addn_space((unsigned char)text[end - 1])) end--;
+  if (!fzf_addn_space((unsigned char)pat[0]))
+    while (start < end && fzf_addn_space((unsigned char)text[start])) start++;
+  if (!fzf_addn_space((unsigned char)pat[pn - 1]))
+    while (end > start && fzf_addn_space((unsigned char)text[end - 1])) end--;
   if (end - start != pn) return false;
   if (case_sensitive) return memcmp(text + start, pat, pn) == 0;
   for (size_t i = 0; i < pn; i++)
@@ -143,6 +168,8 @@ static bool fzf_addn_term(const fzf_term_t *term,
     match = fzf_addn_fuzzy (term->case_sensitive, text, tn, p, pn);
   else if (term->fn == fzf_exact_match_naive)
     match = fzf_addn_exact (term->case_sensitive, text, tn, p, pn);
+  else if (term->fn == fzf_exact_match_boundary)
+    match = fzf_addn_exact_boundary(term->case_sensitive, text, tn, p, pn);
   else if (term->fn == fzf_prefix_match)
     match = fzf_addn_prefix(term->case_sensitive, text, tn, p, pn);
   else if (term->fn == fzf_suffix_match)
@@ -162,7 +189,8 @@ static bool fzf_addn_term(const fzf_term_t *term,
    scorer instead. */
 static bool fzf_addn_is_ascii_algo(fzf_algo_t fn) {
   return fn == fzf_fuzzy_match_v1 || fn == fzf_fuzzy_match_v2 ||
-         fn == fzf_exact_match_naive || fn == fzf_prefix_match ||
+         fn == fzf_exact_match_naive || fn == fzf_exact_match_boundary ||
+         fn == fzf_prefix_match ||
          fn == fzf_suffix_match || fn == fzf_equal_match;
 }
 
@@ -184,7 +212,8 @@ bool fzf_has_match_bytes_preclassified(
   for (size_t i = 0; i < pattern->size; i++) {
     fzf_term_set_t *set = pattern->ptr[i];
     for (size_t j = 0; j < set->size; j++)
-      if (!fzf_addn_is_ascii_algo(set->ptr[j].fn))
+      if (set->ptr[j].normalize ||
+          !fzf_addn_is_ascii_algo(set->ptr[j].fn))
         return fzf_get_score_bytes_preclassified(
                    text, tn, input_is_ascii, pattern, slab) > 0;
   }

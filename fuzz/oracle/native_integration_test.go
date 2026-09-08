@@ -1,0 +1,1557 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package main
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"reflect"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+	"unicode"
+)
+
+const (
+	peerDeadline           = 5 * time.Second
+	fullResultExampleLimit = 8
+	pinnedGoToolchain      = "go1.27.1"
+	pinnedGoUnicodeVersion = "17.0.0"
+	pinnedUTF8ProcVersion  = "2.10.0"
+	pinnedUTF8ProcUnicode  = "16.0.0"
+)
+
+type nativePeer struct {
+	command *exec.Cmd
+	input   io.WriteCloser
+	output  io.Reader
+	stderr  synchronizedCapture
+}
+
+type synchronizedCapture struct {
+	mu       sync.Mutex
+	contents bytes.Buffer
+}
+
+func (c *synchronizedCapture) Write(data []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.contents.Write(data)
+}
+
+func (c *synchronizedCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.contents.String()
+}
+
+func TestSynchronizedCaptureConcurrentWriteAndString(t *testing.T) {
+	const (
+		writers    = 4
+		readers    = 4
+		iterations = 512
+		chunk      = "stderr\n"
+	)
+
+	var capture synchronizedCapture
+	start := make(chan struct{})
+	writersDone := make(chan struct{})
+	failures := make(chan error, writers+readers)
+
+	var writerGroup sync.WaitGroup
+	writerGroup.Add(writers)
+	for writer := 0; writer < writers; writer++ {
+		go func() {
+			defer writerGroup.Done()
+			<-start
+			for iteration := 0; iteration < iterations; iteration++ {
+				written, err := capture.Write([]byte(chunk))
+				if err != nil || written != len(chunk) {
+					failures <- fmt.Errorf("capture write = %d, %v", written, err)
+					return
+				}
+				runtime.Gosched()
+			}
+		}()
+	}
+	go func() {
+		writerGroup.Wait()
+		close(writersDone)
+	}()
+
+	var readerGroup sync.WaitGroup
+	readerGroup.Add(readers)
+	for reader := 0; reader < readers; reader++ {
+		go func() {
+			defer readerGroup.Done()
+			<-start
+			for {
+				snapshot := capture.String()
+				if len(snapshot)%len(chunk) != 0 {
+					failures <- fmt.Errorf("partial capture snapshot length %d", len(snapshot))
+					return
+				}
+				for offset := 0; offset < len(snapshot); offset += len(chunk) {
+					if snapshot[offset:offset+len(chunk)] != chunk {
+						failures <- fmt.Errorf("corrupt capture snapshot at byte %d", offset)
+						return
+					}
+				}
+				select {
+				case <-writersDone:
+					return
+				default:
+					runtime.Gosched()
+				}
+			}
+		}()
+	}
+
+	close(start)
+	<-writersDone
+	readerGroup.Wait()
+	close(failures)
+	for err := range failures {
+		t.Error(err)
+	}
+
+	wantLength := writers * iterations * len(chunk)
+	if got := len(capture.String()); got != wantLength {
+		t.Fatalf("final capture length = %d, want %d", got, wantLength)
+	}
+}
+
+type infoResponse struct {
+	revision string
+	runtime  string
+}
+
+func startNativePeer(t *testing.T, path string) *nativePeer {
+	return startNativePeerWithArgs(t, path)
+}
+
+func startNativePeerWithArgs(t *testing.T, path string, args ...string) *nativePeer {
+	t.Helper()
+	peer := &nativePeer{command: exec.Command(path, args...)}
+	var err error
+	peer.input, err = peer.command.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer.output, err = peer.command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer.command.Stderr = &peer.stderr
+	if err := peer.command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	return peer
+}
+
+func (p *nativePeer) exchange(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	type exchangeResult struct {
+		payload []byte
+		err     error
+	}
+	done := make(chan exchangeResult, 1)
+	go func() {
+		if err := writeFrame(p.input, payload); err != nil {
+			done <- exchangeResult{err: fmt.Errorf("write request: %w", err)}
+			return
+		}
+		response, err := readFrame(p.output)
+		done <- exchangeResult{payload: response, err: err}
+	}()
+	timer := time.NewTimer(peerDeadline)
+	defer stopTimer(timer)
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("native exchange: %v\nstderr: %s", result.err, p.stderr.String())
+		}
+		return result.payload
+	case <-timer.C:
+		if p.command.Process != nil {
+			_ = p.command.Process.Kill()
+		}
+		t.Fatal("native exchange exceeded the five-second deadline")
+		return nil
+	}
+}
+
+func (p *nativePeer) close(t *testing.T) {
+	t.Helper()
+	if err := p.closeWithin(peerDeadline); err != nil {
+		t.Errorf("%v\nstderr: %s", err, p.stderr.String())
+	}
+}
+
+func stopTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+}
+
+func (p *nativePeer) closeWithin(deadline time.Duration) error {
+	closeErr := p.input.Close()
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- p.command.Wait()
+	}()
+
+	timer := time.NewTimer(deadline)
+	defer stopTimer(timer)
+	select {
+	case waitErr := <-waitDone:
+		if closeErr != nil && waitErr != nil {
+			return fmt.Errorf("close native input: %v; native peer failed: %w", closeErr, waitErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close native input: %w", closeErr)
+		}
+		if waitErr != nil {
+			return fmt.Errorf("native peer failed: %w", waitErr)
+		}
+		return nil
+	case <-timer.C:
+		if p.command.Process != nil {
+			_ = p.command.Process.Kill()
+		}
+		return fmt.Errorf("native peer did not exit within %s", deadline)
+	}
+}
+
+func TestNativePeerCloseHasDeadline(t *testing.T) {
+	const helperArgument = "fzf-oracle-close-hang-helper"
+	if len(os.Args) > 1 && os.Args[len(os.Args)-1] == helperArgument {
+		payload, err := readFrame(os.Stdin)
+		if err != nil || !bytes.Equal(payload, []byte{protocolVersion, opcodeInfo}) {
+			os.Exit(2)
+		}
+		if err := writeFrame(os.Stdout, infoPayload()); err != nil {
+			os.Exit(2)
+		}
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+
+	peer := startNativePeerWithArgs(t, os.Args[0],
+		"-test.run=^TestNativePeerCloseHasDeadline$", "--", helperArgument)
+	if _, err := decodeInfoResponse(peer.exchange(t, []byte{protocolVersion, opcodeInfo})); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	err := peer.closeWithin(100 * time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "did not exit within") {
+		t.Fatalf("close got %v; want a deadline error", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("bounded close took %s", elapsed)
+	}
+}
+
+func TestStopTimerDrainsExpiredTimer(t *testing.T) {
+	timer := time.NewTimer(0)
+	<-timer.C
+	stopTimer(timer)
+	select {
+	case <-timer.C:
+		t.Fatal("stopped timer still had a value")
+	default:
+	}
+}
+
+func decodeMatchResponse(payload []byte) (matchResponse, byte, error) {
+	if len(payload) < 3 {
+		return matchResponse{}, 0, fmt.Errorf("response has %d bytes; need at least 3", len(payload))
+	}
+	if payload[0] != protocolVersion || payload[1] != opcodeMatch {
+		return matchResponse{}, payload[2], fmt.Errorf("unexpected response prefix %x", payload[:3])
+	}
+	status := payload[2]
+	if status != statusOK {
+		if len(payload) < 7 {
+			return matchResponse{}, status, fmt.Errorf("error response has %d bytes; need at least 7", len(payload))
+		}
+		messageLength := binary.BigEndian.Uint32(payload[3:7])
+		if uint64(messageLength)+7 != uint64(len(payload)) {
+			return matchResponse{}, status, fmt.Errorf("error response length is inconsistent")
+		}
+		return matchResponse{}, status, fmt.Errorf("native status %d: %s", status, payload[7:])
+	}
+	if len(payload) < 33 {
+		return matchResponse{}, status, fmt.Errorf("success response has %d bytes; need at least 33", len(payload))
+	}
+	if payload[3] > 1 || payload[4] > 1 {
+		return matchResponse{}, status, fmt.Errorf("invalid Boolean fields %d and %d", payload[3], payload[4])
+	}
+	count := binary.BigEndian.Uint32(payload[29:33])
+	want := uint64(33) + uint64(count)*8
+	if want != uint64(len(payload)) {
+		return matchResponse{}, status, fmt.Errorf("success response has %d bytes; positions require %d", len(payload), want)
+	}
+	var positions []int64
+	if payload[4] != 0 {
+		positions = make([]int64, int(count))
+	} else if count != 0 {
+		return matchResponse{}, status, fmt.Errorf("absent positions have count %d", count)
+	}
+	response := matchResponse{
+		matched:          payload[3] != 0,
+		positionsPresent: payload[4] != 0,
+		start:            int64(binary.BigEndian.Uint64(payload[5:13])),
+		end:              int64(binary.BigEndian.Uint64(payload[13:21])),
+		score:            int64(binary.BigEndian.Uint64(payload[21:29])),
+		positions:        positions,
+	}
+	for index := range response.positions {
+		offset := 33 + index*8
+		response.positions[index] = int64(binary.BigEndian.Uint64(payload[offset : offset+8]))
+	}
+	return response, status, nil
+}
+
+func decodeInfoResponse(payload []byte) (infoResponse, error) {
+	if len(payload) < 7 || payload[0] != protocolVersion || payload[1] != opcodeInfo || payload[2] != statusOK {
+		return infoResponse{}, fmt.Errorf("invalid INFO response prefix: %x", payload)
+	}
+	revisionLength := uint64(binary.BigEndian.Uint32(payload[3:7]))
+	if revisionLength > uint64(len(payload)-7) {
+		return infoResponse{}, fmt.Errorf("INFO revision length exceeds payload")
+	}
+	runtimeOffset := uint64(7) + revisionLength
+	if runtimeOffset+4 > uint64(len(payload)) {
+		return infoResponse{}, fmt.Errorf("INFO response lacks runtime length")
+	}
+	runtimeLength := uint64(binary.BigEndian.Uint32(payload[runtimeOffset : runtimeOffset+4]))
+	if runtimeOffset+4+runtimeLength != uint64(len(payload)) {
+		return infoResponse{}, fmt.Errorf("INFO runtime length is inconsistent")
+	}
+	return infoResponse{
+		revision: string(payload[7:runtimeOffset]),
+		runtime:  string(payload[runtimeOffset+4:]),
+	}, nil
+}
+
+func requireNativeUnicodeRuntime(t *testing.T, info infoResponse) {
+	t.Helper()
+	for _, identity := range []string{
+		"utf8proc=" + pinnedUTF8ProcVersion,
+		"unicode=" + pinnedUTF8ProcUnicode,
+	} {
+		if !strings.Contains(info.runtime, identity) {
+			t.Fatalf("native INFO runtime %q lacks %q", info.runtime, identity)
+		}
+	}
+}
+
+func pinnedUnicodeLowercaseDifference(upper, lower rune) bool {
+	switch upper {
+	case 0xa7ce:
+		return lower == 0xa7cf
+	case 0xa7d2:
+		return lower == 0xa7d3
+	case 0xa7d4:
+		return lower == 0xa7d5
+	default:
+		return upper >= 0x16ea0 && upper <= 0x16eb8 &&
+			lower == upper+0x1b
+	}
+}
+
+var unicodeLowercaseAuditAlgorithms = [...]struct {
+	name string
+	id   algorithmID
+}{
+	{"fuzzy-v1", algorithmV1},
+	{"fuzzy-v2", algorithmV2},
+	{"exact", algorithmExact},
+	{"exact-boundary", algorithmExactBoundary},
+	{"prefix", algorithmPrefix},
+	{"suffix", algorithmSuffix},
+	{"equal", algorithmEqual},
+}
+
+func TestNativePeerUnicodeLowercaseVersionAudit(t *testing.T) {
+	if runtime.Version() != pinnedGoToolchain {
+		t.Fatalf("Go runtime is %q; want %q", runtime.Version(), pinnedGoToolchain)
+	}
+	if unicode.Version != pinnedGoUnicodeVersion {
+		t.Fatalf("Go Unicode tables are %q; want %q",
+			unicode.Version, pinnedGoUnicodeVersion)
+	}
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	info, err := decodeInfoResponse(
+		peer.exchange(t, []byte{protocolVersion, opcodeInfo}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireNativeUnicodeRuntime(t, info)
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testedMappings := 0
+	testedRequests := 0
+	versionMappings := 0
+	versionDifferences := 0
+	var differencesByOrientation [2][len(unicodeLowercaseAuditAlgorithms)]int
+	var unexpected []string
+	for upper := rune(0); upper <= unicode.MaxRune; upper++ {
+		if upper >= 0xd800 && upper <= 0xdfff {
+			continue
+		}
+		lower := unicode.ToLower(upper)
+		if lower == upper {
+			continue
+		}
+		testedMappings++
+		versionDifference := pinnedUnicodeLowercaseDifference(upper, lower)
+		if versionDifference {
+			versionMappings++
+		}
+		orientations := [...]struct {
+			name               string
+			pattern, candidate rune
+		}{
+			{"upper-to-lower", upper, lower},
+			{"lower-to-upper", lower, upper},
+		}
+		for orientationIndex, orientation := range orientations {
+			for algorithmIndex, algorithm := range unicodeLowercaseAuditAlgorithms {
+				testedRequests++
+				request := matchRequest{
+					algorithm: algorithm.id,
+					scheme:    schemeDefault,
+					flags:     flagForward,
+					pattern:   []byte(string(orientation.pattern)),
+					candidate: []byte(string(orientation.candidate)),
+				}
+				upstream, err := oracle.match(request)
+				if err != nil {
+					t.Fatalf("%s %s U+%04X/U+%04X upstream: %v",
+						orientation.name, algorithm.name, upper, lower, err)
+				}
+				native, _, err := decodeMatchResponse(peer.exchange(t,
+					matchRequestPayload(request.algorithm, request.scheme, request.flags,
+						request.pattern, request.candidate)))
+				if err != nil {
+					t.Fatalf("%s %s U+%04X/U+%04X native: %v",
+						orientation.name, algorithm.name, upper, lower, err)
+				}
+				different := !matchResponsesEquivalent(native, upstream)
+				if different {
+					differencesByOrientation[orientationIndex][algorithmIndex]++
+					versionDifferences++
+				}
+				if different != versionDifference ||
+					(versionDifference && (!upstream.matched || !canonicalNativeMiss(native))) {
+					if len(unexpected) < fullResultExampleLimit {
+						unexpected = append(unexpected, fmt.Sprintf(
+							"%s %s U+%04X/U+%04X expected-version-difference=%t upstream=(%s) native=(%s)",
+							orientation.name, algorithm.name, upper, lower,
+							versionDifference, compactResponse(upstream),
+							compactResponse(native)))
+					}
+				}
+			}
+		}
+	}
+	if len(unexpected) != 0 {
+		t.Fatalf("Unicode lowercase audit found unexpected results:\n%s",
+			strings.Join(unexpected, "\n"))
+	}
+	for orientationIndex, counts := range differencesByOrientation {
+		for algorithmIndex, count := range counts {
+			if count != 28 {
+				t.Fatalf("Unicode lowercase audit %s %s differences=%d; want 28",
+					[...]string{"upper-to-lower", "lower-to-upper"}[orientationIndex],
+					unicodeLowercaseAuditAlgorithms[algorithmIndex].name, count)
+			}
+		}
+	}
+	if testedMappings != 1488 || testedRequests != 20832 ||
+		versionMappings != 28 || versionDifferences != 392 {
+		t.Fatalf("Unicode lowercase audit shape changed: mappings=%d requests=%d version-mappings=%d version-differences=%d",
+			testedMappings, testedRequests, versionMappings, versionDifferences)
+	}
+	t.Logf("audited %d Go lowercase mappings through %d requests with %d pinned Unicode-version differences",
+		testedMappings, testedRequests, versionDifferences)
+}
+
+func TestNativePeerMatchesRawOracle(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	info, err := decodeInfoResponse(peer.exchange(t, []byte{protocolVersion, opcodeInfo}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRevision := os.Getenv("FZF_NATIVE_EXPECTED_REVISION")
+	if wantRevision == "" {
+		t.Fatal("FZF_NATIVE_EXPECTED_REVISION is required with FZF_NATIVE_ALGO_DRIVER")
+	}
+	if info.revision != wantRevision || info.runtime == "" {
+		t.Fatalf("native INFO got revision=%q runtime=%q; want revision=%q", info.revision, info.runtime, wantRevision)
+	}
+	requireNativeUnicodeRuntime(t, info)
+
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name      string
+		algorithm algorithmID
+		flags     byte
+		pattern   []byte
+		candidate []byte
+	}{
+		{"cjk-v2", algorithmV2, flagCaseSensitive | flagForward, []byte("中文"), []byte("测试中文")},
+		{"supplementary-v1", algorithmV1, flagCaseSensitive | flagForward, []byte("😀"), []byte("a😀b")},
+		{"case-fold-expands-v2", algorithmV2, flagForward, []byte("Ⱥ"), []byte("xⱥ")},
+		{"kelvin-fold-v2", algorithmV2, flagForward, []byte("K"), []byte("xk")},
+		{"sigma-fold-v2", algorithmV2, flagForward, []byte("Σ"), []byte("xσ")},
+		{"embedded-nul-v2", algorithmV2, flagCaseSensitive | flagForward, []byte{'a', 0}, []byte{'x', 'a', 0}},
+		{"current-boundary-alignment-v2", algorithmV2, flagForward, []byte("/a"), []byte("a//a")},
+		{"ascii-boundary-score-v2", algorithmV2, flagCaseSensitive | flagForward, []byte("fzf"), []byte("src/fzf")},
+		{"unicode-boundary-score-v2", algorithmV2, flagForward, []byte("Ⱥ"), []byte("ⱥ")},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := matchRequest{
+				algorithm: testCase.algorithm,
+				scheme:    schemeDefault,
+				flags:     testCase.flags,
+				pattern:   testCase.pattern,
+				candidate: testCase.candidate,
+			}
+			want, err := oracle.match(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := matchRequestPayload(request.algorithm, request.scheme, request.flags, request.pattern, request.candidate)
+			got, _, err := decodeMatchResponse(peer.exchange(t, payload))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("native result %+v does not match upstream result %+v", got, want)
+			}
+		})
+	}
+}
+
+func TestBuiltOracleProcessIsPersistent(t *testing.T) {
+	binary := os.Getenv("FZF_RAW_ORACLE_BINARY")
+	if binary == "" {
+		t.Skip("set FZF_RAW_ORACLE_BINARY to check the built oracle process")
+	}
+
+	// fzf scoring schemes mutate package-global tables that are not fully
+	// reset by a later Init call.  Keep each scheme in its own built process
+	// and compare with pinned results instead of mixing schemes in this process.
+	for _, testCase := range []struct {
+		name       string
+		scheme     schemeID
+		matchScore int64
+	}{
+		{"default", schemeDefault, 84},
+		{"path", schemePath, 84},
+		{"history", schemeHistory, 80},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			peer := startNativePeerWithArgs(t, binary, "--scheme="+testCase.name)
+			defer peer.close(t)
+
+			info, err := decodeInfoResponse(peer.exchange(t, []byte{protocolVersion, opcodeInfo}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.revision != pinnedUpstreamCommit || info.runtime == "" {
+				t.Fatalf("oracle INFO got revision=%q runtime=%q", info.revision, info.runtime)
+			}
+			for _, candidate := range []string{"src/fzf", "测试中文"} {
+				request := matchRequest{
+					algorithm: algorithmV2,
+					scheme:    testCase.scheme,
+					flags:     flagCaseSensitive | flagForward,
+					pattern:   []byte("fzf"),
+					candidate: []byte(candidate),
+				}
+				want := matchResponse{start: -1, end: -1}
+				if candidate == "src/fzf" {
+					want = matchResponse{
+						matched: true, positionsPresent: true,
+						start: 4, end: 7, score: testCase.matchScore,
+						positions: []int64{4, 5, 6},
+					}
+				}
+				got, _, err := decodeMatchResponse(peer.exchange(t,
+					matchRequestPayload(request.algorithm, request.scheme, request.flags, request.pattern, request.candidate)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("built process result %+v does not match in-process result %+v", got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestNativePeerScoringSchemesMatchRawOracle(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	oracleBinary := os.Getenv("FZF_RAW_ORACLE_BINARY")
+	if oracleBinary == "" {
+		t.Fatal("FZF_RAW_ORACLE_BINARY is required with FZF_NATIVE_ALGO_DRIVER")
+	}
+
+	schemes := []struct {
+		name   string
+		id     schemeID
+		scores []int64
+	}{
+		{"default", schemeDefault, []int64{84, 84, 88}},
+		{"path", schemePath, []int64{84, 80, 80}},
+		{"history", schemeHistory, []int64{80, 80, 80}},
+	}
+	candidates := [][]byte{[]byte("src/fzf"), []byte(":fzf"), []byte(" fzf")}
+	for _, scheme := range schemes {
+		t.Run(scheme.name, func(t *testing.T) {
+			peer := startNativePeerWithArgs(t, driver, "--scheme="+scheme.name)
+			defer peer.close(t)
+			oraclePeer := startNativePeerWithArgs(t, oracleBinary,
+				"--scheme="+scheme.name)
+			defer oraclePeer.close(t)
+			for index, candidate := range candidates {
+				request := matchRequest{
+					algorithm: algorithmV2,
+					scheme:    scheme.id,
+					flags:     flagCaseSensitive | flagForward,
+					pattern:   []byte("fzf"),
+					candidate: candidate,
+				}
+				payload := matchRequestPayload(request.algorithm, request.scheme,
+					request.flags, request.pattern, request.candidate)
+				upstream, _, err := decodeMatchResponse(oraclePeer.exchange(t, payload))
+				if err != nil {
+					t.Fatal(err)
+				}
+				native, _, err := decodeMatchResponse(peer.exchange(t, payload))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if upstream.score != scheme.scores[index] || !reflect.DeepEqual(native, upstream) {
+					t.Fatalf("candidate %q: native=%+v upstream=%+v want-score=%d",
+						candidate, native, upstream, scheme.scores[index])
+				}
+			}
+		})
+	}
+}
+
+func TestNativePeerPinnedNormalizationScore(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name      string
+		flags     byte
+		pattern   []byte
+		candidate []byte
+		want      matchResponse
+	}{
+		{
+			name:      "latin-normalization",
+			flags:     flagCaseSensitive | flagNormalize | flagForward,
+			pattern:   []byte("cafe"),
+			candidate: []byte("café"),
+			want: matchResponse{
+				matched: true, positionsPresent: true, start: 0, end: 4, score: 114, positions: []int64{0, 1, 2, 3},
+			},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := matchRequest{
+				algorithm: algorithmV2,
+				scheme:    schemeDefault,
+				flags:     testCase.flags,
+				pattern:   testCase.pattern,
+				candidate: testCase.candidate,
+			}
+			upstream, err := oracle.match(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			native, _, err := decodeMatchResponse(peer.exchange(t,
+				matchRequestPayload(request.algorithm, request.scheme, request.flags, request.pattern, request.candidate)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(upstream, testCase.want) {
+				t.Fatalf("upstream result changed: got %+v; want %+v", upstream, testCase.want)
+			}
+			if !reflect.DeepEqual(native, upstream) {
+				t.Fatalf("normalization result differs: native=%+v upstream=%+v", native, upstream)
+			}
+		})
+	}
+}
+
+func TestNativePeerPinnedNormalizationMembership(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name               string
+		algorithm          algorithmID
+		pattern, candidate string
+	}{
+		{"v1-accent", algorithmV1, "cafe", "café"},
+		{"v2-accent", algorithmV2, "cafe", "café"},
+		{"exact-accent", algorithmExact, "cafe", "café"},
+		{"prefix-accent", algorithmPrefix, "ecl", "éclair"},
+		{"suffix-accent", algorithmSuffix, "cafE", "cafÉ"},
+		{"equal-fullwidth", algorithmEqual, "FZF", "ＦＺＦ"},
+		{"exact-turned", algorithmExact, "a", "ɐ"},
+		{"exact-sharp-s", algorithmExact, "s", "ß"},
+		{"exact-vietnamese-a", algorithmExact, "A", "Ấ"},
+		{"exact-vietnamese-o", algorithmExact, "O", "Ờ"},
+		{"exact-vietnamese-u", algorithmExact, "u", "ự"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := matchRequest{
+				algorithm: testCase.algorithm,
+				scheme:    schemeDefault,
+				flags:     flagCaseSensitive | flagNormalize | flagForward,
+				pattern:   []byte(testCase.pattern),
+				candidate: []byte(testCase.candidate),
+			}
+			upstream, err := oracle.match(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			native, _, err := decodeMatchResponse(peer.exchange(t,
+				matchRequestPayload(request.algorithm, request.scheme, request.flags,
+					request.pattern, request.candidate)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !upstream.matched || native.matched != upstream.matched ||
+				native.start != upstream.start || native.end != upstream.end {
+				t.Fatalf("normalization range differs: native=%+v upstream=%+v",
+					native, upstream)
+			}
+		})
+	}
+}
+func TestNativePeerPinnedExactBoundaryMembership(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name               string
+		flags              byte
+		pattern, candidate string
+		wantMatch          bool
+	}{
+		{"whole", flagCaseSensitive | flagForward, "xyz", "xyz", true},
+		{"slash-boundary", flagCaseSensitive | flagForward, "xyz", "/xyz/", true},
+		{"dash-boundary", flagCaseSensitive | flagForward, "xyz", "-xyz-", true},
+		{"underscore-boundary", flagCaseSensitive | flagForward, "xyz", "_xyz_", true},
+		{"space-boundary", flagCaseSensitive | flagForward, "xyz", "x xyz y", true},
+		{"word-neighbors", flagCaseSensitive | flagForward, "xyz", "xxyzx", false},
+		{"unicode-boundary", flagCaseSensitive | flagForward, "组件", "界/组件-界", true},
+		{"unicode-word-neighbors", flagCaseSensitive | flagForward, "组件", "界组件界", false},
+		{"case-fold", flagForward, "xyz", "/XYZ/", true},
+		{"normalized", flagCaseSensitive | flagNormalize | flagForward, "cafe", "/café/", true},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := matchRequest{
+				algorithm: algorithmExactBoundary,
+				scheme:    schemeDefault,
+				flags:     testCase.flags,
+				pattern:   []byte(testCase.pattern),
+				candidate: []byte(testCase.candidate),
+			}
+			upstream, err := oracle.match(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			native, _, err := decodeMatchResponse(peer.exchange(t,
+				matchRequestPayload(request.algorithm, request.scheme, request.flags,
+					request.pattern, request.candidate)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if upstream.matched != testCase.wantMatch ||
+				native.matched != upstream.matched ||
+				native.start != upstream.start || native.end != upstream.end {
+				t.Fatalf("exact-boundary range differs: native=%+v upstream=%+v",
+					native, upstream)
+			}
+		})
+	}
+}
+
+func TestNativePeerPinnedBackwardRanges(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	longPattern := bytes.Repeat([]byte("a"), 1001)
+	longCandidate := append(append(append([]byte{}, longPattern...), '/'), longPattern...)
+	cases := []struct {
+		name                string
+		algorithm           algorithmID
+		pattern, candidate  []byte
+		caseSensitive       bool
+		normalize           bool
+		wantDifferentRanges bool
+	}{
+		{"v1-ascii", algorithmV1, []byte("ab"), []byte("ab/ab"), true, false, true},
+		{"v2-ascii", algorithmV2, []byte("ab"), []byte("-ab-ab-"), true, false, true},
+		{"exact-ascii", algorithmExact, []byte("ab"), []byte("ab/ab"), true, false, true},
+		{"boundary-ascii", algorithmExactBoundary, []byte("ab"), []byte("/ab/ab/"), true, false, true},
+		{"v1-unicode", algorithmV1, []byte("组件"), []byte("组件/组件"), true, false, true},
+		{"v2-unicode", algorithmV2, []byte("组件"), []byte("-组件-组件-"), true, false, true},
+		{"exact-unicode", algorithmExact, []byte("组件"), []byte("组件/组件"), true, false, true},
+		{"boundary-unicode", algorithmExactBoundary, []byte("组件"), []byte("/组件/组件/"), true, false, true},
+		{"normalized-v1", algorithmV1, []byte("cafe"), []byte("café/café"), true, true, true},
+		{"v2-fallback", algorithmV2, longPattern, longCandidate, true, false, true},
+		{"prefix-invariant", algorithmPrefix, []byte("ab"), []byte("ab/ab"), true, false, false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			results := make([]matchResponse, 2)
+			for direction := 0; direction < 2; direction++ {
+				flags := byte(0)
+				if testCase.caseSensitive {
+					flags |= flagCaseSensitive
+				}
+				if testCase.normalize {
+					flags |= flagNormalize
+				}
+				if direction == 0 {
+					flags |= flagForward
+				}
+				request := matchRequest{
+					algorithm: testCase.algorithm,
+					scheme:    schemeDefault,
+					flags:     flags,
+					pattern:   testCase.pattern,
+					candidate: testCase.candidate,
+				}
+				upstream, err := oracle.match(request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				native, _, err := decodeMatchResponse(peer.exchange(t,
+					matchRequestPayload(request.algorithm, request.scheme, request.flags,
+						request.pattern, request.candidate)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if native.matched != upstream.matched || native.start != upstream.start ||
+					native.end != upstream.end {
+					t.Fatalf("direction flags=0x%02x range differs: native=%+v upstream=%+v",
+						flags, native, upstream)
+				}
+				if testCase.algorithm <= algorithmV2 &&
+					!reflect.DeepEqual(native.positions, upstream.positions) {
+					t.Fatalf("direction flags=0x%02x positions differ: native=%+v upstream=%+v",
+						flags, native, upstream)
+				}
+				results[direction] = native
+			}
+			different := results[0].start != results[1].start ||
+				results[0].end != results[1].end
+			if different != testCase.wantDifferentRanges {
+				t.Fatalf("forward=%+v backward=%+v wantDifferent=%t",
+					results[0], results[1], testCase.wantDifferentRanges)
+			}
+		})
+	}
+}
+
+func TestNativePeerExactBoundarySchemesMatchRawOracle(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	oracleBinary := os.Getenv("FZF_RAW_ORACLE_BINARY")
+	if oracleBinary == "" {
+		t.Fatal("FZF_RAW_ORACLE_BINARY is required with FZF_NATIVE_ALGO_DRIVER")
+	}
+	testCases := []struct {
+		name               string
+		pattern, candidate []byte
+		scores             [3]int64
+	}{
+		{"ascii-slash", []byte("xyz"), []byte("/xyz/"), [3]int64{97, 89, 88}},
+		{"ascii-space", []byte("xyz"), []byte(" xyz "), [3]int64{98, 88, 88}},
+		{"unicode-slash", []byte("组件"), []byte("/组件/"), [3]int64{71, 65, 64}},
+		{"unicode-space", []byte("组件"), []byte(" 组件 "), [3]int64{72, 64, 64}},
+	}
+	schemes := []struct {
+		name string
+		id   schemeID
+	}{
+		{"default", schemeDefault},
+		{"path", schemePath},
+		{"history", schemeHistory},
+	}
+	for schemeIndex, scheme := range schemes {
+		t.Run(scheme.name, func(t *testing.T) {
+			nativePeer := startNativePeerWithArgs(t, driver, "--scheme="+scheme.name)
+			defer nativePeer.close(t)
+			oraclePeer := startNativePeerWithArgs(t, oracleBinary, "--scheme="+scheme.name)
+			defer oraclePeer.close(t)
+			for _, testCase := range testCases {
+				t.Run(testCase.name, func(t *testing.T) {
+					request := matchRequest{
+						algorithm: algorithmExactBoundary,
+						scheme:    scheme.id,
+						flags:     flagCaseSensitive | flagForward,
+						pattern:   testCase.pattern,
+						candidate: testCase.candidate,
+					}
+					payload := matchRequestPayload(request.algorithm, request.scheme,
+						request.flags, request.pattern, request.candidate)
+					upstream, _, err := decodeMatchResponse(oraclePeer.exchange(t, payload))
+					if err != nil {
+						t.Fatal(err)
+					}
+					native, _, err := decodeMatchResponse(nativePeer.exchange(t, payload))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if upstream.score != testCase.scores[schemeIndex] ||
+						native.matched != upstream.matched || native.start != upstream.start ||
+						native.end != upstream.end || native.score != upstream.score {
+						t.Fatalf("native=%+v upstream=%+v want-score=%d",
+							native, upstream, testCase.scores[schemeIndex])
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestNativePeerKnownContiguousResultGaps(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name           string
+		algorithm      algorithmID
+		pattern        []byte
+		candidate      []byte
+		wantUpstream   matchResponse
+		wantNativePeer matchResponse
+	}{
+		{
+			name: "exact-position-representation", algorithm: algorithmExact,
+			pattern: []byte("ab"), candidate: []byte("xabx"),
+			wantUpstream:   matchResponse{matched: true, start: 1, end: 3, score: 36},
+			wantNativePeer: matchResponse{matched: true, positionsPresent: true, start: 1, end: 3, score: 36, positions: []int64{1, 2}},
+		},
+		{
+			name: "suffix-position-representation", algorithm: algorithmSuffix,
+			pattern: []byte("ab"), candidate: []byte("xab"),
+			wantUpstream:   matchResponse{matched: true, start: 1, end: 3, score: 36},
+			wantNativePeer: matchResponse{matched: true, positionsPresent: true, start: 1, end: 3, score: 36, positions: []int64{1, 2}},
+		},
+		{
+			name: "prefix-score-and-position-representation", algorithm: algorithmPrefix,
+			pattern: []byte("ab"), candidate: []byte("abx"),
+			wantUpstream:   matchResponse{matched: true, start: 0, end: 2, score: 62},
+			wantNativePeer: matchResponse{matched: true, positionsPresent: true, start: 0, end: 2, score: 62, positions: []int64{0, 1}},
+		},
+		{
+			name: "equal-score-and-position-representation", algorithm: algorithmEqual,
+			pattern: []byte("ab"), candidate: []byte("ab"),
+			wantUpstream:   matchResponse{matched: true, start: 0, end: 2, score: 62},
+			wantNativePeer: matchResponse{matched: true, positionsPresent: true, start: 0, end: 2, score: 62, positions: []int64{0, 1}},
+		},
+		{
+			name: "v1-empty-pattern-position-representation", algorithm: algorithmV1,
+			pattern: []byte{}, candidate: []byte("abc"),
+			wantUpstream:   matchResponse{matched: true, start: 0, end: 0, score: 0},
+			wantNativePeer: matchResponse{matched: true, positionsPresent: true, start: 0, end: 0, score: 0, positions: []int64{}},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := matchRequest{
+				algorithm: testCase.algorithm,
+				scheme:    schemeDefault,
+				flags:     flagCaseSensitive | flagForward,
+				pattern:   testCase.pattern,
+				candidate: testCase.candidate,
+			}
+			upstream, err := oracle.match(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			native, _, err := decodeMatchResponse(peer.exchange(t,
+				matchRequestPayload(request.algorithm, request.scheme, request.flags, request.pattern, request.candidate)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(upstream, testCase.wantUpstream) {
+				t.Fatalf("upstream gap shape changed: got %+v; want %+v", upstream, testCase.wantUpstream)
+			}
+			if !reflect.DeepEqual(native, testCase.wantNativePeer) {
+				t.Fatalf("native gap shape changed: got %+v; want %+v", native, testCase.wantNativePeer)
+			}
+		})
+	}
+}
+
+func TestNativePeerUTF8EmptySuffixRangeMatchesRawOracle(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := matchRequest{
+		algorithm: algorithmSuffix,
+		scheme:    schemeDefault,
+		flags:     flagCaseSensitive | flagForward,
+		pattern:   []byte{},
+		candidate: []byte("σa你 \u2003"),
+	}
+	upstream, err := oracle.match(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	native, _, err := decodeMatchResponse(peer.exchange(t,
+		matchRequestPayload(request.algorithm, request.scheme, request.flags,
+			request.pattern, request.candidate)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upstream.start != 3 || upstream.end != 3 ||
+		!matchResponsesEquivalent(native, upstream) {
+		t.Fatalf("native=%+v upstream=%+v; want empty suffix range [3,3)",
+			native, upstream)
+	}
+}
+
+func TestNativePeerMembershipMatrix(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name      string
+		algorithm algorithmID
+		pattern   string
+		candidate string
+	}{
+		{"v1-match", algorithmV1, "ab", "a_b"},
+		{"v1-miss", algorithmV1, "ab", "ba"},
+		{"v2-match", algorithmV2, "ab", "a_b"},
+		{"v2-miss", algorithmV2, "ab", "ba"},
+		{"exact-match", algorithmExact, "ab", "xabx"},
+		{"exact-miss", algorithmExact, "ab", "axb"},
+		{"prefix-match", algorithmPrefix, "ab", "abx"},
+		{"prefix-miss", algorithmPrefix, "ab", "xab"},
+		{"suffix-match", algorithmSuffix, "ab", "xab"},
+		{"suffix-miss", algorithmSuffix, "ab", "abx"},
+		{"equal-match", algorithmEqual, "ab", "ab"},
+		{"equal-miss", algorithmEqual, "ab", "xab"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := matchRequest{
+				algorithm: testCase.algorithm,
+				scheme:    schemeDefault,
+				flags:     flagCaseSensitive | flagForward,
+				pattern:   []byte(testCase.pattern),
+				candidate: []byte(testCase.candidate),
+			}
+			upstream, err := oracle.match(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			native, _, err := decodeMatchResponse(peer.exchange(t,
+				matchRequestPayload(request.algorithm, request.scheme, request.flags, request.pattern, request.candidate)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if native.matched != upstream.matched {
+				t.Fatalf("membership differs: native=%t upstream=%t", native.matched, upstream.matched)
+			}
+		})
+	}
+}
+
+func TestNativePeerReportsCurrentCapabilityBoundary(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	exactBoundary := matchRequestPayload(
+		algorithmExactBoundary, schemeDefault, flagCaseSensitive|flagForward,
+		[]byte("a"), []byte("/a/"))
+	result, status, err := decodeMatchResponse(peer.exchange(t, exactBoundary))
+	if err != nil || status != statusOK || !result.matched {
+		t.Fatalf("exact-boundary status=%d result=%+v error=%v", status, result, err)
+	}
+	backward := matchRequestPayload(
+		algorithmExact, schemeDefault, flagCaseSensitive,
+		[]byte("a"), []byte("a/a"))
+	result, status, err = decodeMatchResponse(peer.exchange(t, backward))
+	if err != nil || status != statusOK || !result.matched || result.start != 2 {
+		t.Fatalf("backward status=%d result=%+v error=%v", status, result, err)
+	}
+
+	request := matchRequestPayload(algorithmV2, schemePath, flagForward,
+		[]byte("a"), []byte("a"))
+	_, status, err = decodeMatchResponse(peer.exchange(t, request))
+	if status != statusBadRequest || err == nil {
+		t.Fatalf("scheme mismatch got status %d and error %v; want bad request",
+			status, err)
+	}
+}
+
+func TestMalformedUTF8DifferenceIsExplicit(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+
+	request := matchRequest{
+		algorithm: algorithmV2,
+		scheme:    schemeDefault,
+		flags:     flagCaseSensitive | flagForward,
+		pattern:   []byte{0xff},
+		candidate: []byte{0xfe},
+	}
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream, err := oracle.match(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	native, _, err := decodeMatchResponse(peer.exchange(t,
+		matchRequestPayload(request.algorithm, request.scheme, request.flags, request.pattern, request.candidate)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !upstream.matched || native.matched {
+		t.Fatalf("malformed UTF-8 exception changed: upstream=%+v native=%+v", upstream, native)
+	}
+}
+
+type rawMatrixRNG uint64
+
+func (r *rawMatrixRNG) next() uint64 {
+	x := uint64(*r)
+	x ^= x << 13
+	x ^= x >> 7
+	x ^= x << 17
+	*r = rawMatrixRNG(x)
+	return x
+}
+
+func rawMatrixEnv(t *testing.T, name string, fallback uint64) uint64 {
+	t.Helper()
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		t.Fatalf("%s must be an unsigned decimal integer: %v", name, err)
+	}
+	return parsed
+}
+
+func rawMatrixRequest(seed, serial uint64) matchRequest {
+	if serial%20000 == 0 {
+		return matchRequest{
+			algorithm: algorithmEqual,
+			scheme:    schemeDefault,
+			flags:     flagForward,
+			pattern:   []byte("- "),
+			candidate: []byte("- "),
+		}
+	}
+
+	state := rawMatrixRNG(seed ^ ((serial + 1) * 0x9e3779b97f4a7c15))
+	if state == 0 {
+		state = 0x6a09e667f3bcc909
+	}
+	algorithms := [...]algorithmID{
+		algorithmV1, algorithmV2, algorithmExact, algorithmExactBoundary,
+		algorithmPrefix, algorithmSuffix, algorithmEqual,
+	}
+	alphabet := []byte("abAB/_- .:")
+	request := matchRequest{
+		algorithm: algorithms[state.next()%uint64(len(algorithms))],
+		scheme:    schemeDefault,
+		flags:     0,
+	}
+	if state.next()%2 != 0 {
+		request.flags |= flagForward
+	}
+	if state.next()%2 != 0 {
+		request.flags |= flagCaseSensitive
+	}
+	if state.next()%4 == 0 {
+		request.flags |= flagNormalize
+	}
+	if serial%5000 == 1 {
+		length := [...]int{999, 1000, 1001}[(serial/5000)%3]
+		request.algorithm = algorithmV2
+		request.flags = flagCaseSensitive | flagForward
+		request.pattern = bytes.Repeat([]byte("a"), length)
+		request.candidate = append([]byte("/"), request.pattern...)
+		return request
+	}
+	if serial%1024 == 4 {
+		pairs := [...][2]string{
+			{"k", "K"}, {"ⱥ", "Ⱥ"}, {"σ", "Σ"},
+			{"你", "你"}, {"😀", "😀"}, {"𐐷", "𐐏"},
+		}
+		pair := pairs[(serial/1024)%uint64(len(pairs))]
+		request.flags = flagForward
+		request.pattern = []byte(pair[0])
+		request.candidate = []byte(pair[1])
+		return request
+	}
+	if serial%1024 == 5 {
+		pairs := [...][2]string{
+			{"cafe", "café"}, {"a", "ɐ"}, {"s", "ß"},
+			{"FZF", "ＦＺＦ"}, {"O", "Ø"}, {"1", "１"},
+			{"A", "Ấ"}, {"O", "Ờ"}, {"u", "ự"},
+		}
+		pair := pairs[(serial/1024)%uint64(len(pairs))]
+		request.algorithm = algorithms[state.next()%uint64(len(algorithms))]
+		request.flags = flagCaseSensitive | flagNormalize | flagForward
+		request.pattern = []byte(pair[0])
+		request.candidate = []byte(pair[1])
+		return request
+	}
+	if serial%16 == 3 {
+		atoms := [...]string{
+			"a", "B", "/", "_", " ", "é", "σ", "你", "😀", "K", "Ⱥ", "ⱥ", "𐐷",
+		}
+		patternLength := int(state.next() % 7)
+		candidateLength := int(state.next() % 14)
+		for index := 0; index < patternLength; index++ {
+			request.pattern = append(request.pattern,
+				[]byte(atoms[state.next()%uint64(len(atoms))])...)
+		}
+		for index := 0; index < candidateLength; index++ {
+			request.candidate = append(request.candidate,
+				[]byte(atoms[state.next()%uint64(len(atoms))])...)
+		}
+		return request
+	}
+	patternLength := int(state.next() % 7)
+	candidateLength := int(state.next() % 14)
+	request.pattern = make([]byte, patternLength)
+	request.candidate = make([]byte, candidateLength)
+	for index := range request.pattern {
+		request.pattern[index] = alphabet[state.next()%uint64(len(alphabet))]
+	}
+	for index := range request.candidate {
+		request.candidate[index] = alphabet[state.next()%uint64(len(alphabet))]
+	}
+	return request
+}
+
+type fullResultAudit struct {
+	differenceCount uint64
+	examples        []string
+}
+
+func compactBytes(value []byte) string {
+	const prefixLimit = 12
+	prefix := value
+	suffix := ""
+	if len(prefix) > prefixLimit {
+		prefix = prefix[:prefixLimit]
+		suffix = "..."
+	}
+	return fmt.Sprintf("len=%d hex=%x%s", len(value), prefix, suffix)
+}
+
+func compactResponse(response matchResponse) string {
+	positionSummary := "absent"
+	if response.positionsPresent {
+		positionSummary = fmt.Sprintf("count=%d", len(response.positions))
+		if len(response.positions) != 0 {
+			positionSummary += fmt.Sprintf(" first=%d last=%d",
+				response.positions[0], response.positions[len(response.positions)-1])
+		}
+	}
+	return fmt.Sprintf("matched=%t start=%d end=%d score=%d positions=(%s)",
+		response.matched, response.start, response.end, response.score, positionSummary)
+}
+
+/*
+	Contiguous upstream algorithms return nil positions because callers can
+
+derive every index from the half-open range.  fzf-native materializes those
+indexes for its highlighting API.  Compare the observable position sequence,
+not this representation choice.
+*/
+func semanticPositions(response matchResponse) []int64 {
+	if response.positionsPresent {
+		if len(response.positions) == 0 {
+			return nil
+		}
+		return response.positions
+	}
+	if !response.matched || response.end <= response.start {
+		return nil
+	}
+	positions := make([]int64, response.end-response.start)
+	for index := range positions {
+		positions[index] = response.start + int64(index)
+	}
+	return positions
+}
+
+func matchResponsesEquivalent(left, right matchResponse) bool {
+	return left.matched == right.matched && left.start == right.start &&
+		left.end == right.end && left.score == right.score &&
+		reflect.DeepEqual(semanticPositions(left), semanticPositions(right))
+}
+
+func canonicalNativeMiss(response matchResponse) bool {
+	return !response.matched && response.positionsPresent &&
+		response.start == -1 && response.end == -1 && response.score == 0 &&
+		len(response.positions) == 0
+}
+
+func TestCanonicalNativeMissRejectsCorruptResultShape(t *testing.T) {
+	canonical := matchResponse{positionsPresent: true, start: -1, end: -1}
+	if !canonicalNativeMiss(canonical) {
+		t.Fatal("canonical native miss was rejected")
+	}
+
+	for name, corrupt := range map[string]func(*matchResponse){
+		"end":       func(response *matchResponse) { response.end = 123 },
+		"score":     func(response *matchResponse) { response.score = 777 },
+		"positions": func(response *matchResponse) { response.positions = []int64{0} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := canonical
+			corrupt(&response)
+			if canonicalNativeMiss(response) {
+				t.Fatalf("corrupt native miss was accepted: %s", compactResponse(response))
+			}
+		})
+	}
+}
+
+func compactMatrixDifference(seed, serial uint64, request matchRequest,
+	upstream, native matchResponse) string {
+	return fmt.Sprintf(
+		"seed=%d serial=%d algorithm=%d scheme=%d flags=0x%02x pattern=(%s) candidate=(%s) upstream=(%s) native=(%s)",
+		seed, serial, request.algorithm, request.scheme, request.flags,
+		compactBytes(request.pattern), compactBytes(request.candidate),
+		compactResponse(upstream), compactResponse(native))
+}
+
+func (audit *fullResultAudit) add(seed, serial uint64, request matchRequest,
+	upstream, native matchResponse) {
+	audit.differenceCount++
+	if len(audit.examples) < fullResultExampleLimit {
+		audit.examples = append(audit.examples,
+			compactMatrixDifference(seed, serial, request, upstream, native))
+	}
+}
+
+func TestFullResultAuditUsesCompactBoundedExamples(t *testing.T) {
+	request := matchRequest{
+		algorithm: algorithmV2,
+		flags:     flagCaseSensitive | flagForward,
+		pattern:   bytes.Repeat([]byte("a"), 1001),
+		candidate: append([]byte("/"), bytes.Repeat([]byte("a"), 1001)...),
+	}
+	positions := make([]int64, 1001)
+	for index := range positions {
+		positions[index] = int64(index + 1)
+	}
+	upstream := matchResponse{matched: true, positionsPresent: true,
+		start: 1, end: 1002, score: 10, positions: positions}
+	native := upstream
+	native.score = 9
+
+	var audit fullResultAudit
+	for serial := uint64(0); serial < fullResultExampleLimit+3; serial++ {
+		audit.add(7, serial, request, upstream, native)
+	}
+	if audit.differenceCount != fullResultExampleLimit+3 {
+		t.Fatalf("difference count is %d", audit.differenceCount)
+	}
+	if len(audit.examples) != fullResultExampleLimit {
+		t.Fatalf("example count is %d", len(audit.examples))
+	}
+	for _, example := range audit.examples {
+		if len(example) > 500 || strings.Contains(example, "[1 2 3") {
+			t.Fatalf("diagnostic is not compact: %q", example)
+		}
+	}
+}
+
+func TestNativePeerDeterministicResultMatrices(t *testing.T) {
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+	oracleBinary := os.Getenv("FZF_RAW_ORACLE_BINARY")
+	if oracleBinary == "" {
+		t.Fatal("FZF_RAW_ORACLE_BINARY is required with FZF_NATIVE_ALGO_DRIVER")
+	}
+	seed := rawMatrixEnv(t, "FZF_RAW_MATRIX_SEED", 20260906)
+	start := rawMatrixEnv(t, "FZF_RAW_MATRIX_START", 0)
+	caseCount := rawMatrixEnv(t, "FZF_RAW_MATRIX_CASES", 20000)
+	for _, scheme := range []struct {
+		name string
+		id   schemeID
+	}{
+		{"default", schemeDefault},
+		{"path", schemePath},
+		{"history", schemeHistory},
+	} {
+		t.Run(scheme.name, func(t *testing.T) {
+			nativePeer := startNativePeerWithArgs(t, driver, "--scheme="+scheme.name)
+			defer nativePeer.close(t)
+			oraclePeer := startNativePeerWithArgs(t, oracleBinary, "--scheme="+scheme.name)
+			defer oraclePeer.close(t)
+			oracleInfo, err := decodeInfoResponse(
+				oraclePeer.exchange(t, []byte{protocolVersion, opcodeInfo}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if oracleInfo.revision != pinnedUpstreamCommit || oracleInfo.runtime != runtime.Version() {
+				t.Fatalf("oracle INFO got revision=%q runtime=%q", oracleInfo.revision, oracleInfo.runtime)
+			}
+			var audit fullResultAudit
+			for iteration := uint64(0); iteration < caseCount; iteration++ {
+				serial := start + iteration
+				if serial < start {
+					t.Fatal("raw matrix serial overflow")
+				}
+				request := rawMatrixRequest(seed, serial)
+				request.scheme = scheme.id
+				payload := matchRequestPayload(request.algorithm, request.scheme, request.flags,
+					request.pattern, request.candidate)
+				upstream, _, err := decodeMatchResponse(oraclePeer.exchange(t, payload))
+				if err != nil {
+					t.Fatalf("seed=%d serial=%d upstream error: %v", seed, serial, err)
+				}
+				native, _, err := decodeMatchResponse(nativePeer.exchange(t, payload))
+				if err != nil {
+					t.Fatalf("seed=%d serial=%d native error: %v", seed, serial, err)
+				}
+				if !matchResponsesEquivalent(native, upstream) {
+					audit.add(seed, serial, request, upstream, native)
+				}
+			}
+			if audit.differenceCount != 0 {
+				t.Fatalf("%s result debt in %d of %d cases; first %d differences:\n%s\nreplay one case with FZF_RAW_MATRIX_SEED=%d FZF_RAW_MATRIX_START=SERIAL FZF_RAW_MATRIX_CASES=1",
+					scheme.name, audit.differenceCount, caseCount, len(audit.examples),
+					strings.Join(audit.examples, "\n"), seed)
+			}
+			t.Logf("%s result matrix seed=%d start=%d cases=%d",
+				scheme.name, seed, start, caseCount)
+		})
+	}
+}
