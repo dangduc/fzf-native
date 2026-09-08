@@ -4359,6 +4359,11 @@ static bool async_line_commit_character(AsyncSession *s,
     }
     line->char_count++;
   }
+  for (size_t i = 0; i < width; i++)
+    if (bytes[i] & 0x80) {
+      line->output_has_non_ascii = true;
+      break;
+    }
   return async_line_append_output(s, line, bytes, width);
 }
 
@@ -4372,9 +4377,10 @@ static unsigned async_utf8_expected_width(unsigned char byte) {
 static bool async_line_emit_visible_byte(AsyncSession *s,
                                          AsyncLineDecoder *line,
                                          unsigned char byte) {
-  if (byte & 0x80) line->output_has_non_ascii = true;
-  if (s->max_line_length == 0)
+  if (s->max_line_length == 0) {
+    if (byte & 0x80) line->output_has_non_ascii = true;
     return async_line_append_output(s, line, &byte, 1);
+  }
 
   size_t cap = async_line_limit(s->max_line_length);
   if ((s->max_line_length > 0 && line->over_limit) ||
@@ -4525,6 +4531,7 @@ static bool async_line_emit_visible_run(AsyncSession *s,
     utf8proc_ssize_t width = utf8proc_iterate(
         bytes + offset, (utf8proc_ssize_t)(amount - offset), &codepoint);
     offset += width > 0 ? (size_t)width : 1;
+    line->output_has_non_ascii = true;
     line->char_count++;
     retained_end = offset;
   }
@@ -4569,7 +4576,11 @@ static bool async_line_feed_bytes(AsyncSession *s, AsyncLineDecoder *line,
         visible_or |= byte;
         offset++;
       }
-      if (visible_or & 0x80) line->output_has_non_ascii = true;
+      /* In unbounded mode every byte in the run is retained.  Capped mode
+         classifies only the prefix committed by async_line_emit_visible_run,
+         so a discarded high-bit suffix cannot pessimize an ASCII candidate. */
+      if (s->max_line_length == 0 && (visible_or & 0x80))
+        line->output_has_non_ascii = true;
       if (offset > start &&
           !async_line_emit_visible_run(
               s, line, (const unsigned char *)bytes + start,
