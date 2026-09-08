@@ -129,7 +129,9 @@ static const score_scheme_config_t *score_scheme_config(
 
 static int32_t index_byte(fzf_string_t *string, char b) {
   if (string->size == 0) return -1;
-  const char *match = memchr(string->data, (unsigned char)b, string->size);
+  if (string->data[0] == b) return 0;
+  const char *match = memchr(
+      string->data + 1, (unsigned char)b, string->size - 1);
   return match ? (int32_t)(match - string->data) : -1;
 }
 

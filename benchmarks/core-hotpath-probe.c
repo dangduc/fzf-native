@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 /*
  * Short, deterministic matcher probe for the Chromium, Arabic, and Korean
- * real-data holdout shapes.  It is deliberately synthetic: its purpose is to
+ * real-data holdout shapes, plus the first-byte ASCII hit path used by short
+ * incremental queries.  It is deliberately synthetic: its purpose is to
  * isolate core scorer costs without rereading or sorting a multi-million-line
  * corpus.  Results are provisional and must not be presented as holdout data.
  *
@@ -85,6 +86,21 @@ static probe_item_t *make_ascii_items(void) {
   return items;
 }
 
+static probe_item_t *make_ascii_early_hit_items(void) {
+  probe_item_t *items = calloc(PROBE_ITEMS, sizeof *items);
+  if (!items) abort();
+  for (size_t i = 0; i < PROBE_ITEMS; i++) {
+    char *text = malloc(ASCII_BYTES + 1);
+    if (!text) abort();
+    text[0] = 'z';
+    for (size_t j = 1; j < ASCII_BYTES; j++)
+      text[j] = "abcdefg_/0123456789"[(i * 7 + j * 11) % 19];
+    text[ASCII_BYTES] = '\0';
+    items[i] = (probe_item_t){text, ASCII_BYTES, true};
+  }
+  return items;
+}
+
 static probe_item_t *make_unicode_items(utf8proc_int32_t base,
                                         utf8proc_int32_t first,
                                         utf8proc_int32_t second) {
@@ -156,6 +172,7 @@ static void free_items(probe_item_t *items) {
 
 int main(void) {
   probe_case_t probes[] = {
+      {"EarlyASCII", "z", make_ascii_early_hit_items()},
       {"Chromium", "linux", make_ascii_items()},
       {"Arabic", "\xD8\xA5\xD9\x86",
        make_unicode_items(0x0620, 0x0625, 0x0646)},
