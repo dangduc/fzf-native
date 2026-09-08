@@ -19,6 +19,7 @@
 #include "fzf-additions.h"
 #include "fzf-private.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -167,6 +168,161 @@ static void test_ascii_v2_single_byte_path(void) {
                        true, false, -1, -1, 0, -1);
   check_single_byte_v2("xxxx", 4, 'b', false, true, false,
                        -1, -1, 0, -1);
+}
+
+static uint32_t score_row_oracle_state = UINT32_C(0x7a61c4e9);
+
+static uint32_t score_row_oracle_random(void) {
+  uint32_t x = score_row_oracle_state;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  score_row_oracle_state = x;
+  return x;
+}
+
+/* Treat the unchanged direct v2 matrix path as the differential oracle for
+   the public score-only path.  Bounds also remain on that matrix path, so
+   compare the complete score-and-bounds tuple, not only membership. */
+static void test_ascii_v2_score_only_matches_position_oracle(void) {
+  static const char alphabet[] =
+      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-.";
+  enum { Trials = 2000, MaxText = 96, MaxPattern = 10 };
+  char text_data[MaxText + 1];
+  char pattern_data[MaxPattern + 1];
+
+  for (int scheme = FZF_SCORE_SCHEME_DEFAULT;
+       scheme <= FZF_SCORE_SCHEME_HISTORY; scheme++) {
+    for (int case_sensitive = 0; case_sensitive < 2; case_sensitive++) {
+      for (int normalize = 0; normalize < 2; normalize++) {
+        for (int forward = 0; forward < 2; forward++) {
+          fzf_slab_t *score_slab = fzf_make_default_slab();
+          fzf_slab_t *oracle_slab = fzf_make_default_slab();
+          CHECK(score_slab != NULL);
+          CHECK(oracle_slab != NULL);
+          if (!score_slab || !oracle_slab) {
+            fzf_free_slab(score_slab);
+            fzf_free_slab(oracle_slab);
+            continue;
+          }
+          CHECK(fzf_slab_set_score_scheme(
+              score_slab, (fzf_score_scheme_t)scheme));
+          CHECK(fzf_slab_set_score_scheme(
+              oracle_slab, (fzf_score_scheme_t)scheme));
+
+          for (size_t trial = 0; trial < Trials; trial++) {
+            size_t text_size = 2 + score_row_oracle_random() % (MaxText - 1);
+            size_t pattern_size =
+                2 + score_row_oracle_random() % (MaxPattern - 1);
+            for (size_t i = 0; i < text_size; i++)
+              text_data[i] = alphabet[score_row_oracle_random() %
+                                      (sizeof alphabet - 1)];
+
+            if ((trial & 1) == 0 && pattern_size <= text_size) {
+              size_t next = 0;
+              for (size_t i = 0; i < pattern_size; i++) {
+                size_t max_index = text_size - (pattern_size - i);
+                size_t index = next + score_row_oracle_random() %
+                                        (max_index - next + 1);
+                pattern_data[i] = text_data[index];
+                next = index + 1;
+              }
+            } else {
+              for (size_t i = 0; i < pattern_size; i++)
+                pattern_data[i] = alphabet[score_row_oracle_random() %
+                                           (sizeof alphabet - 1)];
+            }
+            if (!case_sensitive) {
+              for (size_t i = 0; i < pattern_size; i++)
+                pattern_data[i] =
+                    (char)tolower((unsigned char)pattern_data[i]);
+            }
+            text_data[text_size] = '\0';
+            pattern_data[pattern_size] = '\0';
+
+            char *query = strdup(pattern_data);
+            fzf_pattern_t *parsed = fzf_parse_pattern_with_direction(
+                case_sensitive ? CaseRespect : CaseIgnore, normalize, query,
+                true, forward);
+            CHECK(query != NULL);
+            CHECK(parsed != NULL);
+            if (!query || !parsed) {
+              free(query);
+              fzf_free_pattern(parsed);
+              continue;
+            }
+
+            fzf_string_t text = {.data = text_data, .size = text_size};
+            fzf_term_t *term = &parsed->ptr[0]->ptr[0];
+            fzf_string_t *pattern = (fzf_string_t *)term->text;
+
+            fzf_clear_allocation_failure();
+            fzf_result_t oracle_result = fzf_fuzzy_match_v2_with_direction(
+                term->case_sensitive, term->normalize, forward, &text,
+                pattern, NULL, oracle_slab);
+            bool oracle_failed = fzf_allocation_failed();
+            int32_t expected_score = oracle_result.start < 0
+                                         ? 0
+                                         : (oracle_result.score > 0
+                                                ? oracle_result.score
+                                                : 1);
+
+            int32_t score = fzf_get_score(text_data, parsed, score_slab);
+            bool score_failed = fzf_allocation_failed();
+            int32_t byte_score = fzf_get_score_bytes(
+                text_data, text_size, parsed, score_slab);
+            bool byte_score_failed = fzf_allocation_failed();
+            fzf_score_bounds_t bounds = {0};
+            int32_t bounds_score = fzf_get_score_with_bounds(
+                text_data, parsed, score_slab, &bounds);
+            bool bounds_failed = fzf_allocation_failed();
+
+            fzf_score_bounds_t expected_bounds = {0};
+            expected_bounds.raw_score = oracle_result.score;
+            if (oracle_result.start >= 0 &&
+                oracle_result.end > oracle_result.start) {
+              expected_bounds.min_begin = oracle_result.start;
+              expected_bounds.min_end = oracle_result.end;
+              expected_bounds.max_end = oracle_result.end;
+              expected_bounds.valid = true;
+            }
+
+            if (score_failed != oracle_failed ||
+                byte_score_failed != oracle_failed ||
+                bounds_failed != oracle_failed || score != expected_score ||
+                byte_score != expected_score || bounds_score != expected_score ||
+                bounds.raw_score != expected_bounds.raw_score ||
+                bounds.valid != expected_bounds.valid ||
+                (bounds.valid &&
+                 (bounds.min_begin != expected_bounds.min_begin ||
+                  bounds.min_end != expected_bounds.min_end ||
+                  bounds.max_end != expected_bounds.max_end))) {
+              fprintf(stderr,
+                      "  FAIL score-row oracle: trial=%zu scheme=%d case=%d "
+                      "normalize=%d forward=%d text_size=%zu pattern_size=%zu "
+                      "score=%d byte=%d bounds_score=%d "
+                      "bounds=(%d,%d,%d,%lld,%d) oracle=(%d,%d,%d)\n",
+                      trial, scheme, case_sensitive, normalize, forward,
+                      text_size, pattern_size, score, byte_score, bounds_score,
+                      bounds.min_begin, bounds.min_end, bounds.max_end,
+                      (long long)bounds.raw_score, bounds.valid,
+                      oracle_result.start, oracle_result.end,
+                      oracle_result.score);
+              failed++;
+              fzf_free_pattern(parsed);
+              free(query);
+              break;
+            }
+            fzf_free_pattern(parsed);
+            free(query);
+          }
+
+          fzf_free_slab(score_slab);
+          fzf_free_slab(oracle_slab);
+        }
+      }
+    }
+  }
 }
 
 static void test_exact_match(void) {
@@ -1251,6 +1407,7 @@ int main(void) {
   RUN(test_fuzzy_empty_pattern);
   RUN(test_fuzzy_pattern_longer_than_text);
   RUN(test_ascii_v2_single_byte_path);
+  RUN(test_ascii_v2_score_only_matches_position_oracle);
   RUN(test_exact_match);
   RUN(test_exact_no_match);
   RUN(test_pinned_fzf_exact_boundary);
