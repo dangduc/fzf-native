@@ -104,6 +104,16 @@
       (should (string-search expected-revision actual)))
     actual))
 
+(defun fzf-native-upstream--unicode-version-context ()
+  "Return explicitly configured Unicode toolchain identities."
+  (list
+   :upstream-revision (getenv "FZF_REFERENCE_REVISION")
+   :go-toolchain (getenv "FZF_REFERENCE_GO_TOOLCHAIN")
+   :go-unicode-version (getenv "FZF_REFERENCE_UNICODE_VERSION")
+   :native-unicode-library (getenv "FZF_NATIVE_UNICODE_LIBRARY")
+   :native-library-version (getenv "FZF_NATIVE_UNICODE_LIBRARY_VERSION")
+   :native-unicode-version (getenv "FZF_NATIVE_UNICODE_VERSION")))
+
 (defun fzf-native-upstream--case-rng (seed serial)
   "Return an independent deterministic generator for SEED and SERIAL."
   (fzf-native-differential-rng-create
@@ -1289,11 +1299,13 @@ Each specification has the form (KEY VALUES)."
                    (exception
                    (fzf-native-differential-classify
                     case 'membership
-                    (list
-                     :differing-identities difference
-                     :native-membership native-membership
-                     :upstream-membership upstream-membership
-                     :go-decoded-native-membership decoded-membership))))
+                    (append
+                     (list
+                      :differing-identities difference
+                      :native-membership native-membership
+                      :upstream-membership upstream-membership
+                      :go-decoded-native-membership decoded-membership)
+                     (fzf-native-upstream--unicode-version-context)))))
               (if exception
                   (progn
                     (fzf-native-upstream--record-exception exceptions exception)
