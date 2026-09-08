@@ -239,6 +239,25 @@ static BenchMembershipStats bench_membership_stats(
   return stats;
 }
 
+/* Keep the benchmark oracle independent from the optimized radix sorter that
+   produces session results.  This intentionally spells out fzf's public
+   total order and uses libc qsort, so a defect in counting_sort_scored cannot
+   validate itself. */
+static int bench_compare_scored_total(const void *left_value,
+                                      const void *right_value) {
+  const ScoredStr *left = left_value;
+  const ScoredStr *right = right_value;
+  if (left->rank.score != right->rank.score)
+    return left->rank.score > right->rank.score ? -1 : 1;
+  if (left->rank.first != right->rank.first)
+    return left->rank.first < right->rank.first ? -1 : 1;
+  if (left->rank.second != right->rank.second)
+    return left->rank.second < right->rank.second ? -1 : 1;
+  if (left->idx != right->idx)
+    return left->idx < right->idx ? -1 : 1;
+  return 0;
+}
+
 static bool bench_validate_snapshot(AsyncSession *session,
                                     const BenchSnapshot *snapshot,
                                     const char *query, size_t limit,
@@ -298,8 +317,10 @@ static bool bench_validate_snapshot(AsyncSession *session,
   }
   pthread_mutex_unlock(&session->mu);
 
-  if (matched > 1)
-    counting_sort_scored(reference, matched, score_scheme);
+  /* Empty and inverse-only patterns preserve producer order. */
+  if (pattern && pattern->has_positive_term && matched > 1)
+    qsort(reference, matched, sizeof *reference,
+          bench_compare_scored_total);
   size_t expected_count = limit && limit < matched ? limit : matched;
   BenchSnapshot expected_snapshot = {
       .top = reference,
