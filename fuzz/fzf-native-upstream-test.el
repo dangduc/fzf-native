@@ -241,6 +241,28 @@
             (setq index (1+ index)))))
       (apply #'concat (nreverse pieces)))))
 
+(defun fzf-native-upstream--go-decoded-case (case)
+  "Return a copy of CASE after Go's malformed-byte replacement."
+  (let ((decoded (copy-fzf-native-differential-case case)))
+    (setf
+     (fzf-native-differential-case-rendered-query decoded)
+     (fzf-native-upstream--go-output-bytes
+      (fzf-native-differential-case-rendered-query case))
+     (fzf-native-differential-case-candidates decoded)
+     (mapcar
+      (lambda (candidate)
+        (let ((copy (copy-fzf-native-differential-candidate candidate)))
+          (setf (fzf-native-differential-candidate-text copy)
+                (fzf-native-upstream--go-output-bytes
+                 (fzf-native-differential-candidate-text candidate)))
+          copy))
+      (fzf-native-differential-case-candidates case))
+     (fzf-native-differential-case-dimensions decoded)
+     (plist-put
+      (copy-sequence (fzf-native-differential-case-dimensions case))
+      :valid-utf8 t))
+    decoded))
+
 (defun fzf-native-upstream--identity-table (case &optional upstream-output)
   "Return a text-to-identity-queue table for CASE.
 
@@ -1146,13 +1168,28 @@ Each specification has the form (KEY VALUES)."
                            :valid-utf8)
             (should (memq 0 upstream-membership)))
           (unless membership-equal
-            (let ((exception
+            (let* ((difference
+                    (fzf-native-upstream--membership-difference
+                     native-membership upstream-membership))
+                   (decoded-case
+                    (and
+                     (fzf-native-differential--case-has-malformed-utf8-p case)
+                     (fzf-native-upstream--go-decoded-case case)))
+                   (decoded-membership
+                    (and
+                     decoded-case
+                     (fzf-native-upstream--membership
+                      (fzf-native-upstream--identities
+                       decoded-case
+                       (fzf-native-upstream--native decoded-case)))))
+                   (exception
                    (fzf-native-differential-classify
                     case 'membership
                     (list
-                     :differing-identities
-                     (fzf-native-upstream--membership-difference
-                      native-membership upstream-membership)))))
+                     :differing-identities difference
+                     :native-membership native-membership
+                     :upstream-membership upstream-membership
+                     :go-decoded-native-membership decoded-membership))))
               (if exception
                   (progn
                     (fzf-native-upstream--record-exception exceptions exception)
