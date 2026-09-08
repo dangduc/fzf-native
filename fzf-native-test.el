@@ -162,6 +162,17 @@
         (should (equal (fzf-native-score-all candidates "λ$")
                        (cadr case)))))))
 
+(ert-deftest fzf-native-path-delimiter-platform-parity-test ()
+  "The path scheme follows the module host's path separators."
+  (let ((fzf-native-score-scheme 'path)
+        (fzf-native-case-mode 'respect))
+    (let ((slash-score (car (fzf-native-score "src/fzf" "fzf")))
+          (backslash-score (car (fzf-native-score "src\\fzf" "fzf"))))
+      (should (> slash-score 0))
+      (if (eq system-type 'windows-nt)
+          (should (= backslash-score slash-score))
+        (should (< backslash-score slash-score))))))
+
 (ert-deftest fzf-native-inverse-only-or-preserves-producer-order-test ()
   "Inverse-only OR terms do not activate fzf ranking."
   (let ((candidates '("longer" "x" "path/to/value")))
@@ -193,6 +204,14 @@
       (should (equal (fzf-native-score "O" "Ờ") '(0)))
       (should (equal (fzf-native-score-all '("A" "Ā" "ā") "Ā")
                      '("Ā"))))))
+
+(ert-deftest fzf-native-v2-titlecase-candidate-does-not-fold-test ()
+  "Fuzzy V2 folds uppercase candidates, but not titlecase candidates."
+  (let ((fzf-native-case-mode 'ignore)
+        (fzf-native-fuzzy t)
+        (fzf-native-normalize t))
+    (should (equal (fzf-native-score "ǅ" "ǆ") '(0)))
+    (should (> (car (fzf-native-score "Ǆ" "ǆ")) 0))))
 
 (ert-deftest fzf-native-search-direction-public-batch-test ()
   "The direction option selects earlier or later equal-score occurrences."
@@ -3401,9 +3420,11 @@ the bad byte."
     fzf-native-module-init-publication-is-reentry-safe-test
     fzf-native-score-scheme-public-batch-test
     fzf-native-score-scheme-ranking-parity-test
+    fzf-native-path-delimiter-platform-parity-test
     fzf-native-inverse-only-or-preserves-producer-order-test
     fzf-native-score-scheme-invalid-value-test
     fzf-native-normalize-public-batch-test
+    fzf-native-v2-titlecase-candidate-does-not-fold-test
     fzf-native-search-direction-public-batch-test
     fzf-native-exact-boundary-public-batch-test
     fzf-native-search-direction-invalid-value-test
@@ -3432,6 +3453,7 @@ the bad byte."
     fzf-native-async-producer-corrects-pwd-for-directory-test
     fzf-native-async-producer-honors-pwd-removal-test
     fzf-native-score-all-empty-string-candidate-test
+    fzf-native-highlight-one-policy-change-clears-stale-face-test
     fzf-native-utf8-case-ignore-length-changing-fold-test)
   "Public ABI tests run against tracked and freshly built release modules.")
 
