@@ -61,6 +61,47 @@
 
 Pinned fzf V2 does not fold the candidate side of these pairs.")
 
+(defconst fzf-native-differential--unicode-version-lowercase-pairs
+  '((#xa7ce . #xa7cf)
+    (#xa7d2 . #xa7d3)
+    (#xa7d4 . #xa7d5)
+    (#x16ea0 . #x16ebb)
+    (#x16ea1 . #x16ebc)
+    (#x16ea2 . #x16ebd)
+    (#x16ea3 . #x16ebe)
+    (#x16ea4 . #x16ebf)
+    (#x16ea5 . #x16ec0)
+    (#x16ea6 . #x16ec1)
+    (#x16ea7 . #x16ec2)
+    (#x16ea8 . #x16ec3)
+    (#x16ea9 . #x16ec4)
+    (#x16eaa . #x16ec5)
+    (#x16eab . #x16ec6)
+    (#x16eac . #x16ec7)
+    (#x16ead . #x16ec8)
+    (#x16eae . #x16ec9)
+    (#x16eaf . #x16eca)
+    (#x16eb0 . #x16ecb)
+    (#x16eb1 . #x16ecc)
+    (#x16eb2 . #x16ecd)
+    (#x16eb3 . #x16ece)
+    (#x16eb4 . #x16ecf)
+    (#x16eb5 . #x16ed0)
+    (#x16eb6 . #x16ed1)
+    (#x16eb7 . #x16ed2)
+    (#x16eb8 . #x16ed3))
+  "Go 1.27.1 lowercase mappings absent from utf8proc 2.10.0.")
+
+(defconst fzf-native-differential--unicode-version-public-kinds
+  [fuzzy exact boundary-exact prefix suffix equal]
+  "Parsed-query matcher kinds seeded for Unicode-version coverage.")
+
+(defconst fzf-native-differential--unicode-version-seed-count
+  (* (length fzf-native-differential--unicode-version-lowercase-pairs)
+     2
+     (length fzf-native-differential--unicode-version-public-kinds))
+  "Number of cases in one exhaustive parsed Unicode-version seed block.")
+
 (defconst fzf-native-differential--normalization-pairs
   [["cafe" "café"]
    ["A" "Ấ"]
