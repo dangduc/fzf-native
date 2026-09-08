@@ -718,7 +718,7 @@ Each specification has the form (KEY VALUES)."
                (lambda (entry)
                  (eq (plist-get entry :disposition) 'accepted))
                fzf-native-differential-exceptions))
-      '(malformed-utf8-decoder)))
+      '(malformed-utf8-decoder unicode-lowercase-table-version)))
     (dolist (entry fzf-native-differential-exceptions)
       (should
        (equal (plist-get entry :upstream-revision)
@@ -728,6 +728,61 @@ Each specification has the form (KEY VALUES)."
     (should
      (equal (plist-get malformed-exception :scope)
             "Only predicted membership changes for nonempty malformed input."))))
+
+(ert-deftest fzf-native-fuzz-upstream-unicode-version-exception-is-exact ()
+  "Accept only the enumerated pairs under the exact pinned runtime identity."
+  (let* ((case (fzf-native-differential--unicode-version-case 1 0 0))
+         (base-context
+          '(:differing-identities (0)
+            :native-membership (1 2)
+            :upstream-membership (0 1 2)))
+         (context
+          (append base-context
+                  fzf-native-differential-unicode-version-context))
+         (exception
+          (fzf-native-differential-classify case 'membership context)))
+    (should (eq (plist-get exception :name)
+                'unicode-lowercase-table-version))
+    (should (eq (plist-get exception :disposition) 'accepted))
+    (dolist (key '(:upstream-revision :go-toolchain :go-unicode-version
+                   :native-unicode-library :native-library-version
+                   :native-unicode-version))
+      (let ((wrong-context (copy-sequence context)))
+        (setq wrong-context (plist-put wrong-context key "wrong"))
+        (should-not
+         (fzf-native-differential-classify
+          case 'membership wrong-context))))
+    (should-not
+     (fzf-native-differential-classify case 'membership base-context))
+    (should-not
+     (fzf-native-differential-classify case 'ranking context))
+    (should-not
+     (fzf-native-differential-classify
+      case 'membership
+      (append '(:differing-identities (0)
+                :native-membership (0 1 2)
+                :upstream-membership (1 2))
+              fzf-native-differential-unicode-version-context)))
+    (let* ((wrong-case
+            (fzf-native-differential--unicode-version-case 1 0 0))
+           (peer (car (fzf-native-differential-case-candidates wrong-case))))
+      (setf (fzf-native-differential-candidate-text peer) (string #x101))
+      (should-not
+       (fzf-native-differential-classify wrong-case 'membership context)))
+    (let* ((wrong-case
+            (fzf-native-differential--unicode-version-case 1 0 0))
+           (query (fzf-native-differential-case-query wrong-case)))
+      (setf (fzf-native-differential-query-case-mode query) 'smart)
+      (should-not
+       (fzf-native-differential-classify wrong-case 'membership context)))
+    (let ((entry
+           (cl-find 'unicode-lowercase-table-version
+                    fzf-native-differential-exceptions
+                    :key (lambda (item) (plist-get item :name)))))
+      (cl-loop
+       for (key value) on fzf-native-differential-unicode-version-context
+       by #'cddr
+       do (should (equal (plist-get entry key) value))))))
 
 (ert-deftest fzf-native-fuzz-upstream-malformed-exceptions-are-causal ()
   "Accept only exact membership changes predicted by Go decoding."
@@ -899,6 +954,47 @@ Each specification has the form (KEY VALUES)."
         (ert-info ((format "query=%S candidates=%S" rendered-query texts))
           (should (equal native expected))
           (should (equal upstream expected)))))))
+
+(ert-deftest fzf-native-fuzz-upstream-unicode-version-public-expectation ()
+  "Check the exact parsed membership debt for every pinned lowercase pair."
+  (let* ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf")))
+         (runtime-context (fzf-native-upstream--unicode-version-context))
+         (accepted 0))
+    (skip-unless
+     (and fzf
+          (fzf-native-differential--unicode-version-context-p
+           runtime-context)))
+    (fzf-native-upstream--verify-reference fzf)
+    (dotimes (serial fzf-native-differential--unicode-version-seed-count)
+      (let* ((case
+              (fzf-native-differential--unicode-version-case
+               12648430 serial serial))
+             (native
+              (fzf-native-upstream--membership
+               (fzf-native-upstream--identities
+                case (fzf-native-upstream--native case))))
+             (upstream
+              (fzf-native-upstream--membership
+               (fzf-native-upstream--identities
+                case (fzf-native-upstream--fzf fzf case) t)))
+             (difference
+              (fzf-native-upstream--membership-difference native upstream))
+             (exception
+              (fzf-native-differential-classify
+               case 'membership
+               (append
+                (list :differing-identities difference
+                      :native-membership native
+                      :upstream-membership upstream)
+                runtime-context))))
+        (ert-info ((fzf-native-differential-case-description case))
+          (should (equal native '(1 2)))
+          (should (equal upstream '(0 1 2)))
+          (should (equal difference '(0)))
+          (should (eq (plist-get exception :name)
+                      'unicode-lowercase-table-version)))
+        (setq accepted (1+ accepted))))
+    (should (= accepted 336))))
 
 (ert-deftest fzf-native-fuzz-upstream-inverse-only-or-keeps-order ()
   "Compare inverse-only OR order with pinned fzf for each scheme."
