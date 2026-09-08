@@ -121,6 +121,110 @@
   (append (cl-set-difference left right :test #'equal)
           (cl-set-difference right left :test #'equal)))
 
+(defun fzf-native-differential--unicode-version-context-p (context)
+  "Return non-nil when CONTEXT has every pinned Unicode runtime identity."
+  (and
+   (listp context)
+   (cl-loop
+    for (key value) on fzf-native-differential-unicode-version-context
+    by #'cddr
+    always (and (plist-member context key)
+                (equal (plist-get context key) value)))))
+
+(defun fzf-native-differential--unicode-version-orientation
+    (pattern candidate)
+  "Return the pinned lowercase orientation for PATTERN and CANDIDATE."
+  (when (and (stringp pattern) (= (length pattern) 1)
+             (stringp candidate) (= (length candidate) 1))
+    (let ((pattern-codepoint (aref pattern 0))
+          (candidate-codepoint (aref candidate 0)))
+      (cl-loop
+       for pair in fzf-native-differential--unicode-version-lowercase-pairs
+       if (and (= pattern-codepoint (car pair))
+               (= candidate-codepoint (cdr pair)))
+       return (list pair 'upper-to-lower)
+       if (and (= pattern-codepoint (cdr pair))
+               (= candidate-codepoint (car pair)))
+       return (list pair 'lower-to-upper)))))
+
+(defun fzf-native-differential--unicode-version-membership-p
+    (case context)
+  "Recognize the exact upstream-only table miss described by CASE and CONTEXT."
+  (let* ((identities (and (listp context)
+                          (plist-get context :differing-identities)))
+         (native (and (listp context)
+                      (plist-get context :native-membership)))
+         (upstream (and (listp context)
+                        (plist-get context :upstream-membership)))
+         (query (fzf-native-differential-case-query case))
+         (sets (and query (fzf-native-differential-query-sets query)))
+         (term (and (listp sets)
+                    (= (length sets) 1)
+                    (listp (car sets))
+                    (= (length (car sets)) 1)
+                    (caar sets)))
+         (literal (and term (fzf-native-differential-term-literal term)))
+         (dimensions (fzf-native-differential-case-dimensions case))
+         (candidates (fzf-native-differential-case-candidates case))
+         (candidate-ids
+          (mapcar #'fzf-native-differential-candidate-id candidates)))
+    (and
+     (consp identities)
+     (listp native)
+     (listp upstream)
+     (fzf-native-differential--identity-set-equal-p identities identities)
+     (fzf-native-differential--identity-set-equal-p native native)
+     (fzf-native-differential--identity-set-equal-p upstream upstream)
+     (fzf-native-differential--identity-set-equal-p
+      identities
+      (fzf-native-differential--identity-set-difference native upstream))
+     (cl-every (lambda (identity)
+                 (and (member identity upstream)
+                      (not (member identity native))))
+               identities)
+     (= (length candidate-ids)
+        (length (delete-dups (copy-sequence candidate-ids))))
+     (eq (fzf-native-differential-case-profile case) 'parity)
+     (eq (fzf-native-differential-case-comparison case) 'membership)
+     (plist-get dimensions :valid-utf8)
+     query
+     (eq (fzf-native-differential-query-case-mode query) 'ignore)
+     (not (fzf-native-differential-query-normalize query))
+     term
+     (not (fzf-native-differential-term-inverse term))
+     (memq (fzf-native-differential-term-kind term)
+           (append fzf-native-differential--unicode-version-public-kinds nil))
+     (equal (fzf-native-differential-case-rendered-query case)
+            (fzf-native-differential-render-query query))
+     (cl-every
+      (lambda (identity)
+        (let* ((candidate
+                (cl-find identity candidates
+                         :key #'fzf-native-differential-candidate-id
+                         :test #'equal))
+               (orientation
+                (and candidate
+                     (fzf-native-differential--unicode-version-orientation
+                      literal
+                      (fzf-native-differential-candidate-text candidate)))))
+          (and
+           candidate
+           (eq (fzf-native-differential-candidate-role candidate)
+               'unicode-version-peer)
+           orientation
+           (equal (car orientation)
+                  (plist-get dimensions :unicode-version-pair))
+           (eq (cadr orientation)
+               (plist-get dimensions :unicode-version-orientation)))))
+      identities))))
+
+(defun fzf-native-differential--exception-unicode-version-p
+    (case facet context)
+  "Recognize pinned Unicode table membership differences for CASE and FACET."
+  (and (eq facet 'membership)
+       (fzf-native-differential--unicode-version-context-p context)
+       (fzf-native-differential--unicode-version-membership-p case context)))
+
 (defun fzf-native-differential--malformed-query-p (case)
   "Return non-nil when CASE has a malformed rendered query."
   (fzf-native-differential--malformed-utf8-string-p
@@ -203,7 +307,20 @@ cannot change their membership."
      :owner "fzf-native UTF-8 compatibility policy"
      :scope "Only predicted membership changes for nonempty malformed input."
      :remove-when "Both oracles apply one documented malformed-byte policy."
-     :predicate ,#'fzf-native-differential--exception-malformed-utf8-p))
+     :predicate ,#'fzf-native-differential--exception-malformed-utf8-p)
+    (:name unicode-lowercase-table-version
+     :reason "Go Unicode 17 has 28 lowercase pairs absent from utf8proc Unicode 16."
+     :disposition accepted
+     :upstream-revision ,fzf-native-differential-upstream-revision
+     :go-toolchain "go1.27.1"
+     :go-unicode-version "17.0.0"
+     :native-unicode-library "utf8proc"
+     :native-library-version "2.10.0"
+     :native-unicode-version "16.0.0"
+     :owner "fzf-native Unicode table compatibility policy"
+     :scope "Only upstream-only membership for the 28 enumerated one-rune lowercase pairs."
+     :remove-when "Both peers use Unicode tables with the same lowercase mappings."
+     :predicate ,#'fzf-native-differential--exception-unicode-version-p))
   "Ordered, narrow predicates for known differential behavior.")
 
 (defun fzf-native-differential-classify (case facet &optional context)
