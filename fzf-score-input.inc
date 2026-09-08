@@ -14,6 +14,21 @@
 #define FZF_SCORE_COMMIT_BOUNDS_WAS_DEFAULTED 1
 #endif
 
+/* Parsed interactive queries most often contain one positive term.  Answer
+   that shape directly instead of entering two generic set loops and testing
+   inverse/alternative state that the parser has already ruled out. */
+if (!pattern->only_inv && pattern->size == 1 &&
+    pattern->ptr[0]->size == 1 && !pattern->ptr[0]->ptr[0].inv) {
+  fzf_term_t *term = &pattern->ptr[0]->ptr[0];
+  fzf_result_t res = CALL_ALG(
+      term, false, input, input_is_ascii, pattern->forward, NULL, slab);
+  if (fzf_allocation_failed()) return 0;
+  if (res.start < 0) return 0;
+  FZF_SCORE_RECORD_BOUNDS(res);
+  FZF_SCORE_COMMIT_BOUNDS();
+  return res.score > 0 ? res.score : 1;
+}
+
 if (pattern->only_inv) {
   for (size_t i = 0; i < pattern->size; i++) {
     fzf_term_set_t *term_set = pattern->ptr[i];

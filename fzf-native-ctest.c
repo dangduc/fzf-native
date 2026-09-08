@@ -1459,6 +1459,43 @@ static void test_async_reader_rejects_embedded_nul(void) {
   free_async_session(s);
 }
 
+static void test_async_candidate_arena_metadata(void) {
+  AsyncSession *s = make_async_session(NULL, 0);
+  CHECK(s != NULL);
+  const char invalid_utf8[] = {'x', (char)0xff, '\0'};
+  CHECK(async_append_candidate(s, "plain-ascii", strlen("plain-ascii")));
+  CHECK(async_append_candidate(s, invalid_utf8, 2));
+  CHECK(async_append_candidate(s, "", 0));
+
+  const size_t expected_lengths[] = {11, 2, 0};
+  const bool expected_ascii[] = {true, false, true};
+  for (size_t i = 0; i < 3; i++) {
+    const char *candidate = cands_at(s, i);
+    size_t length = SIZE_MAX;
+    bool ascii = false;
+    CHECK(candidate != NULL);
+    async_arena_string_metadata(candidate, &length, &ascii);
+    CHECK(length == expected_lengths[i]);
+    CHECK(ascii == expected_ascii[i]);
+    CHECK(strlen(candidate) == length);
+  }
+
+  size_t fallback_length = ASYNC_ARENA_STRING_LENGTH_MASK;
+  char *long_candidate = malloc(fallback_length + 1);
+  CHECK(long_candidate != NULL);
+  memset(long_candidate, 'z', fallback_length);
+  long_candidate[fallback_length] = '\0';
+  CHECK(async_append_candidate(s, long_candidate, fallback_length));
+  size_t decoded_length = 0;
+  bool decoded_ascii = false;
+  async_arena_string_metadata(
+      cands_at(s, 3), &decoded_length, &decoded_ascii);
+  CHECK(decoded_length == fallback_length);
+  CHECK(decoded_ascii);
+  free(long_candidate);
+  free_async_session(s);
+}
+
 static bool async_line_reference(const unsigned char *raw, size_t raw_len,
                                  ptrdiff_t max_line_length, char **output,
                                  size_t *output_len) {
@@ -1618,6 +1655,33 @@ static void test_async_line_decoder_truncates_without_splitting_utf8(void) {
   CHECK(async_line_finish(s, &line));
   CHECK(s->count == 1);
   CHECK(strcmp(cands_at(s, 0), "\xe4\xbd\xa0\xe5\xa5\xbd") == 0);
+  free(line.output);
+  free_async_session(s);
+}
+
+static void test_async_line_decoder_truncated_ascii_metadata(void) {
+  AsyncSession *s = make_async_session(NULL, 0);
+  CHECK(s != NULL);
+  if (!s) return;
+  s->max_line_length = -3;
+  AsyncLineDecoder line = {0};
+  static const unsigned char input[] = {
+      'a', 'b', 'c', 0xc3, 0xa9, 0xff,
+  };
+  CHECK(async_line_feed_bytes(
+      s, &line, (const char *)input, sizeof input));
+  CHECK(async_line_finish(s, &line));
+  CHECK(s->count == 1);
+
+  const char *candidate = cands_at(s, 0);
+  size_t length = SIZE_MAX;
+  bool ascii = false;
+  CHECK(candidate != NULL);
+  async_arena_string_metadata(candidate, &length, &ascii);
+  CHECK(length == 3);
+  CHECK(ascii);
+  CHECK(strcmp(candidate, "abc") == 0);
+
   free(line.output);
   free_async_session(s);
 }
@@ -4374,9 +4438,11 @@ int main(void) {
   RUN(test_async_reader_long_line);
   RUN(test_async_reader_final_unterminated_line);
   RUN(test_async_reader_rejects_embedded_nul);
+  RUN(test_async_candidate_arena_metadata);
   RUN(test_async_line_decoder_matches_one_shot_reference);
   RUN(test_async_line_decoder_bounds_overlong_records);
   RUN(test_async_line_decoder_truncates_without_splitting_utf8);
+  RUN(test_async_line_decoder_truncated_ascii_metadata);
 
   printf("--- chunked cands_top ---\n");
   RUN(test_cands_top_index_split);

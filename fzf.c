@@ -1184,6 +1184,45 @@ fzf_result_t fzf_fuzzy_match_v1(bool case_sensitive, bool normalize,
                                  pattern, pos, slab, NULL);
 }
 
+/* A one-byte pattern has no DP rows and its score cannot contain a gap or
+   consecutive bonus.  Keep the v2 character-class and tie-breaking rules,
+   but do not allocate five scratch slices or copy the complete candidate. */
+static fzf_result_t fzf_fuzzy_match_v2_one_byte(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, size_t scan_start,
+    const score_scheme_config_t *config) {
+  int16_t max_score = 0;
+  size_t max_score_pos = 0;
+  bool matched = false;
+  int32_t prev_class = config->initial_class;
+  char pattern_byte = pattern->data[0];
+
+  for (size_t idx = scan_start; idx < text->size; idx++) {
+    char c = text->data[idx];
+    char_class class = char_class_of_ascii(c, config);
+    if (!case_sensitive && class == CharUpper)
+      c = (char)tolower((uint8_t)c);
+    if (normalize) c = normalize_rune(c);
+
+    if (c == pattern_byte) {
+      matched = true;
+      int16_t bonus = bonus_for(config, prev_class, class);
+      int16_t score = ScoreMatch + bonus * BonusFirstCharMultiplier;
+      if (forward ? score > max_score : score >= max_score) {
+        max_score = score;
+        max_score_pos = idx;
+        if (forward && bonus >= BonusBoundary) break;
+      }
+    }
+    prev_class = class;
+  }
+
+  if (!matched) return (fzf_result_t){-1, -1, 0};
+  append_pos(pos, max_score_pos);
+  return (fzf_result_t){(int32_t)max_score_pos,
+                        (int32_t)max_score_pos + 1, max_score};
+}
+
 static fzf_result_t fzf_fuzzy_match_v2_impl(
     bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
     fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab,
@@ -1225,6 +1264,10 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
     }
     idx = (size_t)tmp_idx;
   }
+
+  if (M == 1)
+    return fzf_fuzzy_match_v2_one_byte(
+        case_sensitive, normalize, forward, text, pattern, pos, idx, config);
 
   size_t offset16 = 0;
   size_t offset32 = 0;
@@ -1297,13 +1340,6 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
       int16_t score = ScoreMatch + bonus * BonusFirstCharMultiplier;
       h0_sub.data[off] = score;
       c0_sub.data[off] = 1;
-      if (M == 1 && (forward ? score > max_score : score >= max_score)) {
-        max_score = score;
-        max_score_pos = idx + off;
-        if (forward && bonus >= BonusBoundary) {
-          break;
-        }
-      }
       in_gap = false;
     } else {
       if (in_gap) {
@@ -1324,18 +1360,6 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
     free_alloc(h0);
     return (fzf_result_t){-1, -1, 0};
   }
-  if (M == 1) {
-    free_alloc(t);
-    free_alloc(f);
-    free_alloc(bo);
-    free_alloc(c0);
-    free_alloc(h0);
-    fzf_result_t res = {(int32_t)max_score_pos, (int32_t)max_score_pos + 1,
-                        max_score};
-    append_pos(pos, max_score_pos);
-    return res;
-  }
-
   size_t f0 = (size_t)f.data[0];
   size_t width = last_idx - f0 + 1;
   if (M != 0 && width > SIZE_MAX / M) {
@@ -2976,17 +3000,17 @@ static inline fzf_result_t call_alg_for_input(
     algo = get_utf8_algo(algo);
   }
   fzf_string_t *pattern = (fzf_string_t *)term->text;
-  if (algo == fzf_fuzzy_match_v1) {
-    const fzf_ascii_query_plan_t *plan =
-        fzf_fuzzy_query_plan(input, pattern);
-    return fzf_fuzzy_match_v1_impl(
-        term->case_sensitive, term->normalize, forward, input, pattern, pos,
-        slab, plan);
-  }
   if (algo == fzf_fuzzy_match_v2) {
     const fzf_ascii_query_plan_t *plan =
         fzf_fuzzy_query_plan(input, pattern);
     return fzf_fuzzy_match_v2_impl(
+        term->case_sensitive, term->normalize, forward, input, pattern, pos,
+        slab, plan);
+  }
+  if (algo == fzf_fuzzy_match_v1) {
+    const fzf_ascii_query_plan_t *plan =
+        fzf_fuzzy_query_plan(input, pattern);
+    return fzf_fuzzy_match_v1_impl(
         term->case_sensitive, term->normalize, forward, input, pattern, pos,
         slab, plan);
   }
