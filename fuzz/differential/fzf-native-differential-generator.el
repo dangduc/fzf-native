@@ -522,7 +522,7 @@ and NON-UPPER-PEER select variants."
       (setq next-id (1+ next-id)))
     (nreverse candidates)))
 
-(defun fzf-native-differential-generate-case (rng seed serial profile)
+(defun fzf-native-differential--generate-random-case (rng seed serial profile)
   "Generate one deterministic differential case.
 
 RNG supplies choices, SEED and SERIAL identify the replay, and PROFILE is one
@@ -628,6 +628,86 @@ of `common', `parity', or `long'."
            :rank-shape rank-shape
            :valid-utf8 (not (eq text-class 'malformed)))
      :comparison comparison)))
+
+(defun fzf-native-differential--unicode-version-case (seed serial slot)
+  "Return Unicode-version seed SLOT identified by SEED and SERIAL."
+  (let* ((pair-count
+          (length fzf-native-differential--unicode-version-lowercase-pairs))
+         (pair (nth (% slot pair-count)
+                    fzf-native-differential--unicode-version-lowercase-pairs))
+         (orientation-index (% (/ slot pair-count) 2))
+         (kind-index (/ slot (* pair-count 2)))
+         (kind (aref fzf-native-differential--unicode-version-public-kinds
+                     kind-index))
+         (orientation (if (zerop orientation-index)
+                          'lower-to-upper
+                        'upper-to-lower))
+         (pattern-codepoint (if (zerop orientation-index)
+                                (cdr pair)
+                              (car pair)))
+         (candidate-codepoint (if (zerop orientation-index)
+                                  (car pair)
+                                (cdr pair)))
+         (literal (string pattern-codepoint))
+         (candidate (string candidate-codepoint))
+         (term (make-fzf-native-differential-term
+                :kind kind :inverse nil :literal literal))
+         (scheme (aref [default path history] (% slot 3)))
+         (direction (aref [auto forward backward] (% (/ slot 3) 3)))
+         (natural-forward (not (eq scheme 'path)))
+         (forward (pcase direction
+                    ('auto natural-forward)
+                    ('forward t)
+                    (_ nil)))
+         (query (make-fzf-native-differential-query
+                 :sets (list (list term)) :case-mode 'ignore :fuzzy t
+                 :normalize nil :direction direction :forward forward
+                 :score-scheme scheme))
+         (rendered (fzf-native-differential-render-query query)))
+    (make-fzf-native-differential-case
+     :seed seed :serial serial :profile 'parity :query query
+     :rendered-query rendered
+     :candidates
+     (list
+      (make-fzf-native-differential-candidate
+       :id 0 :text candidate :role 'unicode-version-peer)
+      (make-fzf-native-differential-candidate
+       :id 1 :text literal :role 'unicode-version-control)
+      (make-fzf-native-differential-candidate
+       :id 2 :text (copy-sequence literal) :role 'duplicate))
+     :dimensions
+     (list :text-class 'unicode
+           :unicode-casefold t
+           :unicode-version-pair pair
+           :unicode-version-orientation orientation
+           :unicode-non-upper-case nil
+           :normalization-pair nil
+           :normalize nil
+           :direction direction
+           :forward forward
+           :score-scheme scheme
+           :needle-length 1
+           :query-length (length rendered)
+           :anchor-length 1
+           :query-shape 'single
+           :primary-kind kind
+           :rank-shape (aref [front middle tail ambiguous] (% slot 4))
+           :valid-utf8 t)
+     :comparison 'membership)))
+
+(defun fzf-native-differential-generate-case (rng seed serial profile)
+  "Generate deterministic PROFILE case SERIAL using RNG and SEED.
+
+Each 1,024-case parity block starts with exact coverage of every pinned
+Unicode-version pair, orientation, and parsed matcher implementation."
+  (unless (memq profile '(common parity long))
+    (error "Unknown differential profile: %S" profile))
+  (let ((slot (% serial 1024)))
+    (if (and (eq profile 'parity)
+             (< slot fzf-native-differential--unicode-version-seed-count))
+        (fzf-native-differential--unicode-version-case seed serial slot)
+      (fzf-native-differential--generate-random-case
+       rng seed serial profile))))
 
 (defun fzf-native-differential-case-description (case)
   "Return a compact replay description for CASE."
