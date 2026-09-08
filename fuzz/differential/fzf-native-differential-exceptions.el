@@ -22,6 +22,15 @@
   "1372d04f79bde0daa3bab4b96a068baafa808e67"
   "Pinned junegunn/fzf revision for differential exception metadata.")
 
+(defconst fzf-native-differential-unicode-version-context
+  `(:upstream-revision ,fzf-native-differential-upstream-revision
+    :go-toolchain "go1.27.1"
+    :go-unicode-version "17.0.0"
+    :native-unicode-library "utf8proc"
+    :native-library-version "2.10.0"
+    :native-unicode-version "16.0.0")
+  "Exact runtime identity required by the Unicode table exception.")
+
 (defun fzf-native-differential--case-has-kind-p (case kind)
   "Return non-nil if CASE has a term of KIND."
   (cl-some
