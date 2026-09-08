@@ -2801,17 +2801,24 @@ The face covers the matched position; the caller's original is unmutated."
                         (and (listp face)
                              (memq 'my-user-face face))))))))))
 
-(ert-deftest fzf-native-highlight-one-no-match-calls-custom-hook-test ()
-  "A custom highlight hook receives an empty vector for a no-match."
+(ert-deftest fzf-native-highlight-one-empty-positions-contract-test ()
+  "Empty hook positions do not encode match membership."
   (skip-unless (fboundp 'fzf-native-highlight-one))
-  (let (seen-candidate seen-positions)
-    (let* ((fzf-native-highlight-fn
-            (lambda (candidate positions)
-              (setq seen-candidate candidate
-                    seen-positions positions)))
-           (result (fzf-native-highlight-one "abc" "z")))
-      (should (eq seen-candidate result))
-      (should (equal seen-positions [])))))
+  (let ((matched-score (fzf-native-score "abc" "!z"))
+        (missed-score (fzf-native-score "abc" "z"))
+        calls matched-result missed-result)
+    (let ((fzf-native-highlight-fn
+           (lambda (candidate positions)
+             (push (list candidate (copy-sequence positions)) calls))))
+      (setq matched-result (fzf-native-highlight-one "abc" "!z")
+            missed-result (fzf-native-highlight-one "abc" "z")))
+    (setq calls (nreverse calls))
+    (should (equal matched-score '(1)))
+    (should (equal missed-score '(0)))
+    (should (= (length calls) 2))
+    (should (eq (caar calls) matched-result))
+    (should (eq (caadr calls) missed-result))
+    (should (equal (mapcar #'cadr calls) '([] [])))))
 
 (ert-deftest fzf-native-highlight-one-fuzzy-test ()
   "Multi-character fuzzy match attaches face at the matched positions."

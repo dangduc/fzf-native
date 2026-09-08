@@ -898,7 +898,9 @@ static void hl_scratch_free(HlScratch *s) {
    unibyte, packed into
    [s0 e0 s1 e1 …] vector, and passed as (funcall HOOK STR positions).
    A NULL/empty POS is dispatched as an empty vector so the hook can remove
-   highlights left by an earlier matching policy.  No-op only when HOOK is nil.
+   highlights left by an earlier matching policy.  It means "no positive
+   highlight positions", not "no match": inverse-only matches and genuine
+   misses both produce it.  No-op only when HOOK is nil.
 
    SCRATCH provides reusable buffers sized at the start of the score call;
    when NULL or undersized, falls back to a per-call malloc/free pair. */
