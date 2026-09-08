@@ -4,6 +4,13 @@
 
 #include "fzf.h"
 
+/* fzf's byte-oriented algorithms operate on ASCII candidates.  Avoid the
+   locale-aware ctype dispatch in their inner loops: only ASCII uppercase
+   bytes have a distinct folded value in these paths. */
+static inline char fzf_ascii_tolower(unsigned char byte) {
+  return (char)(byte >= 'A' && byte <= 'Z' ? byte + ('a' - 'A') : byte);
+}
+
 #ifdef _MSC_VER
 #define FZF_THREAD_LOCAL __declspec(thread)
 #else

@@ -1229,6 +1229,54 @@ static void test_pinned_fzf_backward_direction(void) {
   fzf_free_positions(positions);
 }
 
+static void test_case_fold_page_filter_is_exhaustive(void) {
+  for (utf8proc_int32_t codepoint = 0; codepoint < 0x110000; codepoint++) {
+    utf8proc_int32_t expected = utf8proc_tolower(codepoint);
+    utf8proc_int32_t actual = utf8proc_case_fold(codepoint);
+    if (actual != expected) {
+      fprintf(stderr,
+              "  FAIL case-fold page filter at U+%04x: %d != %d\n",
+              (unsigned int)codepoint, (int)actual, (int)expected);
+      failed++;
+      break;
+    }
+  }
+  CHECK(utf8proc_case_fold(-1) == utf8proc_tolower(-1));
+  CHECK(utf8proc_case_fold(0x110000) == utf8proc_tolower(0x110000));
+}
+
+static void test_case_fold_page_filter_edge_cases(void) {
+  const utf8proc_int32_t codepoints[] = {
+    'A', 0x00df, 0x0130, 0x01c5, 0x212a, 0xfb00, 0x10400, 0x1d400,
+  };
+  for (size_t i = 0; i < sizeof codepoints / sizeof codepoints[0]; i++)
+    CHECK(utf8proc_case_fold(codepoints[i]) ==
+          utf8proc_tolower(codepoints[i]));
+
+  /* The scorer intentionally implements one-codepoint ToLower, not full
+     Unicode fold expansions: sharp-s and the ff ligature stay unchanged. */
+  CHECK(utf8proc_case_fold(0x00df) == 0x00df);
+  CHECK(utf8proc_case_fold(0xfb00) == 0xfb00);
+  CHECK(utf8proc_case_fold(0x10400) == 0x10428); /* supplementary Deseret */
+  /* Mathematical alphabets case-fold through compatibility mappings, not
+     utf8proc's one-codepoint lowercase table. */
+  CHECK(utf8proc_case_fold(0x1d400) == 0x1d400);
+
+  check_agreement("unicode case-ignore", "\xce\x98\xce\xb5\xcf\x89",
+                  "\xce\xb8\xce\xb5\xcf\x89", CaseIgnore, true, true);
+  check_agreement("unicode case-respect", "\xce\x98\xce\xb5\xcf\x89",
+                  "\xce\xb8\xce\xb5\xcf\x89", CaseRespect, true, false);
+  check_agreement("unicode smart lower", "\xce\x98\xce\xb5\xcf\x89",
+                  "\xce\xb8\xce\xb5\xcf\x89", CaseSmart, true, true);
+  check_agreement("unicode smart upper", "\xce\xb8\xce\xb5\xcf\x89",
+                  "\xce\x98\xce\xb5\xcf\x89", CaseSmart, true, false);
+  check_agreement("supplementary case-ignore",
+                  "\xf0\x90\x90\x80", "\xf0\x90\x90\xa8",
+                  CaseIgnore, true, true);
+  check_agreement("v2 titlecase guard", "\xc7\x85", "\xc7\x86",
+                  CaseIgnore, true, false);
+}
+
 int main(void) {
   printf("--- fzf-additions: fzf_has_match ---\n");
   RUN(test_fuzzy_basic_match);
@@ -1278,6 +1326,8 @@ int main(void) {
   RUN(test_pinned_fzf_latin_normalization);
   RUN(test_normalized_utf8_prefilter);
   RUN(test_pinned_fzf_backward_direction);
+  RUN(test_case_fold_page_filter_is_exhaustive);
+  RUN(test_case_fold_page_filter_edge_cases);
 
   if (failed == 0) {
     printf("\nAll fzf-additions tests passed.\n");
