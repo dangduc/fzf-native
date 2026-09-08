@@ -1041,6 +1041,8 @@ Each specification has the form (KEY VALUES)."
            (eq (fzf-native-differential-case-comparison case) 'membership)
            (plist-get (fzf-native-differential-case-dimensions case)
                       :valid-utf8)
+           (not (plist-get (fzf-native-differential-case-dimensions case)
+                           :unicode-version-pair))
            (fzf-native-differential--case-has-kind-p case 'boundary-exact))
      do
      (let ((native
