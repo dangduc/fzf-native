@@ -16,28 +16,28 @@ const pinnedUpstreamCommit = "1372d04f79bde0daa3bab4b96a068baafa808e67"
 type algorithmID byte
 
 const (
-	algorithmV1 algorithmID = iota
-	algorithmV2
-	algorithmExact
-	algorithmExactBoundary
-	algorithmPrefix
-	algorithmSuffix
-	algorithmEqual
+	algorithmV1            algorithmID = 0
+	algorithmV2            algorithmID = 1
+	algorithmExact         algorithmID = 2
+	algorithmExactBoundary algorithmID = 3
+	algorithmPrefix        algorithmID = 4
+	algorithmSuffix        algorithmID = 5
+	algorithmEqual         algorithmID = 6
 )
 
 type schemeID byte
 
 const (
-	schemeDefault schemeID = iota
-	schemePath
-	schemeHistory
+	schemeDefault schemeID = 0
+	schemePath    schemeID = 1
+	schemeHistory schemeID = 2
 )
 
 const (
-	flagCaseSensitive byte = 1 << iota
-	flagNormalize
-	flagForward
-	validMatchFlags = flagCaseSensitive | flagNormalize | flagForward
+	flagCaseSensitive byte = 1 << 0
+	flagNormalize     byte = 1 << 1
+	flagForward       byte = 1 << 2
+	validMatchFlags        = flagCaseSensitive | flagNormalize | flagForward
 )
 
 type matchRequest struct {
