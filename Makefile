@@ -111,7 +111,8 @@ emacs-asan:
 # No Emacs runtime needed; runs as a plain executable.
 .PHONY: ctest
 ctest: ctest-module ctest-additions ctest-parser-oom ctest-scorer-oom \
-	ctest-session-growth-benchmark ctest-core-hotpath-oracle
+	ctest-session-growth-benchmark ctest-session-trace-benchmark \
+	ctest-core-hotpath-oracle ctest-simd-prefilter
 
 # Prove that the core-hotpath benchmark validates exact per-item scores before
 # it starts timing.  The injected scorer fault must be rejected by the pinned
@@ -165,6 +166,16 @@ ctest-additions:
 		-o $(BUILD_DIR)/fzf-additions-test-windows-paths fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-additions-test-windows-paths
 
+# Direct scalar/SIMD parity and exact-sized-tail coverage for the private
+# prefilters, plus parser fallback at the query-plan size limit.
+.PHONY: ctest-simd-prefilter
+ctest-simd-prefilter:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/fzf-simd-prefilter-test \
+		fzf-simd-prefilter-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-simd-prefilter-test
+
 # Allocation-failure injection for every parser allocation.  fzf.c is
 # included by the test so malloc/calloc/realloc can be replaced locally.
 .PHONY: ctest-parser-oom
@@ -192,6 +203,17 @@ ctest-session-growth-benchmark:
 		etc/session-growth-benchmark-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/session-growth-benchmark-ctest
 
+# Exercise the benchmark's complete edit trace with its full-scan/qsort oracle
+# enabled.  Three timed samples keep this check short while still executing the
+# median-reporting path used by the full benchmark.
+.PHONY: ctest-session-trace-benchmark
+ctest-session-trace-benchmark:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/session-trace-probe-ctest \
+		benchmarks/session-trace-probe.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/session-trace-probe-ctest 4096 2 64 3
+
 # AddressSanitizer + UndefinedBehaviorSanitizer run of the C unit tests.
 # Builds both suites with the sanitizers enabled into distinctly-named
 # binaries (-asan suffix) so they never clobber the plain `ctest` ones,
@@ -210,6 +232,11 @@ ctest-asan:
 		-I. -I$(UTF8PROC_DIR) -pthread \
 		-o $(BUILD_DIR)/fzf-additions-test-asan fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-additions-test-asan
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
+		-I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/fzf-simd-prefilter-test-asan \
+		fzf-simd-prefilter-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-simd-prefilter-test-asan
 	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
 		-DFZF_TEST_WINDOWS_PATH_SCORING -I. -I$(UTF8PROC_DIR) -pthread \
 		-o $(BUILD_DIR)/fzf-additions-test-windows-paths-asan fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
@@ -293,6 +320,28 @@ benchmark-session-growth: benchmark-session-growth-build
 		$(SESSION_GROWTH_INITIAL) $(SESSION_GROWTH_DELTA) \
 		$(SESSION_GROWTH_ROUNDS) $(SESSION_GROWTH_WORKERS) \
 		$(SESSION_GROWTH_LIMIT)
+
+# Persistent interactive edit trace.  The executable validates every result
+# against an independent full scan before it starts timing, then checks the
+# timed results against those validated fingerprints.
+SESSION_TRACE_CANDIDATES ?= 100000
+SESSION_TRACE_WORKERS ?= 8
+SESSION_TRACE_LIMIT ?= 256
+SESSION_TRACE_SAMPLES ?= 9
+SESSION_TRACE_BENCH := $(BUILD_DIR)/session-trace-probe
+
+.PHONY: benchmark-session-trace-build benchmark-session-trace
+benchmark-session-trace-build:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O3 -DNDEBUG \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(SESSION_TRACE_BENCH) benchmarks/session-trace-probe.c \
+		fzf.c fzf-additions.c $(UTF8PROC_SRC)
+
+benchmark-session-trace: benchmark-session-trace-build
+	$(SESSION_TRACE_BENCH) \
+		$(SESSION_TRACE_CANDIDATES) $(SESSION_TRACE_WORKERS) \
+		$(SESSION_TRACE_LIMIT) $(SESSION_TRACE_SAMPLES)
 
 # Coverage-guided and differential test targets live in a separate include so
 # they do not alter the release build or the public module ABI.

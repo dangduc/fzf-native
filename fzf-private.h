@@ -4,6 +4,24 @@
 
 #include "fzf.h"
 
+#ifdef _MSC_VER
+#define FZF_THREAD_LOCAL __declspec(thread)
+#else
+#define FZF_THREAD_LOCAL _Thread_local
+#endif
+
+/* Workers disable SIMD for cache-selected candidate subsets, where matches
+   are deliberately dense and scalar search is cheaper. */
+extern FZF_THREAD_LOCAL bool fzf_simd_prefilter_allowed;
+
+static inline void fzf_set_simd_prefilter_allowed(bool allowed) {
+  fzf_simd_prefilter_allowed = allowed;
+}
+
+static inline bool fzf_get_simd_prefilter_allowed(void) {
+  return fzf_simd_prefilter_allowed;
+}
+
 /* Internal fast paths for callers that classified the exact byte range.
    INPUT_IS_ASCII must describe TEXT[0..TEXT_LEN).  Public callers must use the
    safe bounded functions in fzf.h and fzf-additions.h instead. */

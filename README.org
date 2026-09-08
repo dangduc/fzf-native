@@ -349,10 +349,11 @@ See [[file:multi-round-session-plan.org][multi-round-session-plan.org]] for the 
 
 ** Licenses
 
-The project license is in [[file:LICENSE][LICENSE]] (GNU GPL). The MIT license for
-the fzf code derived from fzf and telescope-fzf-native.nvim is in
-[[file:LICENSE-MIT][LICENSE-MIT]]. Vendored utf8proc and Unicode data notices are in
-[[file:utf8proc-2.10.0/LICENSE.md][utf8proc-2.10.0/LICENSE.md]] and the corresponding source files.
+The project license is in [[file:LICENSE][LICENSE]] (GNU GPL). The fzf code uses
+the MIT license in [[file:LICENSE-MIT][LICENSE-MIT]]. The SIMD prefilters use ideas
+from Frizbee and memchr under the same license. Vendored utf8proc and Unicode
+data notices are in [[file:utf8proc-2.10.0/LICENSE.md][utf8proc-2.10.0/LICENSE.md]]
+and the corresponding source files.
 
 ** Credit
 All credit for fzf.c goes to the

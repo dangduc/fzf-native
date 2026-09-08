@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "fzf-private.h"
+#include "fzf-simd-prefilter.h"
 
 #include <string.h>
 #include <ctype.h>
@@ -10,13 +11,8 @@
 #include "utf8_char_index.h"
 #include "fzf-normalize.inc"
 
-#ifdef _MSC_VER
-#define FZF_THREAD_LOCAL __declspec(thread)
-#else
-#define FZF_THREAD_LOCAL _Thread_local
-#endif
-
 static FZF_THREAD_LOCAL bool fzf_allocation_failure;
+FZF_THREAD_LOCAL bool fzf_simd_prefilter_allowed = true;
 
 void fzf_clear_allocation_failure(void) {
   fzf_allocation_failure = false;
@@ -668,16 +664,35 @@ static bool is_ascii(const char *runes, size_t size) {
   return true;
 }
 
-static int32_t ascii_fuzzy_index(fzf_string_t *input, const char *pattern,
-                                 size_t size, bool case_sensitive) {
-  if (!is_ascii(pattern, size)) {
+static int32_t ascii_fuzzy_index(
+    fzf_string_t *input, fzf_string_t *pattern,
+    const fzf_ascii_query_plan_t *plan, bool case_sensitive) {
+  if (!is_ascii(pattern->data, pattern->size)) {
     return -1;
   }
 
+#if FZF_HAVE_SIMD_PREFILTER
+  if (plan && plan->pattern_size == pattern->size &&
+      plan->case_sensitive == case_sensitive &&
+      pattern->size >= FZF_SIMD_FUZZY_MIN_PATTERN &&
+      input->size >= FZF_SIMD_FUZZY_MIN_TEXT) {
+    const char *first = fzf_ascii_plan_find_byte(
+        input->data, input->size, &plan->bytes[0], case_sensitive);
+    if (!first) return -1;
+    size_t first_index = (size_t)(first - input->data);
+    if (!fzf_ascii_plan_ordered_after_first(
+            input->data, input->size, plan, first_index))
+      return -1;
+    return first_index > 0 ? (int32_t)(first_index - 1) : 0;
+  }
+#else
+  (void)plan;
+#endif
+
   int32_t first_idx = 0;
   int32_t idx = 0;
-  for (size_t pidx = 0; pidx < size; pidx++) {
-    idx = try_skip(input, case_sensitive, pattern[pidx], idx);
+  for (size_t pidx = 0; pidx < pattern->size; pidx++) {
+    idx = try_skip(input, case_sensitive, pattern->data[pidx], idx);
     if (idx < 0) {
       return -1;
     }
@@ -1077,13 +1092,14 @@ static int32_t calculate_score_utf8(bool case_sensitive, bool normalize,
 
 static fzf_result_t fzf_fuzzy_match_v1_impl(
     bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
-    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab,
+    const fzf_ascii_query_plan_t *plan) {
   const size_t M = pattern->size;
   const size_t N = text->size;
   if (M == 0) {
     return (fzf_result_t){0, 0, 0};
   }
-  if (ascii_fuzzy_index(text, pattern->data, M, case_sensitive) < 0) {
+  if (ascii_fuzzy_index(text, pattern, plan, case_sensitive) < 0) {
     return (fzf_result_t){-1, -1, 0};
   }
 
@@ -1158,19 +1174,20 @@ fzf_result_t fzf_fuzzy_match_v1_with_direction(
     bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
     fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
   return fzf_fuzzy_match_v1_impl(case_sensitive, normalize, forward, text,
-                                 pattern, pos, slab);
+                                 pattern, pos, slab, NULL);
 }
 
 fzf_result_t fzf_fuzzy_match_v1(bool case_sensitive, bool normalize,
                                 fzf_string_t *text, fzf_string_t *pattern,
                                 fzf_position_t *pos, fzf_slab_t *slab) {
   return fzf_fuzzy_match_v1_impl(case_sensitive, normalize, true, text,
-                                 pattern, pos, slab);
+                                 pattern, pos, slab, NULL);
 }
 
 static fzf_result_t fzf_fuzzy_match_v2_impl(
     bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
-    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
+    fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab,
+    const fzf_ascii_query_plan_t *plan) {
   const size_t M = pattern->size;
   const size_t N = text->size;
   const score_scheme_config_t *config = score_scheme_config(slab);
@@ -1180,7 +1197,7 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
   if (slab != NULL &&
       (N != 0 && M > SIZE_MAX / N ? true : N * M > slab->I16.cap)) {
     return fzf_fuzzy_match_v1_impl(case_sensitive, normalize, forward, text,
-                                   pattern, pos, slab);
+                                   pattern, pos, slab, plan);
   }
 
   size_t idx;
@@ -1201,7 +1218,7 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
       tmp_idx = try_skip(text, case_sensitive, pattern->data[0], 0);
       if (tmp_idx > 0) tmp_idx--;
     } else {
-      tmp_idx = ascii_fuzzy_index(text, pattern->data, M, case_sensitive);
+      tmp_idx = ascii_fuzzy_index(text, pattern, plan, case_sensitive);
     }
     if (tmp_idx < 0) {
       return (fzf_result_t){-1, -1, 0};
@@ -1480,20 +1497,20 @@ fzf_result_t fzf_fuzzy_match_v2_with_direction(
     bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
     fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
   return fzf_fuzzy_match_v2_impl(case_sensitive, normalize, forward, text,
-                                 pattern, pos, slab);
+                                 pattern, pos, slab, NULL);
 }
 
 fzf_result_t fzf_fuzzy_match_v2(bool case_sensitive, bool normalize,
                                 fzf_string_t *text, fzf_string_t *pattern,
                                 fzf_position_t *pos, fzf_slab_t *slab) {
   return fzf_fuzzy_match_v2_impl(case_sensitive, normalize, true, text,
-                                 pattern, pos, slab);
+                                 pattern, pos, slab, NULL);
 }
 
 static fzf_result_t fzf_exact_match_impl(
     bool case_sensitive, bool normalize, bool forward, bool boundary_check,
     fzf_string_t *text, fzf_string_t *pattern, fzf_position_t *pos,
-    fzf_slab_t *slab) {
+    fzf_slab_t *slab, bool parsed_plan_available) {
   const size_t M = pattern->size;
   const size_t N = text->size;
   const score_scheme_config_t *config = score_scheme_config(slab);
@@ -1504,62 +1521,106 @@ static fzf_result_t fzf_exact_match_impl(
   if (N < M) {
     return (fzf_result_t){-1, -1, 0};
   }
-  if (ascii_fuzzy_index(text, pattern->data, M, case_sensitive) < 0) {
+  /* Keep the legacy ordered-byte rejection in front of the literal scan.
+     It makes a missing query byte a single memchr-class check and avoids
+     scanning every SIMD chunk for seed-free misses. */
+  if (ascii_fuzzy_index(text, pattern, NULL, case_sensitive) < 0)
     return (fzf_result_t){-1, -1, 0};
-  }
-
-  size_t pidx = 0;
+  const fzf_ascii_query_plan_t *plan = NULL;
+  if (parsed_plan_available && M >= 2 && M <= FZF_SIMD_MAX_PATTERN &&
+      N - M + 1 >= FZF_SIMD_LITERAL_MIN_STARTS &&
+      fzf_get_simd_prefilter_allowed())
+    plan = fzf_ascii_query_plan_from_parsed(pattern);
   int32_t best_pos = -1;
-  int16_t bonus = 0;
   int16_t best_bonus = -1;
   bool best_has_boundary_bonus = false;
-  for (size_t idx = 0; idx < N; idx++) {
-    char c = text->data[idx];
-    if (!case_sensitive) {
-      /* TODO(conni2461): He does some unicode stuff here, investigate */
-      c = (char)tolower((uint8_t)c);
-    }
-    if (normalize) {
-      c = normalize_rune(c);
-    }
-    if (c == pattern->data[pidx]) {
-      if (pidx == 0) {
-        bonus = bonus_at(text, idx, config);
+  bool used_plan = false;
+#if FZF_HAVE_SIMD_PREFILTER
+  /* PLAN is supplied only for byte-classified ASCII candidates.  Unicode
+     normalization is therefore the identity operation for this input. */
+  if (plan && plan->pattern_size == M &&
+      plan->case_sensitive == case_sensitive) {
+    used_plan = true;
+    size_t from = 0;
+    while (from <= N - M) {
+      size_t start = fzf_ascii_plan_find_exact(text->data, N, plan, from);
+      if (start == SIZE_MAX) break;
+      size_t idx = start + M - 1;
+      int16_t bonus = bonus_at(text, start, config);
+      bool boundary_match =
+          !boundary_check ||
+          ((start == 0 ||
+            !char_class_is_word(
+                char_class_of(text->data[start - 1], config))) &&
+           (idx + 1 == N ||
+            !char_class_is_word(
+                char_class_of(text->data[idx + 1], config))));
+      if (boundary_match) {
+        bool replace = bonus > best_bonus;
+        if (!forward) {
+          replace = bonus >= BonusBoundary ||
+                    (!best_has_boundary_bonus && bonus >= best_bonus);
+        }
+        if (replace) {
+          best_pos = (int32_t)idx;
+          best_bonus = bonus;
+        }
+        if (bonus >= BonusBoundary) best_has_boundary_bonus = true;
       }
-      pidx++;
-      if (pidx == M) {
-        size_t start = idx - M + 1;
-        bool boundary_match =
-            !boundary_check ||
-            ((start == 0 ||
-              !char_class_is_word(
-                  char_class_of(text->data[start - 1], config))) &&
-             (idx + 1 == N ||
-              !char_class_is_word(
-                  char_class_of(text->data[idx + 1], config))));
-        if (boundary_match) {
-          bool replace = bonus > best_bonus;
-          if (!forward) {
-            replace = bonus >= BonusBoundary ||
-                      (!best_has_boundary_bonus && bonus >= best_bonus);
+      if (boundary_match && forward && bonus >= BonusBoundary) break;
+      if (start == N - M) break;
+      from = start + 1;
+    }
+  }
+#else
+  (void)plan;
+#endif
+
+  if (!used_plan) {
+    size_t pidx = 0;
+    int16_t bonus = 0;
+    for (size_t idx = 0; idx < N; idx++) {
+      char c = text->data[idx];
+      if (!case_sensitive) {
+        /* TODO(conni2461): He does some unicode stuff here, investigate */
+        c = (char)tolower((uint8_t)c);
+      }
+      if (normalize) c = normalize_rune(c);
+      if (c == pattern->data[pidx]) {
+        if (pidx == 0) bonus = bonus_at(text, idx, config);
+        pidx++;
+        if (pidx == M) {
+          size_t start = idx - M + 1;
+          bool boundary_match =
+              !boundary_check ||
+              ((start == 0 ||
+                !char_class_is_word(
+                    char_class_of(text->data[start - 1], config))) &&
+               (idx + 1 == N ||
+                !char_class_is_word(
+                    char_class_of(text->data[idx + 1], config))));
+          if (boundary_match) {
+            bool replace = bonus > best_bonus;
+            if (!forward) {
+              replace = bonus >= BonusBoundary ||
+                        (!best_has_boundary_bonus && bonus >= best_bonus);
+            }
+            if (replace) {
+              best_pos = (int32_t)idx;
+              best_bonus = bonus;
+            }
+            if (bonus >= BonusBoundary) best_has_boundary_bonus = true;
           }
-          if (replace) {
-            best_pos = (int32_t)idx;
-            best_bonus = bonus;
-          }
-          if (bonus >= BonusBoundary) best_has_boundary_bonus = true;
+          if (boundary_match && forward && bonus >= BonusBoundary) break;
+          idx -= pidx - 1;
+          pidx = 0;
+          bonus = 0;
         }
-        if (boundary_match && forward && bonus >= BonusBoundary) {
-          break;
-        }
-        idx -= pidx - 1;
+      } else {
+        idx -= pidx;
         pidx = 0;
         bonus = 0;
       }
-    } else {
-      idx -= pidx;
-      pidx = 0;
-      bonus = 0;
     }
   }
   if (best_pos >= 0) {
@@ -1590,28 +1651,28 @@ fzf_result_t fzf_exact_match_naive_with_direction(
     bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
     fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
   return fzf_exact_match_impl(case_sensitive, normalize, forward, false, text,
-                              pattern, pos, slab);
+                              pattern, pos, slab, false);
 }
 
 fzf_result_t fzf_exact_match_boundary_with_direction(
     bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
     fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
   return fzf_exact_match_impl(case_sensitive, normalize, forward, true, text,
-                              pattern, pos, slab);
+                              pattern, pos, slab, false);
 }
 
 fzf_result_t fzf_exact_match_naive(bool case_sensitive, bool normalize,
                                    fzf_string_t *text, fzf_string_t *pattern,
                                    fzf_position_t *pos, fzf_slab_t *slab) {
   return fzf_exact_match_impl(case_sensitive, normalize, true, false, text,
-                              pattern, pos, slab);
+                              pattern, pos, slab, false);
 }
 
 fzf_result_t fzf_exact_match_boundary(
     bool case_sensitive, bool normalize, fzf_string_t *text,
     fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab) {
   return fzf_exact_match_impl(case_sensitive, normalize, true, true, text,
-                              pattern, pos, slab);
+                              pattern, pos, slab, false);
 }
 
 fzf_result_t fzf_prefix_match(bool case_sensitive, bool normalize,
@@ -2821,13 +2882,38 @@ static bool append_pattern(fzf_pattern_t *pattern, fzf_term_set_t *value) {
 static fzf_string_t *make_pattern_text(const char *data, size_t size,
                                        bool case_sensitive) {
   size_t count = utf8_strlen(data, size);
+  size_t plan_pattern_size =
+      is_ascii_utf8proc(data, size) && size >= 2 &&
+              size <= FZF_SIMD_MAX_PATTERN
+          ? size
+          : 0;
+  size_t plan_size = fzf_ascii_query_plan_size(plan_pattern_size);
+#if FZF_HAVE_SIMD_PREFILTER
+  if (plan_size == 0) return NULL;
+#endif
   if (count > (SIZE_MAX - sizeof(fzf_string_t)) /
                   sizeof(utf8proc_int32_t))
     return NULL;
-  fzf_string_t *text = malloc(
-      sizeof *text + count * sizeof(utf8proc_int32_t));
+  size_t codepoint_bytes = count * sizeof(utf8proc_int32_t);
+  size_t plan_offset = sizeof(fzf_string_t) + codepoint_bytes;
+#if FZF_HAVE_SIMD_PREFILTER
+  size_t alignment = FZF_SIMD_PLAN_ALIGNMENT;
+  size_t remainder = plan_offset % alignment;
+  if (remainder != 0) {
+    size_t padding = alignment - remainder;
+    if (padding > SIZE_MAX - plan_offset) return NULL;
+    plan_offset += padding;
+  }
+#endif
+  if (plan_size > SIZE_MAX - plan_offset) return NULL;
+  fzf_string_t *text = malloc(plan_offset + plan_size);
   if (!text) return NULL;
   utf8proc_int32_t *codepoints = (utf8proc_int32_t *)(text + 1);
+#if FZF_HAVE_SIMD_PREFILTER
+  fzf_ascii_query_plan_t *plan =
+      (fzf_ascii_query_plan_t *)((unsigned char *)text + plan_offset);
+  fzf_ascii_query_plan_init(plan, data, plan_pattern_size, case_sensitive);
+#endif
   *text = (fzf_string_t){
       .data = data,
       .size = size,
@@ -2869,6 +2955,16 @@ static fzf_algo_t get_utf8_algo(fzf_algo_t ascii_algo) {
   return ascii_algo; // fallback
 }
 
+static inline const fzf_ascii_query_plan_t *fzf_fuzzy_query_plan(
+    const fzf_string_t *input, const fzf_string_t *pattern) {
+  if (pattern->size < FZF_SIMD_FUZZY_MIN_PATTERN ||
+      pattern->size > FZF_SIMD_MAX_PATTERN ||
+      input->size < FZF_SIMD_FUZZY_MIN_TEXT ||
+      !fzf_get_simd_prefilter_allowed())
+    return NULL;
+  return fzf_ascii_query_plan_from_parsed(pattern);
+}
+
 static inline fzf_result_t call_alg_for_input(
     fzf_term_t *term, bool normalize, fzf_string_t *input,
     bool input_is_ascii, bool forward, fzf_position_t *pos,
@@ -2880,22 +2976,30 @@ static inline fzf_result_t call_alg_for_input(
     algo = get_utf8_algo(algo);
   }
   fzf_string_t *pattern = (fzf_string_t *)term->text;
-  if (algo == fzf_fuzzy_match_v1)
-    return fzf_fuzzy_match_v1_with_direction(
+  if (algo == fzf_fuzzy_match_v1) {
+    const fzf_ascii_query_plan_t *plan =
+        fzf_fuzzy_query_plan(input, pattern);
+    return fzf_fuzzy_match_v1_impl(
         term->case_sensitive, term->normalize, forward, input, pattern, pos,
-        slab);
-  if (algo == fzf_fuzzy_match_v2)
-    return fzf_fuzzy_match_v2_with_direction(
+        slab, plan);
+  }
+  if (algo == fzf_fuzzy_match_v2) {
+    const fzf_ascii_query_plan_t *plan =
+        fzf_fuzzy_query_plan(input, pattern);
+    return fzf_fuzzy_match_v2_impl(
         term->case_sensitive, term->normalize, forward, input, pattern, pos,
-        slab);
-  if (algo == fzf_exact_match_naive)
-    return fzf_exact_match_naive_with_direction(
-        term->case_sensitive, term->normalize, forward, input, pattern, pos,
-        slab);
-  if (algo == fzf_exact_match_boundary)
-    return fzf_exact_match_boundary_with_direction(
-        term->case_sensitive, term->normalize, forward, input, pattern, pos,
-        slab);
+        slab, plan);
+  }
+  if (algo == fzf_exact_match_naive) {
+    return fzf_exact_match_impl(
+        term->case_sensitive, term->normalize, forward, false, input, pattern,
+        pos, slab, true);
+  }
+  if (algo == fzf_exact_match_boundary) {
+    return fzf_exact_match_impl(
+        term->case_sensitive, term->normalize, forward, true, input, pattern,
+        pos, slab, true);
+  }
   if (algo == fzf_fuzzy_match_v1_utf8)
     return fzf_fuzzy_match_v1_utf8_with_direction(
         term->case_sensitive, term->normalize, forward, input, pattern, pos,

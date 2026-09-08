@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 /*
  * Short, deterministic matcher probe for the Chromium, Arabic, and Korean
- * real-data holdout shapes, the first-byte ASCII hit path used by short
- * incremental queries, and UTF-8 inputs that exceed the v2 slab.  It is
- * deliberately synthetic: its purpose is to isolate core scorer costs without
- * rereading or sorting a multi-million-line corpus.  Results are provisional
- * and must not be presented as holdout data.
+ * real-data holdout shapes, a long ASCII literal, the first-byte ASCII hit path
+ * used by short incremental queries, and UTF-8 inputs that exceed the v2 slab.
+ * It is deliberately synthetic.  Its purpose is to isolate core scorer costs
+ * without rereading or sorting a multi-million-line corpus.  Results are
+ * provisional and must not be presented as holdout data.
  *
  * Build from the repository root:
  *
@@ -161,6 +161,31 @@ static probe_item_t *make_ascii_one_byte_items(void) {
     text[0] = (char)('a' + i % 26);
     text[1] = '\0';
     items[i] = (probe_item_t){text, 1, true};
+  }
+  return items;
+}
+
+/* Exact-substring shape for the two-seed literal scan.  Eight percent are
+   matches.  Another sixty percent contain the selected "native" seed bytes
+   n and v at the same prospective start but corrupt a non-seed byte.  That
+   forces full verification after the SIMD masks intersect. */
+static probe_item_t *make_ascii_literal_items(void) {
+  probe_item_t *items = calloc(PROBE_ITEMS, sizeof *items);
+  if (!items) abort();
+  for (size_t i = 0; i < PROBE_ITEMS; i++) {
+    char *text = malloc(ASCII_BYTES + 1);
+    if (!text) abort();
+    for (size_t j = 0; j < ASCII_BYTES; j++)
+      text[j] = "abcdefg_/0123456789"[(i * 7 + j * 11) % 19];
+    size_t kind = i % 100;
+    if (kind < 4) {
+      memcpy(text + 27, "native", 6);
+    } else if (kind < 8) {
+      memcpy(text + 27, "NATIVE", 6);
+    } else if (kind < 68)
+      memcpy(text + 27, "nxtive", 6);
+    text[ASCII_BYTES] = '\0';
+    items[i] = (probe_item_t){text, ASCII_BYTES, true};
   }
   return items;
 }
@@ -335,6 +360,8 @@ int main(void) {
        {UINT64_C(0x1d5da984442dc286), UINT64_C(0x290addec25f9fb52)}},
       {"Chromium", "linux", make_ascii_items(), PROBE_ITEMS,
        {UINT64_C(0x9ed9b37a1b7f2f03), UINT64_C(0xc448dc43cea84dca)}},
+      {"Literal", "'native", make_ascii_literal_items(), PROBE_ITEMS,
+       {UINT64_C(0x8b29165d53b1d57b), UINT64_C(0x8eb14c86988f74e3)}},
       {"Arabic", "\xD8\xA5\xD9\x86",
        make_unicode_items(0x0620, 0x0625, 0x0646), PROBE_ITEMS,
        {UINT64_C(0xbe61aa8e8f2cce1a), UINT64_C(0x7a752bfa868ee773)}},
