@@ -16,11 +16,16 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode"
 )
 
 const (
 	peerDeadline           = 5 * time.Second
 	fullResultExampleLimit = 8
+	pinnedGoToolchain      = "go1.27.1"
+	pinnedGoUnicodeVersion = "17.0.0"
+	pinnedUTF8ProcVersion  = "2.10.0"
+	pinnedUTF8ProcUnicode  = "16.0.0"
 )
 
 type nativePeer struct {
@@ -341,6 +346,114 @@ func decodeInfoResponse(payload []byte) (infoResponse, error) {
 	}, nil
 }
 
+func requireNativeUnicodeRuntime(t *testing.T, info infoResponse) {
+	t.Helper()
+	for _, identity := range []string{
+		"utf8proc=" + pinnedUTF8ProcVersion,
+		"unicode=" + pinnedUTF8ProcUnicode,
+	} {
+		if !strings.Contains(info.runtime, identity) {
+			t.Fatalf("native INFO runtime %q lacks %q", info.runtime, identity)
+		}
+	}
+}
+
+func pinnedUnicodeLowercaseDifference(upper, lower rune) bool {
+	switch upper {
+	case 0xa7ce:
+		return lower == 0xa7cf
+	case 0xa7d2:
+		return lower == 0xa7d3
+	case 0xa7d4:
+		return lower == 0xa7d5
+	default:
+		return upper >= 0x16ea0 && upper <= 0x16eb8 &&
+			lower == upper+0x1b
+	}
+}
+
+func TestNativePeerUnicodeLowercaseVersionAudit(t *testing.T) {
+	if runtime.Version() != pinnedGoToolchain {
+		t.Fatalf("Go runtime is %q; want %q", runtime.Version(), pinnedGoToolchain)
+	}
+	if unicode.Version != pinnedGoUnicodeVersion {
+		t.Fatalf("Go Unicode tables are %q; want %q",
+			unicode.Version, pinnedGoUnicodeVersion)
+	}
+	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
+	if driver == "" {
+		t.Skip("set FZF_NATIVE_ALGO_DRIVER to check the native peer")
+	}
+
+	peer := startNativePeer(t, driver)
+	defer peer.close(t)
+	info, err := decodeInfoResponse(
+		peer.exchange(t, []byte{protocolVersion, opcodeInfo}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireNativeUnicodeRuntime(t, info)
+	oracle, err := newRawOracle(schemeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tested := 0
+	versionDifferences := 0
+	var unexpected []string
+	for upper := rune(0); upper <= unicode.MaxRune; upper++ {
+		if upper >= 0xd800 && upper <= 0xdfff {
+			continue
+		}
+		lower := unicode.ToLower(upper)
+		if lower == upper {
+			continue
+		}
+		tested++
+		request := matchRequest{
+			algorithm: algorithmEqual,
+			scheme:    schemeDefault,
+			flags:     flagForward,
+			pattern:   []byte(string(upper)),
+			candidate: []byte(string(lower)),
+		}
+		upstream, err := oracle.match(request)
+		if err != nil {
+			t.Fatalf("U+%04X -> U+%04X upstream: %v", upper, lower, err)
+		}
+		native, _, err := decodeMatchResponse(peer.exchange(t,
+			matchRequestPayload(request.algorithm, request.scheme, request.flags,
+				request.pattern, request.candidate)))
+		if err != nil {
+			t.Fatalf("U+%04X -> U+%04X native: %v", upper, lower, err)
+		}
+		different := !matchResponsesEquivalent(native, upstream)
+		versionDifference := pinnedUnicodeLowercaseDifference(upper, lower)
+		if versionDifference {
+			versionDifferences++
+		}
+		if different != versionDifference ||
+			(versionDifference && (!upstream.matched || native.matched)) {
+			if len(unexpected) < fullResultExampleLimit {
+				unexpected = append(unexpected, fmt.Sprintf(
+					"U+%04X -> U+%04X expected-version-difference=%t upstream=(%s) native=(%s)",
+					upper, lower, versionDifference,
+					compactResponse(upstream), compactResponse(native)))
+			}
+		}
+	}
+	if tested != 1488 || versionDifferences != 28 {
+		t.Fatalf("Unicode lowercase audit shape changed: tested=%d version-differences=%d",
+			tested, versionDifferences)
+	}
+	if len(unexpected) != 0 {
+		t.Fatalf("Unicode lowercase audit found unexpected results:\n%s",
+			strings.Join(unexpected, "\n"))
+	}
+	t.Logf("audited %d Go lowercase pairs with %d pinned Unicode-version differences",
+		tested, versionDifferences)
+}
+
 func TestNativePeerMatchesRawOracle(t *testing.T) {
 	driver := os.Getenv("FZF_NATIVE_ALGO_DRIVER")
 	if driver == "" {
@@ -360,6 +473,7 @@ func TestNativePeerMatchesRawOracle(t *testing.T) {
 	if info.revision != wantRevision || info.runtime == "" {
 		t.Fatalf("native INFO got revision=%q runtime=%q; want revision=%q", info.revision, info.runtime, wantRevision)
 	}
+	requireNativeUnicodeRuntime(t, info)
 
 	oracle, err := newRawOracle(schemeDefault)
 	if err != nil {
