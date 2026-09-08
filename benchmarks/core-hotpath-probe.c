@@ -125,6 +125,29 @@ static probe_item_t *make_unicode_items(utf8proc_int32_t base,
   return items;
 }
 
+/* A hit-heavy counterweight to the miss-dominated holdout shapes above.
+   Every query matches only at the final codepoint.  This catches a full extra
+   candidate decode hidden behind otherwise valuable early rejection. */
+static probe_item_t *make_unicode_late_hit_items(utf8proc_int32_t base,
+                                                utf8proc_int32_t query) {
+  probe_item_t *items = calloc(PROBE_ITEMS, sizeof *items);
+  if (!items) abort();
+  for (size_t i = 0; i < PROBE_ITEMS; i++) {
+    char *text = malloc(UNICODE_CODEPOINTS * 4 + 1);
+    if (!text) abort();
+    size_t offset = 0;
+    for (size_t j = 0; j < UNICODE_CODEPOINTS; j++) {
+      utf8proc_int32_t cp = base + (utf8proc_int32_t)((i + j * 7) % 24);
+      if (cp == query) cp = base;
+      if (j + 1 == UNICODE_CODEPOINTS) cp = query;
+      put_cp(text, &offset, cp);
+    }
+    text[offset] = '\0';
+    items[i] = (probe_item_t){text, offset, false};
+  }
+  return items;
+}
+
 static uint64_t score_once(const probe_case_t *probe, fzf_pattern_t *pattern,
                            fzf_slab_t *slab) {
   uint64_t checksum = 0;
@@ -178,6 +201,8 @@ int main(void) {
        make_unicode_items(0x0620, 0x0625, 0x0646)},
       {"Korean", "\xEB\x8B\x88\xEB\x8B\xA4",
        make_unicode_items(0xAC00, 0xB2C8, 0xB2E4)},
+      {"UTF8-hit", "\xE7\x95\x8C",
+       make_unicode_late_hit_items(0x4E00, 0x754C)},
   };
 
   for (size_t i = 0; i < sizeof probes / sizeof probes[0]; i++)

@@ -764,10 +764,14 @@ static bool utf8_fuzzy_index_size(fzf_string_t *input, const char *pattern,
                                   size_t pattern_len, bool case_sensitive,
                                   bool normalize,
                                   bool v2_candidate_case,
-                                  size_t *first_idx_out) {
+                                  size_t *first_idx_out,
+                                  size_t *input_char_count_out) {
   *first_idx_out = 0;
+  if (input_char_count_out) *input_char_count_out = 0;
   // Handle empty pattern
   if (pattern_len == 0) {
+    if (input_char_count_out)
+      *input_char_count_out = utf8_strlen(input->data, input->size);
     return true;
   }
 
@@ -779,6 +783,7 @@ static bool utf8_fuzzy_index_size(fzf_string_t *input, const char *pattern,
   size_t input_pos = 0;
   size_t pattern_pos = 0;
   size_t first_idx = 0;
+  size_t input_char_count = 0;
   
   // Process each pattern character
   while (pattern_pos < pattern_len && input_pos < input->size) {
@@ -804,6 +809,7 @@ static bool utf8_fuzzy_index_size(fzf_string_t *input, const char *pattern,
       utf8proc_ssize_t input_bytes = utf8_iterate_lossy(
         (const utf8proc_uint8_t*)(input_ptr + search_pos),
         input->size - search_pos, &input_cp);
+      input_char_count++;
       
       utf8proc_int32_t input_cp_cmp = input_cp;
       if (!case_sensitive) {
@@ -827,15 +833,32 @@ static bool utf8_fuzzy_index_size(fzf_string_t *input, const char *pattern,
       }
 
       search_pos += input_bytes;
+      input_pos = search_pos;
     }
 
     if (!found) {
+      if (input_char_count_out) *input_char_count_out = input_char_count;
       return false; // Pattern character not found
     }
     
     pattern_pos += pattern_bytes;
   }
-  
+
+  /* Fuzzy v2 needs the full character count to size its DP arrays.  Finish
+     that mandatory count here so a successful prefilter can reuse this decode
+     instead of making the char-map builder decode the candidate again. */
+  if (input_char_count_out) {
+    while (input_pos < input->size) {
+      utf8proc_int32_t input_cp;
+      utf8proc_ssize_t input_bytes = utf8_iterate_lossy(
+          (const utf8proc_uint8_t *)(input_ptr + input_pos),
+          input->size - input_pos, &input_cp);
+      input_pos += (size_t)input_bytes;
+      input_char_count++;
+    }
+    *input_char_count_out = input_char_count;
+  }
+
   if (pattern_pos < pattern_len) return false;
   *first_idx_out = first_idx;
   return true;
@@ -845,7 +868,7 @@ int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
                          size_t pattern_len, bool case_sensitive) {
   size_t first_idx = 0;
   if (!utf8_fuzzy_index_size(input, pattern, pattern_len, case_sensitive,
-                             false, false, &first_idx) ||
+                             false, false, &first_idx, NULL) ||
       first_idx > INT32_MAX)
     return -1;
   return (int32_t)first_idx;
@@ -2349,14 +2372,16 @@ static fzf_result_t fzf_fuzzy_match_v2_utf8_impl(
      table decodes the whole candidate twice and writes one slot per byte;
      none of that state is observed when the subsequence prefilter fails. */
   size_t tmp_idx = 0;
+  size_t candidate_char_count = 0;
   if (!utf8_fuzzy_index_size(text, pattern->data, M, case_sensitive,
-                             normalize, true, &tmp_idx)) {
+                             normalize, true, &tmp_idx,
+                             &candidate_char_count)) {
     return (fzf_result_t){-1, -1, 0};
   }
 
   // Build byte-to-char mapping for character position tracking
-  utf8_char_map_t *char_map = utf8_build_char_map(
-      text->data, N, slab ? &slab->UTF8 : NULL);
+  utf8_char_map_t *char_map = utf8_build_char_map_counted(
+      text->data, N, candidate_char_count, slab ? &slab->UTF8 : NULL);
   if (!char_map) {
     fzf_mark_allocation_failure();
     return (fzf_result_t){-1, -1, 0};

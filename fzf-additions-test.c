@@ -673,6 +673,32 @@ static void test_slab_allocation_failure_is_reported(void) {
 }
 
 static void test_utf8_char_map_scratch_reuse_and_cap(void) {
+  /* The fused fuzzy-v2 path supplies a count from its subsequence scan.  Its
+     counted builder must produce exactly the legacy map, including malformed
+     bytes handled by the surrogate-escape policy. */
+  const char mixed[] = {'a', (char)0xE4, (char)0xBD, (char)0xA0,
+                        (char)0xFF, 'z'};
+  utf8_char_map_scratch_t reference_scratch = {0};
+  utf8_char_map_scratch_t counted_scratch = {0};
+  utf8_char_map_t *reference = utf8_build_char_map(
+      mixed, sizeof mixed, &reference_scratch);
+  utf8_char_map_t *counted = utf8_build_char_map_counted(
+      mixed, sizeof mixed, 4, &counted_scratch);
+  CHECK(reference != NULL);
+  CHECK(counted != NULL);
+  if (reference && counted) {
+    CHECK(reference->char_count == counted->char_count);
+    CHECK(reference->byte_count == counted->byte_count);
+    for (size_t i = 0; i <= sizeof mixed; i++)
+      CHECK(reference->byte_to_char[i] == counted->byte_to_char[i]);
+  }
+  CHECK(utf8_build_char_map_counted(
+            mixed, sizeof mixed, sizeof mixed + 1, NULL) == NULL);
+  CHECK(utf8_build_char_map_counted(
+            mixed, sizeof mixed, 3, NULL) == NULL);
+  free(reference_scratch.map.byte_to_char);
+  free(counted_scratch.map.byte_to_char);
+
   utf8_char_map_scratch_t scratch = {0};
   const char small[] = "a\xE4\xBD\xA0z";
   utf8_char_map_t *first = utf8_build_char_map(

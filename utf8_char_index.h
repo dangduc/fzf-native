@@ -55,14 +55,15 @@ static inline utf8proc_ssize_t utf8_iterate_lossy(
     return bytes;
 }
 
-/* Create a byte-to-char mapping for a UTF-8 string.  SCRATCH may be NULL.
-   A returned map with owned=false aliases SCRATCH and remains valid only
-   until that same scratch is reused or destroyed.  An owned=true map is
-   independent and must be passed to utf8_free_char_map.  Returns NULL on
-   allocation failure without releasing existing scratch storage. */
-static inline utf8_char_map_t* utf8_build_char_map(
-    const char *str, size_t byte_len, utf8_char_map_scratch_t *scratch) {
-    if (byte_len == SIZE_MAX) return NULL;
+/* Create a byte-to-char mapping after the caller has already decoded STR and
+   counted its lossy UTF-8 units.  This entry point lets a matcher fuse useful
+   work (such as subsequence rejection) into the otherwise mandatory counting
+   pass.  CHAR_COUNT must be the count produced by utf8_iterate_lossy over the
+   complete BYTE_LEN-byte range. */
+static inline utf8_char_map_t* utf8_build_char_map_counted(
+    const char *str, size_t byte_len, size_t char_count,
+    utf8_char_map_scratch_t *scratch) {
+    if (byte_len == SIZE_MAX || char_count > byte_len) return NULL;
     size_t byte_slots = byte_len + 1;
     if (byte_slots > SIZE_MAX / sizeof(size_t)) return NULL;
     size_t map_bytes = byte_slots * sizeof(size_t);
@@ -70,25 +71,9 @@ static inline utf8_char_map_t* utf8_build_char_map(
         map_bytes <= FZF_UTF8_CHAR_MAP_RETAINED_BYTES_MAX;
     utf8_char_map_t *map = retain ? &scratch->map : calloc(1, sizeof *map);
     if (!map) return NULL;
-    
-    // First pass: count characters
-    const uint8_t *ptr = (const uint8_t *)str;
-    size_t byte_pos = 0;
-    size_t char_count = 0;
-    
-    while (byte_pos < byte_len) {
-        utf8proc_int32_t cp;
-        utf8proc_ssize_t bytes = utf8_iterate_lossy(ptr + byte_pos, byte_len - byte_pos, &cp);
-        byte_pos += bytes;
-        if (char_count == SIZE_MAX) {
-            if (!retain) free(map);
-            return NULL;
-        }
-        char_count++;
-    }
 
-    // Allocate or grow the mapping array.  Every used element is overwritten, so
-    // zero-initialization is unnecessary.
+    /* Allocate or grow the mapping array.  Every used element is overwritten,
+       so zero-initialization is unnecessary. */
     if (retain) {
         if (scratch->byte_slot_capacity < byte_slots) {
             size_t *next = realloc(map->byte_to_char, map_bytes);
@@ -105,32 +90,60 @@ static inline utf8_char_map_t* utf8_build_char_map(
             return NULL;
         }
     }
-    
-    map->byte_count = byte_len;
-    map->char_count = char_count;
-    
-    // Second pass: build mappings
-    byte_pos = 0;
+
+    const uint8_t *ptr = (const uint8_t *)str;
+    size_t byte_pos = 0;
     size_t char_pos = 0;
-    
     while (byte_pos < byte_len) {
         utf8proc_int32_t cp;
-        utf8proc_ssize_t bytes = utf8_iterate_lossy(ptr + byte_pos, byte_len - byte_pos, &cp);
-        
-        // All bytes in this character map to the same char position
-        // bytes is guaranteed >= 1, so the cast to size_t cannot wrap.
+        utf8proc_ssize_t bytes = utf8_iterate_lossy(
+            ptr + byte_pos, byte_len - byte_pos, &cp);
+
+        /* All bytes in this character map to the same char position. */
         for (size_t i = 0; i < (size_t)bytes; i++) {
             map->byte_to_char[byte_pos + i] = char_pos;
         }
-        
-        byte_pos += bytes;
+
+        byte_pos += (size_t)bytes;
         char_pos++;
     }
-    
-    // Handle end positions
+    if (char_pos != char_count) {
+        if (map->owned) {
+            free(map->byte_to_char);
+            free(map);
+        } else {
+            map->byte_count = 0;
+            map->char_count = 0;
+        }
+        return NULL;
+    }
+    map->byte_count = byte_len;
+    map->char_count = char_count;
     map->byte_to_char[byte_len] = char_count;
-    
     return map;
+}
+
+/* Create a byte-to-char mapping for a UTF-8 string.  SCRATCH may be NULL.
+   A returned map with owned=false aliases SCRATCH and remains valid only
+   until that same scratch is reused or destroyed.  An owned=true map is
+   independent and must be passed to utf8_free_char_map.  Returns NULL on
+   allocation failure without releasing existing scratch storage. */
+static inline utf8_char_map_t* utf8_build_char_map(
+    const char *str, size_t byte_len, utf8_char_map_scratch_t *scratch) {
+    if (byte_len == SIZE_MAX) return NULL;
+
+    /* First pass: count characters. */
+    const uint8_t *ptr = (const uint8_t *)str;
+    size_t byte_pos = 0;
+    size_t char_count = 0;
+    while (byte_pos < byte_len) {
+        utf8proc_int32_t cp;
+        utf8proc_ssize_t bytes = utf8_iterate_lossy(
+            ptr + byte_pos, byte_len - byte_pos, &cp);
+        byte_pos += (size_t)bytes;
+        char_count++;
+    }
+    return utf8_build_char_map_counted(str, byte_len, char_count, scratch);
 }
 
 // Free an independent map.  A scratch-owned map is released with its slab.
