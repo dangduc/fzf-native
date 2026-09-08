@@ -512,9 +512,30 @@ Each specification has the form (KEY VALUES)."
 
 (ert-deftest fzf-native-fuzz-upstream-malformed-ranking-uses-membership ()
   "Do not rank byte strings that Go rewrites while decoding malformed UTF-8."
-  (let ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf")))
-        (case
-         (fzf-native-upstream--generated-case 3735928559 9885 'parity)))
+  (let* ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf")))
+         (term
+          (make-fzf-native-differential-term
+           :kind 'fuzzy :inverse nil :literal "a"))
+         (query
+          (make-fzf-native-differential-query
+           :sets (list (list term)) :case-mode 'respect :fuzzy t
+           :normalize nil :direction 'auto :forward t
+           :score-scheme 'default))
+         (case
+          (make-fzf-native-differential-case
+           :seed 0 :serial 0 :profile 'regression
+           :query query :rendered-query "a"
+           :candidates
+           (list
+            (make-fzf-native-differential-candidate
+             :id 0
+             :text (unibyte-string
+                    ?l ?o ?n ?g ?/ ?p ?r ?e ?f ?i ?x ?/ ?a #xff)
+             :role 'long)
+            (make-fzf-native-differential-candidate
+             :id 1 :text (unibyte-string ?a #xfe) :role 'short))
+           :dimensions '(:text-class malformed :valid-utf8 nil)
+           :comparison 'membership)))
     (skip-unless fzf)
     (fzf-native-upstream--verify-reference fzf)
     (should-not
