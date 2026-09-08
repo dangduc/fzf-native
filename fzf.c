@@ -1189,7 +1189,15 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
     /* Keep the common one-byte incremental query in this hot caller.  The
        compiler can inline try_skip here without expanding every multi-byte
        ascii_fuzzy_index call site. */
-    if (M == 1) {
+    if (M == 1 && N == 1) {
+      char pattern_byte = pattern->data[0];
+      char text_byte = text->data[0];
+      bool exact = text_byte == pattern_byte;
+      bool folded = !case_sensitive && pattern_byte >= 'a' &&
+                    pattern_byte <= 'z' &&
+                    text_byte == pattern_byte - (char)32;
+      tmp_idx = exact || folded ? 0 : -1;
+    } else if (M == 1) {
       tmp_idx = try_skip(text, case_sensitive, pattern->data[0], 0);
       if (tmp_idx > 0) tmp_idx--;
     } else {

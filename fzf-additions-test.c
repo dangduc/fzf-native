@@ -126,6 +126,16 @@ static void test_ascii_v2_single_byte_path(void) {
   static const char embedded_nul[] = {'x', '\0', 'b', 'x'};
   static const char malformed[] = {'x', (char)0xe9, 'x'};
 
+  check_single_byte_v2("a", 1, 'a', true, false, true,
+                       0, 1, 36, 0);
+  check_single_byte_v2("A", 1, 'a', false, false, true,
+                       0, 1, 36, 0);
+  check_single_byte_v2("A", 1, 'a', true, false, true,
+                       -1, -1, 0, -1);
+  check_single_byte_v2("b", 1, 'a', false, false, true,
+                       -1, -1, 0, -1);
+  check_single_byte_v2("A", 1, 'a', false, true, false,
+                       0, 1, 36, 0);
   check_single_byte_v2("zAxaZ", 5, 'a', false, false, true,
                        1, 2, 30, 1);
   check_single_byte_v2("zAxaZ", 5, 'a', true, false, true,

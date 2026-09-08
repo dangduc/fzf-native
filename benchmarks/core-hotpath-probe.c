@@ -106,6 +106,22 @@ static probe_item_t *make_ascii_early_hit_items(void) {
   return items;
 }
 
+/* One-character completion symbols are small but miss-heavy.  Cycling over
+   the alphabet gives query "z" one hit in 26 candidates and prevents an
+   all-hit microbenchmark from hiding fixed dispatch overhead on misses. */
+static probe_item_t *make_ascii_one_byte_items(void) {
+  probe_item_t *items = calloc(PROBE_ITEMS, sizeof *items);
+  if (!items) abort();
+  for (size_t i = 0; i < PROBE_ITEMS; i++) {
+    char *text = malloc(2);
+    if (!text) abort();
+    text[0] = (char)('a' + i % 26);
+    text[1] = '\0';
+    items[i] = (probe_item_t){text, 1, true};
+  }
+  return items;
+}
+
 static probe_item_t *make_unicode_items(utf8proc_int32_t base,
                                         utf8proc_int32_t first,
                                         utf8proc_int32_t second) {
@@ -228,6 +244,7 @@ static void free_items(probe_item_t *items, size_t item_count) {
 int main(void) {
   probe_case_t probes[] = {
       {"EarlyASCII", "z", make_ascii_early_hit_items(), PROBE_ITEMS},
+      {"OneByte", "z", make_ascii_one_byte_items(), PROBE_ITEMS},
       {"Chromium", "linux", make_ascii_items(), PROBE_ITEMS},
       {"Arabic", "\xD8\xA5\xD9\x86",
        make_unicode_items(0x0620, 0x0625, 0x0646), PROBE_ITEMS},
