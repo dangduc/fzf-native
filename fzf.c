@@ -1193,6 +1193,7 @@ static fzf_result_t fzf_fuzzy_match_v2_one_byte(
     const score_scheme_config_t *config) {
   int16_t max_score = 0;
   size_t max_score_pos = 0;
+  bool matched = false;
   int32_t prev_class = config->initial_class;
   char pattern_byte = pattern->data[0];
 
@@ -1204,6 +1205,7 @@ static fzf_result_t fzf_fuzzy_match_v2_one_byte(
     if (normalize) c = normalize_rune(c);
 
     if (c == pattern_byte) {
+      matched = true;
       int16_t bonus = bonus_for(config, prev_class, class);
       int16_t score = ScoreMatch + bonus * BonusFirstCharMultiplier;
       if (forward ? score > max_score : score >= max_score) {
@@ -1215,6 +1217,7 @@ static fzf_result_t fzf_fuzzy_match_v2_one_byte(
     prev_class = class;
   }
 
+  if (!matched) return (fzf_result_t){-1, -1, 0};
   append_pos(pos, max_score_pos);
   return (fzf_result_t){(int32_t)max_score_pos,
                         (int32_t)max_score_pos + 1, max_score};

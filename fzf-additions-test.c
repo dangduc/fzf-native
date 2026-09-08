@@ -125,12 +125,20 @@ static void check_single_byte_v2(const char *text, size_t text_size,
 static void test_ascii_v2_single_byte_path(void) {
   static const char embedded_nul[] = {'x', '\0', 'b', 'x'};
   static const char malformed[] = {'x', (char)0xe9, 'x'};
+  static const char normalizable[] = {(char)0xe9};
 
   check_single_byte_v2("a", 1, 'a', true, false, true,
                        0, 1, 36, 0);
   check_single_byte_v2("A", 1, 'a', false, false, true,
                        0, 1, 36, 0);
   check_single_byte_v2("A", 1, 'a', true, false, true,
+                       -1, -1, 0, -1);
+  /* The byte prefilter can accept an exact raw byte that the scorer then
+     folds away.  A failed post-fold comparison must not emit a result or a
+     highlight position. */
+  check_single_byte_v2("A", 1, 'A', false, false, true,
+                       -1, -1, 0, -1);
+  check_single_byte_v2("A", 1, 'A', false, false, false,
                        -1, -1, 0, -1);
   check_single_byte_v2("b", 1, 'a', false, false, true,
                        -1, -1, 0, -1);
@@ -150,6 +158,13 @@ static void test_ascii_v2_single_byte_path(void) {
                        true, 2, 3, 32, 2);
   check_single_byte_v2(malformed, sizeof malformed, (char)0xe9, true, false,
                        true, 1, 2, 32, 1);
+  /* Likewise, the raw high byte matches the prefilter but normalizes to a
+     different byte before comparison.  Exercise both tie directions and the
+     no-position miss contract. */
+  check_single_byte_v2(normalizable, sizeof normalizable, (char)0xe9, true,
+                       true, true, -1, -1, 0, -1);
+  check_single_byte_v2(normalizable, sizeof normalizable, (char)0xe9, true,
+                       true, false, -1, -1, 0, -1);
   check_single_byte_v2("xxxx", 4, 'b', false, true, false,
                        -1, -1, 0, -1);
 }
