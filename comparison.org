@@ -4,10 +4,10 @@
 
 * Purpose
 
-This document compares current fzf, the Telescope port, and the Emacs port.
-It records source facts and executed behavior at fixed revisions.
+This document compares current fzf, the Telescope port, and two Emacs port
+snapshots. It records source facts and executed behavior at fixed revisions.
 
-The comparison covers product scope, matching, text handling, incremental work,
+The comparison covers product scope, match behavior, text handling, incremental work,
 interfaces, memory, concurrency, platforms, tests, and performance evidence.
 
 This document does not rank performance.
@@ -15,39 +15,41 @@ No common end-to-end performance test exists for the three products.
 
 * Terms
 
-| Term | Meaning |
-|------+---------|
-| current fzf | The pinned =junegunn/fzf= snapshot. |
-| Telescope port | The pinned =telescope-fzf-native.nvim= snapshot. |
-| Emacs port | This =fzf-native= repository at the pinned snapshot. |
-| host | The application that owns a native matching component. |
-| candidate | One input string that a matcher tests. |
-| membership | The candidates that match a query. |
-| score | The integer that one matcher assigns to one match. |
-| position | One matched code point or byte offset. |
-| result | Membership, score, positions, and rank where available. |
-| code point | One Unicode scalar value used by a matcher. |
-| grapheme cluster | One displayed character that can contain multiple code points. |
-| slab | Reusable scratch buffers for one matcher worker. |
-| snapshot | Published session metadata with an optional completed candidate list. |
-| refinement | A scan that uses earlier membership to reduce candidate work. |
-| ABI | The compiled interface between a host and a native component. |
-| API | Functions or commands that one component offers to another component. |
-| FFI | The LuaJIT interface that calls C functions. |
-| POSIX | The Unix interface used here on macOS, Linux, and FreeBSD. |
-| FIFO | First-in, first-out work order. |
-| SGR sequence | An ANSI escape sequence that sets text style. |
-| ASan | The AddressSanitizer memory-error detector. |
-| UBSan | The UndefinedBehaviorSanitizer error detector. |
-| TSan | The ThreadSanitizer data-race detector. |
+| Term               | Meaning                                                               |
+|--------------------+-----------------------------------------------------------------------|
+| current fzf        | The pinned =junegunn/fzf= snapshot.                                   |
+| Telescope port     | The pinned =telescope-fzf-native.nvim= snapshot.                      |
+| Emacs port         | The package 2.8 =fzf-native= snapshot from the first audit.           |
+| current Emacs port | The package 3.3 =fzf-native= snapshot from this update.               |
+| host               | The application that owns a native matching component.                |
+| candidate          | One input string that a matcher tests.                                |
+| membership         | The candidates that match a query.                                    |
+| score              | The integer that one matcher assigns to one match.                    |
+| position           | One matched code point or byte offset.                                |
+| result             | Membership, score, positions, and rank where available.               |
+| code point         | One Unicode scalar value used by a matcher.                           |
+| grapheme cluster   | One displayed character that can contain multiple code points.        |
+| slab               | Reusable scratch buffers for one matcher worker.                      |
+| snapshot           | Published session metadata with an optional completed candidate list. |
+| refinement         | A scan that uses earlier membership to reduce candidate work.         |
+| ABI                | The compiled interface between a host and a native component.         |
+| API                | Functions or commands that one component offers to another component. |
+| FFI                | The LuaJIT interface that calls C functions.                          |
+| POSIX              | The Unix interface used here on macOS, Linux, and FreeBSD.            |
+| FIFO               | First-in, first-out work order.                                       |
+| SGR sequence       | An ANSI escape sequence that sets text style.                         |
+| ASan               | The AddressSanitizer memory-error detector.                           |
+| UBSan              | The UndefinedBehaviorSanitizer error detector.                        |
+| TSan               | The ThreadSanitizer data-race detector.                               |
 
 * Audit snapshot
 
-| Product | Revision | Commit time | Observed version |
-|---------+----------+-------------+------------------|
-| [[https://github.com/junegunn/fzf/tree/1372d04f79bde0daa3bab4b96a068baafa808e67][current fzf]] | =1372d04f79bde0daa3bab4b96a068baafa808e67= | 2026-09-06 11:27 +0900 | =v0.74.3-9-g1372d04f= |
-| [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/tree/b25b749b9db64d375d782094e2b9dce53ad53a40][Telescope port]] | =b25b749b9db64d375d782094e2b9dce53ad53a40= | 2026-05-06 16:30 +0200 | =b25b749= |
-| [[https://github.com/dangduc/fzf-native/tree/ae3e3e1e8d737949455210f9304dc726ba0e51a1][Emacs port]] | =ae3e3e1e8d737949455210f9304dc726ba0e51a1= | 2026-09-04 22:49 -0400 | package 2.8 |
+| Product            | Revision                                   | Commit time            | Observed version      |
+|--------------------+--------------------------------------------+------------------------+-----------------------|
+| [[https://github.com/junegunn/fzf/tree/1372d04f79bde0daa3bab4b96a068baafa808e67][current fzf]]        | =1372d04f79bde0daa3bab4b96a068baafa808e67= | 2026-09-06 11:27 +0900 | =v0.74.3-9-g1372d04f= |
+| [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/tree/b25b749b9db64d375d782094e2b9dce53ad53a40][Telescope port]]     | =b25b749b9db64d375d782094e2b9dce53ad53a40= | 2026-05-06 16:30 +0200 | =b25b749=             |
+| [[https://github.com/dangduc/fzf-native/tree/ae3e3e1e8d737949455210f9304dc726ba0e51a1][Emacs port]]         | =ae3e3e1e8d737949455210f9304dc726ba0e51a1= | 2026-09-04 22:49 -0400 | package 2.8           |
+| [[https://github.com/dangduc/fzf-native/tree/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d][current Emacs port]] | =4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d= | 2026-09-08 10:42 +0000 | package 3.3           |
 
 The audit ran on Darwin 25.5.0 with arm64 hardware.
 It used Apple Clang 21.0.0, Go 1.27.1, Neovim 0.12.5, and Emacs 30.2.
@@ -57,14 +59,17 @@ Later revisions can change any result.
 
 * Main conclusions
 
-- All three products retain the same fzf scoring lineage.
-- All three products support 17 of the 18 tested query forms.
+- All compared matchers retain the same fzf scoring lineage.
+- Current fzf, the Telescope port, and the package 2.8 Emacs port support 17 of the 18 tested query forms.
+- The current Emacs port supports all 18 tested query forms.
 - Current fzf is a complete terminal application.
 - The Telescope port is a scalar native scorer for Telescope.
 - The Emacs port provides batch scoring and persistent producer sessions.
-- The two C cores still agree on every tested ASCII primitive result.
+- The current Emacs port aligns its supported query and scoring controls with current fzf.
+- The current Emacs port keeps the byte-preserving malformed-input policy.
+- The Telescope and package 2.8 C cores agree on every tested ASCII primitive result.
 - The Emacs port adds Unicode and malformed-byte behavior that the Telescope port lacks.
-- Current fzf uses newer scoring rules, normalization, query syntax, and rank rules.
+- Compared with the Telescope and package 2.8 ports, current fzf uses newer scoring rules, normalization, query syntax, and rank rules.
 - Compatible membership does not imply compatible scores, positions, rank, interface, or lifecycle.
 - None of the three products treats query text as a regular expression.
 
@@ -79,32 +84,34 @@ Therefore, the 0.27 reference identifies an era, not an exact import point.
 The Emacs port first added =fzf.c= in June 2022.
 Its initial =fzf.c= and =fzf.h= blobs exactly match one Telescope revision.
 
-| Evidence | Value |
-|----------+-------|
-| Telescope first C commit | [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/commit/d5a9c45721ba8cbf4c9b1821e105b552bbac8722][=d5a9c457=]], 2021-04-09 |
-| Earlier fzf tag | [[https://github.com/junegunn/fzf/releases/tag/0.27.0][=0.27.0=]], 2021-04-06 |
-| Emacs first C commit | [[https://github.com/dangduc/fzf-native/commit/10cd7f8aeaa54c8870bf836afbeae6991ea4d48d][=10cd7f8a=]], 2022-06-03 |
-| Matching Telescope commit | [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/commit/8ec164b541327202e5e74f99bcc5fe5845720e18][=8ec164b5=]], 2022-02-19 |
-| Matching =fzf.c= blob | =6973b24e03b2dc998eca40e1c8a11b76b9e789fc= |
-| Matching =fzf.h= blob | =7bc16473c7be5f97d0ae62b6e079986f860af1f8= |
+| Evidence                  | Value                                      |
+|---------------------------+--------------------------------------------|
+| Telescope first C commit  | [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/commit/d5a9c45721ba8cbf4c9b1821e105b552bbac8722][=d5a9c457=]], 2021-04-09                     |
+| Earlier fzf tag           | [[https://github.com/junegunn/fzf/releases/tag/0.27.0][=0.27.0=]], 2021-04-06                       |
+| Emacs first C commit      | [[https://github.com/dangduc/fzf-native/commit/10cd7f8aeaa54c8870bf836afbeae6991ea4d48d][=10cd7f8a=]], 2022-06-03                     |
+| Matching Telescope commit | [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/commit/8ec164b541327202e5e74f99bcc5fe5845720e18][=8ec164b5=]], 2022-02-19                     |
+| Matching =fzf.c= blob     | =6973b24e03b2dc998eca40e1c8a11b76b9e789fc= |
+| Matching =fzf.h= blob     | =7bc16473c7be5f97d0ae62b6e079986f860af1f8= |
 
-The current C files no longer match.
-A direct diff reports 1,740 additions and 213 deletions in the Emacs file.
+The package 2.8 =fzf.c= file no longer matches the Telescope file.
+A direct diff reports 1,740 additions and 213 deletions in the package 2.8 =fzf.c= file.
+
+The package 3.3 =fzf.c= file differs by 2,570 additions and 349 deletions from the Telescope file.
 
 This count measures text changes only.
 It does not measure correctness, features, or maintenance cost.
 
 * Product boundary
 
-| Property | current fzf | Telescope port | Emacs port |
-|----------+-------------+----------------+------------|
-| Primary form | Go executable | C shared library and Lua adapter | C dynamic module and Emacs Lisp loader |
-| Primary host | Terminal and shell | Neovim with Telescope | Emacs |
-| User interface | Complete terminal interface | Telescope owns the interface | A higher-level Emacs package owns the interface |
-| Native candidate store | Chunk list | None | Batch arrays or a session arena |
-| Native query lifecycle | Persistent during one fzf run | Scalar calls through one sorter | Scalar, batch, or persistent session calls |
-| Native producer | Standard input, command, channel, or walker | None | One shell command per session |
-| Native result form | Terminal list and selected output | Reciprocal score and byte positions | Emacs strings, highlights, or snapshots |
+| Property               | current fzf                                 | Telescope port                      | Emacs port                                            | current Emacs port                                                            |
+|------------------------+---------------------------------------------+-------------------------------------+-------------------------------------------------------+-------------------------------------------------------------------------------|
+| Primary form           | Go executable                               | C shared library and Lua adapter    | C dynamic module and Emacs Lisp loader                | C dynamic module and Emacs Lisp loader                                        |
+| Primary host           | Terminal and shell                          | Neovim with Telescope               | Emacs                                                 | Emacs                                                                         |
+| User interface         | Complete terminal interface                 | Telescope owns the interface        | A higher-level Emacs package owns the interface       | A higher-level Emacs package owns the interface                               |
+| Native candidate store | Chunk list                                  | None                                | Batch arrays or a session arena                       | Batch arrays or a session arena                                               |
+| Native query lifecycle | Persistent during one fzf run               | Scalar calls through one sorter     | Scalar, batch, or persistent session calls            | Scalar, batch, or persistent session calls with per-request matching controls |
+| Native producer        | Standard input, command, channel, or walker | None                                | One shell command per session                         | One shell command per session                                                 |
+| Native result form     | Terminal list and selected output           | Reciprocal score and byte positions | Emacs strings, highlights, or request-aware snapshots | Emacs strings, highlights, or request-aware snapshots                         |
 
 Current fzf owns the complete find-select cycle.
 The two ports expose matching work to another application.
@@ -138,45 +145,47 @@ Their host adapters do not expose an algorithm selection setting.
 
 All three cores use the same base values:
 
-| Value | Number |
-|-------+--------|
-| character match | 16 |
-| new gap | -3 |
-| extended gap | -1 |
-| general boundary bonus | 8 |
-| camel-case bonus | 7 |
-| consecutive bonus | 4 |
-| first-character multiplier | 2 |
+| Value                      | Number |
+|----------------------------+--------|
+| character match            |     16 |
+| new gap                    |     -3 |
+| extended gap               |     -1 |
+| general boundary bonus     |      8 |
+| camel-case bonus           |      7 |
+| consecutive bonus          |      4 |
+| first-character multiplier |      2 |
 
 These shared values do not make the final scores equal.
 Current fzf applies more boundary classes and configurable schemes.
 
 ** Query language
 
-| Query form | current fzf | Telescope port | Emacs port |
-|------------+-------------+----------------+------------|
-| =word= | fuzzy term | fuzzy term | fuzzy term |
-| ='word= | exact term | exact term | exact term |
-| ='word'= | exact term at word boundaries | final quote stays in the term | final quote stays in the term |
-| =^word= | prefix term | prefix term | prefix term |
-| =word$= | suffix term | suffix term | suffix term |
-| =^word$= | equal term | equal term | equal term |
-| =!word= | inverse exact term | inverse exact term | inverse exact term |
-| =word other= | two AND terms | two AND terms | two AND terms |
-| =word | other= | OR alternatives | OR alternatives | OR alternatives |
-| =two\ words= | one term with a space | one term with a space | one term with a space |
-| global exact mode | =--exact= | =fuzzy=false= | =fzf-native-fuzzy=nil= |
-| smart, ignore, respect case | yes | yes | yes |
-| regular-expression query | no | no | no |
+| Query form                  | current fzf                   | Telescope port                | Emacs port                    | current Emacs port            |
+|-----------------------------+-------------------------------+-------------------------------+-------------------------------+-------------------------------|
+| =word=                      | fuzzy term                    | fuzzy term                    | fuzzy term                    | fuzzy term                    |
+| ='word=                     | exact term                    | exact term                    | exact term                    | exact term                    |
+| ='word'=                    | exact term at word boundaries | final quote stays in the term | final quote stays in the term | exact term at word boundaries |
+| =^word=                     | prefix term                   | prefix term                   | prefix term                   | prefix term                   |
+| =word$=                     | suffix term                   | suffix term                   | suffix term                   | suffix term                   |
+| =^word$=                    | equal term                    | equal term                    | equal term                    | equal term                    |
+| =!word=                     | inverse exact term            | inverse exact term            | inverse exact term            | inverse exact term            |
+| =word other=                | two AND terms                 | two AND terms                 | two AND terms                 | two AND terms                 |
+| =word= \vert{} =other=      | OR alternatives               | OR alternatives               | OR alternatives               | OR alternatives               |
+| =two\ words=                | one term with a space         | one term with a space         | one term with a space         | one term with a space         |
+| global exact mode           | =--exact=                     | =fuzzy=false=                 | =fzf-native-fuzzy=nil=        | =fzf-native-fuzzy=nil=        |
+| smart, ignore, respect case | yes                           | yes                           | yes                           | yes                           |
+| regular-expression query    | no                            | no                            | no                            | no                            |
 
 Current fzf added the ='word'= boundary form after the C ports diverged.
 The current fzf parser maps this form to =ExactMatchBoundary=.
 
-The C parsers do not define that term type.
+The Telescope parser and the package 2.8 parser do not define that term type.
 They retain the final quote as candidate data.
 
+The current Emacs parser defines an exact-boundary term for this form.
+
 A query such as =f.o= is not a regular expression.
-All three probes matched the literal candidate =f.o= and rejected =foo=.
+All four parser probes matched the literal candidate =f.o= and rejected =foo=.
 
 Current fzf separately accepts regular expressions for field delimiters.
 That option does not change query matching.
@@ -193,13 +202,13 @@ Source references:
 Current fzf gives whitespace and delimiter boundaries separate default bonuses.
 The default values are 10 for whitespace, 9 for delimiters, and 8 for other boundaries.
 
-Both C ports use one boundary value of 8.
+The Telescope port and the package 2.8 Emacs port use one boundary value of 8.
 This difference changes scores and can change the selected V2 positions.
 
-| V2 query | Candidate | current fzf | Telescope port | Emacs port |
-|----------+-----------+-------------+----------------+------------|
-| =fzf= | =src/fzf= | score 84, positions 4,5,6 | score 80, positions 4,5,6 | score 80, positions 4,5,6 |
-| =/a= | =a//a= | score 59, positions 2,3 | score 56, positions 1,3 | score 56, positions 1,3 |
+| V2 query | Candidate | current fzf               | Telescope port            | Emacs port                | current Emacs port        |
+|----------+-----------+---------------------------+---------------------------+---------------------------+---------------------------|
+| =fzf=    | =src/fzf= | score 84, positions 4,5,6 | score 80, positions 4,5,6 | score 80, positions 4,5,6 | score 84, positions 4,5,6 |
+| =/a=     | =a//a=    | score 59, positions 2,3   | score 56, positions 1,3   | score 56, positions 1,3   | score 59, positions 2,3   |
 
 Current fzf supports =default=, =path=, and =history= scoring schemes.
 It also supports configurable length, chunk, pathname, begin, end, and input-order tie rules.
@@ -214,7 +223,14 @@ The Emacs port ranks a session result by higher score, then earlier producer ind
 Its synchronous batch path also keeps stable equal-score order in normal operation.
 An emergency synchronous =qsort= fallback can change equal-score order after an allocation failure.
 
-Do not compare score numbers across current fzf and either C port.
+The current Emacs port supports the =default=, =path=, and =history= schemes.
+The default scheme sorts by score, trimmed character length, and producer index.
+The path scheme adds pathname distance.
+The history scheme sorts by score and producer index.
+An inverse-only query retains producer order.
+Batch and session results use the same order.
+
+Compare score numbers only with a known common option set.
 Do not assume that equal membership produces equal rank.
 
 Source references:
@@ -223,21 +239,22 @@ Source references:
 - [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/options.go#L1336-L1404][current fzf rank settings]]
 - [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/blob/b25b749b9db64d375d782094e2b9dce53ad53a40/lua/telescope/_extensions/fzf.lua#L78-L92][Telescope score adapter]]
 - [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/architecture.org#L187-L201][Emacs rank contract]]
+- [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/architecture.org#L176-L229][current Emacs score and rank contract]]
 
 * Text model
 
-| Property | current fzf | Telescope port | Emacs port |
-|----------+-------------+----------------+------------|
-| Valid UTF-8 unit | Go code point | byte | Unicode code point |
-| Case conversion | Go Unicode tables | C =tolower= on each byte | vendored utf8proc 2.10.0 |
-| Case conversion size | one code point to one code point | one byte to one byte | one code point to one code point |
-| Latin accent normalization | on by default | unavailable | unavailable through the public parser |
-| Disable accent normalization | =--literal= | already disabled | already disabled |
-| Distinct malformed bytes | collapse to replacement code points | remain distinct | remain distinct |
-| Valid UTF-8 positions | code-point offsets | byte offsets | code-point offsets |
-| Malformed-byte positions | replacement-code-point offsets | byte offsets | byte offsets in Emacs unibyte strings |
-| Whitespace classes | Go Unicode tables | C byte classes | utf8proc Unicode categories |
-| Grapheme clusters | separate code points | separate bytes | separate code points |
+| Property                     | current fzf                         | Telescope port           | Emacs port                            | current Emacs port                    |
+|------------------------------+-------------------------------------+--------------------------+---------------------------------------+---------------------------------------|
+| Valid UTF-8 unit             | Go code point                       | byte                     | Unicode code point                    | Unicode code point                    |
+| Case conversion              | Go Unicode tables                   | C =tolower= on each byte | vendored utf8proc 2.10.0              | vendored utf8proc 2.10.0              |
+| Case conversion size         | one code point to one code point    | one byte to one byte     | one code point to one code point      | one code point to one code point      |
+| Latin accent normalization   | on by default                       | unavailable              | unavailable through the public parser | on by default                         |
+| Disable accent normalization | =--literal=                         | already disabled         | already disabled                      | =fzf-native-normalize=nil=            |
+| Distinct malformed bytes     | collapse to replacement code points | remain distinct          | remain distinct                       | remain distinct                       |
+| Valid UTF-8 positions        | code-point offsets                  | byte offsets             | code-point offsets                    | code-point offsets                    |
+| Malformed-byte positions     | replacement-code-point offsets      | byte offsets             | byte offsets in Emacs unibyte strings | byte offsets in Emacs unibyte strings |
+| Whitespace classes           | Go Unicode tables                   | C byte classes           | utf8proc Unicode categories           | utf8proc Unicode categories           |
+| Grapheme clusters            | separate code points                | separate bytes           | separate code points                  | separate code points                  |
 
 Current fzf uses Latin-letter normalization, not full Unicode normalization.
 The default can make =cafe= match =café=.
@@ -245,10 +262,13 @@ The default can make =cafe= match =café=.
 The Telescope Lua adapter always passes =normalize=false=.
 Its README also lists Unicode case matching as incomplete.
 
-The Emacs public parser also disables accent normalization.
+The package 2.8 Emacs parser disables accent normalization.
 Its Unicode path still supports Unicode case matching and Unicode whitespace.
 
-Both current fzf and the Emacs port use simple one-code-point lowercase maps.
+The current Emacs parser enables fzf Latin normalization by default.
+The =fzf-native-normalize= option can disable it for one request.
+
+Current fzf and both Emacs snapshots use simple one-code-point lowercase maps.
 Neither product applies multi-code-point full case folding.
 
 No matcher treats a grapheme cluster as one matching unit.
@@ -265,19 +285,20 @@ The Emacs port assigns a distinct internal value to each invalid byte.
 The Emacs module returns malformed candidates as Emacs unibyte strings.
 This policy preserves Unix path bytes during matching and return.
 
-| Query bytes | Candidate bytes | current fzf | Telescope port | Emacs port |
-|-------------+-----------------+-------------+----------------+------------|
-| =ff= | =ff= | match | match | match |
-| =ff= | =fe= | match | no match | no match |
-| =c3= | =ff= | match | no match | no match |
-| =ff= | =ef bf bd= | match | no match | no match |
-| =ff 61= | =fe 61= | match | no match | no match |
+| Query bytes | Candidate bytes | current fzf | Telescope port | Emacs port | current Emacs port |
+|-------------+-----------------+-------------+----------------+------------+--------------------|
+| =ff=        | =ff=            | match       | match          | match      | match              |
+| =ff=        | =fe=            | match       | no match       | no match   | no match           |
+| =c3=        | =ff=            | match       | no match       | no match   | no match           |
+| =ff=        | =ef bf bd=      | match       | no match       | no match   | no match           |
+| =ff 61=     | =fe 61=         | match       | no match       | no match   | no match           |
 
 Source references:
 
 - [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/util/chars.go#L110-L158][current fzf byte decoding]]
 - [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/blob/b25b749b9db64d375d782094e2b9dce53ad53a40/README.md#L174-L180][Telescope normalization limitations]]
 - [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/architecture.org#L162-L175][Emacs Unicode and raw-byte contract]]
+- [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/architecture.org#L165-L187][current Emacs Unicode and raw-byte contract]]
 
 * Incremental operation
 
@@ -292,7 +313,7 @@ The matcher divides 1,024-candidate chunks among Go workers.
 Each worker owns reusable scratch memory.
 The default worker limit follows the processor count.
 
-The matcher checks cancellation between chunks.
+The matcher examines the cancellation state between chunks.
 It publishes search progress after a 200 millisecond threshold.
 
 Current fzf uses three main cache layers:
@@ -359,7 +380,7 @@ The stable-batch cache defaults to 64 MiB and 4,096 query records.
 Safe refinement can reuse complete membership from an earlier broader query.
 It supports simple prefix growth, added AND terms, reordered AND terms, and safe inverse terms.
 
-The coordinator rescans cached members and appended candidates when the proof is valid.
+A valid proof lets the coordinator rescan cached members and appended candidates.
 It recomputes every retained score and final rank.
 
 The public snapshot contains only completed candidates.
@@ -370,18 +391,18 @@ It publishes one authoritative result after a scoring attempt completes.
 
 ** Incremental comparison
 
-| Property | current fzf | Telescope port | Emacs port session |
-|----------+-------------+----------------+--------------------|
-| Persistent native candidate pool | yes | no | yes |
-| Persistent parsed-query cache | yes | yes | yes, inside result evidence |
-| Membership cache | per 1,024-candidate chunk | none natively, and the start hook clears the host subset | full result and stable batch |
-| Exact full-result cache | yes | no | yes |
-| Candidate-growth refresh | automatic | host controlled | automatic for the latest request |
-| Query supersession | matcher reset | host prompt change | request replacement and abort flag |
-| Native progress | percentage event | none | resolved and total counts |
-| Publish worker matches directly | no | not applicable | no |
-| Retain prior result during new work | terminal owns the shown result | host controlled | yes, marked stale |
-| Replace producer in place | reload actions | host controlled | no, start another session |
+| Property                            | current fzf                    | Telescope port                                           | Emacs port session                 | current Emacs port session                                                      |
+|-------------------------------------+--------------------------------+----------------------------------------------------------+------------------------------------+---------------------------------------------------------------------------------|
+| Persistent native candidate pool    | yes                            | no                                                       | yes                                | yes                                                                             |
+| Persistent parsed-query cache       | yes                            | yes                                                      | yes, inside result evidence        | yes, in both cache classes                                                      |
+| Membership cache                    | per 1,024-candidate chunk      | none natively, and the start hook clears the host subset | full result and stable batch       | whole-result immutable index chains and stable-batch sparse arrays or bitmaps   |
+| Exact full-result cache             | yes                            | no                                                       | yes                                | yes, keyed by the complete matching policy                                      |
+| Candidate-growth refresh            | automatic                      | host controlled                                          | automatic for the latest request   | automatic, with delta-only scoring for requests covered by exact cache evidence |
+| Query supersession                  | matcher reset                  | host prompt change                                       | request replacement and abort flag | request replacement and abort flag                                              |
+| Native progress                     | percentage event               | none                                                     | resolved and total counts          | resolved and total counts                                                       |
+| Publish worker matches directly     | no                             | not applicable                                           | no                                 | no                                                                              |
+| Retain prior result during new work | terminal owns the shown result | host controlled                                          | yes, marked stale                  | yes, marked stale                                                               |
+| Replace producer in place           | reload actions                 | host controlled                                          | no, start another session          | no, start another session                                                       |
 
 Source references:
 
@@ -390,25 +411,26 @@ Source references:
 - [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/chunklist.go#L9-L150][current fzf candidate snapshots]]
 - [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/blob/b25b749b9db64d375d782094e2b9dce53ad53a40/lua/telescope/_extensions/fzf.lua#L18-L99][Telescope sorter state]]
 - [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/architecture.org#L245-L545][Emacs session and cache design]]
+- [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/architecture.org#L276-L575][current Emacs session and cache design]]
 
 * Candidate input and user features
 
-| Feature | current fzf | Telescope port | Emacs port |
-|---------+-------------+----------------+------------|
-| Newline input | yes | host supplies strings | session reader uses newlines |
-| NUL-delimited input | =--read0= | no native reader | no |
-| Final unterminated record | yes | not applicable | yes |
-| Built-in file walker | yes | no | no |
-| Shell command producer | yes | no | one per session |
-| Candidate tail limit | =--tail= | host controlled | none, with a separate per-line character cap |
-| ANSI input | parses styling with =--ansi= | no native parser | session reader removes SGR sequences |
-| Field selection | delimiter and =--nth= family | host controlled | no |
-| Regular-expression delimiter | yes | host controlled | no |
-| Preview process | yes | Telescope owns it | no |
-| Key and event actions | yes | Telescope owns them | no |
-| Multiple selection | yes | Telescope owns it | no |
-| Listen server | TCP or Unix socket | no | no |
-| Shell integrations | Bash, Zsh, Fish, and Nushell | no | no |
+| Feature                      | current fzf                  | Telescope port        | Emacs port                                   | current Emacs port                           |
+|------------------------------+------------------------------+-----------------------+----------------------------------------------+----------------------------------------------|
+| Newline input                | yes                          | host supplies strings | session reader uses newlines                 | session reader uses newlines                 |
+| NUL-delimited input          | =--read0=                    | no native reader      | no                                           | no                                           |
+| Final unterminated record    | yes                          | not applicable        | yes                                          | yes                                          |
+| Built-in file walker         | yes                          | no                    | no                                           | no                                           |
+| Shell command producer       | yes                          | no                    | one per session                              | one per session                              |
+| Candidate tail limit         | =--tail=                     | host controlled       | none, with a separate per-line character cap | none, with a separate per-line character cap |
+| ANSI input                   | parses styling with =--ansi= | no native parser      | session reader removes SGR sequences         | session reader removes CSI SGR sequences     |
+| Field selection              | delimiter and =--nth= family | host controlled       | no                                           | no                                           |
+| Regular-expression delimiter | yes                          | host controlled       | no                                           | no                                           |
+| Preview process              | yes                          | Telescope owns it     | no                                           | no                                           |
+| Key and event actions        | yes                          | Telescope owns them   | no                                           | no                                           |
+| Multiple selection           | yes                          | Telescope owns it     | no                                           | no                                           |
+| Listen server                | TCP or Unix socket           | no                    | no                                           | no                                           |
+| Shell integrations           | Bash, Zsh, Fish, and Nushell | no                    | no                                           | no                                           |
 
 Current fzf can use NUL as the record delimiter.
 The probe returned =alpha\0beta\0= after =--read0 --print0 --filter a=.
@@ -420,7 +442,7 @@ The Telescope raw algorithm functions also accept explicit buffer sizes.
 The Lua adapter does not expose those raw calls.
 
 The Emacs module rejects embedded NUL in queries and candidates.
-It also rejects NUL in session output, including discarded line data.
+It also rejects NUL in all session output and discarded line data.
 
 Source references:
 
@@ -430,33 +452,33 @@ Source references:
 
 * Concurrency and cancellation
 
-| Property | current fzf | Telescope port | Emacs port |
-|----------+-------------+----------------+------------|
-| Matching workers | up to processor count by default | none in the C library | up to 64 |
-| Work unit | 1,024-candidate chunk | one scalar host call | 2,048-candidate batch |
-| Scratch reuse | one slab per worker | one slab per sorter | one slab per worker |
-| Session control thread | matcher loop | none | one coordinator per session |
-| Reader task | one Go reader | none | one POSIX reader thread per session |
-| Query cancellation | reset event and atomic flag | no native cancellation | every 256 candidates and during long loops |
-| Producer stop | closes and kills the command | not applicable | kills the producer process group |
-| Multi-session fairness | one fzf process owns one matcher | host controlled | shared FIFO worker epochs |
+| Property               | current fzf                      | Telescope port         | Emacs port                                 | current Emacs port                                                                    |
+|------------------------+----------------------------------+------------------------+--------------------------------------------+---------------------------------------------------------------------------------------|
+| Matching workers       | up to processor count by default | none in the C library  | up to 64                                   | up to 64 shared session workers, while batch calls use bounded temporary workers      |
+| Work unit              | 1,024-candidate chunk            | one scalar host call   | 2,048-candidate batch                      | 2,048-candidate batch, with at most 64 batches per window                             |
+| Scratch reuse          | one slab per worker              | one slab per sorter    | one slab per worker                        | one slab per worker, with the request score scheme                                    |
+| Session control thread | matcher loop                     | none                   | one coordinator per session                | one coordinator per session                                                           |
+| Reader task            | one Go reader                    | none                   | one POSIX reader thread per session        | one POSIX reader thread per session                                                   |
+| Query cancellation     | reset event and atomic flag      | no native cancellation | every 256 candidates and during long loops | every 256 candidates and during long sort and copy loops                              |
+| Producer stop          | closes and kills the command     | not applicable         | kills the producer process group           | kills the producer process group and owns child reaping                               |
+| Multi-session fairness | one fzf process owns one matcher | host controlled        | shared FIFO worker epochs                  | process-wide FIFO session queue, where workers yield after one batch under contention |
 
 The Emacs Windows build runs batch work on the calling thread.
 Its persistent session API is unavailable on Windows.
 
 * Cache bounds and memory ownership
 
-| Property | current fzf | Telescope port | Emacs port |
-|----------+-------------+----------------+------------|
-| Candidate ownership | process chunk list | Telescope | batch call or session arena |
-| Parsed-pattern ownership | process map | sorter map | call or cache entry |
-| Explicit parsed-pattern bound | no | no | result-cache bounds apply |
-| Membership representation | 1,024-bit chunk bitmap | none | indexes, sparse arrays, or bitmaps |
-| Aggregate membership byte bound | no explicit cache byte limit | not applicable | 64 MiB per cache class by default |
-| Full-result entry test | fewer than 100,000 results | none | result capacity and byte checks |
-| Public handle cleanup | process exit | explicit free during sorter destroy | Emacs finalizer or explicit stop |
+| Property                        | current fzf                  | Telescope port                      | Emacs port                         | current Emacs port                                                                                 |
+|---------------------------------+------------------------------+-------------------------------------+------------------------------------+----------------------------------------------------------------------------------------------------|
+| Candidate ownership             | process chunk list           | Telescope                           | batch call or session arena        | batch call or append-only session arena                                                            |
+| Parsed-pattern ownership        | process map                  | sorter map                          | call or cache entry                | call or bounded whole-result and stable-batch cache entry                                          |
+| Explicit parsed-pattern bound   | no                           | no                                  | result-cache bounds apply          | whole-result entry and byte bounds, plus stable-batch query and byte bounds                        |
+| Membership representation       | 1,024-bit chunk bitmap       | none                                | indexes, sparse arrays, or bitmaps | immutable index chains, sparse arrays, or bitmaps                                                  |
+| Aggregate membership byte bound | no explicit cache byte limit | not applicable                      | 64 MiB per cache class by default  | 64 MiB per cache class by default                                                                  |
+| Full-result entry test          | fewer than 100,000 results   | none                                | result capacity and byte checks    | entry count and byte checks, with complete membership limited to half the whole-result byte budget |
+| Public handle cleanup           | process exit                 | explicit free during sorter destroy | Emacs finalizer or explicit stop   | Emacs finalizer or explicit stop                                                                   |
 
-Current fzf retires chunk cache entries when =--tail= removes chunks.
+Current fzf retires a cache entry after =--tail= removes its chunk.
 Its maps have no explicit aggregate byte limit.
 
 The Telescope adapter frees patterns and the slab during sorter destruction.
@@ -476,7 +498,7 @@ The internal Go packages do not provide a versioned shared-library ABI.
 ** Telescope port
 
 The built library exports 15 C functions.
-They cover six matchers, pattern parsing, scoring, positions, and slab allocation.
+They cover six matchers, the pattern parser, scores, positions, and slab allocation.
 
 The LuaJIT FFI adapter exposes parsed patterns, scores, positions, and slabs.
 The Telescope extension converts these values into one Telescope sorter.
@@ -495,37 +517,41 @@ fzf_suffix_match
 ** Emacs port
 
 The release module exports =emacs_module_init= and =plugin_is_GPL_compatible= only.
-Module initialization registers 17 Emacs Lisp functions.
+The package 2.8 POSIX module registers 17 Emacs Lisp functions.
+The current POSIX module registers 18 functions. The current Windows module registers eight.
 
-| Group | Functions |
-|-------+-----------|
-| scalar and batch | =fzf-native-score=, =fzf-native-score-all= |
-| highlight | =fzf-native-highlight-one=, =fzf-native-highlight-all= |
-| slab | =fzf-native-make-slab=, =fzf-native-make-default-slab= |
-| session lifecycle | =fzf-native-async-start=, =fzf-native-async-stop= |
-| request API | =fzf-native-async-submit=, =fzf-native-async-status=, =fzf-native-async-snapshot= |
-| compatibility API | =fzf-native-async-candidates=, =fzf-native-async-stats=, =fzf-native-async-generation=, =fzf-native-async-result-fresh-p= |
-| configuration helper | =fzf-native-filter-only-p= |
-| ABI check | =fzf-native-session-abi-version= |
+| Group                | Functions in Emacs port                                                                                                   | Functions in current Emacs port                                                                                           |
+|----------------------+---------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------|
+| scalar and batch     | =fzf-native-score=, =fzf-native-score-all=                                                                                | =fzf-native-score=, =fzf-native-score-all=                                                                                |
+| highlight            | =fzf-native-highlight-one=, =fzf-native-highlight-all=                                                                    | =fzf-native-highlight-one=, =fzf-native-highlight-all=                                                                    |
+| slab                 | =fzf-native-make-slab=, =fzf-native-make-default-slab=                                                                    | =fzf-native-make-slab=, =fzf-native-make-default-slab=                                                                    |
+| session lifecycle    | =fzf-native-async-start=, =fzf-native-async-stop=                                                                         | =fzf-native-async-start=, =fzf-native-async-stop=                                                                         |
+| request API          | =fzf-native-async-submit=, =fzf-native-async-status=, =fzf-native-async-snapshot=                                         | =fzf-native-async-submit=, =fzf-native-async-status=, =fzf-native-async-snapshot=                                         |
+| compatibility API    | =fzf-native-async-candidates=, =fzf-native-async-stats=, =fzf-native-async-generation=, =fzf-native-async-result-fresh-p= | =fzf-native-async-candidates=, =fzf-native-async-stats=, =fzf-native-async-generation=, =fzf-native-async-result-fresh-p= |
+| configuration helper | =fzf-native-filter-only-p=                                                                                                | =fzf-native-filter-only-p=                                                                                                |
+| ABI check            | =fzf-native-session-abi-version=                                                                                          | =fzf-native-abi-version= and POSIX alias =fzf-native-session-abi-version=                                                 |
 
-POSIX modules report session ABI version 1.
-The Emacs Lisp loader rejects a missing or different session ABI.
+The package 2.8 POSIX modules report session ABI version 1.
+The current modules report ABI version 2 on every platform.
+
+The current loader rejects a different ABI on every supported platform.
+POSIX modules also provide the session ABI name as a compatibility alias.
 
 This handshake protects the persistent session interface.
 It does not make the module ABI compatible with the Telescope C library.
 
 * Build, platform, and license
 
-| Property | current fzf | Telescope port | Emacs port |
-|----------+-------------+----------------+------------|
-| Main languages | Go | C and Lua | C and Emacs Lisp |
-| Build tool | Go and Make | CMake or Make | CMake and Make |
-| Host requirement | none | Neovim, Telescope, and LuaJIT FFI | Emacs 29.1 or later |
-| Runtime native dependency | self-contained executable | built shared C library | vendored utf8proc linked statically |
-| Published native artifacts | release executables | none in the repository | committed Emacs modules |
-| CI or release systems | Darwin, Linux, Windows, FreeBSD, OpenBSD, Android | Linux and macOS tests, plus a Windows build | macOS, Linux, FreeBSD, and Windows |
-| Architecture coverage | release matrix has six systems and seven architecture names, with exclusions | current compiler target | listed bundled architectures only |
-| Repository license | MIT | MIT | GPL-3.0-or-later |
+| Property                   | current fzf                                                                  | Telescope port                              | Emacs port                          | current Emacs port                                                |
+|----------------------------+------------------------------------------------------------------------------+---------------------------------------------+-------------------------------------+-------------------------------------------------------------------|
+| Main languages             | Go                                                                           | C and Lua                                   | C and Emacs Lisp                    | C and Emacs Lisp                                                  |
+| Build tool                 | Go and Make                                                                  | CMake or Make                               | CMake and Make                      | CMake and Make                                                    |
+| Host requirement           | none                                                                         | Neovim, Telescope, and LuaJIT FFI           | Emacs 29.1 or later                 | Emacs 29.1 or later                                               |
+| Runtime native dependency  | self-contained executable                                                    | built shared C library                      | vendored utf8proc linked statically | vendored utf8proc linked statically                               |
+| Published native artifacts | release executables                                                          | none in the repository                      | committed Emacs modules             | committed, ABI-smoked Emacs modules                               |
+| CI or release systems      | Darwin, Linux, Windows, FreeBSD, OpenBSD, Android                            | Linux and macOS tests, plus a Windows build | macOS, Linux, FreeBSD, and Windows  | macOS, Linux, FreeBSD, and Windows                                |
+| Architecture coverage      | release matrix has six systems and seven architecture names, with exclusions | current compiler target                     | listed bundled architectures only   | x86-64 on Linux, FreeBSD, Windows, and macOS, plus arm64 on macOS |
+| Repository license         | MIT                                                                          | MIT                                         | GPL-3.0-or-later                    | GPL-3.0-or-later                                                  |
 
 The Emacs matcher files retain MIT license markers and copied fzf attribution.
 The module, Emacs Lisp, and repository license use GPL-3.0-or-later.
@@ -546,15 +572,21 @@ Source references:
 
 ** Repository tests
 
-| Product | Command | Result |
-|---------+---------+--------|
-| current fzf | =FZF_VERSION=0.74.3 GO=/opt/homebrew/bin/go make test= | four Go packages passed |
-| Telescope C | =DYLD_LIBRARY_PATH=$PWD/build ./build/test= | 63 passed |
-| Telescope Lua | =make ntest= | 10 passed, 0 failed, 0 errors |
-| Emacs native C | =make BUILD_DIR=build-comparison-ctest ctest= | 115 module tests and 34 matcher tests passed |
-| Emacs parser failures | same =ctest= command | 25 allocation sites passed |
-| Emacs scorer failures | same =ctest= command | 36 allocation failures passed |
-| Emacs public API | =FZF_NATIVE_TEST_MODULE=MODULE EMACS=EMACS make test= | 168 passed, 0 unexpected |
+| Product                       | Command                                                                    | Result                                                                                         |
+|-------------------------------+----------------------------------------------------------------------------+------------------------------------------------------------------------------------------------|
+| current fzf                   | =FZF_VERSION=0.74.3 GO=/opt/homebrew/bin/go make test=                     | four Go packages passed                                                                        |
+| Telescope C                   | =DYLD_LIBRARY_PATH=$PWD/build ./build/test=                                | 63 passed                                                                                      |
+| Telescope Lua                 | =make ntest=                                                               | 10 passed, 0 failed, 0 errors                                                                  |
+| Emacs native C                | =make BUILD_DIR=build-comparison-ctest ctest=                              | 115 module tests and 34 matcher tests passed                                                   |
+| Emacs parser failures         | same =ctest= command                                                       | 25 allocation sites passed                                                                     |
+| Emacs scorer failures         | same =ctest= command                                                       | 36 allocation failures passed                                                                  |
+| Emacs public API              | =FZF_NATIVE_TEST_MODULE=MODULE EMACS=EMACS make test=                      | 168 passed, 0 unexpected                                                                       |
+| Current Emacs native C        | =make ctest=                                                               | 131 module tests, 47 matcher tests, 6 SIMD prefilter tests, and three benchmark oracles passed |
+| Current Emacs parser failures | same =ctest= command                                                       | 25 allocation sites passed                                                                     |
+| Current Emacs scorer failures | same =ctest= command                                                       | 56 allocation failures passed                                                                  |
+| Current Emacs C sanitizers    | =make BUILD_DIR=build-comparison-current-asan ctest-asan=                  | ASan and UBSan suites passed                                                                   |
+| Current Emacs public API      | =EMACS=/Users/duc/emacs/nextstep/Emacs.app/Contents/MacOS/Emacs make test= | 188 passed, 0 unexpected                                                                       |
+| Current Emacs fzf oracle      | =make fuzz-oracle-test FZF_SOURCE=PINNED_FZF=                              | 60,000 raw score, range, and position cases passed                                             |
 
 The current fzf suite includes exhaustive one-character and two-character V2 equivalence tests.
 It also contains five Go fuzz entry points.
@@ -562,10 +594,13 @@ It also contains five Go fuzz entry points.
 The Telescope repository contains no sanitizer or coverage-guided fuzz target.
 Its own test commands still passed at the pinned revision.
 
-The Emacs repository contains matcher and session libFuzzer targets.
+The package 2.8 Emacs repository contains matcher and session libFuzzer targets.
 It also contains sanitizer replay, TSan replay, real-Emacs random, and upstream membership targets.
 
-The Emacs C test build completed with compiler warnings.
+The current Emacs repository adds a producer-reader libFuzzer target.
+Its pinned fzf oracle compares raw score, range, and positions.
+
+The package 2.8 Emacs C test build completed with compiler warnings.
 Apple Clang reported unused values and signed integer comparisons in =fzf.c=.
 
 ** ASCII primitive matrix
@@ -575,26 +610,29 @@ A temporary C driver called the exported C algorithm functions directly.
 
 The matrix used this finite set of combinations:
 
-| Dimension | Values |
-|-----------+--------|
-| algorithms | V1, V2, exact, prefix, suffix, equal |
-| case setting | ignore and respect |
-| normalization | disabled |
-| direction | forward |
-| pattern alphabet | =aA/= |
-| pattern length | one through two bytes |
-| candidate alphabet | =aA/= |
-| candidate length | zero through four bytes |
-| total calls per implementation | 17,424 |
+| Dimension                      | Values                               |
+|--------------------------------+--------------------------------------|
+| algorithms                     | V1, V2, exact, prefix, suffix, equal |
+| case setting                   | ignore and respect                   |
+| normalization                  | disabled                             |
+| direction                      | forward                              |
+| pattern alphabet               | =aA/=                                |
+| pattern length                 | one through two bytes                |
+| candidate alphabet             | =aA/=                                |
+| candidate length               | zero through four bytes              |
+| total calls per implementation | 17,424                               |
 
 The drivers pre-lowered ignored-case C patterns.
 This step matches the preparation done by both C parsers.
 
-| Comparison | Membership equal | Raw result tuple equal | Score equal among 6,324 matches | Positions equal among matches |
-|------------+------------------+-----------------------+----------------------------------+-------------------------------|
-| Telescope port versus Emacs port | 17,424 | 17,424 | 6,324 | 6,324 |
-| current fzf versus Telescope port | 17,424 | 11,677 | 1,266 | 3,252 |
-| current fzf versus Emacs port | 17,424 | 11,677 | 1,266 | 3,252 |
+This fixed matrix covers the package 2.8 Emacs snapshot.
+The current snapshot uses the separate 60,000-case raw fzf oracle shown above.
+
+| Comparison                        | Membership equal | Raw result tuple equal | Score equal among 6,324 matches | Positions equal among matches |
+|-----------------------------------+------------------+------------------------+---------------------------------+-------------------------------|
+| Telescope port versus Emacs port  | 17,424           | 17,424                 | 6,324                           | 6,324                         |
+| current fzf versus Telescope port | 17,424           | 11,677                 | 1,266                           | 3,252                         |
+| current fzf versus Emacs port     | 17,424           | 11,677                 | 1,266                           | 3,252                         |
 
 Current fzf exact, prefix, suffix, and equal primitives return no position slice.
 The C primitives return explicit positions for these matches.
@@ -612,39 +650,45 @@ It compared membership through =fzf --filter= and each C parsed-pattern API.
 
 The query set covered fuzzy, exact, boundary, prefix, suffix, equal, inverse, AND, OR, spaces, smart case, and global exact mode.
 
-The two C ports agreed on all 18 rows.
-Current fzf agreed on 17 rows.
+The Telescope and package 2.8 ports agreed on all 18 rows.
+Current fzf agreed with them on 17 rows.
+The current Emacs port agreed with current fzf on all 18 rows.
 
 The only difference was the newer ='foo'= exact-boundary form.
 Current fzf matched =foo=, =bar foo baz=, =foo-bar=, and =FOO=.
 
-Both C ports matched no candidate in that test row.
+The Telescope and package 2.8 ports matched no candidate in that test row.
 Their parsed term included the final quote.
+The current Emacs port matched the same four candidates as current fzf.
 
 ** Unicode matrix
 
 The Unicode probe used parsed public patterns for both C ports.
 It used ignore-case mode in all 13 rows.
 Twelve rows disabled normalization in every core.
-One row enabled current fzf normalization to test that product-specific feature.
+One row enabled normalization in current fzf and the current Emacs port.
 
-| Query and candidate | current fzf | Telescope port | Emacs port |
-|---------------------+-------------+----------------+------------|
-| =café= and =CAFÉ= | match | no match | match |
-| =σ= and =Σ= | match | no match | match |
-| =k= and =K= | match | no match | match |
-| =ⱥ= and =Ⱥ= | match | no match | match |
-| =ß= and =ẞ= | match | no match | match |
-| =中文= and =测试中文= | match at 2,3 | match at bytes 6-11 | match at 2,3 |
-| =😀= and =a😀b= | match at 1 | match at bytes 1-4 | match at 1 |
-| combining mark and =é= | match at 1 | match at bytes 1-2 | match at 1 |
-| normalized =cafe= and =café= | match | no match | no match |
+| Query and candidate          | current fzf  | Telescope port      | Emacs port   | current Emacs port |
+|------------------------------+--------------+---------------------+--------------+--------------------|
+| =café= and =CAFÉ=            | match        | no match            | match        | match              |
+| =σ= and =Σ=                  | match        | no match            | match        | match              |
+| =k= and =K=                  | match        | no match            | match        | match              |
+| =ⱥ= and =Ⱥ=                  | match        | no match            | match        | match              |
+| =ß= and =ẞ=                  | match        | no match            | match        | match              |
+| =中文= and =测试中文=        | match at 2,3 | match at bytes 6-11 | match at 2,3 | match at 2,3       |
+| =😀= and =a😀b=              | match at 1   | match at bytes 1-4  | match at 1   | match at 1         |
+| combining mark and =é=       | match at 1   | match at bytes 1-2  | match at 1   | match at 1         |
+| normalized =cafe= and =café= | match        | no match            | no match     | match              |
 
 The complete Unicode probe contained 13 cases.
-Current fzf and the Emacs port agreed on membership in 12 cases.
+Current fzf and the package 2.8 Emacs port agreed on membership in 12 cases.
 
 The accent-normalization case caused their only difference.
 Current fzf and the Telescope port agreed on membership in six cases.
+The current Emacs port agreed with current fzf in all 13 cases.
+
+The Go 1.27 and utf8proc Unicode tables differ for 28 lowercase mappings.
+Those mappings are outside the displayed rows.
 
 ** Malformed-byte matrix
 
@@ -657,7 +701,8 @@ The table in [[*Malformed UTF-8][Malformed UTF-8]] shows the distinguishing case
 
 ** Persistent Emacs session probe
 
-One Emacs process loaded the fresh module, started one producer, and submitted two queries through one handle.
+One Emacs process loaded the package 2.8 module.
+It started one producer and submitted two queries through one handle.
 
 #+begin_src text
 abi=1 first-id=1 first=("alpha" "alphabet" "beta" "gamma")
@@ -667,16 +712,20 @@ second-id=2 second=("alpha" "alphabet") total=4
 The second query reused the same producer and four-candidate pool.
 The narrower query received a new request identifier.
 
+The tracked current Darwin arm64 module also loaded in Emacs 30.2.
+It reported ABI 2 and the compatible session ABI 2.
+The exact-boundary and default-normalization probes passed through the public Emacs API.
+
 ** Native symbol probe
 
 =nm -gU= found 15 text exports in the Telescope shared library.
 The symbol list appears in [[*Telescope port][Telescope port]].
 
-The same command found one text export in the Emacs module.
-=nm= also found the required GPL compatibility data symbol.
+The same command found one text export in each Emacs module snapshot.
+=nm= also found the required GPL compatibility data symbol in each snapshot.
 
-Both Darwin libraries linked only to =/usr/lib/libSystem.B.dylib=.
-The Emacs module contains utf8proc through static linkage.
+The Telescope library and both Emacs module snapshots linked only to =/usr/lib/libSystem.B.dylib=.
+Both Emacs module snapshots contain utf8proc through static linkage.
 
 ** Telescope adapter probe
 
@@ -694,7 +743,7 @@ abc!    0
 The current start hook clears the filtered subset for ordinary and operator prompts.
 The native prompt-pattern cache still persists until sorter destruction.
 
-The exported sorter uses defaults only when callers omit the options table.
+When callers omit the options table, the exported sorter uses defaults.
 An empty options table raises =nil is not a valid case mode=.
 
 The ten Lua tests load =fzf_lib= only.
@@ -702,15 +751,15 @@ They do not load =telescope._extensions.fzf= or test these sorter behaviors.
 
 * Test and benchmark coverage
 
-| Area | current fzf | Telescope port | Emacs port |
-|------+-------------+----------------+------------|
-| Core unit tests | four Go package suites | 63 C tests | 149 direct C tests plus failure sweeps |
-| Application or binding tests | terminal and reader packages | 10 FFI tests, no sorter test found | 168 Emacs tests |
-| Finite domains | exhaustive V2 fast paths | none found | differential matrices and fuzz corpora |
-| Coverage-guided fuzzing | five Go targets | none found | matcher and session libFuzzer targets |
-| Concurrency sanitizer | no repository target found | none found | session TSan replay target |
-| Memory sanitizers | Go runtime checks | none found | ASan and UBSan targets |
-| Upstream comparison | not applicable | none found | current fzf membership target |
+| Area                         | current fzf                  | Telescope port                     | Emacs port                             | current Emacs port                                                                                                     |
+|------------------------------+------------------------------+------------------------------------+----------------------------------------+------------------------------------------------------------------------------------------------------------------------|
+| Core unit tests              | four Go package suites       | 63 C tests                         | 149 direct C tests plus failure sweeps | 178 direct C tests, 6 SIMD prefilter tests, and 81 allocation-failure injections                                       |
+| Application or binding tests | terminal and reader packages | 10 FFI tests, no sorter test found | 168 Emacs tests                        | 188 Emacs tests plus 4 generated ABI and session property tests                                                        |
+| Finite domains               | exhaustive V2 fast paths     | none found                         | differential matrices and fuzz corpora | raw 60,000-case score, range, and position matrices, structured profiles, and a scalar-to-SIMD prefilter matrix        |
+| Coverage-guided fuzzing      | five Go targets              | none found                         | matcher and session libFuzzer targets  | matcher, session-state, and producer-reader libFuzzer targets                                                          |
+| Concurrency sanitizer        | no repository target found   | none found                         | session TSan replay target             | session-state and producer-reader TSan replay targets                                                                  |
+| Memory sanitizers            | Go runtime checks            | none found                         | ASan and UBSan targets                 | ASan and UBSan for C suites, Emacs reentry, corpus replay, and libFuzzer                                               |
+| Upstream comparison          | not applicable               | none found                         | current fzf membership target          | pinned raw score, range, and position oracle plus structured batch and persistent-session membership and rank profiles |
 
 Each repository measures a different performance boundary.
 Current fzf has Go microbenchmarks for cache, ANSI, and low-level search helpers.
@@ -718,25 +767,27 @@ Current fzf has Go microbenchmarks for cache, ANSI, and low-level search helpers
 The Telescope README shows an older comparison against Telescope sorters.
 The repository does not contain the benchmark driver or raw result data.
 
-The Emacs repository has relative ERT guards and a session cache history test.
+The package 2.8 Emacs repository has relative ERT guards and a session cache history test.
 It also records external completion benchmark work in the session design history.
+
+The current Emacs repository adds benchmark oracles for ASCII, UTF-8, and sessions.
 
 These tests do not support a fastest-product claim.
 A fair test needs equivalent data, queries, warm state, result limits, host work, and output work.
 
 * Compatibility rules
 
-Use these rules when one integration claims fzf compatibility:
+When one integration claims fzf compatibility, use these rules:
 
 1. Name the exact fzf revision or query subset.
 2. Compare membership separately from score, positions, and rank.
 3. State whether Latin accent normalization is active.
 4. State the case table and malformed-byte policy.
 5. State whether positions count bytes or code points.
-6. Treat ='word'= as unsupported in both C ports.
+6. Treat ='word'= as unsupported in the Telescope and package 2.8 ports.
 7. Treat regular-expression query syntax as unsupported everywhere.
 8. Treat host lifecycle and native lifecycle as separate contracts.
-9. Do not use one implementation's score as another implementation's threshold.
+9. Do not use a score from one implementation as a threshold in another implementation.
 10. Run an end-to-end host test before a compatibility release.
 
 The ASCII and query probes show membership agreement across their tested subsets.
@@ -748,16 +799,16 @@ For score-sensitive rank, Unicode text, or interactive state, use product-specif
 - The audit did not exercise every current fzf option or terminal action.
 - The audit did not compare rendered terminal, Telescope, and Emacs interfaces.
 - The audit did not run a common end-to-end performance test.
-- Host applications can add filtering, ordering, display, and cancellation behavior.
+- Host applications can add filters, order, display, and cancellation behavior.
 - Repository tests describe implemented checks, not complete correctness proofs.
 - License statements report file and repository markings only.
 
 * Update procedure
 
-1. Pin all three revisions before the audit.
+1. Pin all repositories and each compared snapshot before the audit.
 2. Record tool versions and the test system.
-3. Run each repository's own test commands.
-4. Rebuild both C libraries from their pinned sources.
+3. Run the test commands of each repository.
+4. Build each compared C snapshot from its pinned source.
 5. Run the ASCII, query, Unicode, and malformed-byte probes.
 6. Inspect new query terms, score values, rank rules, and text tables.
 7. Inspect reader, cache, worker, and public interface changes.
@@ -767,22 +818,35 @@ For score-sensitive rank, Unicode text, or interactive state, use product-specif
 
 * Source map
 
-| Product | Area | Pinned source |
-|---------+------+---------------|
-| current fzf | algorithms | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/algo/algo.go][=src/algo/algo.go=]] |
-| current fzf | query parser | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/pattern.go][=src/pattern.go=]] |
-| current fzf | matcher | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/matcher.go][=src/matcher.go=]] |
-| current fzf | candidate store | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/chunklist.go][=src/chunklist.go=]] |
-| current fzf | cache | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/cache.go][=src/cache.go=]] |
-| current fzf | reader | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/reader.go][=src/reader.go=]] |
-| current fzf | terminal | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/terminal.go][=src/terminal.go=]] |
-| Telescope port | matcher and parser | [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/blob/b25b749b9db64d375d782094e2b9dce53ad53a40/src/fzf.c][=src/fzf.c=]] |
-| Telescope port | C interface | [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/blob/b25b749b9db64d375d782094e2b9dce53ad53a40/src/fzf.h][=src/fzf.h=]] |
-| Telescope port | FFI adapter | [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/blob/b25b749b9db64d375d782094e2b9dce53ad53a40/lua/fzf_lib.lua][=lua/fzf_lib.lua=]] |
-| Telescope port | Telescope sorter | [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/blob/b25b749b9db64d375d782094e2b9dce53ad53a40/lua/telescope/_extensions/fzf.lua][=lua/telescope/_extensions/fzf.lua=]] |
-| Emacs port | matcher and parser | [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/fzf.c][=fzf.c=]] |
-| Emacs port | batch and session module | [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/fzf-native-module.c][=fzf-native-module.c=]] |
-| Emacs port | Lisp loader | [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/fzf-native.el][=fzf-native.el=]] |
-| Emacs port | architecture | [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/architecture.org][=architecture.org=]] |
-| Emacs port | matcher fuzz target | [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/fuzz/fzf-native-fuzz.c][=fuzz/fzf-native-fuzz.c=]] |
-| Emacs port | session fuzz target | [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/fuzz/fzf-native-session-fuzz.c][=fuzz/fzf-native-session-fuzz.c=]] |
+| Product            | Area                     | Pinned source                            |
+|--------------------+--------------------------+------------------------------------------|
+| current fzf        | algorithms               | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/algo/algo.go][=src/algo/algo.go=]]                       |
+| current fzf        | query parser             | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/pattern.go][=src/pattern.go=]]                         |
+| current fzf        | matcher                  | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/matcher.go][=src/matcher.go=]]                         |
+| current fzf        | candidate store          | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/chunklist.go][=src/chunklist.go=]]                       |
+| current fzf        | cache                    | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/cache.go][=src/cache.go=]]                           |
+| current fzf        | reader                   | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/reader.go][=src/reader.go=]]                          |
+| current fzf        | terminal                 | [[https://github.com/junegunn/fzf/blob/1372d04f79bde0daa3bab4b96a068baafa808e67/src/terminal.go][=src/terminal.go=]]                        |
+| Telescope port     | matcher and parser       | [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/blob/b25b749b9db64d375d782094e2b9dce53ad53a40/src/fzf.c][=src/fzf.c=]]                              |
+| Telescope port     | C interface              | [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/blob/b25b749b9db64d375d782094e2b9dce53ad53a40/src/fzf.h][=src/fzf.h=]]                              |
+| Telescope port     | FFI adapter              | [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/blob/b25b749b9db64d375d782094e2b9dce53ad53a40/lua/fzf_lib.lua][=lua/fzf_lib.lua=]]                        |
+| Telescope port     | Telescope sorter         | [[https://github.com/nvim-telescope/telescope-fzf-native.nvim/blob/b25b749b9db64d375d782094e2b9dce53ad53a40/lua/telescope/_extensions/fzf.lua][=lua/telescope/_extensions/fzf.lua=]]      |
+| Emacs port         | matcher and parser       | [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/fzf.c][=fzf.c=]]                                  |
+| Emacs port         | batch and session module | [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/fzf-native-module.c][=fzf-native-module.c=]]                    |
+| Emacs port         | Lisp loader              | [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/fzf-native.el][=fzf-native.el=]]                          |
+| Emacs port         | architecture             | [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/architecture.org][=architecture.org=]]                       |
+| Emacs port         | matcher fuzz target      | [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/fuzz/fzf-native-fuzz.c][=fuzz/fzf-native-fuzz.c=]]                 |
+| Emacs port         | session fuzz target      | [[https://github.com/dangduc/fzf-native/blob/ae3e3e1e8d737949455210f9304dc726ba0e51a1/fuzz/fzf-native-session-fuzz.c][=fuzz/fzf-native-session-fuzz.c=]]         |
+| current Emacs port | matcher and parser       | [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/fzf.c][=fzf.c=]]                                  |
+| current Emacs port | bounded matcher helpers  | [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/fzf-additions.c][=fzf-additions.c=]]                        |
+| current Emacs port | SIMD prefilters          | [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/fzf-simd-prefilter.h][=fzf-simd-prefilter.h=]]                   |
+| current Emacs port | normalization table      | [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/fzf-normalize.inc][=fzf-normalize.inc=]]                      |
+| current Emacs port | batch and session module | [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/fzf-native-module.c][=fzf-native-module.c=]]                    |
+| current Emacs port | Lisp loader              | [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/fzf-native.el][=fzf-native.el=]]                          |
+| current Emacs port | architecture             | [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/architecture.org][=architecture.org=]]                       |
+| current Emacs port | matcher fuzz target      | [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/fuzz/fzf-native-fuzz.c][=fuzz/fzf-native-fuzz.c=]]                 |
+| current Emacs port | session fuzz targets     | [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/fuzz/fzf-native-session-fuzz.c][=fuzz/fzf-native-session-fuzz.c=]]         |
+| current Emacs port | raw fzf oracle           | [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/fuzz/oracle/native_integration_test.go][=fuzz/oracle/native_integration_test.go=]] |
+| current Emacs port | structured fzf oracle    | [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/fuzz/fzf-native-upstream-test.el][=fuzz/fzf-native-upstream-test.el=]]       |
+| current Emacs port | fuzz CI                  | [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/.github/workflows/fuzz.yaml][=.github/workflows/fuzz.yaml=]]            |
+| current Emacs port | artifact pipeline        | [[https://github.com/dangduc/fzf-native/blob/4b9236e8cd1e9f9f3aaf5f2ebf83f1fc5995d38d/.github/workflows/cmake-binaries.yaml][=.github/workflows/cmake-binaries.yaml=]]  |
