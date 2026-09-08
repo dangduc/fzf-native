@@ -733,8 +733,20 @@ utf8proc_int32_t utf8proc_case_fold(utf8proc_int32_t codepoint) {
   return utf8proc_tolower(codepoint);
 }
 
-int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
-                         size_t pattern_len, bool case_sensitive) {
+/* FuzzyMatchV2 follows fzf's unicode.IsUpper guard when it lowercases
+   candidate runes.  This is intentionally narrower than Unicode ToLower:
+   titlecase letters and cased numbers can have lowercase mappings without
+   belonging to the Lu category. */
+static utf8proc_int32_t v2_case_fold_candidate(
+    utf8proc_int32_t codepoint) {
+  return utf8proc_category(codepoint) == UTF8PROC_CATEGORY_LU
+             ? utf8proc_case_fold(codepoint)
+             : codepoint;
+}
+
+static int32_t utf8_fuzzy_index_impl(
+    fzf_string_t *input, const char *pattern, size_t pattern_len,
+    bool case_sensitive, bool v2_candidate_case) {
   // Handle empty pattern
   if (pattern_len == 0) {
     return 0;
@@ -775,7 +787,9 @@ int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
       
       utf8proc_int32_t input_cp_cmp = input_cp;
       if (!case_sensitive) {
-        input_cp_cmp = utf8proc_case_fold(input_cp);
+        input_cp_cmp = v2_candidate_case
+                           ? v2_case_fold_candidate(input_cp)
+                           : utf8proc_case_fold(input_cp);
       }
       
       if (input_cp_cmp == pattern_cp) {
@@ -803,6 +817,19 @@ int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
   
   // If we processed all pattern characters, we have a match
   return (pattern_pos >= pattern_len) ? first_idx : -1;
+}
+
+int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
+                         size_t pattern_len, bool case_sensitive) {
+  return utf8_fuzzy_index_impl(input, pattern, pattern_len, case_sensitive,
+                               false);
+}
+
+static int32_t utf8_fuzzy_index_v2(fzf_string_t *input, const char *pattern,
+                                   size_t pattern_len,
+                                   bool case_sensitive) {
+  return utf8_fuzzy_index_impl(input, pattern, pattern_len, case_sensitive,
+                               true);
 }
 
 /* UTF-8 helper functions */
@@ -2308,8 +2335,8 @@ static fzf_result_t fzf_fuzzy_match_v2_utf8_impl(
   // Check if pattern exists in text (returns byte position)
   int32_t tmp_idx = normalize
                         ? 0
-                        : utf8_fuzzy_index(text, pattern->data, M,
-                                           case_sensitive);
+                        : utf8_fuzzy_index_v2(text, pattern->data, M,
+                                              case_sensitive);
   if (tmp_idx < 0) {
     utf8_free_char_map(char_map);
     return (fzf_result_t){-1, -1, 0};
@@ -2415,7 +2442,7 @@ static fzf_result_t fzf_fuzzy_match_v2_utf8_impl(
 
     utf8proc_int32_t c = cp;
     if (!case_sensitive) {
-      c = utf8proc_case_fold(cp);
+      c = v2_case_fold_candidate(cp);
     }
     if (normalize) {
       c = fzf_normalize_codepoint(c);

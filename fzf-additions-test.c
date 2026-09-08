@@ -419,6 +419,15 @@ static void test_utf8_terms(void) {
      transformed pattern length under ASan/UBSan. */
   check_agreement("utf8 shrinking case-fold", "k", "K", CaseIgnore, true, true);
   check_agreement("utf8 shrinking candidate-fold", "K", "k", CaseIgnore, true, true);
+  /* V2 mirrors unicode.IsUpper rather than lowercasing every rune that has a
+     simple lowercase mapping.  U+01C5 is titlecase and U+2160 is a number, so
+     neither candidate folds; the Lu counterpart U+01C4 still must fold. */
+  check_agreement("utf8 v2 titlecase does not fold", "ǅ", "ǆ",
+                  CaseIgnore, true, false);
+  check_agreement("utf8 v2 cased number does not fold", "Ⅰ", "ⅰ",
+                  CaseIgnore, true, false);
+  check_agreement("utf8 v2 uppercase still folds", "Ǆ", "ǆ",
+                  CaseIgnore, true, true);
   /* U+023A LATIN CAPITAL LETTER A WITH STROKE lowercases to U+2C65.
      The candidate encoding is two bytes and the folded pattern encoding is
      three, so byte-count feasibility guards incorrectly reject a match. */
