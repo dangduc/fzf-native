@@ -902,6 +902,36 @@ static void test_score_bounds_aggregate_positive_terms(void) {
   CHECK(bounds.min_begin == 2);
   CHECK(bounds.min_end == 4);
   CHECK(bounds.max_end == 9);
+  CHECK(bounds.raw_score == score);
+  fzf_free_slab(slab);
+  fzf_free_pattern(pattern);
+}
+
+static void test_score_bounds_hide_partial_and_match(void) {
+  char query[] = "a z";
+  fzf_pattern_t *pattern = fzf_parse_pattern(
+      CaseRespect, false, query, true);
+  fzf_slab_t *slab = fzf_make_default_slab();
+  fzf_score_bounds_t bounds = {
+    .min_begin = -99, .min_end = -99, .max_end = -99,
+    .raw_score = -99, .valid = true,
+  };
+  CHECK(pattern != NULL && slab != NULL);
+
+  int score = fzf_get_score_with_bounds("a", pattern, slab, &bounds);
+  CHECK(score == 0);
+  CHECK(!bounds.valid);
+  CHECK(bounds.raw_score == 0);
+  CHECK(bounds.min_begin == 0);
+  CHECK(bounds.min_end == 0);
+  CHECK(bounds.max_end == 0);
+
+  score = fzf_get_score_with_bounds("az", pattern, slab, &bounds);
+  CHECK(score > 0);
+  CHECK(bounds.valid);
+  CHECK(bounds.raw_score == score);
+  CHECK(bounds.min_begin == 0);
+  CHECK(bounds.max_end == 2);
   fzf_free_slab(slab);
   fzf_free_pattern(pattern);
 }
@@ -3969,6 +3999,7 @@ int main(void) {
   RUN(test_ascii_rank_fast_path_matches_unicode_decoder);
   RUN(test_ranked_score_fast_path_preserves_raw_score);
   RUN(test_score_bounds_aggregate_positive_terms);
+  RUN(test_score_bounds_hide_partial_and_match);
 
   printf("--- counting_sort_scored ---\n");
   RUN(test_scored_n_zero);

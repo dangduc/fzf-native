@@ -3098,8 +3098,14 @@ int32_t fzf_get_score_with_bounds_bytes_preclassified(
   if (pattern->ptr == NULL) return 1;
 
   fzf_string_t input = {.data = text, .size = text_len};
-#define FZF_SCORE_RECORD_BOUNDS(result) fzf_score_bounds_add(bounds, (result))
+  fzf_score_bounds_t staged_bounds = {0};
+#define FZF_SCORE_RECORD_BOUNDS(result) \
+  fzf_score_bounds_add(&staged_bounds, (result))
+#define FZF_SCORE_COMMIT_BOUNDS() do { \
+  if (bounds) *bounds = staged_bounds; \
+} while (0)
 #include "fzf-score-input.inc"
+#undef FZF_SCORE_COMMIT_BOUNDS
 #undef FZF_SCORE_RECORD_BOUNDS
 }
 

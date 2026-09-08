@@ -9,6 +9,10 @@
 #define FZF_SCORE_RECORD_BOUNDS(result) ((void)(result))
 #define FZF_SCORE_RECORD_BOUNDS_WAS_DEFAULTED 1
 #endif
+#ifndef FZF_SCORE_COMMIT_BOUNDS
+#define FZF_SCORE_COMMIT_BOUNDS() ((void)0)
+#define FZF_SCORE_COMMIT_BOUNDS_WAS_DEFAULTED 1
+#endif
 
 if (pattern->only_inv) {
   for (size_t i = 0; i < pattern->size; i++) {
@@ -60,9 +64,18 @@ for (size_t i = 0; i < pattern->size; i++) {
   total_score += current_score;
 }
 
+/* Bounds are useful only for a complete match.  The bounds-enabled caller
+   accumulates them privately and publishes them here, after every AND term
+   set has matched. */
+FZF_SCORE_COMMIT_BOUNDS();
+
 #ifdef FZF_SCORE_RECORD_BOUNDS_WAS_DEFAULTED
 #undef FZF_SCORE_RECORD_BOUNDS_WAS_DEFAULTED
 #undef FZF_SCORE_RECORD_BOUNDS
+#endif
+#ifdef FZF_SCORE_COMMIT_BOUNDS_WAS_DEFAULTED
+#undef FZF_SCORE_COMMIT_BOUNDS_WAS_DEFAULTED
+#undef FZF_SCORE_COMMIT_BOUNDS
 #endif
 
 return total_score > 0 ? total_score : 1;
