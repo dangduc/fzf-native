@@ -15,6 +15,7 @@
 #include "fzf.h"
 #include "fzf-additions.h"
 #include "fzf-private.h"
+#include "fzf-simd-prefilter.h"
 #include "utf8proc-2.10.0/utf8proc.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -2531,6 +2532,8 @@ static size_t cache_pattern_bytes(const fzf_pattern_t *pattern) {
       if (!cache_bytes_add(&bytes, sizeof(fzf_string_t)) ||
           !cache_bytes_add(&bytes, text_len) ||
           !cache_bytes_add(&bytes, 1) ||
+          (text && !cache_bytes_add(
+                       &bytes, fzf_ascii_query_plan_private_size(text))) ||
           (text && !cache_bytes_mul_add(
                        &bytes, text->codepoint_count,
                        sizeof *text->codepoints)))
@@ -5892,6 +5895,8 @@ struct AsyncScoringBatch {
   unsigned len;
   size_t batch_id;
   bool cacheable;
+  /* True when a prior membership selected this dense candidate subset. */
+  bool selective;
   ScoredStr xs[BATCH_SIZE];
 };
 
@@ -6001,6 +6006,7 @@ static void async_score_batches(struct AsyncScoringShared *shared,
     unsigned original_len = batch->len;
     unsigned n = 0;
     bool aborted = false;
+    fzf_set_simd_prefilter_allowed(!batch->selective);
     for (unsigned i = 0; i < batch->len; i++) {
       if (atomic_load_explicit(&shared->allocation_failed,
                                memory_order_relaxed)) {
@@ -6041,6 +6047,7 @@ static void async_score_batches(struct AsyncScoringShared *shared,
         n++;
       }
     }
+    fzf_set_simd_prefilter_allowed(true);
     if (aborted) break;
     batch->len = n;
     if (batch->cacheable && shared->batch_cache && shared->target_query)
@@ -6685,6 +6692,7 @@ static void *scoring_thread_fn(void *arg) {
         struct AsyncScoringBatch *batch = &batches[wi];
         batch->batch_id = bi;
         batch->cacheable = full_stable_batch;
+        batch->selective = use_refinement || reused;
         batch->len = (unsigned)selected_count;
         pthread_mutex_lock(&s->mu);
         for (size_t local_i = 0; local_i < selected_count; local_i++) {

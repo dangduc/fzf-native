@@ -24,6 +24,7 @@
 
 #include "fzf-additions.h"
 #include "fzf-private.h"
+#include "fzf-simd-prefilter.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -39,11 +40,25 @@ static inline bool fzf_addn_space(unsigned char c) {
 /* Fuzzy: the pattern's characters appear in TEXT in order.  Pattern is
    already case-normalized by fzf_parse_pattern when case_sensitive is
    false, so we only need to lowercase the text side. */
-static bool fzf_addn_fuzzy(bool case_sensitive,
-                           const char *text, size_t tn,
-                           const char *pat,  size_t pn) {
+static bool fzf_addn_fuzzy(
+    bool case_sensitive, const char *text, size_t tn,
+    const fzf_string_t *pattern, const fzf_ascii_query_plan_t *plan) {
+  const char *pat = pattern->data;
+  size_t pn = pattern->size;
   if (pn == 0) return true;
   if (tn < pn) return false;
+#if FZF_HAVE_SIMD_PREFILTER
+  if (plan && plan->pattern_size == pn &&
+      plan->case_sensitive == case_sensitive &&
+      pn >= FZF_SIMD_FUZZY_MIN_PATTERN && tn >= FZF_SIMD_FUZZY_MIN_TEXT) {
+    const char *first = fzf_ascii_plan_find_byte(
+        text, tn, &plan->bytes[0], case_sensitive);
+    return first && fzf_ascii_plan_ordered_after_first(
+                        text, tn, plan, (size_t)(first - text));
+  }
+#else
+  (void)plan;
+#endif
   size_t pi = 0;
   if (case_sensitive) {
     for (size_t ti = 0; ti < tn && pi < pn; ti++)
@@ -62,11 +77,34 @@ static inline bool fzf_addn_word(unsigned char c) {
          (c >= '0' && c <= '9');
 }
 
-static bool fzf_addn_exact_impl(bool case_sensitive, bool boundary_check,
-                                const char *text, size_t tn,
-                                const char *pat, size_t pn) {
+static bool fzf_addn_exact_impl(
+    bool case_sensitive, bool boundary_check, const char *text, size_t tn,
+    const fzf_string_t *pattern, const fzf_ascii_query_plan_t *plan) {
+  const char *pat = pattern->data;
+  size_t pn = pattern->size;
   if (pn == 0) return true;
   if (tn < pn) return false;
+#if FZF_HAVE_SIMD_PREFILTER
+  if (plan && plan->pattern_size == pn &&
+      plan->case_sensitive == case_sensitive) {
+    size_t from = 0;
+    while (from <= tn - pn) {
+      size_t position = fzf_ascii_plan_find_exact(text, tn, plan, from);
+      if (position == SIZE_MAX) return false;
+      if (!boundary_check ||
+          ((position == 0 ||
+            !fzf_addn_word((unsigned char)text[position - 1])) &&
+           (position + pn == tn ||
+            !fzf_addn_word((unsigned char)text[position + pn]))))
+        return true;
+      if (position == tn - pn) return false;
+      from = position + 1;
+    }
+    return false;
+  }
+#else
+  (void)plan;
+#endif
   for (size_t i = 0; i + pn <= tn; i++) {
     bool eq = true;
     if (case_sensitive) {
@@ -87,16 +125,16 @@ static bool fzf_addn_exact_impl(bool case_sensitive, bool boundary_check,
   return false;
 }
 
-static bool fzf_addn_exact(bool case_sensitive,
-                           const char *text, size_t tn,
-                           const char *pat, size_t pn) {
-  return fzf_addn_exact_impl(case_sensitive, false, text, tn, pat, pn);
+static bool fzf_addn_exact(
+    bool case_sensitive, const char *text, size_t tn,
+    const fzf_string_t *pattern, const fzf_ascii_query_plan_t *plan) {
+  return fzf_addn_exact_impl(case_sensitive, false, text, tn, pattern, plan);
 }
 
-static bool fzf_addn_exact_boundary(bool case_sensitive,
-                                    const char *text, size_t tn,
-                                    const char *pat, size_t pn) {
-  return fzf_addn_exact_impl(case_sensitive, true, text, tn, pat, pn);
+static bool fzf_addn_exact_boundary(
+    bool case_sensitive, const char *text, size_t tn,
+    const fzf_string_t *pattern, const fzf_ascii_query_plan_t *plan) {
+  return fzf_addn_exact_impl(case_sensitive, true, text, tn, pattern, plan);
 }
 
 static bool fzf_addn_prefix(bool case_sensitive,
@@ -164,13 +202,38 @@ static bool fzf_addn_term(const fzf_term_t *term,
   const char *p     = pat ? pat->data : "";
   size_t      pn    = pat ? pat->size : 0;
   bool match;
-  if (term->fn == fzf_fuzzy_match_v1 || term->fn == fzf_fuzzy_match_v2)
-    match = fzf_addn_fuzzy (term->case_sensitive, text, tn, p, pn);
-  else if (term->fn == fzf_exact_match_naive)
-    match = fzf_addn_exact (term->case_sensitive, text, tn, p, pn);
-  else if (term->fn == fzf_exact_match_boundary)
-    match = fzf_addn_exact_boundary(term->case_sensitive, text, tn, p, pn);
-  else if (term->fn == fzf_prefix_match)
+  if (term->fn == fzf_fuzzy_match_v1 || term->fn == fzf_fuzzy_match_v2) {
+    const fzf_ascii_query_plan_t *plan = NULL;
+    if (pn >= FZF_SIMD_FUZZY_MIN_PATTERN &&
+        pn <= FZF_SIMD_MAX_PATTERN && tn >= FZF_SIMD_FUZZY_MIN_TEXT &&
+        fzf_get_simd_prefilter_allowed())
+      plan = fzf_ascii_query_plan_from_parsed(pat);
+    match = fzf_addn_fuzzy(term->case_sensitive, text, tn, pat, plan);
+  } else if (term->fn == fzf_exact_match_naive) {
+    if (term->case_sensitive && tn >= pn && memcmp(text, p, pn) == 0) {
+      match = true;
+    } else {
+      const fzf_ascii_query_plan_t *plan = NULL;
+      if (pn >= 2 && pn <= FZF_SIMD_MAX_PATTERN && tn >= pn &&
+          tn - pn + 1 >= FZF_SIMD_LITERAL_MIN_STARTS &&
+          fzf_get_simd_prefilter_allowed())
+        plan = fzf_ascii_query_plan_from_parsed(pat);
+      match = fzf_addn_exact(term->case_sensitive, text, tn, pat, plan);
+    }
+  } else if (term->fn == fzf_exact_match_boundary) {
+    if (term->case_sensitive && tn >= pn && memcmp(text, p, pn) == 0 &&
+        (pn == tn || !fzf_addn_word((unsigned char)text[pn]))) {
+      match = true;
+    } else {
+      const fzf_ascii_query_plan_t *plan = NULL;
+      if (pn >= 2 && pn <= FZF_SIMD_MAX_PATTERN && tn >= pn &&
+          tn - pn + 1 >= FZF_SIMD_LITERAL_MIN_STARTS &&
+          fzf_get_simd_prefilter_allowed())
+        plan = fzf_ascii_query_plan_from_parsed(pat);
+      match = fzf_addn_exact_boundary(
+          term->case_sensitive, text, tn, pat, plan);
+    }
+  } else if (term->fn == fzf_prefix_match)
     match = fzf_addn_prefix(term->case_sensitive, text, tn, p, pn);
   else if (term->fn == fzf_suffix_match)
     match = fzf_addn_suffix(term->case_sensitive, text, tn, p, pn);

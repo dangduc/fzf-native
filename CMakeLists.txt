@@ -73,6 +73,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     fzf.c
     fzf.h
     fzf-private.h
+    fzf-simd-prefilter.h
     fzf-score-input.inc
     fzf-additions.c
     fzf-additions.h
@@ -84,6 +85,7 @@ else()
     fzf.c
     fzf.h
     fzf-private.h
+    fzf-simd-prefilter.h
     fzf-score-input.inc
     fzf-additions.c
     fzf-additions.h)
