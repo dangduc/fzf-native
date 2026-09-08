@@ -681,8 +681,12 @@ static void test_score_schemes_are_slab_local(void) {
   CHECK(fuzzy_score_with_slab("src/fzf", default_slab) == 84);
   CHECK(fuzzy_score_with_slab("src\\fzf", default_slab) == 80);
   CHECK(fuzzy_score_with_slab("src/fzf", path_slab) == 84);
+#if defined(_WIN32) || defined(FZF_TEST_WINDOWS_PATH_SCORING)
   CHECK(fuzzy_score_with_slab("src\\fzf", path_slab) ==
         fuzzy_score_with_slab("src/fzf", path_slab));
+#else
+  CHECK(fuzzy_score_with_slab("src\\fzf", path_slab) == 80);
+#endif
   CHECK(fuzzy_score_with_slab("src/fzf", history_slab) == 80);
   CHECK(fuzzy_score_with_slab(":fzf", default_slab) == 84);
   CHECK(fuzzy_score_with_slab(":fzf", path_slab) == 80);

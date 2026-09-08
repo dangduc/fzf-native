@@ -130,6 +130,9 @@ ctest-additions:
 	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. -I$(UTF8PROC_DIR) \
 		-o $(BUILD_DIR)/fzf-additions-test fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-additions-test
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -DFZF_TEST_WINDOWS_PATH_SCORING -I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/fzf-additions-test-windows-paths fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-additions-test-windows-paths
 
 # Allocation-failure injection for every parser allocation.  fzf.c is
 # included by the test so malloc/calloc/realloc can be replaced locally.
@@ -166,6 +169,10 @@ ctest-asan:
 		-I. -I$(UTF8PROC_DIR) -pthread \
 		-o $(BUILD_DIR)/fzf-additions-test-asan fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-additions-test-asan
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
+		-DFZF_TEST_WINDOWS_PATH_SCORING -I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/fzf-additions-test-windows-paths-asan fzf-additions-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-additions-test-windows-paths-asan
 	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
 		-I. -I$(UTF8PROC_DIR) \
 		-o $(BUILD_DIR)/fzf-parser-oom-ctest-asan fzf-parser-oom-ctest.c fzf-additions.c $(UTF8PROC_SRC)

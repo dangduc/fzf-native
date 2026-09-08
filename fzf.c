@@ -505,9 +505,12 @@ static fzf_i32_t alloc32(size_t *offset, fzf_slab_t *slab, size_t size) {
 static bool score_scheme_delimiter(const score_scheme_config_t *config,
                                    utf8proc_int32_t codepoint) {
   if (codepoint == '/') return true;
-  /* Score Windows and portable path separators identically in the path
-     scheme on every host.  Pinned fzf adds both in its Windows branch. */
+  /* Pinned fzf adds the host path separator alongside '/' only when they
+     differ.  The test override exercises this Windows branch on POSIX without
+     defining _WIN32 and changing unrelated libc compatibility paths. */
+#if defined(_WIN32) || defined(FZF_TEST_WINDOWS_PATH_SCORING)
   if (config->path_delimiters_only && codepoint == '\\') return true;
+#endif
   return !config->path_delimiters_only &&
          (codepoint == ',' || codepoint == ':' || codepoint == ';' ||
           codepoint == '|');
