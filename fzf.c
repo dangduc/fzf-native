@@ -3,7 +3,6 @@
 #include "fzf-simd-prefilter.h"
 
 #include <string.h>
-#include <ctype.h>
 #include <stdlib.h>
 
 // UTF8PROC integration for Unicode support
@@ -302,7 +301,7 @@ static char *str_tolower(const char *str, size_t size) {
     char *lower_str = (char *)malloc(size + 1);
     if (!lower_str) return NULL;
     for (size_t i = 0; i < size; i++) {
-      lower_str[i] = (char)tolower((uint8_t)str[i]);
+      lower_str[i] = fzf_ascii_tolower((uint8_t)str[i]);
     }
     lower_str[size] = '\0';
     return lower_str;
@@ -755,8 +754,26 @@ int32_t char_class_of_utf8proc(utf8proc_int32_t codepoint) {
                                  &score_scheme_configs[FZF_SCORE_SCHEME_DEFAULT]);
 }
 
+/* Only 29 of Unicode's 4352 256-codepoint pages contain a lowercase mapping
+   in the vendored utf8proc data.  Avoid its two-level property-table lookup
+   for the overwhelmingly common caseless scripts.  The bits are generated
+   exhaustively from utf8proc_property_t.lowercase_seqindex. */
+static bool fzf_page_has_lowercase_mapping(utf8proc_int32_t codepoint) {
+  static const uint64_t pages[] = {
+      UINT64_C(0x00001012d009003f), UINT64_C(0x0000000000000000),
+      UINT64_C(0x000000c000000000), UINT64_C(0x8000000000000000),
+      UINT64_C(0x0000000001003030), UINT64_C(0x0000400000000000),
+      UINT64_C(0x0000000000000000), UINT64_C(0x0002020000f00000),
+  };
+  uint32_t page = (uint32_t)codepoint >> 8;
+  return page < 64 * (sizeof pages / sizeof pages[0]) &&
+         (pages[page >> 6] & (UINT64_C(1) << (page & 63))) != 0;
+}
+
 utf8proc_int32_t utf8proc_case_fold(utf8proc_int32_t codepoint) {
-  return utf8proc_tolower(codepoint);
+  return fzf_page_has_lowercase_mapping(codepoint)
+             ? utf8proc_tolower(codepoint)
+             : codepoint;
 }
 
 /* FuzzyMatchV2 follows fzf's unicode.IsUpper guard when it lowercases
@@ -765,8 +782,9 @@ utf8proc_int32_t utf8proc_case_fold(utf8proc_int32_t codepoint) {
    belonging to the Lu category. */
 static utf8proc_int32_t v2_case_fold_candidate(
     utf8proc_int32_t codepoint) {
+  if (!fzf_page_has_lowercase_mapping(codepoint)) return codepoint;
   return utf8proc_category(codepoint) == UTF8PROC_CATEGORY_LU
-             ? utf8proc_case_fold(codepoint)
+             ? utf8proc_tolower(codepoint)
              : codepoint;
 }
 
@@ -957,7 +975,7 @@ static int32_t calculate_score(bool case_sensitive, bool normalize,
     int32_t class = char_class_of(c, config);
     if (!case_sensitive) {
       /* TODO(conni2461): He does some unicode stuff here, investigate */
-      c = (char)tolower((uint8_t)c);
+      c = fzf_ascii_tolower((uint8_t)c);
     }
     if (normalize) {
       c = normalize_rune(c);
@@ -1117,7 +1135,7 @@ static fzf_result_t fzf_fuzzy_match_v1_impl(
     /* TODO(conni2461): Common pattern maybe a macro would be good here */
     if (!case_sensitive) {
       /* TODO(conni2461): He does some unicode stuff here, investigate */
-      c = (char)tolower((uint8_t)c);
+      c = fzf_ascii_tolower((uint8_t)c);
     }
     if (normalize) {
       c = normalize_rune(c);
@@ -1145,7 +1163,7 @@ static fzf_result_t fzf_fuzzy_match_v1_impl(
       char c = text->data[text_index];
       if (!case_sensitive) {
         /* TODO(conni2461): He does some unicode stuff here, investigate */
-        c = (char)tolower((uint8_t)c);
+        c = fzf_ascii_tolower((uint8_t)c);
       }
       if (normalize) {
         c = normalize_rune(c);
@@ -1274,7 +1292,7 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
     class = char_class_of_ascii(c, config);
     if (!case_sensitive && class == CharUpper) {
       /* TODO(conni2461): unicode support */
-      c = (char)tolower((uint8_t)c);
+      c = fzf_ascii_tolower((uint8_t)c);
     }
     if (normalize) {
       c = normalize_rune(c);
@@ -1583,7 +1601,7 @@ static fzf_result_t fzf_exact_match_impl(
       char c = text->data[idx];
       if (!case_sensitive) {
         /* TODO(conni2461): He does some unicode stuff here, investigate */
-        c = (char)tolower((uint8_t)c);
+        c = fzf_ascii_tolower((uint8_t)c);
       }
       if (normalize) c = normalize_rune(c);
       if (c == pattern->data[pidx]) {
@@ -1693,7 +1711,7 @@ fzf_result_t fzf_prefix_match(bool case_sensitive, bool normalize,
   for (size_t i = 0; i < M; i++) {
     char c = text->data[trimmed_len + i];
     if (!case_sensitive) {
-      c = (char)tolower((uint8_t)c);
+      c = fzf_ascii_tolower((uint8_t)c);
     }
     if (normalize) {
       c = normalize_rune(c);
@@ -1735,7 +1753,7 @@ fzf_result_t fzf_suffix_match(bool case_sensitive, bool normalize,
   for (size_t idx = 0; idx < M; idx++) {
     char c = text->data[idx + diff];
     if (!case_sensitive) {
-      c = (char)tolower((uint8_t)c);
+      c = fzf_ascii_tolower((uint8_t)c);
     }
     if (normalize) {
       c = normalize_rune(c);
@@ -1784,7 +1802,7 @@ fzf_result_t fzf_equal_match(bool case_sensitive, bool normalize,
       char pchar = pattern->data[idx];
       char c = text->data[trimmed_len + idx];
       if (!case_sensitive) {
-        c = (char)tolower((uint8_t)c);
+        c = fzf_ascii_tolower((uint8_t)c);
       }
       if (normalize_rune(c) != normalize_rune(pchar)) {
         match = false;
@@ -1797,7 +1815,7 @@ fzf_result_t fzf_equal_match(bool case_sensitive, bool normalize,
       char pchar = pattern->data[idx];
       char c = text->data[trimmed_len + idx];
       if (!case_sensitive) {
-        c = (char)tolower((uint8_t)c);
+        c = fzf_ascii_tolower((uint8_t)c);
       }
       if (c != pchar) {
         match = false;

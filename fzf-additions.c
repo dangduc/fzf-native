@@ -26,11 +26,10 @@
 #include "fzf-private.h"
 #include "fzf-simd-prefilter.h"
 
-#include <ctype.h>
 #include <string.h>
 
 static inline char fzf_addn_lower(unsigned char c) {
-  return (char)tolower(c);
+  return fzf_ascii_tolower(c);
 }
 
 static inline bool fzf_addn_space(unsigned char c) {
