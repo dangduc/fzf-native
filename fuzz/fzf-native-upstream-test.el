@@ -484,6 +484,39 @@ Each specification has the form (KEY VALUES)."
                     (length
                      (fzf-native-differential-term-literal primary)))))))
 
+(ert-deftest fzf-native-fuzz-upstream-generator-seeds-unicode-version-grid ()
+  "Seed every pinned Unicode pair, orientation, and public matcher kind."
+  (let* ((seed 12648430)
+         (cases
+          (cl-loop
+           for serial below fzf-native-differential--unicode-version-seed-count
+           collect (fzf-native-upstream--generated-case seed serial 'parity)))
+         (grid
+          (mapcar
+           (lambda (case)
+             (let ((dimensions
+                    (fzf-native-differential-case-dimensions case)))
+               (list (plist-get dimensions :unicode-version-pair)
+                     (plist-get dimensions :unicode-version-orientation)
+                     (plist-get dimensions :primary-kind))))
+           cases)))
+    (should (= (length cases) 336))
+    (should (= (length grid) (length (delete-dups (copy-sequence grid)))))
+    (should
+     (equal
+      (delete-dups (mapcar #'car grid))
+      fzf-native-differential--unicode-version-lowercase-pairs))
+    (dolist (orientation '(lower-to-upper upper-to-lower))
+      (should (cl-find orientation grid :key #'cadr)))
+    (dolist (kind (append
+                   fzf-native-differential--unicode-version-public-kinds nil))
+      (should (cl-find kind grid :key #'caddr)))
+    (dolist (case cases)
+      (should
+       (equal (fzf-native-differential-case-rendered-query case)
+              (fzf-native-differential-render-query
+               (fzf-native-differential-case-query case)))))))
+
 (ert-deftest fzf-native-fuzz-upstream-ci-parity-profile-has-strict-coverage ()
   "Keep the bounded CI parity lane effective across public controls."
   (let* ((seed 12648430)
