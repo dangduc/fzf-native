@@ -2997,17 +2997,17 @@ static inline fzf_result_t call_alg_for_input(
     algo = get_utf8_algo(algo);
   }
   fzf_string_t *pattern = (fzf_string_t *)term->text;
-  if (algo == fzf_fuzzy_match_v1) {
-    const fzf_ascii_query_plan_t *plan =
-        fzf_fuzzy_query_plan(input, pattern);
-    return fzf_fuzzy_match_v1_impl(
-        term->case_sensitive, term->normalize, forward, input, pattern, pos,
-        slab, plan);
-  }
   if (algo == fzf_fuzzy_match_v2) {
     const fzf_ascii_query_plan_t *plan =
         fzf_fuzzy_query_plan(input, pattern);
     return fzf_fuzzy_match_v2_impl(
+        term->case_sensitive, term->normalize, forward, input, pattern, pos,
+        slab, plan);
+  }
+  if (algo == fzf_fuzzy_match_v1) {
+    const fzf_ascii_query_plan_t *plan =
+        fzf_fuzzy_query_plan(input, pattern);
+    return fzf_fuzzy_match_v1_impl(
         term->case_sensitive, term->normalize, forward, input, pattern, pos,
         slab, plan);
   }
