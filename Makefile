@@ -111,7 +111,37 @@ emacs-asan:
 # No Emacs runtime needed; runs as a plain executable.
 .PHONY: ctest
 ctest: ctest-module ctest-additions ctest-parser-oom ctest-scorer-oom \
-	ctest-session-growth-benchmark
+	ctest-session-growth-benchmark ctest-core-hotpath-oracle
+
+# Prove that the core-hotpath benchmark validates exact per-item scores before
+# it starts timing.  The injected scorer fault must be rejected by the pinned
+# fingerprints rather than producing a plausible-looking timing result.
+.PHONY: ctest-core-hotpath-oracle
+ctest-core-hotpath-oracle:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 \
+		-I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/core-hotpath-oracle \
+		benchmarks/core-hotpath-probe.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/core-hotpath-oracle
+	$(CC) -std=gnu11 -Wall -Wextra -O2 \
+		-DFZF_CORE_HOTPATH_FAULT_SCORE \
+		-I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/core-hotpath-oracle-fault \
+		benchmarks/core-hotpath-probe.c fzf.c $(UTF8PROC_SRC)
+	@set +e; \
+		$(BUILD_DIR)/core-hotpath-oracle-fault \
+			>$(BUILD_DIR)/core-hotpath-oracle-fault.log 2>&1; \
+		rc=$$?; \
+		if [ $$rc -ne 1 ] || \
+		   ! grep -q "core-hotpath fingerprint mismatch" \
+			$(BUILD_DIR)/core-hotpath-oracle-fault.log; then \
+			cat $(BUILD_DIR)/core-hotpath-oracle-fault.log; \
+			echo "core-hotpath benchmark oracle did not reject score fault"; \
+			exit 1; \
+		fi; \
+		cat $(BUILD_DIR)/core-hotpath-oracle-fault.log; \
+		echo "core-hotpath benchmark oracle rejected score fault"
 
 # Module-internal tests (counting sort, cache, async_reader, etc.).
 # Links fzf-additions.c because fzf-native-module.c now references
