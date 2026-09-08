@@ -138,6 +138,31 @@ static int exercise_score_positions(const char *label, const char *candidate,
   }
 }
 
+static int test_v2_single_byte_observes_prior_failure(void) {
+  static const char candidate_byte = 'a';
+  static const char pattern_byte = 'a';
+  fzf_string_t candidate = {.data = &candidate_byte, .size = 1};
+  fzf_string_t pattern = {.data = &pattern_byte, .size = 1};
+  fzf_position_t positions = {0};
+
+  fail_at = SIZE_MAX;
+  allocation_number = 0;
+  failure_injected = false;
+  fzf_allocation_failure = true;
+  fzf_result_t result = fzf_fuzzy_match_v2(
+      true, false, &candidate, &pattern, &positions, NULL);
+  if (result.start != -1 || result.end != -1 || result.score != 0 ||
+      positions.size != 0 || !fzf_allocation_failed()) {
+    free(positions.data);
+    fzf_clear_allocation_failure();
+    return fail("single-byte prior OOM", 0,
+                "scratch-free v2 path did not preserve failure state");
+  }
+  free(positions.data);
+  fzf_clear_allocation_failure();
+  return 0;
+}
+
 int main(void) {
   size_t tested = 0;
   char ascii_query[] = "abc";
@@ -161,7 +186,8 @@ int main(void) {
       exercise_positions("UTF-8 positions", "a你---界z", utf8_pattern,
                          &tested) ||
       exercise_score_positions("UTF-8 combined", "a你---界z", utf8_pattern,
-                               &tested);
+                               &tested) ||
+      test_v2_single_byte_observes_prior_failure();
 
   fail_at = SIZE_MAX;
   fzf_free_pattern(ascii_pattern);

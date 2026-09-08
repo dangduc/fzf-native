@@ -5,6 +5,14 @@
 #include <string.h>
 #include <stdlib.h>
 
+#if defined(_MSC_VER)
+#define FZF_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define FZF_NOINLINE __attribute__((noinline))
+#else
+#define FZF_NOINLINE
+#endif
+
 // UTF8PROC integration for Unicode support
 #include "utf8proc-2.10.0/utf8proc.h"
 #include "utf8_char_index.h"
@@ -179,12 +187,6 @@ static size_t trailing_whitespaces(fzf_string_t *str) {
     pos += (size_t)width;
   }
   return trailing;
-}
-
-static void copy_runes(fzf_string_t *src, fzf_i32_t *destination) {
-  for (size_t i = 0; i < src->size; i++) {
-    destination->data[i] = (int32_t)src->data[i];
-  }
 }
 
 static void copy_into_i16(i16_slice_t *src, fzf_i16_t *dest) {
@@ -1202,6 +1204,11 @@ fzf_result_t fzf_fuzzy_match_v1(bool case_sensitive, bool normalize,
                                  pattern, pos, slab, NULL);
 }
 
+static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_single(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, size_t start,
+    const score_scheme_config_t *config);
+
 static fzf_result_t fzf_fuzzy_match_v2_impl(
     bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
     fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab,
@@ -1244,6 +1251,16 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
     idx = (size_t)tmp_idx;
   }
 
+  if (M == 1) {
+    /* Direct algorithm callers can intentionally carry an allocation failure
+       into this call.  The former scratch allocation path observed that flag
+       before scoring; keep the same failure result on the scratch-free path. */
+    if (fzf_allocation_failed())
+      return (fzf_result_t){-1, -1, 0};
+    return fzf_fuzzy_match_v2_single(
+        case_sensitive, normalize, forward, text, pattern, pos, idx, config);
+  }
+
   size_t offset16 = 0;
   size_t offset32 = 0;
 
@@ -1263,7 +1280,6 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
     free_alloc(h0);
     return (fzf_result_t){-1, -1, 0};
   }
-  copy_runes(text, &t); // input.CopyRunes(T)
 
   // Phase 2. Calculate bonus for each point
   int16_t max_score = 0;
@@ -1278,6 +1294,9 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
   int32_t prev_class = config->initial_class;
   bool in_gap = false;
 
+  /* Initialize the rune suffix while computing its bonus data.  The old
+     whole-array copy wrote every rune immediately before this loop overwrote
+     the matched suffix; positions before IDX are never read by later rows. */
   i32_slice_t t_sub = slice_i32(t.data, idx, t.size); // T[idx:];
   i16_slice_t h0_sub =
       slice_i16_right(slice_i16(h0.data, idx, h0.size).data, t_sub.size);
@@ -1288,7 +1307,7 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
 
   for (size_t off = 0; off < t_sub.size; off++) {
     char_class class;
-    char c = (char)t_sub.data[off];
+    char c = text->data[idx + off];
     class = char_class_of_ascii(c, config);
     if (!case_sensitive && class == CharUpper) {
       /* TODO(conni2461): unicode support */
@@ -1315,13 +1334,6 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
       int16_t score = ScoreMatch + bonus * BonusFirstCharMultiplier;
       h0_sub.data[off] = score;
       c0_sub.data[off] = 1;
-      if (M == 1 && (forward ? score > max_score : score >= max_score)) {
-        max_score = score;
-        max_score_pos = idx + off;
-        if (forward && bonus >= BonusBoundary) {
-          break;
-        }
-      }
       in_gap = false;
     } else {
       if (in_gap) {
@@ -1342,18 +1354,6 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
     free_alloc(h0);
     return (fzf_result_t){-1, -1, 0};
   }
-  if (M == 1) {
-    free_alloc(t);
-    free_alloc(f);
-    free_alloc(bo);
-    free_alloc(c0);
-    free_alloc(h0);
-    fzf_result_t res = {(int32_t)max_score_pos, (int32_t)max_score_pos + 1,
-                        max_score};
-    append_pos(pos, max_score_pos);
-    return res;
-  }
-
   size_t f0 = (size_t)f.data[0];
   size_t width = last_idx - f0 + 1;
   if (M != 0 && width > SIZE_MAX / M) {
@@ -3508,4 +3508,37 @@ void fzf_free_slab(fzf_slab_t *slab) {
     free(slab->UTF8.map.byte_to_char);
     free(slab);
   }
+}
+
+/* Keep the one-rune specialization out of the multi-rune instruction layout:
+   it is common in incremental completion, but cold for longer DP queries. */
+static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_single(
+    bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_position_t *pos, size_t start,
+    const score_scheme_config_t *config) {
+  char pattern_char = pattern->data[0];
+  int16_t max_score = 0;
+  size_t max_score_pos = 0;
+  char_class prev_class = config->initial_class;
+  for (size_t text_index = start; text_index < text->size; text_index++) {
+    char c = text->data[text_index];
+    char_class class = char_class_of_ascii(c, config);
+    if (!case_sensitive && class == CharUpper)
+      c = fzf_ascii_tolower((uint8_t)c);
+    if (normalize) c = normalize_rune(c);
+    if (c == pattern_char) {
+      int16_t bonus = bonus_for(config, prev_class, class);
+      int16_t score = ScoreMatch + bonus * BonusFirstCharMultiplier;
+      if (forward ? score > max_score : score >= max_score) {
+        max_score = score;
+        max_score_pos = text_index;
+        if (forward && bonus >= BonusBoundary) break;
+      }
+    }
+    prev_class = class;
+  }
+  if (max_score == 0) return (fzf_result_t){-1, -1, 0};
+  append_pos(pos, max_score_pos);
+  return (fzf_result_t){(int32_t)max_score_pos,
+                        (int32_t)max_score_pos + 1, max_score};
 }
