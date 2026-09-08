@@ -241,7 +241,10 @@ static BenchMembershipStats bench_membership_stats(
 
 static bool bench_validate_snapshot(AsyncSession *session,
                                     const BenchSnapshot *snapshot,
-                                    const char *query, size_t limit) {
+                                    const char *query, size_t limit,
+                                    fzf_case_types case_mode, bool fuzzy,
+                                    bool normalize, bool forward,
+                                    fzf_score_scheme_t score_scheme) {
   if (snapshot->pool_generation > SIZE_MAX / sizeof(ScoredStr)) return false;
   ScoredStr *reference = snapshot->pool_generation
       ? malloc(snapshot->pool_generation * sizeof *reference) : NULL;
@@ -253,9 +256,11 @@ static bool bench_validate_snapshot(AsyncSession *session,
     return false;
   }
   fzf_pattern_t *pattern = query_copy
-      ? fzf_parse_pattern(CaseSmart, false, query_copy, true) : NULL;
+      ? fzf_parse_pattern_with_direction(
+            case_mode, normalize, query_copy, fuzzy, forward) : NULL;
   fzf_slab_t *slab = fzf_make_default_slab();
-  if ((*query && !pattern) || !slab) {
+  if ((*query && !pattern) || !slab ||
+      !fzf_slab_set_score_scheme(slab, score_scheme)) {
     free(query_copy);
     if (pattern) fzf_free_pattern(pattern);
     if (slab) fzf_free_slab(slab);
@@ -264,11 +269,20 @@ static bool bench_validate_snapshot(AsyncSession *session,
   }
 
   size_t matched = 0;
+  bool can_reuse_public_score =
+      fzf_rank_can_reuse_public_score(pattern, score_scheme);
   pthread_mutex_lock(&session->mu);
   for (size_t i = 0; i < snapshot->pool_generation; i++) {
     char *candidate = session->cands_top[i >> CANDS_BLOCK_SHIFT]
                                         [i & CANDS_BLOCK_MASK];
-    int score = pattern ? fzf_get_score(candidate, pattern, slab) : 1;
+    FzfRankKeys rank = {0};
+    size_t candidate_len = strlen(candidate);
+    bool input_is_ascii = is_ascii_utf8proc(candidate, candidate_len);
+    int score = pattern
+        ? fzf_score_and_rank(
+              candidate, candidate_len, input_is_ascii, pattern, slab,
+              score_scheme, can_reuse_public_score, &rank)
+        : 1;
     if (fzf_allocation_failed()) {
       pthread_mutex_unlock(&session->mu);
       free(query_copy);
@@ -279,12 +293,13 @@ static bool bench_validate_snapshot(AsyncSession *session,
     }
     if (score > 0)
       reference[matched++] = (ScoredStr){
-          .str = candidate, .score = score, .idx = (uint32_t)i};
+          .str = candidate, .score = score, .idx = (uint32_t)i,
+          .rank = rank};
   }
   pthread_mutex_unlock(&session->mu);
 
   if (matched > 1)
-    counting_sort_scored(reference, matched, FZF_SCORE_SCHEME_DEFAULT);
+    counting_sort_scored(reference, matched, score_scheme);
   size_t expected_count = limit && limit < matched ? limit : matched;
   BenchSnapshot expected_snapshot = {
       .top = reference,
@@ -493,7 +508,9 @@ int main(int argc, char **argv) {
   bool validation_ok = timed_ok;
   if (timed_ok) {
     for (size_t i = 0; i <= rounds; i++) {
-      if (!bench_validate_snapshot(session, &snapshots[i], query, limit)) {
+      if (!bench_validate_snapshot(
+              session, &snapshots[i], query, limit,
+              CaseSmart, true, false, true, FZF_SCORE_SCHEME_DEFAULT)) {
         validation_ok = false;
         break;
       }

@@ -110,7 +110,8 @@ emacs-asan:
 # Includes fzf-native-module.c directly so static functions are visible.
 # No Emacs runtime needed; runs as a plain executable.
 .PHONY: ctest
-ctest: ctest-module ctest-additions ctest-parser-oom ctest-scorer-oom
+ctest: ctest-module ctest-additions ctest-parser-oom ctest-scorer-oom \
+	ctest-session-growth-benchmark
 
 # Module-internal tests (counting sort, cache, async_reader, etc.).
 # Links fzf-additions.c because fzf-native-module.c now references
@@ -151,6 +152,16 @@ ctest-scorer-oom:
 		-o $(BUILD_DIR)/fzf-scorer-oom-ctest fzf-scorer-oom-ctest.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-scorer-oom-ctest
 
+# Keep the benchmark's full-scan oracle honest with candidates whose producer
+# order differs from their final fzf rank order.
+.PHONY: ctest-session-growth-benchmark
+ctest-session-growth-benchmark:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/session-growth-benchmark-ctest \
+		etc/session-growth-benchmark-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/session-growth-benchmark-ctest
+
 # AddressSanitizer + UndefinedBehaviorSanitizer run of the C unit tests.
 # Builds both suites with the sanitizers enabled into distinctly-named
 # binaries (-asan suffix) so they never clobber the plain `ctest` ones,
@@ -181,6 +192,11 @@ ctest-asan:
 		-I. -I$(UTF8PROC_DIR) \
 		-o $(BUILD_DIR)/fzf-scorer-oom-ctest-asan fzf-scorer-oom-ctest.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-scorer-oom-ctest-asan
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/session-growth-benchmark-ctest-asan \
+		etc/session-growth-benchmark-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/session-growth-benchmark-ctest-asan
 
 .PHONY: clean
 clean:
