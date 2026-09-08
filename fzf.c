@@ -1185,7 +1185,16 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
 
   size_t idx;
   {
-    int32_t tmp_idx = ascii_fuzzy_index(text, pattern->data, M, case_sensitive);
+    int32_t tmp_idx;
+    /* Keep the common one-byte incremental query in this hot caller.  The
+       compiler can inline try_skip here without expanding every multi-byte
+       ascii_fuzzy_index call site. */
+    if (M == 1) {
+      tmp_idx = try_skip(text, case_sensitive, pattern->data[0], 0);
+      if (tmp_idx > 0) tmp_idx--;
+    } else {
+      tmp_idx = ascii_fuzzy_index(text, pattern->data, M, case_sensitive);
+    }
     if (tmp_idx < 0) {
       return (fzf_result_t){-1, -1, 0};
     }

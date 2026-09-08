@@ -91,6 +91,59 @@ static void test_fuzzy_pattern_longer_than_text(void) {
                   CaseIgnore, true, false);
 }
 
+static void check_single_byte_v2(const char *text, size_t text_size,
+                                 char pattern_byte, bool case_sensitive,
+                                 bool normalize, bool forward,
+                                 int32_t expected_start, int32_t expected_end,
+                                 int32_t expected_score,
+                                 int32_t expected_position) {
+  for (int use_slab = 0; use_slab < 2; use_slab++) {
+    fzf_string_t candidate = {.data = text, .size = text_size};
+    fzf_string_t pattern = {.data = &pattern_byte, .size = 1};
+    fzf_position_t positions = {0};
+    fzf_slab_t *slab = use_slab ? fzf_make_default_slab() : NULL;
+    CHECK(!use_slab || slab != NULL);
+    if (use_slab && !slab) continue;
+
+    fzf_clear_allocation_failure();
+    fzf_result_t result = fzf_fuzzy_match_v2_with_direction(
+        case_sensitive, normalize, forward, &candidate, &pattern, &positions,
+        slab);
+    CHECK(!fzf_allocation_failed());
+    CHECK(result.start == expected_start);
+    CHECK(result.end == expected_end);
+    CHECK(result.score == expected_score);
+    CHECK(positions.size == (expected_position >= 0 ? 1u : 0u));
+    if (expected_position >= 0 && positions.size == 1)
+      CHECK(positions.data[0] == (uint32_t)expected_position);
+
+    free(positions.data);
+    fzf_free_slab(slab);
+  }
+}
+
+static void test_ascii_v2_single_byte_path(void) {
+  static const char embedded_nul[] = {'x', '\0', 'b', 'x'};
+  static const char malformed[] = {'x', (char)0xe9, 'x'};
+
+  check_single_byte_v2("zAxaZ", 5, 'a', false, false, true,
+                       1, 2, 30, 1);
+  check_single_byte_v2("zAxaZ", 5, 'a', true, false, true,
+                       3, 4, 16, 3);
+  check_single_byte_v2("/a/a/", 5, 'a', true, false, true,
+                       1, 2, 34, 1);
+  check_single_byte_v2("/a/a/", 5, 'a', true, false, false,
+                       3, 4, 34, 3);
+  check_single_byte_v2("/e-e", 4, 'e', true, true, true,
+                       1, 2, 34, 1);
+  check_single_byte_v2(embedded_nul, sizeof embedded_nul, 'b', true, false,
+                       true, 2, 3, 32, 2);
+  check_single_byte_v2(malformed, sizeof malformed, (char)0xe9, true, false,
+                       true, 1, 2, 32, 1);
+  check_single_byte_v2("xxxx", 4, 'b', false, true, false,
+                       -1, -1, 0, -1);
+}
+
 static void test_exact_match(void) {
   check_agreement("exact 'pat", "foobarbaz", "'bar",
                   CaseIgnore, true, true);
@@ -1172,6 +1225,7 @@ int main(void) {
   RUN(test_fuzzy_basic_no_match);
   RUN(test_fuzzy_empty_pattern);
   RUN(test_fuzzy_pattern_longer_than_text);
+  RUN(test_ascii_v2_single_byte_path);
   RUN(test_exact_match);
   RUN(test_exact_no_match);
   RUN(test_pinned_fzf_exact_boundary);
