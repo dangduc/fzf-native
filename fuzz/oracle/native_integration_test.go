@@ -465,7 +465,7 @@ func TestNativePeerUnicodeLowercaseVersionAudit(t *testing.T) {
 					versionDifferences++
 				}
 				if different != versionDifference ||
-					(versionDifference && (!upstream.matched || native.matched)) {
+					(versionDifference && (!upstream.matched || !canonicalNativeMiss(native))) {
 					if len(unexpected) < fullResultExampleLimit {
 						unexpected = append(unexpected, fmt.Sprintf(
 							"%s %s U+%04X/U+%04X expected-version-difference=%t upstream=(%s) native=(%s)",
@@ -1410,6 +1410,33 @@ func matchResponsesEquivalent(left, right matchResponse) bool {
 	return left.matched == right.matched && left.start == right.start &&
 		left.end == right.end && left.score == right.score &&
 		reflect.DeepEqual(semanticPositions(left), semanticPositions(right))
+}
+
+func canonicalNativeMiss(response matchResponse) bool {
+	return !response.matched && response.positionsPresent &&
+		response.start == -1 && response.end == -1 && response.score == 0 &&
+		len(response.positions) == 0
+}
+
+func TestCanonicalNativeMissRejectsCorruptResultShape(t *testing.T) {
+	canonical := matchResponse{positionsPresent: true, start: -1, end: -1}
+	if !canonicalNativeMiss(canonical) {
+		t.Fatal("canonical native miss was rejected")
+	}
+
+	for name, corrupt := range map[string]func(*matchResponse){
+		"end":       func(response *matchResponse) { response.end = 123 },
+		"score":     func(response *matchResponse) { response.score = 777 },
+		"positions": func(response *matchResponse) { response.positions = []int64{0} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := canonical
+			corrupt(&response)
+			if canonicalNativeMiss(response) {
+				t.Fatalf("corrupt native miss was accepted: %s", compactResponse(response))
+			}
+		})
+	}
 }
 
 func compactMatrixDifference(seed, serial uint64, request matchRequest,
