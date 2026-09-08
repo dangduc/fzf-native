@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 /*
  * Short, deterministic matcher probe for the Chromium, Arabic, and Korean
- * real-data holdout shapes, plus the first-byte ASCII hit path used by short
- * incremental queries.  It is deliberately synthetic: its purpose is to
- * isolate core scorer costs without rereading or sorting a multi-million-line
- * corpus.  Results are provisional and must not be presented as holdout data.
+ * real-data holdout shapes, the first-byte ASCII hit path used by short
+ * incremental queries, and UTF-8 inputs that exceed the v2 slab.  It is
+ * deliberately synthetic: its purpose is to isolate core scorer costs without
+ * rereading or sorting a multi-million-line corpus.  Results are provisional
+ * and must not be presented as holdout data.
  *
  * Build from the repository root:
  *
@@ -29,6 +30,9 @@
 #endif
 #define ASCII_BYTES 72u
 #define UNICODE_CODEPOINTS 36u
+#define FALLBACK_ITEMS 512u
+#define FALLBACK_CODEPOINTS 4096u
+#define FALLBACK_QUERY_CODEPOINTS 26u
 
 typedef struct {
   char *data;
@@ -40,6 +44,7 @@ typedef struct {
   const char *name;
   const char *query;
   probe_item_t *items;
+  size_t item_count;
 } probe_case_t;
 
 static volatile uint64_t score_sink;
@@ -148,11 +153,38 @@ static probe_item_t *make_unicode_late_hit_items(utf8proc_int32_t base,
   return items;
 }
 
+static probe_item_t *make_unicode_v1_fallback_items(bool early) {
+  probe_item_t *items = calloc(FALLBACK_ITEMS, sizeof *items);
+  if (!items) abort();
+  for (size_t i = 0; i < FALLBACK_ITEMS; i++) {
+    char *text = malloc(FALLBACK_CODEPOINTS * 3 + 1);
+    if (!text) abort();
+    size_t offset = 0;
+    for (size_t j = 0; j < FALLBACK_CODEPOINTS; j++) {
+      bool query_slot = early ? j < FALLBACK_QUERY_CODEPOINTS
+                              : j >= FALLBACK_CODEPOINTS -
+                                         FALLBACK_QUERY_CODEPOINTS;
+      if (query_slot) {
+        size_t query_index = early ? j
+                                   : j - (FALLBACK_CODEPOINTS -
+                                          FALLBACK_QUERY_CODEPOINTS);
+        text[offset++] = (char)('a' + query_index);
+      } else {
+        put_cp(text, &offset,
+               0x4E00 + (utf8proc_int32_t)((i + j * 7) % 24));
+      }
+    }
+    text[offset] = '\0';
+    items[i] = (probe_item_t){text, offset, false};
+  }
+  return items;
+}
+
 static uint64_t score_once(const probe_case_t *probe, fzf_pattern_t *pattern,
                            fzf_slab_t *slab) {
   uint64_t checksum = 0;
   uint64_t start = now_ns();
-  for (size_t i = 0; i < PROBE_ITEMS; i++) {
+  for (size_t i = 0; i < probe->item_count; i++) {
     const probe_item_t *item = &probe->items[i];
     checksum += (uint32_t)fzf_get_score_bytes_preclassified(
         item->data, item->size, item->ascii, pattern, slab);
@@ -182,32 +214,36 @@ static void run_case(const probe_case_t *probe) {
   uint64_t median = samples[PROBE_SAMPLES / 2];
   printf("%-8s %8.3f ms  %7.2f ns/item  checksum=%" PRIu64 "\n",
          probe->name, (double)median / 1e6,
-         (double)median / (double)PROBE_ITEMS, score_sink);
+         (double)median / (double)probe->item_count, score_sink);
 
   fzf_free_slab(slab);
   fzf_free_pattern(pattern);
 }
 
-static void free_items(probe_item_t *items) {
-  for (size_t i = 0; i < PROBE_ITEMS; i++) free(items[i].data);
+static void free_items(probe_item_t *items, size_t item_count) {
+  for (size_t i = 0; i < item_count; i++) free(items[i].data);
   free(items);
 }
 
 int main(void) {
   probe_case_t probes[] = {
-      {"EarlyASCII", "z", make_ascii_early_hit_items()},
-      {"Chromium", "linux", make_ascii_items()},
+      {"EarlyASCII", "z", make_ascii_early_hit_items(), PROBE_ITEMS},
+      {"Chromium", "linux", make_ascii_items(), PROBE_ITEMS},
       {"Arabic", "\xD8\xA5\xD9\x86",
-       make_unicode_items(0x0620, 0x0625, 0x0646)},
+       make_unicode_items(0x0620, 0x0625, 0x0646), PROBE_ITEMS},
       {"Korean", "\xEB\x8B\x88\xEB\x8B\xA4",
-       make_unicode_items(0xAC00, 0xB2C8, 0xB2E4)},
+       make_unicode_items(0xAC00, 0xB2C8, 0xB2E4), PROBE_ITEMS},
       {"UTF8-hit", "\xE7\x95\x8C",
-       make_unicode_late_hit_items(0x4E00, 0x754C)},
+       make_unicode_late_hit_items(0x4E00, 0x754C), PROBE_ITEMS},
+      {"V1-early", "abcdefghijklmnopqrstuvwxyz",
+       make_unicode_v1_fallback_items(true), FALLBACK_ITEMS},
+      {"V1-late", "abcdefghijklmnopqrstuvwxyz",
+       make_unicode_v1_fallback_items(false), FALLBACK_ITEMS},
   };
 
   for (size_t i = 0; i < sizeof probes / sizeof probes[0]; i++)
     run_case(&probes[i]);
   for (size_t i = 0; i < sizeof probes / sizeof probes[0]; i++)
-    free_items(probes[i].items);
+    free_items(probes[i].items, probes[i].item_count);
   return 0;
 }

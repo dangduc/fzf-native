@@ -2379,6 +2379,18 @@ static fzf_result_t fzf_fuzzy_match_v2_utf8_impl(
     return (fzf_result_t){-1, -1, 0};
   }
 
+  /* The prefilter already counted the candidate with the same lossy decoder
+     used by both matchers.  Decide whether v2 fits before constructing its
+     byte-to-character table; v1 builds the table it needs itself. */
+  bool v2_size_overflows = candidate_char_count != 0 &&
+                           Mc > SIZE_MAX / candidate_char_count;
+  if (slab != NULL &&
+      (v2_size_overflows ||
+       candidate_char_count * Mc > slab->I16.cap)) {
+    return fzf_fuzzy_match_v1_utf8_impl(case_sensitive, normalize, forward,
+                                        text, pattern, pos, slab);
+  }
+
   // Build byte-to-char mapping for character position tracking
   utf8_char_map_t *char_map = utf8_build_char_map_counted(
       text->data, N, candidate_char_count, slab ? &slab->UTF8 : NULL);
@@ -2388,14 +2400,6 @@ static fzf_result_t fzf_fuzzy_match_v2_utf8_impl(
   }
 
   const size_t Nc = char_map->char_count;
-
-  // Fall back to v1 if slab is insufficient (use character counts)
-  if (slab != NULL &&
-      (Nc != 0 && Mc > SIZE_MAX / Nc ? true : Nc * Mc > slab->I16.cap)) {
-    utf8_free_char_map(char_map);
-    return fzf_fuzzy_match_v1_utf8_impl(case_sensitive, normalize, forward,
-                                        text, pattern, pos, slab);
-  }
 
   // Start one character before the first match, just as ascii_fuzzy_index
   // does for the byte matcher.  Phase 2 needs that character to establish

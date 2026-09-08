@@ -228,9 +228,9 @@ benchmark-score-positions:
 		$(BENCH_SCORE_POSITIONS_ROUNDS) $(BENCH_SCORE_POSITIONS_SAMPLES)
 
 # Short synthetic probe for the core matcher paths used by the Chromium,
-# Arabic, and Korean holdouts, plus the first-byte ASCII hit path.  This
-# isolates scoring and prints provisional timings; it is not a replacement
-# for the real-data benchmark.
+# Arabic, and Korean holdouts, plus first-byte ASCII hits and UTF-8 inputs that
+# exceed the v2 slab.  This isolates scoring and prints provisional timings;
+# it is not a replacement for the real-data benchmark.
 .PHONY: benchmark-core-hotpath-probe
 benchmark-core-hotpath-probe:
 	mkdir -p $(BUILD_DIR)

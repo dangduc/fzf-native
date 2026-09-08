@@ -365,6 +365,60 @@ static void test_utf8_v1_reverse_scan_tightens_match(void) {
   free(dup);
 }
 
+static void test_utf8_default_slab_v1_fallback_matches_direct_v1(void) {
+  enum { candidate_codepoints = 4096, query_codepoints = 26 };
+  const size_t filler_codepoints = candidate_codepoints - query_codepoints;
+  const size_t candidate_bytes = filler_codepoints * 3 + query_codepoints;
+  char *candidate = malloc(candidate_bytes + 1);
+  CHECK(candidate != NULL);
+  if (!candidate) return;
+
+  size_t offset = 0;
+  for (size_t i = 0; i < filler_codepoints; i++) {
+    memcpy(candidate + offset, "\xE4\xB8\x80", 3);
+    offset += 3;
+  }
+  memcpy(candidate + offset, "abcdefghijklmnopqrstuvwxyz", query_codepoints);
+  candidate[candidate_bytes] = '\0';
+
+  fzf_string_t text = {.data = candidate, .size = candidate_bytes};
+  fzf_string_t pattern = {.data = "abcdefghijklmnopqrstuvwxyz",
+                          .size = query_codepoints};
+  fzf_slab_t *v2_slab = fzf_make_default_slab();
+  fzf_slab_t *v1_slab = fzf_make_default_slab();
+  CHECK(v2_slab != NULL && v1_slab != NULL);
+  if (!v2_slab || !v1_slab) goto cleanup;
+  CHECK(candidate_codepoints * query_codepoints > v2_slab->I16.cap);
+
+  fzf_position_t v2_positions = {0};
+  fzf_position_t v1_positions = {0};
+  fzf_clear_allocation_failure();
+  fzf_result_t fallback = fzf_fuzzy_match_v2_utf8(
+      true, false, &text, &pattern, &v2_positions, v2_slab);
+  bool fallback_oom = fzf_allocation_failed();
+  fzf_clear_allocation_failure();
+  fzf_result_t direct = fzf_fuzzy_match_v1_utf8(
+      true, false, &text, &pattern, &v1_positions, v1_slab);
+  bool direct_oom = fzf_allocation_failed();
+
+  CHECK(!fallback_oom && !direct_oom);
+  CHECK(fallback.start == direct.start);
+  CHECK(fallback.end == direct.end);
+  CHECK(fallback.score == direct.score);
+  CHECK(v2_positions.size == v1_positions.size);
+  if (v2_positions.size == v1_positions.size) {
+    for (size_t i = 0; i < v2_positions.size; i++)
+      CHECK(v2_positions.data[i] == v1_positions.data[i]);
+  }
+  free(v2_positions.data);
+  free(v1_positions.data);
+
+cleanup:
+  fzf_free_slab(v2_slab);
+  fzf_free_slab(v1_slab);
+  free(candidate);
+}
+
 static void test_case_ignore(void) {
   check_agreement("case-ignore matches", "SrcFooBar", "srcfoo",
                   CaseIgnore, true, true);
@@ -1138,6 +1192,7 @@ int main(void) {
   RUN(test_small_slab_long_gap_preserves_match);
   RUN(test_small_slab_inverse_long_gap_preserves_membership);
   RUN(test_utf8_v1_reverse_scan_tightens_match);
+  RUN(test_utf8_default_slab_v1_fallback_matches_direct_v1);
   RUN(test_case_ignore);
   RUN(test_case_respect_matches_when_case_aligns);
   RUN(test_case_respect_no_match_when_case_differs);
