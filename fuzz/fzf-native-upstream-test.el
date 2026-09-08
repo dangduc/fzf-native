@@ -462,6 +462,32 @@ Each specification has the form (KEY VALUES)."
                     (length
                      (fzf-native-differential-term-literal primary)))))))
 
+(ert-deftest fzf-native-fuzz-upstream-ci-parity-profile-has-strict-coverage ()
+  "Keep the bounded CI parity lane effective across public controls."
+  (let* ((seed 12648430)
+         (cases
+          (cl-loop for serial below 1000
+                   collect (fzf-native-upstream--generated-case
+                            seed serial 'parity)))
+         (tuples
+          (delete-dups
+           (mapcar
+            (lambda (case)
+              (list
+               (fzf-native-upstream--dimension-value case :normalize)
+               (fzf-native-upstream--dimension-value case :direction)
+               (fzf-native-upstream--dimension-value case :score-scheme)))
+            cases))))
+    (should
+     (cl-some
+      (lambda (case)
+        (eq (fzf-native-differential-case-comparison case) 'ranking))
+      cases))
+    (dolist (normalize '(nil t))
+      (dolist (direction '(auto forward backward))
+        (dolist (scheme '(default path history))
+          (should (member (list normalize direction scheme) tuples)))))))
+
 (ert-deftest fzf-native-fuzz-upstream-malformed-ranking-uses-membership ()
   "Do not rank byte strings that Go rewrites while decoding malformed UTF-8."
   (let ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf")))

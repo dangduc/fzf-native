@@ -103,6 +103,13 @@ jobs:
           FZF_SOURCE: ${{ github.workspace }}/build/fzf-oracle-source
         run: make fuzz-upstream-pinned
 
+      - name: Compare strict structured parity with pinned fzf
+        env:
+          FZF_SOURCE: ${{ github.workspace }}/build/fzf-oracle-source
+          FZF_NATIVE_UPSTREAM_PROFILE: parity
+          FZF_NATIVE_UPSTREAM_CASES: 1000
+        run: make fuzz-upstream-pinned
+
       - name: Compare V2 fallback length boundaries
         env:
           FZF_SOURCE: ${{ github.workspace }}/build/fzf-oracle-source

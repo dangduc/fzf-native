@@ -78,6 +78,8 @@ make FZF_SOURCE=/path/to/pinned/fzf \
 
 Set =FZF_NATIVE_UPSTREAM_PROFILE=long= to test lengths 999, 1000, and 1001.
 Set =FZF_NATIVE_UPSTREAM_PROFILE=parity= to test strict public parity behavior.
+Pull-request CI runs 1,000 parity cases.  That bound includes ranking comparisons
+and every normalize, direction, and score-scheme control tuple.
 
 ** Native matcher lane
 
