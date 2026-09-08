@@ -192,7 +192,8 @@ Set the higher-level package option unless your code calls fzf-native directly.
 | =fzf-native-filter-only-logic= | =or= | Every scoring request | Combine enabled filter-only triggers. |
 
 The =default= scheme gives the largest bonus to a match after whitespace.
-The =path= scheme gives the largest bonus to a match after a slash.
+The =path= scheme gives the largest bonus to a match after a slash on every
+host and after a backslash on Windows.
 The =history= scheme gives equal bonuses to whitespace and delimiters.
 
 The default scheme ranks by score, trimmed character length, and producer order.

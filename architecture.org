@@ -208,6 +208,9 @@ The default scheme uses this total order:
 2. Shorter trimmed character length.
 3. Earlier producer index.
 
+For scoring, the path scheme treats slash as a delimiter on every host and
+backslash as an additional delimiter on Windows.
+
 The path scheme adds pathname distance before character length.
 Pathname distance starts after the last slash or backslash before the match.
 

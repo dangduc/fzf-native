@@ -156,7 +156,8 @@ confirmation before compiling."
 (defcustom fzf-native-score-scheme 'default
   "Scoring scheme used by native matching and highlighting.
 default  Prefer word starts after whitespace and common delimiters.
-path     Prefer path components; only slash is a delimiter.
+path     Prefer path components.  Slash is a delimiter on every host;
+         backslash is also a delimiter on Windows.
 history  Give all word boundaries the same weight.
 
 The module reads this value for each matching or highlighting call.
