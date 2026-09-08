@@ -372,6 +372,19 @@ func pinnedUnicodeLowercaseDifference(upper, lower rune) bool {
 	}
 }
 
+var unicodeLowercaseAuditAlgorithms = [...]struct {
+	name string
+	id   algorithmID
+}{
+	{"fuzzy-v1", algorithmV1},
+	{"fuzzy-v2", algorithmV2},
+	{"exact", algorithmExact},
+	{"exact-boundary", algorithmExactBoundary},
+	{"prefix", algorithmPrefix},
+	{"suffix", algorithmSuffix},
+	{"equal", algorithmEqual},
+}
+
 func TestNativePeerUnicodeLowercaseVersionAudit(t *testing.T) {
 	if runtime.Version() != pinnedGoToolchain {
 		t.Fatalf("Go runtime is %q; want %q", runtime.Version(), pinnedGoToolchain)
@@ -398,8 +411,11 @@ func TestNativePeerUnicodeLowercaseVersionAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tested := 0
+	testedMappings := 0
+	testedRequests := 0
+	versionMappings := 0
 	versionDifferences := 0
+	var differencesByOrientation [2][len(unicodeLowercaseAuditAlgorithms)]int
 	var unexpected []string
 	for upper := rune(0); upper <= unicode.MaxRune; upper++ {
 		if upper >= 0xd800 && upper <= 0xdfff {
@@ -409,49 +425,78 @@ func TestNativePeerUnicodeLowercaseVersionAudit(t *testing.T) {
 		if lower == upper {
 			continue
 		}
-		tested++
-		request := matchRequest{
-			algorithm: algorithmEqual,
-			scheme:    schemeDefault,
-			flags:     flagForward,
-			pattern:   []byte(string(upper)),
-			candidate: []byte(string(lower)),
-		}
-		upstream, err := oracle.match(request)
-		if err != nil {
-			t.Fatalf("U+%04X -> U+%04X upstream: %v", upper, lower, err)
-		}
-		native, _, err := decodeMatchResponse(peer.exchange(t,
-			matchRequestPayload(request.algorithm, request.scheme, request.flags,
-				request.pattern, request.candidate)))
-		if err != nil {
-			t.Fatalf("U+%04X -> U+%04X native: %v", upper, lower, err)
-		}
-		different := !matchResponsesEquivalent(native, upstream)
+		testedMappings++
 		versionDifference := pinnedUnicodeLowercaseDifference(upper, lower)
 		if versionDifference {
-			versionDifferences++
+			versionMappings++
 		}
-		if different != versionDifference ||
-			(versionDifference && (!upstream.matched || native.matched)) {
-			if len(unexpected) < fullResultExampleLimit {
-				unexpected = append(unexpected, fmt.Sprintf(
-					"U+%04X -> U+%04X expected-version-difference=%t upstream=(%s) native=(%s)",
-					upper, lower, versionDifference,
-					compactResponse(upstream), compactResponse(native)))
+		orientations := [...]struct {
+			name               string
+			pattern, candidate rune
+		}{
+			{"upper-to-lower", upper, lower},
+			{"lower-to-upper", lower, upper},
+		}
+		for orientationIndex, orientation := range orientations {
+			for algorithmIndex, algorithm := range unicodeLowercaseAuditAlgorithms {
+				testedRequests++
+				request := matchRequest{
+					algorithm: algorithm.id,
+					scheme:    schemeDefault,
+					flags:     flagForward,
+					pattern:   []byte(string(orientation.pattern)),
+					candidate: []byte(string(orientation.candidate)),
+				}
+				upstream, err := oracle.match(request)
+				if err != nil {
+					t.Fatalf("%s %s U+%04X/U+%04X upstream: %v",
+						orientation.name, algorithm.name, upper, lower, err)
+				}
+				native, _, err := decodeMatchResponse(peer.exchange(t,
+					matchRequestPayload(request.algorithm, request.scheme, request.flags,
+						request.pattern, request.candidate)))
+				if err != nil {
+					t.Fatalf("%s %s U+%04X/U+%04X native: %v",
+						orientation.name, algorithm.name, upper, lower, err)
+				}
+				different := !matchResponsesEquivalent(native, upstream)
+				if different {
+					differencesByOrientation[orientationIndex][algorithmIndex]++
+					versionDifferences++
+				}
+				if different != versionDifference ||
+					(versionDifference && (!upstream.matched || native.matched)) {
+					if len(unexpected) < fullResultExampleLimit {
+						unexpected = append(unexpected, fmt.Sprintf(
+							"%s %s U+%04X/U+%04X expected-version-difference=%t upstream=(%s) native=(%s)",
+							orientation.name, algorithm.name, upper, lower,
+							versionDifference, compactResponse(upstream),
+							compactResponse(native)))
+					}
+				}
 			}
 		}
-	}
-	if tested != 1488 || versionDifferences != 28 {
-		t.Fatalf("Unicode lowercase audit shape changed: tested=%d version-differences=%d",
-			tested, versionDifferences)
 	}
 	if len(unexpected) != 0 {
 		t.Fatalf("Unicode lowercase audit found unexpected results:\n%s",
 			strings.Join(unexpected, "\n"))
 	}
-	t.Logf("audited %d Go lowercase pairs with %d pinned Unicode-version differences",
-		tested, versionDifferences)
+	for orientationIndex, counts := range differencesByOrientation {
+		for algorithmIndex, count := range counts {
+			if count != 28 {
+				t.Fatalf("Unicode lowercase audit %s %s differences=%d; want 28",
+					[...]string{"upper-to-lower", "lower-to-upper"}[orientationIndex],
+					unicodeLowercaseAuditAlgorithms[algorithmIndex].name, count)
+			}
+		}
+	}
+	if testedMappings != 1488 || testedRequests != 20832 ||
+		versionMappings != 28 || versionDifferences != 392 {
+		t.Fatalf("Unicode lowercase audit shape changed: mappings=%d requests=%d version-mappings=%d version-differences=%d",
+			testedMappings, testedRequests, versionMappings, versionDifferences)
+	}
+	t.Logf("audited %d Go lowercase mappings through %d requests with %d pinned Unicode-version differences",
+		testedMappings, testedRequests, versionDifferences)
 }
 
 func TestNativePeerMatchesRawOracle(t *testing.T) {
