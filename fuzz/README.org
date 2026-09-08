@@ -183,23 +183,35 @@ Every ordinary case also has one candidate that must match upstream fzf.
 An accepted difference needs a narrow executable predicate.
 The entry must include an owner, an upstream revision, and a removal condition.
 
-The parsed lane accepts only malformed UTF-8 decoder behavior.
+The parsed lane accepts malformed UTF-8 decoder behavior and one pinned
+Unicode table-version expectation.
 Go and utf8proc replace malformed byte sequences differently.
 The exception applies only when a nonempty malformed query or candidate has an
 exact membership change predicted by running the native matcher on Go-decoded
 input.  Empty-query losses and incomplete predictions always fail.
 
+The parsed Unicode expectation requires the exact fzf revision, Go =1.27.1=
+and Unicode =17.0.0=, plus utf8proc =2.10.0= and Unicode =16.0.0=.  Its
+deterministic 336-case grid covers the 28 enumerated lowercase pairs in both
+pattern/candidate orientations and all six parsed matcher kinds.  The
+classifier accepts only upstream-only membership for the mapped one-rune peer
+in a single positive, case-ignore term.  A missing identity or broader case
+shape fails closed.
+
 The raw lane also has one version-scoped Unicode table exception.  Go 1.27.1
 knows the Unicode 17 lowercase mappings U+A7CE, U+A7D2, U+A7D4, and
-U+16EA0--U+16EB8; utf8proc's Unicode 16 tables do not.  The exhaustive audit
-checks all 1,488 Go lowercase pairs and accepts exactly those 28 misses.  A
-toolchain, table, result-shape, or exception-count change fails the audit and
-requires an explicit pin review.
+U+16EA0--U+16EB8; utf8proc's Unicode 16 tables do not.  The exhaustive raw
+audit checks all 1,488 Go lowercase pairs in both orientations through all
+seven algorithms: 20,832 requests with exactly 28 misses in each of the 14
+orientation/algorithm cells.  A toolchain, table, result-shape, or count change
+fails the audit and requires an explicit pin review.
 
 Raw algorithms use the pinned fzf Latin-fold table and both search directions.
 The public API exposes normalization, direction, and all three score schemes.
-The strict parity profile compares supported ranking behavior without an exception.
-Crashes, hangs, races, unknown candidates, and valid UTF-8 differences always fail.
+The parity profile compares supported ranking behavior and applies only the
+exact parsed Unicode expectation above.
+Crashes, hangs, races, unknown candidates, and all other valid UTF-8
+differences always fail.
 
 Review [[file:differential/fzf-native-differential-exceptions.el][the exception policy]] when a result differs.
 Reduce the input before you change this policy.

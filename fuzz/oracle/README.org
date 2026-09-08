@@ -195,9 +195,11 @@ The native driver also accepts =--scheme=default=, =--scheme=path=, or
 =--scheme=history= and keeps that choice for its process lifetime.
 The checks compare Unicode results and full result matrices for all three
 scoring schemes.  An exhaustive lowercase audit checks all 1,488 mappings in
-the pinned Go tables.  It accepts exactly 28 version differences: U+A7CE,
-U+A7D2, U+A7D4, and U+16EA0--U+16EB8.  Any other difference, or any change to
-that set, fails the audit.
+the pinned Go tables in both pattern/candidate orientations through all seven
+raw algorithms.  Its 20,832 requests accept exactly 28 version differences in
+each of the 14 orientation/algorithm cells: U+A7CE, U+A7D2, U+A7D4, and
+U+16EA0--U+16EB8.  Any other difference, or any change to those counts, fails
+the audit.
 Named checks enforce scheme score and alignment parity.
 They also record normalization and malformed UTF-8 gaps.
 Delete each gap check after fzf-native gains parity for that case.
