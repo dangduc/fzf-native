@@ -54,6 +54,13 @@
    ["i" "İ"]
    ["ß" "ẞ"]])
 
+(defconst fzf-native-differential--non-upper-case-pairs
+  [["ǆ" "ǅ"]
+   ["ⅰ" "Ⅰ"]]
+  "Lowercase mappings whose source is not a Unicode uppercase letter.
+
+Pinned fzf V2 does not fold the candidate side of these pairs.")
+
 (defconst fzf-native-differential--normalization-pairs
   [["cafe" "café"]
    ["A" "Ấ"]
@@ -219,7 +226,7 @@ For fuzzy and exact terms, derive text from QUERY-NEEDLE or NEEDLE."
   "Return a text plan for RNG, PROFILE, SERIAL, CASE-MODE, and NORMALIZE."
   (let* ((variant
           (fzf-native-differential--pick
-           rng [ascii unicode unicode casefold malformed]))
+           rng [ascii unicode unicode casefold non-upper-case malformed]))
          ;; A case-fold pair cannot be the guaranteed matching candidate in
          ;; respect-case mode.  Keep that draw as ordinary Unicode instead.
          (normalization-pair
@@ -230,19 +237,30 @@ For fuzzy and exact terms, derive text from QUERY-NEEDLE or NEEDLE."
          (casefold (and (not normalization-pair)
                         (eq variant 'casefold)
                         (not (eq case-mode 'respect))))
+         (non-upper-case
+          (and (not normalization-pair)
+               (eq variant 'non-upper-case)
+               (not (eq case-mode 'respect))))
          (text-class
           (cond (normalization-pair 'unicode)
                 (casefold 'unicode)
+                (non-upper-case 'unicode)
                 ((eq variant 'casefold) 'unicode)
+                ((eq variant 'non-upper-case) 'unicode)
                 (t variant)))
          (target (fzf-native-differential--length-target profile serial))
          (pair (and casefold
                     (fzf-native-differential--pick
                      rng fzf-native-differential--case-pairs)))
+         (non-upper-pair
+          (and non-upper-case
+               (fzf-native-differential--pick
+                rng fzf-native-differential--non-upper-case-pairs)))
          (query-unit
           (cond
            (normalization-pair (aref normalization-pair 0))
            (pair (aref pair 0))
+           (non-upper-pair (aref non-upper-pair 0))
            ((eq text-class 'unicode)
             (fzf-native-differential--pick
              rng fzf-native-differential--unicode-atoms))
@@ -259,9 +277,15 @@ For fuzzy and exact terms, derive text from QUERY-NEEDLE or NEEDLE."
          (query-needle
           (fzf-native-differential--fit-length query-unit target))
          (candidate-needle
-          (fzf-native-differential--fit-length candidate-unit target)))
+          (fzf-native-differential--fit-length candidate-unit target))
+         (non-upper-peer
+          (and non-upper-pair
+               (fzf-native-differential--fit-length
+                (aref non-upper-pair 1) target))))
     (list :class text-class
           :casefold casefold
+          :non-upper-case non-upper-case
+          :non-upper-peer non-upper-peer
           :normalization-pair (and normalization-pair t)
           :target target
           :query-needle query-needle
@@ -409,10 +433,12 @@ CANDIDATE-NEEDLE and QUERY-NEEDLE supply equivalent match text."
      id (apply #'concat (nreverse pieces)))))
 
 (defun fzf-native-differential--candidates
-    (rng anchor primary-kind candidate-needle query-needle text-class)
+    (rng anchor primary-kind candidate-needle query-needle text-class
+         rank-shape non-upper-peer)
   "Use RNG to return identified candidates around ANCHOR.
 
-PRIMARY-KIND, CANDIDATE-NEEDLE, QUERY-NEEDLE, and TEXT-CLASS select variants."
+PRIMARY-KIND, CANDIDATE-NEEDLE, QUERY-NEEDLE, TEXT-CLASS, RANK-SHAPE,
+and NON-UPPER-PEER select variants."
   (let ((candidates
          (list (make-fzf-native-differential-candidate
                 :id 0 :text anchor :role 'anchor)))
@@ -437,6 +463,14 @@ PRIMARY-KIND, CANDIDATE-NEEDLE, QUERY-NEEDLE, and TEXT-CLASS select variants."
            :role 'near-miss)
           candidates)
     (setq next-id (1+ next-id))
+    (when non-upper-peer
+      (push (make-fzf-native-differential-candidate
+             :id next-id
+             :text (fzf-native-differential--anchor-text
+                    rng next-id non-upper-peer primary-kind rank-shape)
+             :role 'non-upper-case-peer)
+            candidates)
+      (setq next-id (1+ next-id)))
     (dotimes (_ (+ 3 (fzf-native-differential-random rng 6)))
       (push (make-fzf-native-differential-candidate
              :id next-id
@@ -495,6 +529,8 @@ of `common', `parity', or `long'."
            rng profile serial case-mode normalize))
          (text-class (plist-get text-plan :class))
          (casefold (plist-get text-plan :casefold))
+         (non-upper-case (plist-get text-plan :non-upper-case))
+         (non-upper-peer (plist-get text-plan :non-upper-peer))
          (query-needle (plist-get text-plan :query-needle))
          (candidate-needle (plist-get text-plan :candidate-needle))
          (anchor
@@ -525,7 +561,8 @@ of `common', `parity', or `long'."
             'membership))
          (candidates
           (fzf-native-differential--candidates
-           rng anchor primary-kind candidate-needle query-needle text-class)))
+           rng anchor primary-kind candidate-needle query-needle text-class
+           rank-shape non-upper-peer)))
     (make-fzf-native-differential-case
      :seed seed
      :serial serial
@@ -536,6 +573,7 @@ of `common', `parity', or `long'."
      :dimensions
      (list :text-class text-class
            :unicode-casefold casefold
+           :unicode-non-upper-case non-upper-case
            :normalization-pair (plist-get text-plan :normalization-pair)
            :normalize normalize
            :direction direction

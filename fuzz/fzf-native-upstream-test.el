@@ -367,7 +367,7 @@ Each specification has the form (KEY VALUES)."
                             seed serial 'long)))
          text-classes length-targets query-shapes primary-kinds rank-shapes
          normalize-modes direction-modes directions score-schemes
-         normalization-pairs)
+         normalization-pairs non-upper-cases)
     (should
      (equal (mapcar #'fzf-native-differential-case-description left)
             (mapcar #'fzf-native-differential-case-description right)))
@@ -396,6 +396,8 @@ Each specification has the form (KEY VALUES)."
               score-schemes)
         (push (plist-get dimensions :normalization-pair)
               normalization-pairs)
+        (push (plist-get dimensions :unicode-non-upper-case)
+              non-upper-cases)
         (pcase (fzf-native-upstream--dimension-value case :direction)
           ('auto
            (should
@@ -433,6 +435,7 @@ Each specification has the form (KEY VALUES)."
     (dolist (scheme '(default path history))
       (should (memq scheme score-schemes)))
     (should (memq t normalization-pairs))
+    (should (memq t non-upper-cases))
     (fzf-native-upstream--assert-pairwise-coverage
      (cl-remove-if
       (lambda (case)
@@ -686,6 +689,43 @@ Each specification has the form (KEY VALUES)."
                         collect
                         (make-fzf-native-differential-candidate
                          :id id :text text :role 'normalization-probe))))
+             (native
+              (fzf-native-upstream--membership
+               (fzf-native-upstream--identities
+                case (fzf-native-upstream--native case))))
+             (upstream
+              (fzf-native-upstream--membership
+               (fzf-native-upstream--identities
+                case (fzf-native-upstream--fzf fzf case) t))))
+        (ert-info ((format "query=%S candidates=%S" rendered-query texts))
+          (should (equal native expected))
+          (should (equal upstream expected)))))))
+
+(ert-deftest fzf-native-fuzz-upstream-v2-folds-only-uppercase-candidates ()
+  "Keep public V2 case-insensitive membership aligned with pinned fzf."
+  (let ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf"))))
+    (skip-unless fzf)
+    (fzf-native-upstream--verify-reference fzf)
+    (dolist (spec '(("ǆ" ("ǅ" "Ǆ" "ǆ") (1 2))
+                    ("ⅰ" ("Ⅰ" "ⅰ") (1))))
+      (let* ((rendered-query (nth 0 spec))
+             (texts (nth 1 spec))
+             (expected (nth 2 spec))
+             (query
+              (make-fzf-native-differential-query
+               :sets nil :case-mode 'ignore :fuzzy t :normalize nil
+               :direction 'auto :forward t :score-scheme 'default))
+             (case
+              (make-fzf-native-differential-case
+               :seed 0 :serial 0 :profile 'parity :query query
+               :rendered-query rendered-query :comparison 'membership
+               :dimensions '(:valid-utf8 t)
+               :candidates
+               (cl-loop for text in texts
+                        for id from 0
+                        collect
+                        (make-fzf-native-differential-candidate
+                         :id id :text text :role 'casefold-probe))))
              (native
               (fzf-native-upstream--membership
                (fzf-native-upstream--identities
