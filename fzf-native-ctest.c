@@ -135,6 +135,96 @@ static void test_candidate_analysis_fuses_nul_and_ascii_checks(void) {
   CHECK(ascii);
 }
 
+static void test_async_candidate_metadata_round_trip(void) {
+  typedef struct {
+    char *str;
+    int score;
+    uint32_t idx;
+    FzfRankKeys rank;
+  } ScoredStrBeforeMetadata;
+  CHECK(sizeof(ScoredStr) == sizeof(ScoredStrBeforeMetadata));
+
+  Arena arena = {0};
+  static const char ascii_text[] = "workspace/src/alpha.c";
+  static const char unicode_text[] = "caf\xc3\xa9";
+  static const char invalid_text[] = {'a', (char)0xff, 'b', '\0'};
+  const struct {
+    const char *text;
+    size_t len;
+    bool ascii;
+  } cases[] = {
+    {ascii_text, sizeof ascii_text - 1, true},
+    {unicode_text, sizeof unicode_text - 1, false},
+    {invalid_text, sizeof invalid_text - 1, false},
+    {"", 0, true},
+  };
+
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    char *stored = arena_strdup(
+        &arena, cases[i].text, cases[i].len, cases[i].ascii);
+    CHECK(stored != NULL);
+    if (!stored) continue;
+    ScoredStr candidate = {
+      .str = stored,
+      .metadata = async_arena_candidate_metadata(stored),
+    };
+    size_t measured_len = SIZE_MAX;
+    bool measured_ascii = !cases[i].ascii;
+    async_candidate_measure(&candidate, &measured_len, &measured_ascii);
+    CHECK(measured_len == cases[i].len);
+    CHECK(measured_ascii == cases[i].ascii);
+  }
+
+  /* Zero metadata remains a safe compatibility path for records assembled
+     outside the session arena. */
+  ScoredStr fallback = {.str = (char *)unicode_text};
+  size_t fallback_len = 0;
+  bool fallback_ascii = true;
+  async_candidate_measure(&fallback, &fallback_len, &fallback_ascii);
+  CHECK(fallback_len == sizeof unicode_text - 1);
+  CHECK(!fallback_ascii);
+
+  /* Exercise both sides of the compact-length sentinel.  Long ASCII lines
+     retain classification while length falls back to strlen; long byte-junk
+     lines safely rederive both values. */
+  const size_t boundary_lengths[] = {
+    ASYNC_CANDIDATE_LENGTH_MASK - 1,
+    ASYNC_CANDIDATE_LENGTH_MASK,
+    ASYNC_CANDIDATE_LENGTH_MASK + 1,
+  };
+  for (size_t i = 0;
+       i < sizeof boundary_lengths / sizeof boundary_lengths[0]; i++) {
+    size_t long_len = boundary_lengths[i];
+    char *long_text = malloc(long_len + 1);
+    CHECK(long_text != NULL);
+    if (!long_text) continue;
+    memset(long_text, 'x', long_len);
+    long_text[long_len] = '\0';
+    for (int ascii_case = 0; ascii_case < 2; ascii_case++) {
+      bool expected_ascii = ascii_case != 0;
+      if (!expected_ascii) long_text[long_len - 1] = (char)0xff;
+      char *stored = arena_strdup(
+          &arena, long_text, long_len, expected_ascii);
+      CHECK(stored != NULL);
+      if (stored) {
+        ScoredStr candidate = {
+          .str = stored,
+          .metadata = async_arena_candidate_metadata(stored),
+        };
+        size_t measured_len = 0;
+        bool measured_ascii = !expected_ascii;
+        async_candidate_measure(
+            &candidate, &measured_len, &measured_ascii);
+        CHECK(measured_len == long_len);
+        CHECK(measured_ascii == expected_ascii);
+      }
+      long_text[long_len - 1] = 'x';
+    }
+    free(long_text);
+  }
+  arena_free(&arena);
+}
+
 static enum emacs_funcall_exit ctest_copy_pending_exit;
 static emacs_value ctest_copy_original;
 static emacs_value ctest_copy_encoded;
@@ -1540,6 +1630,17 @@ static void test_async_line_decoder_matches_one_shot_reference(void) {
         if (actual) {
           CHECK(strlen(actual) == reference_len);
           CHECK(memcmp(actual, reference, reference_len) == 0);
+          ScoredStr candidate = {
+            .str = (char *)actual,
+            .metadata = async_arena_candidate_metadata(actual),
+          };
+          size_t measured_len = SIZE_MAX;
+          bool measured_ascii = false;
+          async_candidate_measure(
+              &candidate, &measured_len, &measured_ascii);
+          CHECK(measured_len == reference_len);
+          CHECK(measured_ascii == is_ascii_utf8proc(
+                                      reference, reference_len));
         }
         expected_count++;
       } else {
@@ -1618,6 +1719,30 @@ static void test_async_line_decoder_truncates_without_splitting_utf8(void) {
   CHECK(async_line_finish(s, &line));
   CHECK(s->count == 1);
   CHECK(strcmp(cands_at(s, 0), "\xe4\xbd\xa0\xe5\xa5\xbd") == 0);
+
+  /* Bytes beyond a negative truncation cap must not make the retained ASCII
+     prefix pessimistically Unicode. */
+  static const unsigned char ascii_then_unicode[] = {
+      'a', 'b', 0xc3, 0xa9,
+  };
+  CHECK(async_line_feed_bytes(
+      s, &line, (const char *)ascii_then_unicode,
+      sizeof ascii_then_unicode));
+  CHECK(async_line_finish(s, &line));
+  CHECK(s->count == 2);
+  const char *truncated = cands_at(s, 1);
+  CHECK(truncated != NULL && strcmp(truncated, "ab") == 0);
+  if (truncated) {
+    ScoredStr candidate = {
+      .str = (char *)truncated,
+      .metadata = async_arena_candidate_metadata(truncated),
+    };
+    size_t measured_len = 0;
+    bool measured_ascii = false;
+    async_candidate_measure(&candidate, &measured_len, &measured_ascii);
+    CHECK(measured_len == 2);
+    CHECK(measured_ascii);
+  }
   free(line.output);
   free_async_session(s);
 }
@@ -4442,6 +4567,7 @@ int main(void) {
   RUN(test_async_snapshot_staleness_covers_pool_growth);
   RUN(test_batch_worker_stops_on_shared_allocation_failure);
   RUN(test_candidate_analysis_fuses_nul_and_ascii_checks);
+  RUN(test_async_candidate_metadata_round_trip);
   RUN(test_copy_emacs_string_fallback_is_bounded);
   RUN(test_score_all_empty_collection_frees_query_bump);
   RUN(test_lossless_string_conversion_preserves_runtime_errors);

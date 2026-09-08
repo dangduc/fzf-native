@@ -2003,15 +2003,41 @@ emacs_value fzf_native_make_slab(emacs_env *env,
 typedef struct ArenaChunk { struct ArenaChunk *next; size_t used; char data[]; } ArenaChunk;
 typedef struct { ArenaChunk *head; } Arena;
 
-static char *arena_strdup(Arena *a, const char *s, size_t len) {
-  size_t need = len + 1;
-  if (!a->head || a->head->used + need > ARENA_CHUNK_SIZE) {
-    size_t chunk_sz = sizeof(ArenaChunk) + (need > ARENA_CHUNK_SIZE ? need : ARENA_CHUNK_SIZE);
+#define ASYNC_CANDIDATE_LENGTH_MASK UINT16_C(0x7fff)
+#define ASYNC_CANDIDATE_ASCII_FLAG UINT16_C(0x8000)
+
+static uint16_t async_candidate_metadata(size_t len, bool ascii) {
+  /* Zero means "measure on demand" for callers that construct ScoredStr
+     values outside the session arena.  Store short lengths plus one. */
+  uint16_t stored_len = len < ASYNC_CANDIDATE_LENGTH_MASK
+                            ? (uint16_t)(len + 1)
+                            : 0;
+  return (uint16_t)(stored_len |
+                    (ascii ? ASYNC_CANDIDATE_ASCII_FLAG : 0));
+}
+
+static uint16_t async_arena_candidate_metadata(const char *str) {
+  uint16_t metadata;
+  memcpy(&metadata, str - sizeof metadata, sizeof metadata);
+  return metadata;
+}
+
+static char *arena_strdup(Arena *a, const char *s, size_t len, bool ascii) {
+  if (len > SIZE_MAX - sizeof(ArenaChunk) - sizeof(uint16_t) - 1)
+    return NULL;
+  size_t need = sizeof(uint16_t) + len + 1;
+  if (!a->head || need > ARENA_CHUNK_SIZE ||
+      a->head->used > ARENA_CHUNK_SIZE - need) {
+    size_t chunk_sz = sizeof(ArenaChunk) +
+                      (need > ARENA_CHUNK_SIZE ? need : ARENA_CHUNK_SIZE);
     ArenaChunk *c = malloc(chunk_sz);
     if (!c) return NULL;
     c->used = 0; c->next = a->head; a->head = c;
   }
-  char *p = a->head->data + a->head->used;
+  char *storage = a->head->data + a->head->used;
+  uint16_t metadata = async_candidate_metadata(len, ascii);
+  memcpy(storage, &metadata, sizeof metadata);
+  char *p = storage + sizeof metadata;
   memcpy(p, s, len + 1);
   a->head->used += need;
   return p;
@@ -2049,7 +2075,25 @@ typedef struct {
   int score;
   uint32_t idx;
   FzfRankKeys rank;
+  /* Session-arena byte length and ASCII state in the tail padding that this
+     record already had on supported ABIs.  Zero remains a safe fallback for
+     test and compatibility records built outside the arena. */
+  uint16_t metadata;
 } ScoredStr;
+
+static void async_candidate_measure(const ScoredStr *candidate, size_t *len,
+                                    bool *ascii) {
+  uint16_t stored_len =
+      candidate->metadata & ASYNC_CANDIDATE_LENGTH_MASK;
+  *len = stored_len ? (size_t)stored_len - 1 : strlen(candidate->str);
+  if (candidate->metadata & ASYNC_CANDIDATE_ASCII_FLAG) {
+    *ascii = true;
+  } else if (stored_len) {
+    *ascii = false;
+  } else {
+    *ascii = is_ascii_utf8proc(candidate->str, *len);
+  }
+}
 
 /* Reference-counted immutable index array.  Allocated once by the scoring
    thread on cache_insert, retained in O(1) (atomic refcount bump under the
@@ -4144,8 +4188,8 @@ static void async_publish_stop(AsyncSession *s) {
    top-level block pointer before taking MU is safe.  Keeping this operation
    separate from getline lets the native interactive fuzzer drive the real
    growth path without an Emacs process or a shell child. */
-static bool async_append_candidate(AsyncSession *s, const char *line,
-                                   size_t len) {
+static bool async_append_candidate_preclassified(
+    AsyncSession *s, const char *line, size_t len, bool ascii) {
   if (atomic_load_explicit(&s->stop, memory_order_acquire)) return false;
   size_t i  = s->count;
   size_t hi = i >> CANDS_BLOCK_SHIFT;
@@ -4160,7 +4204,7 @@ static bool async_append_candidate(AsyncSession *s, const char *line,
     return false;
   }
 
-  char *dup = arena_strdup(&s->arena, line, len);
+  char *dup = arena_strdup(&s->arena, line, len, ascii);
   if (!dup) {
     async_record_producer_failure(
         s, AsyncProducerErrorAllocation, ENOMEM);
@@ -4196,6 +4240,15 @@ static bool async_append_candidate(AsyncSession *s, const char *line,
   atomic_fetch_add_explicit(&s->gen, 1, memory_order_relaxed);
   async_notify_candidate_growth(s);
   return true;
+}
+
+/* Test and embedding callers do not necessarily use the incremental reader,
+   so retain the original self-classifying helper for them. */
+static bool async_append_candidate(AsyncSession *s, const char *line,
+                                   size_t len) {
+  if (atomic_load_explicit(&s->stop, memory_order_acquire)) return false;
+  return async_append_candidate_preclassified(
+      s, line, len, is_ascii_utf8proc(line, len));
 }
 
 enum AsyncAnsiState {
@@ -4234,6 +4287,7 @@ typedef struct {
   enum AsyncAnsiState ansi_state;
   bool                over_limit;
   bool                saw_bytes;
+  bool                output_has_non_ascii;
 } AsyncLineDecoder;
 
 static size_t async_line_limit(ptrdiff_t configured) {
@@ -4307,6 +4361,7 @@ static bool async_line_commit_character(AsyncSession *s,
     }
     line->char_count++;
   }
+  if (bytes[0] & 0x80) line->output_has_non_ascii = true;
   return async_line_append_output(s, line, bytes, width);
 }
 
@@ -4320,8 +4375,10 @@ static unsigned async_utf8_expected_width(unsigned char byte) {
 static bool async_line_emit_visible_byte(AsyncSession *s,
                                          AsyncLineDecoder *line,
                                          unsigned char byte) {
-  if (s->max_line_length == 0)
+  if (s->max_line_length == 0) {
+    if (byte & 0x80) line->output_has_non_ascii = true;
     return async_line_append_output(s, line, &byte, 1);
+  }
 
   size_t cap = async_line_limit(s->max_line_length);
   if ((s->max_line_length > 0 && line->over_limit) ||
@@ -4473,6 +4530,7 @@ static bool async_line_emit_visible_run(AsyncSession *s,
         bytes + offset, (utf8proc_ssize_t)(amount - offset), &codepoint);
     offset += width > 0 ? (size_t)width : 1;
     line->char_count++;
+    line->output_has_non_ascii = true;
     retained_end = offset;
   }
 
@@ -4508,12 +4566,17 @@ static bool async_line_feed_bytes(AsyncSession *s, AsyncLineDecoder *line,
 
     if (line->ansi_state == AsyncAnsiNormal && line->pending_crs == 0) {
       size_t start = offset;
+      bool retain_all = s->max_line_length == 0;
+      unsigned char visible_bits = 0;
       while (offset < amount) {
         unsigned char byte = (unsigned char)bytes[offset];
         if (byte == '\0' || byte == '\r' || byte == 0x1b)
           break;
+        visible_bits |= byte;
         offset++;
       }
+      if (retain_all && (visible_bits & 0x80))
+        line->output_has_non_ascii = true;
       if (offset > start &&
           !async_line_emit_visible_run(
               s, line, (const unsigned char *)bytes + start,
@@ -4555,6 +4618,7 @@ static void async_line_reset(AsyncLineDecoder *line) {
   line->ansi_state = AsyncAnsiNormal;
   line->over_limit = false;
   line->saw_bytes = false;
+  line->output_has_non_ascii = false;
   if (line->output) line->output[0] = '\0';
 }
 
@@ -4574,7 +4638,9 @@ static bool async_line_finish(AsyncSession *s, AsyncLineDecoder *line) {
   if (publish) {
     if (!async_line_reserve(s, line, 0)) return false;
     line->output[line->output_len] = '\0';
-    ok = async_append_candidate(s, line->output, line->output_len);
+    ok = async_append_candidate_preclassified(
+        s, line->output, line->output_len,
+        !line->output_has_non_ascii);
   }
   async_line_reset(line);
   return ok;
@@ -6023,16 +6089,19 @@ static void async_score_batches(struct AsyncScoringShared *shared,
       FzfRankKeys rank = {0};
       if (!pattern) {
         sc = 1;                  /* empty filter: keep everything */
-      } else if (filter_only) {
-        sc = fzf_has_match(batch->xs[i].str, pattern, slab) ? 1 : 0;
       } else {
-        text_len = strlen(batch->xs[i].str);
-        input_is_ascii = is_ascii_utf8proc(
-            batch->xs[i].str, text_len);
-        sc = fzf_score_and_rank(
-            batch->xs[i].str, text_len, input_is_ascii,
-            pattern, slab, shared->score_scheme,
-            can_reuse_public_score, &rank);
+        async_candidate_measure(
+            &batch->xs[i], &text_len, &input_is_ascii);
+        sc = filter_only
+                 ? (fzf_has_match_bytes_preclassified(
+                        batch->xs[i].str, text_len, input_is_ascii,
+                        pattern, slab)
+                        ? 1
+                        : 0)
+                 : fzf_score_and_rank(
+                       batch->xs[i].str, text_len, input_is_ascii,
+                       pattern, slab, shared->score_scheme,
+                       can_reuse_public_score, &rank);
       }
       if (fzf_allocation_failed()) {
         atomic_store_explicit(&shared->allocation_failed, true,
@@ -6716,6 +6785,8 @@ static void *scoring_thread_fn(void *arg) {
           batch->xs[local_i].str =
               s->cands_top[global_i >> CANDS_BLOCK_SHIFT]
                           [global_i & CANDS_BLOCK_MASK];
+          batch->xs[local_i].metadata = async_arena_candidate_metadata(
+              batch->xs[local_i].str);
           batch->xs[local_i].score = 0;
           batch->xs[local_i].idx = (uint32_t)global_i;
         }
@@ -7023,8 +7094,9 @@ static void *scoring_thread_fn(void *arg) {
           rank_aborted = true;
           break;
         }
-        size_t text_len = strlen(flat[i].str);
-        bool input_is_ascii = is_ascii_utf8proc(flat[i].str, text_len);
+        size_t text_len;
+        bool input_is_ascii;
+        async_candidate_measure(&flat[i], &text_len, &input_is_ascii);
         flat[i].score = fzf_score_and_rank(
             flat[i].str, text_len, input_is_ascii, pattern, rank_slab,
             score_scheme, can_reuse_public_score, &flat[i].rank);
