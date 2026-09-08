@@ -91,6 +91,69 @@ static void test_fuzzy_pattern_longer_than_text(void) {
                   CaseIgnore, true, false);
 }
 
+static void check_single_byte_v2(const char *text, size_t text_size,
+                                 char pattern_byte, bool case_sensitive,
+                                 bool normalize, bool forward,
+                                 int32_t expected_start, int32_t expected_end,
+                                 int32_t expected_score,
+                                 int32_t expected_position) {
+  for (int use_slab = 0; use_slab < 2; use_slab++) {
+    fzf_string_t candidate = {.data = text, .size = text_size};
+    fzf_string_t pattern = {.data = &pattern_byte, .size = 1};
+    fzf_position_t positions = {0};
+    fzf_slab_t *slab = use_slab ? fzf_make_default_slab() : NULL;
+    CHECK(!use_slab || slab != NULL);
+    if (use_slab && !slab) continue;
+
+    fzf_clear_allocation_failure();
+    fzf_result_t result = fzf_fuzzy_match_v2_with_direction(
+        case_sensitive, normalize, forward, &candidate, &pattern, &positions,
+        slab);
+    CHECK(!fzf_allocation_failed());
+    CHECK(result.start == expected_start);
+    CHECK(result.end == expected_end);
+    CHECK(result.score == expected_score);
+    CHECK(positions.size == (expected_position >= 0 ? 1u : 0u));
+    if (expected_position >= 0 && positions.size == 1)
+      CHECK(positions.data[0] == (uint32_t)expected_position);
+
+    free(positions.data);
+    fzf_free_slab(slab);
+  }
+}
+
+static void test_ascii_v2_single_byte_path(void) {
+  static const char embedded_nul[] = {'x', '\0', 'b', 'x'};
+  static const char malformed[] = {'x', (char)0xe9, 'x'};
+
+  check_single_byte_v2("a", 1, 'a', true, false, true,
+                       0, 1, 36, 0);
+  check_single_byte_v2("A", 1, 'a', false, false, true,
+                       0, 1, 36, 0);
+  check_single_byte_v2("A", 1, 'a', true, false, true,
+                       -1, -1, 0, -1);
+  check_single_byte_v2("b", 1, 'a', false, false, true,
+                       -1, -1, 0, -1);
+  check_single_byte_v2("A", 1, 'a', false, true, false,
+                       0, 1, 36, 0);
+  check_single_byte_v2("zAxaZ", 5, 'a', false, false, true,
+                       1, 2, 30, 1);
+  check_single_byte_v2("zAxaZ", 5, 'a', true, false, true,
+                       3, 4, 16, 3);
+  check_single_byte_v2("/a/a/", 5, 'a', true, false, true,
+                       1, 2, 34, 1);
+  check_single_byte_v2("/a/a/", 5, 'a', true, false, false,
+                       3, 4, 34, 3);
+  check_single_byte_v2("/e-e", 4, 'e', true, true, true,
+                       1, 2, 34, 1);
+  check_single_byte_v2(embedded_nul, sizeof embedded_nul, 'b', true, false,
+                       true, 2, 3, 32, 2);
+  check_single_byte_v2(malformed, sizeof malformed, (char)0xe9, true, false,
+                       true, 1, 2, 32, 1);
+  check_single_byte_v2("xxxx", 4, 'b', false, true, false,
+                       -1, -1, 0, -1);
+}
+
 static void test_exact_match(void) {
   check_agreement("exact 'pat", "foobarbaz", "'bar",
                   CaseIgnore, true, true);
@@ -365,6 +428,60 @@ static void test_utf8_v1_reverse_scan_tightens_match(void) {
   free(dup);
 }
 
+static void test_utf8_default_slab_v1_fallback_matches_direct_v1(void) {
+  enum { candidate_codepoints = 4096, query_codepoints = 26 };
+  const size_t filler_codepoints = candidate_codepoints - query_codepoints;
+  const size_t candidate_bytes = filler_codepoints * 3 + query_codepoints;
+  char *candidate = malloc(candidate_bytes + 1);
+  CHECK(candidate != NULL);
+  if (!candidate) return;
+
+  size_t offset = 0;
+  for (size_t i = 0; i < filler_codepoints; i++) {
+    memcpy(candidate + offset, "\xE4\xB8\x80", 3);
+    offset += 3;
+  }
+  memcpy(candidate + offset, "abcdefghijklmnopqrstuvwxyz", query_codepoints);
+  candidate[candidate_bytes] = '\0';
+
+  fzf_string_t text = {.data = candidate, .size = candidate_bytes};
+  fzf_string_t pattern = {.data = "abcdefghijklmnopqrstuvwxyz",
+                          .size = query_codepoints};
+  fzf_slab_t *v2_slab = fzf_make_default_slab();
+  fzf_slab_t *v1_slab = fzf_make_default_slab();
+  CHECK(v2_slab != NULL && v1_slab != NULL);
+  if (!v2_slab || !v1_slab) goto cleanup;
+  CHECK(candidate_codepoints * query_codepoints > v2_slab->I16.cap);
+
+  fzf_position_t v2_positions = {0};
+  fzf_position_t v1_positions = {0};
+  fzf_clear_allocation_failure();
+  fzf_result_t fallback = fzf_fuzzy_match_v2_utf8(
+      true, false, &text, &pattern, &v2_positions, v2_slab);
+  bool fallback_oom = fzf_allocation_failed();
+  fzf_clear_allocation_failure();
+  fzf_result_t direct = fzf_fuzzy_match_v1_utf8(
+      true, false, &text, &pattern, &v1_positions, v1_slab);
+  bool direct_oom = fzf_allocation_failed();
+
+  CHECK(!fallback_oom && !direct_oom);
+  CHECK(fallback.start == direct.start);
+  CHECK(fallback.end == direct.end);
+  CHECK(fallback.score == direct.score);
+  CHECK(v2_positions.size == v1_positions.size);
+  if (v2_positions.size == v1_positions.size) {
+    for (size_t i = 0; i < v2_positions.size; i++)
+      CHECK(v2_positions.data[i] == v1_positions.data[i]);
+  }
+  free(v2_positions.data);
+  free(v1_positions.data);
+
+cleanup:
+  fzf_free_slab(v2_slab);
+  fzf_free_slab(v1_slab);
+  free(candidate);
+}
+
 static void test_case_ignore(void) {
   check_agreement("case-ignore matches", "SrcFooBar", "srcfoo",
                   CaseIgnore, true, true);
@@ -550,6 +667,121 @@ static void test_invalid_utf8_fuzzy_fallback_returns_positions(void) {
   fzf_free_pattern(pattern);
 }
 
+static void check_score_positions_equivalence(const char *label,
+                                              const char *text,
+                                              const char *query,
+                                              fzf_case_types case_mode,
+                                              bool fuzzy,
+                                              bool normalize,
+                                              fzf_slab_config_t config,
+                                              fzf_score_scheme_t scheme) {
+  char *query_copy = strdup(query);
+  fzf_pattern_t *pattern =
+      fzf_parse_pattern(case_mode, normalize, query_copy, fuzzy);
+  fzf_slab_t *legacy_slab = fzf_make_slab(config);
+  fzf_slab_t *combined_slab = fzf_make_slab(config);
+  CHECK(pattern != NULL);
+  CHECK(legacy_slab != NULL);
+  CHECK(combined_slab != NULL);
+  if (pattern && legacy_slab && combined_slab) {
+    CHECK(fzf_slab_set_score_scheme(legacy_slab, scheme));
+    CHECK(fzf_slab_set_score_scheme(combined_slab, scheme));
+    int32_t legacy_score = fzf_get_score(text, pattern, legacy_slab);
+    fzf_position_t *legacy_positions =
+        fzf_get_positions(text, pattern, legacy_slab);
+    fzf_position_t *combined_positions = (fzf_position_t *)(uintptr_t)1;
+    int32_t combined_score = fzf_get_score_positions(
+        text, pattern, combined_slab, &combined_positions);
+    if (legacy_score != combined_score) {
+      fprintf(stderr, "FAIL %s: score %d != %d\n", label,
+              legacy_score, combined_score);
+      failed++;
+    }
+    if (!!legacy_positions != !!combined_positions) {
+      fprintf(stderr, "FAIL %s: position presence differs\n", label);
+      failed++;
+    } else if (legacy_positions && combined_positions) {
+      if (legacy_positions->size != combined_positions->size) {
+        fprintf(stderr, "FAIL %s: position count %zu != %zu\n", label,
+                legacy_positions->size, combined_positions->size);
+        failed++;
+      } else if (legacy_positions->size > 0 &&
+                 memcmp(legacy_positions->data, combined_positions->data,
+                        legacy_positions->size * sizeof(uint32_t)) != 0) {
+        fprintf(stderr, "FAIL %s: position values differ\n", label);
+        failed++;
+      }
+    }
+    CHECK(fzf_get_score_positions(
+              text, pattern, combined_slab, NULL) == legacy_score);
+    fzf_free_positions(combined_positions);
+    fzf_free_positions(legacy_positions);
+  }
+  fzf_free_slab(combined_slab);
+  fzf_free_slab(legacy_slab);
+  fzf_free_pattern(pattern);
+  free(query_copy);
+}
+
+static void test_combined_score_positions_matches_legacy_calls(void) {
+  const fzf_slab_config_t normal = {100000, 2048};
+  const fzf_slab_config_t tiny = {1, 1};
+  check_score_positions_equivalence(
+      "ASCII fuzzy", "src/emacs-module.c", "emc", CaseIgnore, true, false,
+      normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "ASCII miss", "src/emacs-module.c", "xyz", CaseIgnore, true, false,
+      normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "empty query", "src/emacs-module.c", "", CaseIgnore, true, false,
+      normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "extended", "src/foo/emacs-module.c", "foo | bar !test .c$",
+      CaseIgnore, true, false, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "inverse-only keep", "src/emacs-module.c", "!test",
+      CaseIgnore, true, false, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "inverse-only reject", "src/emacs-test.c", "!test",
+      CaseIgnore, true, false, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "UTF-8 fuzzy", "路径/组件-123", "组件", CaseSmart, true, false,
+      normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "UTF-8 case fold", "CAFÉ", "café", CaseIgnore, true, false, normal,
+      FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "invalid UTF-8", "ca\xe9zzQR", "QR$", CaseRespect, true, false,
+      normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "v1 fallback", "a----------------b", "ab", CaseRespect, true, false,
+      tiny, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "default suffix", "src/foo/fzf  ", "fzf$", CaseRespect, true, false,
+      normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "UTF-8 suffix", "σa你 \xe2\x80\x83", "你$", CaseRespect, true,
+      false, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "path scheme", ":fzf", "fzf", CaseRespect, true, false, normal,
+      FZF_SCORE_SCHEME_PATH);
+  check_score_positions_equivalence(
+      "history scheme", " fzf", "fzf", CaseRespect, true, false, normal,
+      FZF_SCORE_SCHEME_HISTORY);
+  check_score_positions_equivalence(
+      "normalized single term", "src/café.c", "cafe", CaseRespect, true,
+      true, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "normalized compound", "src/café/module.c", "cafe module",
+      CaseRespect, true, true, normal, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "normalized v1 fallback", "x----café", "cafe", CaseRespect, true,
+      true, tiny, FZF_SCORE_SCHEME_DEFAULT);
+  check_score_positions_equivalence(
+      "accented query stays directional", "src/cafe.c", "café",
+      CaseRespect, true, true, normal, FZF_SCORE_SCHEME_DEFAULT);
+}
+
 static void test_slab_allocation_failure_is_reported(void) {
   fzf_slab_t *slab =
       fzf_make_slab((fzf_slab_config_t){SIZE_MAX, SIZE_MAX});
@@ -558,6 +790,32 @@ static void test_slab_allocation_failure_is_reported(void) {
 }
 
 static void test_utf8_char_map_scratch_reuse_and_cap(void) {
+  /* The fused fuzzy-v2 path supplies a count from its subsequence scan.  Its
+     counted builder must produce exactly the legacy map, including malformed
+     bytes handled by the surrogate-escape policy. */
+  const char mixed[] = {'a', (char)0xE4, (char)0xBD, (char)0xA0,
+                        (char)0xFF, 'z'};
+  utf8_char_map_scratch_t reference_scratch = {0};
+  utf8_char_map_scratch_t counted_scratch = {0};
+  utf8_char_map_t *reference = utf8_build_char_map(
+      mixed, sizeof mixed, &reference_scratch);
+  utf8_char_map_t *counted = utf8_build_char_map_counted(
+      mixed, sizeof mixed, 4, &counted_scratch);
+  CHECK(reference != NULL);
+  CHECK(counted != NULL);
+  if (reference && counted) {
+    CHECK(reference->char_count == counted->char_count);
+    CHECK(reference->byte_count == counted->byte_count);
+    for (size_t i = 0; i <= sizeof mixed; i++)
+      CHECK(reference->byte_to_char[i] == counted->byte_to_char[i]);
+  }
+  CHECK(utf8_build_char_map_counted(
+            mixed, sizeof mixed, sizeof mixed + 1, NULL) == NULL);
+  CHECK(utf8_build_char_map_counted(
+            mixed, sizeof mixed, 3, NULL) == NULL);
+  free(reference_scratch.map.byte_to_char);
+  free(counted_scratch.map.byte_to_char);
+
   utf8_char_map_scratch_t scratch = {0};
   const char small[] = "a\xE4\xBD\xA0z";
   utf8_char_map_t *first = utf8_build_char_map(
@@ -814,6 +1072,54 @@ static void test_pinned_fzf_latin_normalization(void) {
   fzf_free_pattern(uppercase);
 }
 
+static void test_normalized_utf8_prefilter(void) {
+  fzf_slab_t *slab = fzf_make_default_slab();
+  fzf_position_t *positions = fzf_pos_array(0);
+  CHECK(slab != NULL);
+  CHECK(positions != NULL);
+  if (!slab || !positions) goto done;
+
+  fzf_string_t miss_text = {.data = "cafzzzz", .size = 7};
+  fzf_string_t miss_pattern = {.data = "cafe", .size = 4};
+  fzf_result_t miss = fzf_fuzzy_match_v2_utf8(
+      true, true, &miss_text, &miss_pattern, positions, slab);
+  CHECK(miss.start < 0);
+  CHECK(slab->UTF8.map.byte_to_char == NULL);
+  CHECK(slab->UTF8.byte_slot_capacity == 0);
+
+  fzf_string_t hit_text = {
+      .data = "xxcaf\xC3\xA9yy",
+      .size = sizeof "xxcaf\xC3\xA9yy" - 1,
+  };
+  fzf_string_t hit_pattern = {.data = "cafe", .size = 4};
+  fzf_result_t hit = fzf_fuzzy_match_v2_utf8(
+      true, true, &hit_text, &hit_pattern, positions, slab);
+  CHECK(hit.start == 2);
+  CHECK(hit.end == 6);
+  CHECK(hit.score > 0);
+  CHECK(positions->size == 4);
+
+  utf8proc_int32_t cached_accent = 0x00e9;
+  fzf_string_t cached_pattern = {
+      .data = "\xC3\xA9",
+      .size = 2,
+      .codepoints = &cached_accent,
+      .codepoint_count = 1,
+      .codepoints_case_folded = false,
+  };
+  fzf_string_t ascii_text = {.data = "e", .size = 1};
+  positions->size = 0;
+  fzf_result_t cached = fzf_fuzzy_match_v2_utf8(
+      true, true, &ascii_text, &cached_pattern, positions, slab);
+  CHECK(cached.start == 0);
+  CHECK(cached.end == 1);
+  CHECK(cached.score > 0);
+
+done:
+  fzf_free_positions(positions);
+  fzf_free_slab(slab);
+}
+
 static void test_pinned_fzf_backward_direction(void) {
   fzf_string_t ascii_text = {.data = "ab/ab", .size = 5};
   fzf_string_t ascii_v2_text = {.data = "-ab-ab-", .size = 7};
@@ -929,6 +1235,7 @@ int main(void) {
   RUN(test_fuzzy_basic_no_match);
   RUN(test_fuzzy_empty_pattern);
   RUN(test_fuzzy_pattern_longer_than_text);
+  RUN(test_ascii_v2_single_byte_path);
   RUN(test_exact_match);
   RUN(test_exact_no_match);
   RUN(test_pinned_fzf_exact_boundary);
@@ -949,6 +1256,7 @@ int main(void) {
   RUN(test_small_slab_long_gap_preserves_match);
   RUN(test_small_slab_inverse_long_gap_preserves_membership);
   RUN(test_utf8_v1_reverse_scan_tightens_match);
+  RUN(test_utf8_default_slab_v1_fallback_matches_direct_v1);
   RUN(test_case_ignore);
   RUN(test_case_respect_matches_when_case_aligns);
   RUN(test_case_respect_no_match_when_case_differs);
@@ -961,12 +1269,14 @@ int main(void) {
   RUN(test_bounded_entry_points_need_no_terminator);
   RUN(test_invalid_utf8_exact_is_lossless);
   RUN(test_invalid_utf8_fuzzy_fallback_returns_positions);
+  RUN(test_combined_score_positions_matches_legacy_calls);
   RUN(test_slab_allocation_failure_is_reported);
   RUN(test_utf8_char_map_scratch_reuse_and_cap);
   RUN(test_default_score_distinguishes_boundaries);
   RUN(test_score_schemes_are_slab_local);
   RUN(test_utf8_empty_suffix_trims_trailing_whitespace);
   RUN(test_pinned_fzf_latin_normalization);
+  RUN(test_normalized_utf8_prefilter);
   RUN(test_pinned_fzf_backward_direction);
 
   if (failed == 0) {

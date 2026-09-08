@@ -110,7 +110,38 @@ emacs-asan:
 # Includes fzf-native-module.c directly so static functions are visible.
 # No Emacs runtime needed; runs as a plain executable.
 .PHONY: ctest
-ctest: ctest-module ctest-additions ctest-parser-oom ctest-scorer-oom
+ctest: ctest-module ctest-additions ctest-parser-oom ctest-scorer-oom \
+	ctest-session-growth-benchmark ctest-core-hotpath-oracle
+
+# Prove that the core-hotpath benchmark validates exact per-item scores before
+# it starts timing.  The injected scorer fault must be rejected by the pinned
+# fingerprints rather than producing a plausible-looking timing result.
+.PHONY: ctest-core-hotpath-oracle
+ctest-core-hotpath-oracle:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 \
+		-I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/core-hotpath-oracle \
+		benchmarks/core-hotpath-probe.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/core-hotpath-oracle
+	$(CC) -std=gnu11 -Wall -Wextra -O2 \
+		-DFZF_CORE_HOTPATH_FAULT_SCORE \
+		-I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/core-hotpath-oracle-fault \
+		benchmarks/core-hotpath-probe.c fzf.c $(UTF8PROC_SRC)
+	@set +e; \
+		$(BUILD_DIR)/core-hotpath-oracle-fault \
+			>$(BUILD_DIR)/core-hotpath-oracle-fault.log 2>&1; \
+		rc=$$?; \
+		if [ $$rc -ne 1 ] || \
+		   ! grep -q "core-hotpath fingerprint mismatch" \
+			$(BUILD_DIR)/core-hotpath-oracle-fault.log; then \
+			cat $(BUILD_DIR)/core-hotpath-oracle-fault.log; \
+			echo "core-hotpath benchmark oracle did not reject score fault"; \
+			exit 1; \
+		fi; \
+		cat $(BUILD_DIR)/core-hotpath-oracle-fault.log; \
+		echo "core-hotpath benchmark oracle rejected score fault"
 
 # Module-internal tests (counting sort, cache, async_reader, etc.).
 # Links fzf-additions.c because fzf-native-module.c now references
@@ -151,6 +182,16 @@ ctest-scorer-oom:
 		-o $(BUILD_DIR)/fzf-scorer-oom-ctest fzf-scorer-oom-ctest.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-scorer-oom-ctest
 
+# Keep the benchmark's full-scan oracle honest with candidates whose producer
+# order differs from their final fzf rank order.
+.PHONY: ctest-session-growth-benchmark
+ctest-session-growth-benchmark:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/session-growth-benchmark-ctest \
+		etc/session-growth-benchmark-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/session-growth-benchmark-ctest
+
 # AddressSanitizer + UndefinedBehaviorSanitizer run of the C unit tests.
 # Builds both suites with the sanitizers enabled into distinctly-named
 # binaries (-asan suffix) so they never clobber the plain `ctest` ones,
@@ -181,6 +222,11 @@ ctest-asan:
 		-I. -I$(UTF8PROC_DIR) \
 		-o $(BUILD_DIR)/fzf-scorer-oom-ctest-asan fzf-scorer-oom-ctest.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-scorer-oom-ctest-asan
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/session-growth-benchmark-ctest-asan \
+		etc/session-growth-benchmark-test.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/session-growth-benchmark-ctest-asan
 
 .PHONY: clean
 clean:
@@ -196,6 +242,57 @@ benchmark-batch-cache-history:
 	FZF_NATIVE_SOURCE_DIR=$(CURDIR) \
 		FZF_NATIVE_TEST_MODULE=$(abspath $(BUILD_DIR)/bench-module/fzf-native-module.so) \
 		$(EMACS) -Q --batch -l etc/batch-cache-query-history-benchmark.el
+
+# Short, deterministic A/B probe for the legacy score+positions pair versus
+# the combined one-pass API.  Increase the two arguments for steadier local
+# measurements; defaults intentionally stay suitable for developer loops.
+BENCH_SCORE_POSITIONS_ROUNDS ?= 4000
+BENCH_SCORE_POSITIONS_SAMPLES ?= 9
+.PHONY: benchmark-score-positions
+benchmark-score-positions:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -O3 -DNDEBUG -I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/score-positions-benchmark \
+		etc/score-positions-benchmark.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/score-positions-benchmark \
+		$(BENCH_SCORE_POSITIONS_ROUNDS) $(BENCH_SCORE_POSITIONS_SAMPLES)
+
+# Short synthetic probe for the core matcher paths used by the Chromium,
+# Arabic, and Korean holdouts, plus first-byte ASCII hits and UTF-8 inputs that
+# exceed the v2 slab.  This isolates scoring and prints provisional timings;
+# it is not a replacement for the real-data benchmark.
+.PHONY: benchmark-core-hotpath-probe
+benchmark-core-hotpath-probe:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -O3 -DNDEBUG -I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/core-hotpath-probe \
+		benchmarks/core-hotpath-probe.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/core-hotpath-probe
+
+# Real persistent-session growth probe.  Timings include producer appends,
+# growth notification, coordinator work, shared workers, cache update, and
+# result publication.  Full-scan validation runs after all timed rounds.
+SESSION_GROWTH_INITIAL ?= 1000000
+SESSION_GROWTH_DELTA ?= 1000
+# Exercise enough growth epochs to include bounded-chain flatten tail latency.
+SESSION_GROWTH_ROUNDS ?= 40
+SESSION_GROWTH_WORKERS ?= 8
+SESSION_GROWTH_LIMIT ?= 10000
+SESSION_GROWTH_BENCH := $(BUILD_DIR)/session-growth-benchmark
+
+.PHONY: benchmark-session-growth-build benchmark-session-growth
+benchmark-session-growth-build:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O3 -DNDEBUG \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(SESSION_GROWTH_BENCH) etc/session-growth-benchmark.c \
+		fzf.c fzf-additions.c $(UTF8PROC_SRC)
+
+benchmark-session-growth: benchmark-session-growth-build
+	$(SESSION_GROWTH_BENCH) \
+		$(SESSION_GROWTH_INITIAL) $(SESSION_GROWTH_DELTA) \
+		$(SESSION_GROWTH_ROUNDS) $(SESSION_GROWTH_WORKERS) \
+		$(SESSION_GROWTH_LIMIT)
 
 # Coverage-guided and differential test targets live in a separate include so
 # they do not alter the release build or the public module ABI.

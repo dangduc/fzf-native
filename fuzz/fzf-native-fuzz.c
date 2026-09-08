@@ -47,7 +47,19 @@ static fzf_slab_t *make_selected_slab(uint8_t options) {
   static const size_t caps16[] = {1, 8, 64, 1024, 8192, 100 * 1024};
   static const size_t caps32[] = {1, 8, 64, 256, 1024, 2048};
   size_t which = (options >> 3) % (sizeof(caps16) / sizeof(caps16[0]));
-  return fzf_make_slab((fzf_slab_config_t){caps16[which], caps32[which]});
+  fzf_slab_t *slab =
+      fzf_make_slab((fzf_slab_config_t){caps16[which], caps32[which]});
+  fzf_score_scheme_t scheme = (fzf_score_scheme_t)((options >> 6) % 3);
+  if (slab && !fzf_slab_set_score_scheme(slab, scheme)) abort();
+  return slab;
+}
+
+static fzf_slab_t *copy_slab_policy(const fzf_slab_t *source) {
+  if (!source) return NULL;
+  fzf_slab_t *copy = fzf_make_slab(
+      (fzf_slab_config_t){source->I16.cap, source->I32.cap});
+  if (!copy || !fzf_slab_set_score_scheme(copy, source->score_scheme)) abort();
+  return copy;
 }
 
 static void check_positions(const char *candidate, bool matched,
@@ -76,6 +88,55 @@ static void check_position_order(const fzf_position_t *positions) {
         ((positions->data[i] > positions->data[i - 1]) != increasing))
       fuzz_fail("unordered highlight positions");
   }
+}
+
+static void check_combined_score_positions(const char *candidate,
+                                           fzf_pattern_t *pattern,
+                                           const fzf_slab_t *policy) {
+  fzf_slab_t *separate_slab = copy_slab_policy(policy);
+  fzf_slab_t *combined_slab = copy_slab_policy(policy);
+
+  int32_t separate_score = fzf_get_score(candidate, pattern, separate_slab);
+  bool score_oom = fzf_allocation_failed();
+  fzf_position_t *separate_positions =
+      fzf_get_positions(candidate, pattern, separate_slab);
+  bool positions_oom = fzf_allocation_failed();
+
+  fzf_position_t *combined_positions = (fzf_position_t *)(uintptr_t)1;
+  int32_t combined_score = fzf_get_score_positions(
+      candidate, pattern, combined_slab, &combined_positions);
+  bool combined_oom = fzf_allocation_failed();
+
+  if ((score_oom && separate_score != 0) ||
+      (positions_oom && separate_positions != NULL) ||
+      (combined_oom && (combined_score != 0 || combined_positions != NULL)))
+    fuzz_fail("an allocation failure returned a partial score/position result");
+
+  /* The combined path can allocate differently from the two-call path.  An
+     actual allocator failure therefore has no cross-path result oracle. */
+  if (!score_oom && !positions_oom && !combined_oom) {
+    if (combined_score != separate_score)
+      fuzz_fail("combined and separate score results differ");
+    if (!!combined_positions != !!separate_positions)
+      fuzz_fail("combined and separate position presence differs");
+    if (combined_positions &&
+        (combined_positions->size != separate_positions->size ||
+         (combined_positions->size > 0 &&
+          memcmp(combined_positions->data, separate_positions->data,
+                 combined_positions->size * sizeof *combined_positions->data))))
+      fuzz_fail("combined and separate position results differ");
+    check_positions(candidate, separate_score > 0, separate_positions);
+    check_positions(candidate, combined_score > 0, combined_positions);
+    if (pattern->size == 1 && pattern->ptr[0]->size == 1) {
+      check_position_order(separate_positions);
+      check_position_order(combined_positions);
+    }
+  }
+
+  fzf_free_positions(combined_positions);
+  fzf_free_positions(separate_positions);
+  fzf_free_slab(combined_slab);
+  fzf_free_slab(separate_slab);
 }
 
 static fzf_algo_t utf8_variant(fzf_algo_t algorithm) {
@@ -664,6 +725,12 @@ static void run_one(const uint8_t *data, size_t size) {
   bool fuzzy = (options & 4) != 0;
   fzf_pattern_t *pattern =
       fzf_parse_pattern(case_mode, false, query, fuzzy);
+  char *combined_query = malloc(query_size + 1);
+  if (!combined_query) abort();
+  memcpy(combined_query, payload, query_size);
+  combined_query[query_size] = '\0';
+  fzf_pattern_t *combined_pattern = fzf_parse_pattern(
+      case_mode, (options & 0x10) != 0, combined_query, fuzzy);
   /* main currently underflows in suffix_match when a mutated suffix pattern
      is longer than its candidate.  The additive fuzz layer records but does
      not alter that pre-existing behavior; the stacked matcher fix advertises
@@ -678,7 +745,7 @@ static void run_one(const uint8_t *data, size_t size) {
 #endif
   fzf_slab_t *default_slab = fzf_make_default_slab();
   fzf_slab_t *selected_slab = make_selected_slab(options);
-  if (!pattern || !default_slab || !selected_slab)
+  if (!pattern || !combined_pattern || !default_slab || !selected_slab)
     abort();
 
   int32_t score = fzf_get_score(candidate, pattern, default_slab);
@@ -714,6 +781,13 @@ static void run_one(const uint8_t *data, size_t size) {
   check_positions(candidate, selected_score > 0, positions);
   fzf_free_positions(positions);
 
+  /* Exercise configured slab paths and the NULL-slab v1 fallback.  The
+     variant pattern also covers normalization without changing the older
+     metamorphic relations above. */
+  check_combined_score_positions(candidate, combined_pattern, default_slab);
+  check_combined_score_positions(candidate, combined_pattern, selected_slab);
+  check_combined_score_positions(candidate, combined_pattern, NULL);
+
   check_case_monotonicity(candidate, query, fuzzy, default_slab);
   check_whitespace_equivalence(candidate, query, case_mode, fuzzy,
                                default_slab, score);
@@ -726,7 +800,9 @@ static void run_one(const uint8_t *data, size_t size) {
 
   fzf_free_slab(selected_slab);
   fzf_free_slab(default_slab);
+  fzf_free_pattern(combined_pattern);
   fzf_free_pattern(pattern);
+  free(combined_query);
   free(candidate);
   free(query);
 }

@@ -657,13 +657,13 @@ static void test_growth_retry_query_oom_is_terminal(void) {
 
 static void test_n_zero(void) {
   struct Candidate xs[1] = { make_candidate(7, 0) };
-  counting_sort_candidates(xs, 0);
+  counting_sort_candidates(xs, 0, FZF_SCORE_SCHEME_PATH);
   CHECK(xs[0].score == 7);  /* untouched */
 }
 
 static void test_n_one(void) {
   struct Candidate xs[1] = { make_candidate(42, 0) };
-  counting_sort_candidates(xs, 1);
+  counting_sort_candidates(xs, 1, FZF_SCORE_SCHEME_PATH);
   CHECK(xs[0].score == 42);
 }
 
@@ -674,7 +674,7 @@ static void test_small_n_insertion_sort(void) {
     make_candidate(1, 3), make_candidate(7, 4), make_candidate(0, 5),
     make_candidate(9, 6), make_candidate(4, 7),
   };
-  counting_sort_candidates(xs, 8);
+  counting_sort_candidates(xs, 8, FZF_SCORE_SCHEME_PATH);
   CHECK(is_descending_by_score(xs, 8));
   CHECK(xs[0].score == 9);
   CHECK(xs[7].score == 0);
@@ -684,7 +684,7 @@ static void test_small_n_stability(void) {
   struct Candidate xs[8];
   for (size_t i = 0; i < 8; i++)
     xs[i] = make_candidate(7, i);
-  counting_sort_candidates(xs, 8);
+  counting_sort_candidates(xs, 8, FZF_SCORE_SCHEME_PATH);
   for (size_t i = 0; i < 8; i++) {
     CHECK(xs[i].score == 7);
     CHECK(xs[i].s.len == i);
@@ -700,7 +700,7 @@ static void test_large_n_correctness(void) {
   for (size_t i = 0; i < N; i++) {
     xs[i] = make_candidate((int)(rand_r(&seed) % 5000), i);
   }
-  counting_sort_candidates(xs, N);
+  counting_sort_candidates(xs, N, FZF_SCORE_SCHEME_PATH);
   CHECK(is_descending_by_score(xs, N));
   free(xs);
 }
@@ -713,7 +713,7 @@ static void test_stability_with_ties(void) {
     /* score alternates 10 / 5; tag = original index */
     xs[i] = make_candidate((i % 2 == 0) ? 10 : 5, i);
   }
-  counting_sort_candidates(xs, N);
+  counting_sort_candidates(xs, N, FZF_SCORE_SCHEME_PATH);
 
   /* First N/2 entries: score=10, tags 0,2,4,... in order */
   for (size_t i = 0; i < N / 2; i++) {
@@ -732,7 +732,7 @@ static void test_all_same_score(void) {
   enum { N = 128 };
   struct Candidate xs[N];
   for (size_t i = 0; i < N; i++) xs[i] = make_candidate(7, i);
-  counting_sort_candidates(xs, N);
+  counting_sort_candidates(xs, N, FZF_SCORE_SCHEME_PATH);
   for (size_t i = 0; i < N; i++) {
     CHECK(xs[i].score == 7);
     CHECK(xs[i].s.len == i);
@@ -744,7 +744,7 @@ static void test_all_zero_score(void) {
   enum { N = 100 };
   struct Candidate xs[N];
   for (size_t i = 0; i < N; i++) xs[i] = make_candidate(0, i);
-  counting_sort_candidates(xs, N);
+  counting_sort_candidates(xs, N, FZF_SCORE_SCHEME_PATH);
   for (size_t i = 0; i < N; i++) {
     CHECK(xs[i].score == 0);
     CHECK(xs[i].s.len == i);
@@ -762,7 +762,7 @@ static void test_matches_qsort(void) {
     a[i] = make_candidate(s, i);
     b[i] = make_candidate(s, i);
   }
-  counting_sort_candidates(a, N);
+  counting_sort_candidates(a, N, FZF_SCORE_SCHEME_PATH);
   qsort(b, N, sizeof *b, cmp_candidate);
   for (size_t i = 0; i < N; i++) {
     CHECK(a[i].score == b[i].score);
@@ -783,6 +783,12 @@ static void test_rank_keys_match_fzf_length_and_path_rules(void) {
   CHECK(default_keys.first == 2);
   CHECK(default_keys.second == 0);
   CHECK(default_keys.score == UINT16_MAX);
+
+  /* History ranks by score alone and must not scan candidate bytes. */
+  FzfRankKeys history_keys = fzf_rank_keys_preclassified(
+      NULL, SIZE_MAX, false, &bounds, FZF_SCORE_SCHEME_HISTORY);
+  CHECK(history_keys.score == UINT16_MAX);
+  CHECK(history_keys.first == 0 && history_keys.second == 0);
 
   size_t long_length = (size_t)UINT16_MAX + 100;
   char *long_text = malloc(long_length);
@@ -959,13 +965,13 @@ static int is_scored_descending(ScoredStr *xs, size_t n) {
 
 static void test_scored_n_zero(void) {
   ScoredStr xs[1] = { make_scored(7, 0) };
-  counting_sort_scored(xs, 0);
+  counting_sort_scored(xs, 0, FZF_SCORE_SCHEME_PATH);
   CHECK(xs[0].score == 7);
 }
 
 static void test_scored_n_one(void) {
   ScoredStr xs[1] = { make_scored(42, 0) };
-  counting_sort_scored(xs, 1);
+  counting_sort_scored(xs, 1, FZF_SCORE_SCHEME_PATH);
   CHECK(xs[0].score == 42);
 }
 
@@ -976,7 +982,7 @@ static void test_scored_large_n_correctness(void) {
   unsigned seed = 0xBEEF;
   for (size_t i = 0; i < N; i++)
     xs[i] = make_scored((int)(rand_r(&seed) % 5000), i);
-  counting_sort_scored(xs, N);
+  counting_sort_scored(xs, N, FZF_SCORE_SCHEME_PATH);
   CHECK(is_scored_descending(xs, N));
   free(xs);
 }
@@ -986,7 +992,7 @@ static void test_scored_stability(void) {
   ScoredStr xs[N];
   for (size_t i = 0; i < N; i++)
     xs[i] = make_scored((i % 2 == 0) ? 10 : 5, i);
-  counting_sort_scored(xs, N);
+  counting_sort_scored(xs, N, FZF_SCORE_SCHEME_PATH);
   for (size_t i = 0; i < N / 2; i++) {
     CHECK(xs[i].score == 10);
     CHECK((size_t)(uintptr_t)xs[i].str == i * 2);
@@ -1006,7 +1012,7 @@ static void test_scored_matches_qsort(void) {
     a[i] = make_scored(s, i);
     b[i] = make_scored(s, i);
   }
-  counting_sort_scored(a, N);
+  counting_sort_scored(a, N, FZF_SCORE_SCHEME_PATH);
   qsort(b, N, sizeof *b, cmp_scored_desc);
   for (size_t i = 0; i < N; i++) {
     CHECK(a[i].score == b[i].score);
@@ -1021,7 +1027,7 @@ static void test_scored_sort_uses_fzf_secondary_keys(void) {
   values[0].rank = (FzfRankKeys){.score = 100, .first = 9, .second = 1};
   values[1].rank = (FzfRankKeys){.score = 100, .first = 3, .second = 8};
   values[2].rank = (FzfRankKeys){.score = 100, .first = 3, .second = 2};
-  counting_sort_scored(values, 3);
+  counting_sort_scored(values, 3, FZF_SCORE_SCHEME_PATH);
   CHECK(values[0].idx == 2);
   CHECK(values[1].idx == 1);
   CHECK(values[2].idx == 0);
@@ -1031,9 +1037,38 @@ static void test_scored_sort_uses_fzf_secondary_keys(void) {
   };
   saturated[0].rank.first = 1;
   saturated[1].rank.first = 2;
-  counting_sort_scored(saturated, 2);
+  counting_sort_scored(saturated, 2, FZF_SCORE_SCHEME_PATH);
   CHECK(saturated[0].idx == 4);
   CHECK(saturated[1].idx == 5);
+}
+
+static void test_scheme_specific_radix_ranges_match_total_order(void) {
+  CHECK(fzf_rank_radix_first_pass(FZF_SCORE_SCHEME_HISTORY) == 4);
+  CHECK(fzf_rank_radix_first_pass(FZF_SCORE_SCHEME_DEFAULT) == 2);
+  CHECK(fzf_rank_radix_first_pass(FZF_SCORE_SCHEME_PATH) == 0);
+
+  enum { N = 512 };
+  unsigned seed = 0x51cedu;
+  for (fzf_score_scheme_t scheme = FZF_SCORE_SCHEME_DEFAULT;
+       scheme <= FZF_SCORE_SCHEME_HISTORY; scheme++) {
+    ScoredStr actual[N], expected[N];
+    for (size_t i = 0; i < N; i++) {
+      FzfRankKeys rank = {
+        .score = (uint16_t)(rand_r(&seed) % 64),
+        .first = scheme == FZF_SCORE_SCHEME_HISTORY
+                     ? 0 : (uint16_t)(rand_r(&seed) % 64),
+        .second = scheme == FZF_SCORE_SCHEME_PATH
+                      ? (uint16_t)(rand_r(&seed) % 64) : 0,
+      };
+      actual[i] = (ScoredStr){
+        .score = rank.score, .idx = (uint32_t)i, .rank = rank};
+    }
+    memcpy(expected, actual, sizeof actual);
+    counting_sort_scored(actual, N, scheme);
+    qsort(expected, N, sizeof *expected, cmp_scored_desc);
+    for (size_t i = 0; i < N; i++)
+      CHECK(actual[i].idx == expected[i].idx);
+  }
 }
 
 static void test_bounded_top_k_matches_full_stable_sort(void) {
@@ -1047,8 +1082,8 @@ static void test_bounded_top_k_matches_full_stable_sort(void) {
   memcpy(left, input, sizeof left);
   memcpy(right, input + SPLIT, sizeof right);
   qsort(reference, N, sizeof *reference, cmp_scored_desc);
-  counting_sort_scored(left, SPLIT);
-  counting_sort_scored(right, N - SPLIT);
+  counting_sort_scored(left, SPLIT, FZF_SCORE_SCHEME_PATH);
+  counting_sort_scored(right, N - SPLIT, FZF_SCORE_SCHEME_PATH);
   size_t count = async_merge_top_k(
       left, MIN((size_t)K, (size_t)SPLIT),
       right, MIN((size_t)K, (size_t)(N - SPLIT)),
@@ -1079,7 +1114,18 @@ static void test_top_k_finalization_observes_cancellation(void) {
   ScoredStr out[2];
   _Atomic bool stop = true;
   CHECK(async_merge_top_k(left, 1, right, 1, 2, out, &stop) == SIZE_MAX);
-  CHECK(!counting_sort_scored_abortable(right, 1, &stop));
+  CHECK(!counting_sort_scored_abortable(
+      right, 1, &stop, FZF_SCORE_SCHEME_PATH));
+}
+
+static void test_top_k_unchanged_requires_dominated_window(void) {
+  ScoredStr top[] = {make_scored(10, 0), make_scored(10, 1)};
+  ScoredStr later_tie[] = {make_scored(10, 2)};
+  ScoredStr better[] = {make_scored(11, 2)};
+  CHECK(async_top_k_unchanged(top, 2, later_tie, 1, 2));
+  CHECK(!async_top_k_unchanged(top, 2, better, 1, 2));
+  CHECK(!async_top_k_unchanged(top, 1, later_tie, 1, 2));
+  CHECK(!async_top_k_unchanged(top, 2, later_tie, 0, 2));
 }
 
 static void test_allocationless_sort_matches_total_order(void) {
@@ -1635,6 +1681,303 @@ static ScoredStr make_top(const char *str, int score) {
   s.str   = (char *)str;   /* not freed by the cache (cache strdups internally) */
   s.score = score;
   return s;
+}
+
+static void test_shared_membership_growth_reuses_immutable_prefix(void) {
+  uint32_t base_values[] = {1, 3, 7, 11};
+  uint32_t delta_values[] = {14, 19, 23};
+  SharedIdx *base = shared_idx_alloc_abortable(
+      base_values, sizeof base_values / sizeof *base_values, NULL);
+  CHECK(base != NULL);
+  SharedIdx *extended = shared_idx_extend_abortable(
+      base, delta_values, sizeof delta_values / sizeof *delta_values,
+      SIZE_MAX, NULL);
+  CHECK(extended != NULL);
+  if (!base || !extended) {
+    shared_idx_release(base);
+    shared_idx_release(extended);
+    return;
+  }
+
+  CHECK(extended->prefix == base);
+  CHECK(extended->count == 7);
+  CHECK(extended->own_count == 3);
+  CHECK(extended->depth == 2);
+  CHECK(extended->storage_bytes ==
+        base->storage_bytes + sizeof *extended +
+            3 * sizeof *extended->idx);
+  CHECK(shared_idx_valid_for_boundary(extended, 24));
+  CHECK(!shared_idx_valid_for_boundary(extended, 23));
+
+  _Atomic bool stop = true;
+  CHECK(shared_idx_extend_abortable(
+            base, delta_values,
+            sizeof delta_values / sizeof *delta_values,
+            SIZE_MAX, &stop) == NULL);
+  uint32_t out_of_order[] = {14, 13};
+  CHECK(shared_idx_extend_abortable(
+            base, out_of_order, 2, SIZE_MAX, NULL) == NULL);
+
+  uint32_t expected[] = {1, 3, 7, 11, 14, 19, 23};
+  SharedIdxCursor cursor;
+  CHECK(shared_idx_cursor_init(&cursor, extended));
+  for (size_t i = 0; i < sizeof expected / sizeof *expected; i++) {
+    uint32_t actual = UINT32_MAX;
+    CHECK(shared_idx_cursor_next(&cursor, &actual));
+    CHECK(actual == expected[i]);
+  }
+  uint32_t exhausted = 0;
+  CHECK(!shared_idx_cursor_next(&cursor, &exhausted));
+
+  Cache cache;
+  cache_init_limits(&cache, 4, 1024 * 1024);
+  cache_insert_shared_for_request_abortable(
+      &cache, "needle", 24, CaseSmart, true, false, true,
+      FZF_SCORE_SCHEME_DEFAULT, false,
+      NULL, 0, extended->count, extended, NULL);
+  ScoredStr *top = NULL;
+  size_t top_count = 0, pool_gen = 0, matched_count = 0;
+  bool covered = false;
+  SharedIdx *cached = NULL;
+  CHECK(cache_lookup_exact_for_request(
+      &cache, "needle", CaseSmart, true, false, 0,
+      &top, &top_count, &cached, &pool_gen, &matched_count, &covered));
+  CHECK(cached == extended);
+  CHECK(pool_gen == 24);
+  CHECK(matched_count == extended->count);
+  shared_idx_release(cached);
+  free(top);
+  cache_free(&cache);
+  shared_idx_release(extended);
+  shared_idx_release(base);
+}
+
+static void test_shared_membership_growth_compacts_at_depth_limit(void) {
+  const uint32_t base_count = 4096;
+  uint32_t *base_values = malloc(base_count * sizeof *base_values);
+  CHECK(base_values != NULL);
+  if (!base_values) return;
+  for (uint32_t value = 0; value < base_count; value++)
+    base_values[value] = value;
+  SharedIdx *membership = shared_idx_alloc_abortable(
+      base_values, base_count, NULL);
+  free(base_values);
+  CHECK(membership != NULL);
+  if (!membership) return;
+
+  for (uint32_t offset = 0; offset < SHARED_IDX_MAX_DEPTH - 1; offset++) {
+    uint32_t value = base_count + offset;
+    SharedIdx *next = shared_idx_extend_abortable(
+        membership, &value, 1, SIZE_MAX, NULL);
+    CHECK(next != NULL);
+    shared_idx_release(membership);
+    membership = next;
+    if (!membership) return;
+  }
+  CHECK(membership->depth == SHARED_IDX_MAX_DEPTH);
+
+  SharedIdxCursor before_cursor;
+  CHECK(shared_idx_cursor_init(&before_cursor, membership));
+  SharedIdx *retained = (SharedIdx *)
+      before_cursor.segments[SHARED_IDX_COMPACT_RETAIN_DEPTH - 1];
+  CHECK(retained != NULL);
+  CHECK(retained->depth == SHARED_IDX_COMPACT_RETAIN_DEPTH);
+  shared_idx_retain(retained);
+
+  uint32_t final_value = base_count + SHARED_IDX_MAX_DEPTH - 1;
+  size_t total_count = membership->count + 1;
+  size_t compacted_own_count = total_count - retained->count;
+  size_t compacted_budget = retained->storage_bytes + sizeof(SharedIdx) +
+      compacted_own_count * sizeof(uint32_t);
+  size_t full_budget = sizeof(SharedIdx) + total_count * sizeof(uint32_t);
+
+  /* Cancellation releases the temporary retained-prefix reference and leaves
+     the source chain unchanged. */
+  uint32_t refs_before = atomic_load_explicit(
+      &retained->refcount, memory_order_relaxed);
+  _Atomic bool stop = true;
+  CHECK(shared_idx_extend_abortable(
+            membership, &final_value, 1, compacted_budget, &stop) == NULL);
+  CHECK(atomic_load_explicit(&retained->refcount, memory_order_relaxed) ==
+        refs_before);
+
+  /* A byte cap that fits only the canonical flat representation keeps the
+     previous max-storage behavior as a fallback. */
+  SharedIdx *fully_flattened = shared_idx_extend_abortable(
+      membership, &final_value, 1, full_budget, NULL);
+  CHECK(fully_flattened != NULL);
+  if (fully_flattened) {
+    CHECK(fully_flattened->depth == 1);
+    CHECK(fully_flattened->prefix == NULL);
+    CHECK(fully_flattened->suffix_compactions_since_flatten == 0);
+    CHECK(fully_flattened->storage_bytes == full_budget);
+    shared_idx_release(fully_flattened);
+  }
+
+  SharedIdx *compacted = shared_idx_extend_abortable(
+      membership, &final_value, 1, compacted_budget, NULL);
+  CHECK(compacted != NULL);
+  if (!compacted) {
+    shared_idx_release(retained);
+    shared_idx_release(membership);
+    return;
+  }
+  CHECK(compacted->depth == SHARED_IDX_COMPACT_RETAIN_DEPTH + 1);
+  CHECK(compacted->suffix_compactions_since_flatten == 1);
+  CHECK(compacted->prefix == retained);
+  CHECK(compacted->count == total_count);
+  CHECK(compacted->own_count == compacted_own_count);
+  CHECK(compacted->storage_bytes == compacted_budget);
+  CHECK(compacted->storage_bytes <= compacted_budget);
+  /* The large base allocation remains shared; only newer values were copied
+     into the compacted node. */
+  CHECK(compacted->own_count < base_count / 100);
+
+  shared_idx_release(membership);
+
+  SharedIdxCursor cursor;
+  CHECK(shared_idx_cursor_init(&cursor, compacted));
+  for (uint32_t expected = 0; expected < total_count; expected++) {
+    uint32_t actual = UINT32_MAX;
+    CHECK(shared_idx_cursor_next(&cursor, &actual));
+    CHECK(actual == expected);
+  }
+  uint32_t exhausted = 0;
+  CHECK(!shared_idx_cursor_next(&cursor, &exhausted));
+  shared_idx_release(retained);
+  shared_idx_release(compacted);
+}
+
+static void test_shared_membership_growth_bounds_suffix_compactions(void) {
+  const uint32_t base_count = 1024;
+  uint32_t *values = malloc(base_count * sizeof *values);
+  CHECK(values != NULL);
+  if (!values) return;
+  for (uint32_t value = 0; value < base_count; value++)
+    values[value] = value;
+  SharedIdx *membership = shared_idx_alloc_abortable(
+      values, base_count, NULL);
+  free(values);
+  CHECK(membership != NULL);
+  if (!membership) return;
+
+  uint32_t next_value = base_count;
+  /* Reach the first depth limit, then perform the two permitted suffix-only
+     compactions.  Each returns to depth 17, leaving 16 extensions until the
+     next depth-limit event. */
+  for (size_t i = 0; i < SHARED_IDX_MAX_DEPTH - 1; i++, next_value++) {
+    SharedIdx *next = shared_idx_extend_abortable(
+        membership, &next_value, 1, SIZE_MAX, NULL);
+    CHECK(next != NULL);
+    shared_idx_release(membership);
+    membership = next;
+    if (!membership) return;
+  }
+  CHECK(membership->depth == SHARED_IDX_MAX_DEPTH);
+
+  for (uint8_t expected_compactions = 1;
+       expected_compactions <= SHARED_IDX_SUFFIX_COMPACTION_LIMIT;
+       expected_compactions++) {
+    size_t extensions = expected_compactions == 1
+        ? 1 : SHARED_IDX_MAX_DEPTH - SHARED_IDX_COMPACT_RETAIN_DEPTH;
+    for (size_t i = 0; i < extensions; i++, next_value++) {
+      SharedIdx *next = shared_idx_extend_abortable(
+          membership, &next_value, 1, SIZE_MAX, NULL);
+      CHECK(next != NULL);
+      shared_idx_release(membership);
+      membership = next;
+      if (!membership) return;
+    }
+    CHECK(membership->depth == SHARED_IDX_COMPACT_RETAIN_DEPTH + 1);
+    CHECK(membership->suffix_compactions_since_flatten ==
+          expected_compactions);
+  }
+
+  /* The next depth-limit event must use the canonical full flatten and reset
+     the bound, rather than recopying the fixed-anchor suffix a third time. */
+  for (size_t i = 0;
+       i < SHARED_IDX_MAX_DEPTH - SHARED_IDX_COMPACT_RETAIN_DEPTH - 1;
+       i++, next_value++) {
+    SharedIdx *next = shared_idx_extend_abortable(
+        membership, &next_value, 1, SIZE_MAX, NULL);
+    CHECK(next != NULL);
+    shared_idx_release(membership);
+    membership = next;
+    if (!membership) return;
+  }
+  CHECK(membership->depth == SHARED_IDX_MAX_DEPTH);
+  CHECK(membership->suffix_compactions_since_flatten ==
+        SHARED_IDX_SUFFIX_COMPACTION_LIMIT);
+  uint32_t refs_before = atomic_load_explicit(
+      &membership->refcount, memory_order_relaxed);
+  _Atomic bool stop = true;
+  CHECK(shared_idx_extend_abortable(
+            membership, &next_value, 1, SIZE_MAX, &stop) == NULL);
+  CHECK(atomic_load_explicit(
+            &membership->refcount, memory_order_relaxed) == refs_before);
+
+  SharedIdx *flattened = shared_idx_extend_abortable(
+      membership, &next_value, 1, SIZE_MAX, NULL);
+  CHECK(flattened != NULL);
+  shared_idx_release(membership);
+  membership = flattened;
+  next_value++;
+  if (!membership) return;
+  CHECK(membership->depth == 1);
+  CHECK(membership->prefix == NULL);
+  CHECK(membership->suffix_compactions_since_flatten == 0);
+  CHECK(membership->count == next_value);
+  CHECK(membership->storage_bytes ==
+        sizeof *membership + membership->count * sizeof *membership->idx);
+
+  SharedIdxCursor cursor;
+  CHECK(shared_idx_cursor_init(&cursor, membership));
+  for (uint32_t expected = 0; expected < next_value; expected++) {
+    uint32_t actual = UINT32_MAX;
+    CHECK(shared_idx_cursor_next(&cursor, &actual));
+    CHECK(actual == expected);
+  }
+  uint32_t exhausted = 0;
+  CHECK(!shared_idx_cursor_next(&cursor, &exhausted));
+  shared_idx_release(membership);
+}
+
+static void test_shared_membership_growth_respects_storage_budget(void) {
+  const size_t budget = 2048;
+  uint32_t first = 0;
+  SharedIdx *membership = shared_idx_alloc_abortable(&first, 1, NULL);
+  CHECK(membership != NULL);
+  if (!membership) return;
+
+  bool flattened_for_budget = false;
+  for (uint32_t value = 1; value < SHARED_IDX_MAX_DEPTH; value++) {
+    size_t previous_depth = membership->depth;
+    SharedIdx *next = shared_idx_extend_abortable(
+        membership, &value, 1, budget, NULL);
+    CHECK(next != NULL);
+    shared_idx_release(membership);
+    membership = next;
+    if (!membership) return;
+    CHECK(membership->storage_bytes <= budget);
+    if (previous_depth > 1 && membership->depth == 1)
+      flattened_for_budget = true;
+  }
+  CHECK(flattened_for_budget);
+  CHECK(membership->count == SHARED_IDX_MAX_DEPTH);
+
+  SharedIdx *unchanged = shared_idx_extend_abortable(
+      membership, NULL, 0, budget, NULL);
+  CHECK(unchanged == membership);
+  shared_idx_release(unchanged);
+
+  SharedIdxCursor cursor;
+  CHECK(shared_idx_cursor_init(&cursor, membership));
+  for (uint32_t expected = 0; expected < SHARED_IDX_MAX_DEPTH; expected++) {
+    uint32_t actual = UINT32_MAX;
+    CHECK(shared_idx_cursor_next(&cursor, &actual));
+    CHECK(actual == expected);
+  }
+  shared_idx_release(membership);
 }
 
 static void test_cache_lookup_miss_on_empty(void) {
@@ -4008,9 +4351,11 @@ int main(void) {
   RUN(test_scored_stability);
   RUN(test_scored_matches_qsort);
   RUN(test_scored_sort_uses_fzf_secondary_keys);
+  RUN(test_scheme_specific_radix_ranges_match_total_order);
   RUN(test_bounded_top_k_matches_full_stable_sort);
   RUN(test_membership_cap_discards_incomplete_prefix);
   RUN(test_top_k_finalization_observes_cancellation);
+  RUN(test_top_k_unchanged_requires_dominated_window);
   RUN(test_allocationless_sort_matches_total_order);
 
   printf("--- async_strip_ansi ---\n");
@@ -4038,6 +4383,10 @@ int main(void) {
   RUN(test_cands_top_accessor_reads_block_pointer);
 
   printf("--- cache (phase 1: exact-match) ---\n");
+  RUN(test_shared_membership_growth_reuses_immutable_prefix);
+  RUN(test_shared_membership_growth_compacts_at_depth_limit);
+  RUN(test_shared_membership_growth_bounds_suffix_compactions);
+  RUN(test_shared_membership_growth_respects_storage_budget);
   RUN(test_cache_lookup_miss_on_empty);
   RUN(test_cache_insert_then_lookup_hit);
   RUN(test_cache_lookup_miss_distinct_query);

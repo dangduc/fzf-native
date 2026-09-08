@@ -25,6 +25,18 @@ type pair struct {
 }
 
 var cEntry = regexp.MustCompile(`\{0x([0-9A-Fa-f]+), ('(?:\\.|[^'])+')\}`)
+var cPageEntry = regexp.MustCompile(`FZF_NORMALIZED_SOURCE_PAGE\(0x([0-9A-Fa-f]+)\)`)
+
+func sourcePages(pairs []pair) []rune {
+	var result []rune
+	for _, entry := range pairs {
+		page := entry.source >> 8
+		if len(result) == 0 || result[len(result)-1] != page {
+			result = append(result, page)
+		}
+	}
+	return result
+}
 
 func runeLiteral(text string) (rune, error) {
 	value, err := strconv.Unquote(text)
@@ -80,30 +92,44 @@ func upstream(path string) ([]pair, error) {
 	return result, nil
 }
 
-func native(path string) ([]pair, error) {
+func native(path string) ([]pair, []rune, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !bytes.Contains(data, []byte("fzf_normalized_runes")) {
-		return nil, fmt.Errorf("normalization table not found in %s", path)
+		return nil, nil, fmt.Errorf("normalization table not found in %s", path)
 	}
 	var result []pair
 	for _, match := range cEntry.FindAllSubmatch(data, -1) {
 		source, err := strconv.ParseInt(string(match[1]), 16, 32)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		target, err := runeLiteral(string(match[2]))
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if len(result) > 0 && rune(source) <= result[len(result)-1].source {
-			return nil, fmt.Errorf("C table not strictly sorted at U+%04X", source)
+			return nil, nil, fmt.Errorf("C table not strictly sorted at U+%04X", source)
 		}
 		result = append(result, pair{rune(source), target})
 	}
-	return result, nil
+	var pages []rune
+	for _, match := range cPageEntry.FindAllSubmatch(data, -1) {
+		page, err := strconv.ParseInt(string(match[1]), 16, 32)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(pages) > 0 && rune(page) <= pages[len(pages)-1] {
+			return nil, nil, fmt.Errorf("C source pages not strictly sorted at 0x%02X", page)
+		}
+		pages = append(pages, rune(page))
+	}
+	if len(pages) == 0 {
+		return nil, nil, fmt.Errorf("normalization source pages not found in %s", path)
+	}
+	return result, pages, nil
 }
 
 func writeTable(path string, pairs []pair) error {
@@ -113,7 +139,8 @@ func writeTable(path string, pairs []pair) error {
  *
  * Generated from junegunn/fzf src/algo/normalize.go at
  * 1372d04f79bde0daa3bab4b96a068baafa808e67.  Keep this sorted by source
- * codepoint so fzf_normalize_codepoint can use binary search.
+ * codepoint so fzf_normalize_codepoint can use binary search.  The source-page
+ * inventory is generated and audited from these same entries.
  */
 
 typedef struct {
@@ -121,6 +148,17 @@ typedef struct {
   utf8proc_int32_t target;
 } fzf_normalized_rune_t;
 
+`)
+	pages := sourcePages(pairs)
+	fmt.Fprintln(&output, "#define FZF_NORMALIZED_SOURCE_PAGES \\")
+	for index, page := range pages {
+		fmt.Fprintf(&output, "  FZF_NORMALIZED_SOURCE_PAGE(0x%02X)", page)
+		if index != len(pages)-1 {
+			fmt.Fprint(&output, " \\")
+		}
+		fmt.Fprintln(&output)
+	}
+	fmt.Fprint(&output, `
 static const fzf_normalized_rune_t fzf_normalized_runes[] = {
 `)
 	for index, entry := range pairs {
@@ -154,10 +192,11 @@ func main() {
 			panic(err)
 		}
 	}
-	got, err := native(flag.Arg(1))
+	got, gotPages, err := native(flag.Arg(1))
 	if err != nil {
 		panic(err)
 	}
+	wantPages := sourcePages(want)
 	differences := 0
 	limit := len(want)
 	if len(got) < limit {
@@ -174,7 +213,23 @@ func main() {
 		fmt.Printf("entry count got %d want %d\n", len(got), len(want))
 		differences++
 	}
-	fmt.Printf("upstream=%d native=%d differences=%d\n", len(want), len(got), differences)
+	pageLimit := len(wantPages)
+	if len(gotPages) < pageLimit {
+		pageLimit = len(gotPages)
+	}
+	for index := 0; index < pageLimit; index++ {
+		if gotPages[index] != wantPages[index] {
+			fmt.Printf("source page %d got 0x%02X want 0x%02X\n",
+				index, gotPages[index], wantPages[index])
+			differences++
+		}
+	}
+	if len(gotPages) != len(wantPages) {
+		fmt.Printf("source page count got %d want %d\n", len(gotPages), len(wantPages))
+		differences++
+	}
+	fmt.Printf("upstream=%d native=%d pages=%d differences=%d\n",
+		len(want), len(got), len(gotPages), differences)
 	if differences != 0 {
 		os.Exit(1)
 	}

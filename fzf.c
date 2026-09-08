@@ -128,12 +128,11 @@ static const score_scheme_config_t *score_scheme_config(
 }
 
 static int32_t index_byte(fzf_string_t *string, char b) {
-  for (size_t i = 0; i < string->size; i++) {
-    if (string->data[i] == b) {
-      return (int32_t)i;
-    }
-  }
-  return -1;
+  if (string->size == 0) return -1;
+  if (string->data[0] == b) return 0;
+  const char *match = memchr(
+      string->data + 1, (unsigned char)b, string->size - 1);
+  return match ? (int32_t)(match - string->data) : -1;
 }
 
 static bool fzf_unicode_is_space(utf8proc_int32_t cp) {
@@ -366,10 +365,6 @@ static size_t min64u(size_t a, size_t b) {
   return (a < b) ? a : b;
 }
 
-static size_t index_at(size_t index, size_t max, bool forward) {
-  return forward ? index : max - index - 1;
-}
-
 fzf_position_t *fzf_pos_array(size_t len) {
   if (len > SIZE_MAX / sizeof(uint32_t)) {
     fzf_mark_allocation_failure();
@@ -589,6 +584,16 @@ static int16_t bonus_at(fzf_string_t *input, size_t idx,
 }
 
 static utf8proc_int32_t fzf_normalize_codepoint(utf8proc_int32_t codepoint) {
+  if (codepoint < 0x00c0) return codepoint;
+  switch ((uint32_t)codepoint >> 8) {
+#define FZF_NORMALIZED_SOURCE_PAGE(page) case page:
+      FZF_NORMALIZED_SOURCE_PAGES
+#undef FZF_NORMALIZED_SOURCE_PAGE
+#undef FZF_NORMALIZED_SOURCE_PAGES
+      break;
+    default:
+      return codepoint;
+  }
   size_t lo = 0;
   size_t hi = sizeof fzf_normalized_runes / sizeof fzf_normalized_runes[0];
   while (lo < hi) {
@@ -750,12 +755,24 @@ static utf8proc_int32_t v2_case_fold_candidate(
              : codepoint;
 }
 
-static int32_t utf8_fuzzy_index_impl(
-    fzf_string_t *input, const char *pattern, size_t pattern_len,
-    bool case_sensitive, bool v2_candidate_case) {
+/* Find the first byte of a fuzzy UTF-8 subsequence without narrowing an
+   input offset.  Apply the same case-fold and pinned normalization map as
+   the scorer when NORMALIZE is true.  The public compatibility wrapper below
+   still returns an int32_t, while internal callers can safely prefilter
+   size_t-bounded input. */
+static bool utf8_fuzzy_index_size(fzf_string_t *input, const char *pattern,
+                                  size_t pattern_len, bool case_sensitive,
+                                  bool normalize,
+                                  bool v2_candidate_case,
+                                  size_t *first_idx_out,
+                                  size_t *input_char_count_out) {
+  *first_idx_out = 0;
+  if (input_char_count_out) *input_char_count_out = 0;
   // Handle empty pattern
   if (pattern_len == 0) {
-    return 0;
+    if (input_char_count_out)
+      *input_char_count_out = utf8_strlen(input->data, input->size);
+    return true;
   }
 
   // Unified implementation for both ASCII and UTF-8
@@ -765,8 +782,8 @@ static int32_t utf8_fuzzy_index_impl(
   
   size_t input_pos = 0;
   size_t pattern_pos = 0;
-  int32_t first_idx = -1;  // Initialize to -1 to indicate not found
-  int32_t char_idx = 0;
+  size_t first_idx = 0;
+  size_t input_char_count = 0;
   
   // Process each pattern character
   while (pattern_pos < pattern_len && input_pos < input->size) {
@@ -780,22 +797,28 @@ static int32_t utf8_fuzzy_index_impl(
     if (!case_sensitive) {
       pattern_cp = utf8proc_case_fold(pattern_cp);
     }
+    if (normalize) {
+      pattern_cp = fzf_normalize_codepoint(pattern_cp);
+    }
     
     // Search for this pattern character starting from current position
     bool found = false;
-    int32_t search_char_idx = char_idx;
     size_t search_pos = input_pos;
     
     while (search_pos < input->size) {
       utf8proc_ssize_t input_bytes = utf8_iterate_lossy(
         (const utf8proc_uint8_t*)(input_ptr + search_pos),
         input->size - search_pos, &input_cp);
+      input_char_count++;
       
       utf8proc_int32_t input_cp_cmp = input_cp;
       if (!case_sensitive) {
         input_cp_cmp = v2_candidate_case
                            ? v2_case_fold_candidate(input_cp)
                            : utf8proc_case_fold(input_cp);
+      }
+      if (normalize) {
+        input_cp_cmp = fzf_normalize_codepoint(input_cp_cmp);
       }
       
       if (input_cp_cmp == pattern_cp) {
@@ -806,42 +829,55 @@ static int32_t utf8_fuzzy_index_impl(
         }
         found = true;
         input_pos = search_pos + input_bytes;
-        char_idx = search_char_idx + 1;
         break;
       }
-      
+
       search_pos += input_bytes;
-      search_char_idx++;
+      input_pos = search_pos;
     }
-    
+
     if (!found) {
-      return -1; // Pattern character not found
+      if (input_char_count_out) *input_char_count_out = input_char_count;
+      return false; // Pattern character not found
     }
     
     pattern_pos += pattern_bytes;
   }
-  
-  // If we processed all pattern characters, we have a match
-  return (pattern_pos >= pattern_len) ? first_idx : -1;
+
+  /* Fuzzy v2 needs the full character count to size its DP arrays.  Finish
+     that mandatory count here so a successful prefilter can reuse this decode
+     instead of making the char-map builder decode the candidate again. */
+  if (input_char_count_out) {
+    while (input_pos < input->size) {
+      utf8proc_int32_t input_cp;
+      utf8proc_ssize_t input_bytes = utf8_iterate_lossy(
+          (const utf8proc_uint8_t *)(input_ptr + input_pos),
+          input->size - input_pos, &input_cp);
+      input_pos += (size_t)input_bytes;
+      input_char_count++;
+    }
+    *input_char_count_out = input_char_count;
+  }
+
+  if (pattern_pos < pattern_len) return false;
+  *first_idx_out = first_idx;
+  return true;
 }
 
 int32_t utf8_fuzzy_index(fzf_string_t *input, const char *pattern,
                          size_t pattern_len, bool case_sensitive) {
-  return utf8_fuzzy_index_impl(input, pattern, pattern_len, case_sensitive,
-                               false);
-}
-
-static int32_t utf8_fuzzy_index_v2(fzf_string_t *input, const char *pattern,
-                                   size_t pattern_len,
-                                   bool case_sensitive) {
-  return utf8_fuzzy_index_impl(input, pattern, pattern_len, case_sensitive,
-                               true);
+  size_t first_idx = 0;
+  if (!utf8_fuzzy_index_size(input, pattern, pattern_len, case_sensitive,
+                             false, false, &first_idx, NULL) ||
+      first_idx > INT32_MAX)
+    return -1;
+  return (int32_t)first_idx;
 }
 
 /* UTF-8 helper functions */
 
 // UTF-8 aware character comparison
-static bool utf8_char_equal(utf8proc_int32_t cp1, utf8proc_int32_t cp2, 
+static bool utf8_char_equal(utf8proc_int32_t cp1, utf8proc_int32_t cp2,
                            bool case_sensitive, bool normalize) {
   if (!case_sensitive) {
     cp1 = utf8proc_case_fold(cp1);
@@ -1055,8 +1091,13 @@ static fzf_result_t fzf_fuzzy_match_v1_impl(
   size_t sidx = 0;
   size_t eidx = 0;
   bool started = false;
+  /* Select the scan direction once.  SIZE_MAX is -1 modulo size_t, so each
+     hot loop can advance its valid index without a direction branch. */
+  size_t scan_delta = forward ? 1 : SIZE_MAX;
+  size_t text_index = forward ? 0 : N - 1;
+  size_t pattern_index = forward ? 0 : M - 1;
   for (size_t step = 0; step < N; step++) {
-    char c = text->data[index_at(step, N, forward)];
+    char c = text->data[text_index];
     /* TODO(conni2461): Common pattern maybe a macro would be good here */
     if (!case_sensitive) {
       /* TODO(conni2461): He does some unicode stuff here, investigate */
@@ -1065,7 +1106,7 @@ static fzf_result_t fzf_fuzzy_match_v1_impl(
     if (normalize) {
       c = normalize_rune(c);
     }
-    if (c == pattern->data[index_at(pidx, M, forward)]) {
+    if (c == pattern->data[pattern_index]) {
       if (!started) {
         sidx = step;
         started = true;
@@ -1075,12 +1116,17 @@ static fzf_result_t fzf_fuzzy_match_v1_impl(
         eidx = step + 1;
         break;
       }
+      pattern_index += scan_delta;
     }
+    text_index += scan_delta;
   }
   if (started && eidx > 0) {
     size_t remaining = M;
+    size_t tighten_delta = forward ? SIZE_MAX : 1;
+    text_index = forward ? eidx - 1 : N - eidx;
+    pattern_index = forward ? M - 1 : 0;
     for (size_t step = eidx; step-- > sidx;) {
-      char c = text->data[index_at(step, N, forward)];
+      char c = text->data[text_index];
       if (!case_sensitive) {
         /* TODO(conni2461): He does some unicode stuff here, investigate */
         c = (char)tolower((uint8_t)c);
@@ -1088,13 +1134,15 @@ static fzf_result_t fzf_fuzzy_match_v1_impl(
       if (normalize) {
         c = normalize_rune(c);
       }
-      if (c == pattern->data[index_at(remaining - 1, M, forward)]) {
+      if (c == pattern->data[pattern_index]) {
         remaining--;
         if (remaining == 0) {
           sidx = step;
           break;
         }
+        pattern_index += tighten_delta;
       }
+      text_index += tighten_delta;
     }
 
     size_t start = forward ? sidx : N - eidx;
@@ -1137,7 +1185,24 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
 
   size_t idx;
   {
-    int32_t tmp_idx = ascii_fuzzy_index(text, pattern->data, M, case_sensitive);
+    int32_t tmp_idx;
+    /* Keep the common one-byte incremental query in this hot caller.  The
+       compiler can inline try_skip here without expanding every multi-byte
+       ascii_fuzzy_index call site. */
+    if (M == 1 && N == 1) {
+      char pattern_byte = pattern->data[0];
+      char text_byte = text->data[0];
+      bool exact = text_byte == pattern_byte;
+      bool folded = !case_sensitive && pattern_byte >= 'a' &&
+                    pattern_byte <= 'z' &&
+                    text_byte == pattern_byte - (char)32;
+      tmp_idx = exact || folded ? 0 : -1;
+    } else if (M == 1) {
+      tmp_idx = try_skip(text, case_sensitive, pattern->data[0], 0);
+      if (tmp_idx > 0) tmp_idx--;
+    } else {
+      tmp_idx = ascii_fuzzy_index(text, pattern->data, M, case_sensitive);
+    }
     if (tmp_idx < 0) {
       return (fzf_result_t){-1, -1, 0};
     }
@@ -2310,15 +2375,6 @@ static fzf_result_t fzf_fuzzy_match_v2_utf8_impl(
     return (fzf_result_t){0, 0, 0};
   }
 
-  // Build byte-to-char mapping for character position tracking
-  utf8_char_map_t *char_map = utf8_build_char_map(
-      text->data, N, slab ? &slab->UTF8 : NULL);
-  if (!char_map) {
-    fzf_mark_allocation_failure();
-    return (fzf_result_t){-1, -1, 0};
-  }
-
-  const size_t Nc = char_map->char_count;
   bool cached_pattern_cps = !normalize && pattern->codepoints != NULL &&
       pattern->codepoints_case_folded == !case_sensitive;
   const size_t Mc = cached_pattern_cps
@@ -2326,34 +2382,48 @@ static fzf_result_t fzf_fuzzy_match_v2_utf8_impl(
                       : utf8_strlen(pattern->data, M);
 
   if (Mc == 0) {
-    utf8_free_char_map(char_map);
     return (fzf_result_t){0, 0, 0};
   }
 
-  // Fall back to v1 if slab is insufficient (use character counts)
+  /* Reject non-matches before building the byte-to-character table.  The
+     table decodes the whole candidate twice and writes one slot per byte;
+     none of that state is observed when the subsequence prefilter fails. */
+  size_t tmp_idx = 0;
+  size_t candidate_char_count = 0;
+  if (!utf8_fuzzy_index_size(text, pattern->data, M, case_sensitive,
+                             normalize, true, &tmp_idx,
+                             &candidate_char_count)) {
+    return (fzf_result_t){-1, -1, 0};
+  }
+
+  /* The prefilter already counted the candidate with the same lossy decoder
+     used by both matchers.  Decide whether v2 fits before constructing its
+     byte-to-character table; v1 builds the table it needs itself. */
+  bool v2_size_overflows = candidate_char_count != 0 &&
+                           Mc > SIZE_MAX / candidate_char_count;
   if (slab != NULL &&
-      (Nc != 0 && Mc > SIZE_MAX / Nc ? true : Nc * Mc > slab->I16.cap)) {
-    utf8_free_char_map(char_map);
+      (v2_size_overflows ||
+       candidate_char_count * Mc > slab->I16.cap)) {
     return fzf_fuzzy_match_v1_utf8_impl(case_sensitive, normalize, forward,
                                         text, pattern, pos, slab);
   }
 
-  // Check if pattern exists in text (returns byte position)
-  int32_t tmp_idx = normalize
-                        ? 0
-                        : utf8_fuzzy_index_v2(text, pattern->data, M,
-                                              case_sensitive);
-  if (tmp_idx < 0) {
-    utf8_free_char_map(char_map);
+  // Build byte-to-char mapping for character position tracking
+  utf8_char_map_t *char_map = utf8_build_char_map_counted(
+      text->data, N, candidate_char_count, slab ? &slab->UTF8 : NULL);
+  if (!char_map) {
+    fzf_mark_allocation_failure();
     return (fzf_result_t){-1, -1, 0};
   }
+
+  const size_t Nc = char_map->char_count;
 
   // Start one character before the first match, just as ascii_fuzzy_index
   // does for the byte matcher.  Phase 2 needs that character to establish
   // the real boundary/camel bonus at the first match; starting directly at
   // the match incorrectly treats every non-initial UTF-8 match as a word
   // boundary.
-  size_t match_idx = utf8_byte_to_char(char_map, (size_t)tmp_idx);
+  size_t match_idx = utf8_byte_to_char(char_map, tmp_idx);
   size_t idx = match_idx > 0 ? match_idx - 1 : 0;
 
   // Pre-decode pattern codepoints (case-folded if needed)
@@ -3142,21 +3212,28 @@ int32_t fzf_get_score_with_bounds_bytes_preclassified(
 #undef FZF_SCORE_RECORD_BOUNDS
 }
 
-fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
-                                  fzf_slab_t *slab) {
-  fzf_clear_allocation_failure();
+static int32_t score_positions_for_input(const char *text,
+                                         fzf_pattern_t *pattern,
+                                         fzf_slab_t *slab,
+                                         fzf_position_t **positions,
+                                         bool compute_score) {
+  *positions = NULL;
   // If the pattern is an empty string then pattern->ptr will be NULL and we
-  // basically don't want to filter. Return 1 for telescope
+  // basically don't want to filter. Return 1 for telescope and no positions.
   if (pattern->ptr == NULL) {
-    return NULL;
+    return 1;
   }
 
   fzf_string_t input = {.data = text, .size = strlen(text)};
   bool input_is_ascii = is_ascii_utf8proc(input.data, input.size);
-  fzf_position_t *all_pos = fzf_pos_array(0);
-  if (!all_pos) return NULL;
+  /* Keep the wrapper on the stack until a match is known.  Simple misses then
+     retain the score-only fast path and allocate no position storage. */
+  fzf_position_t position_data = {0};
+  fzf_position_t *all_pos = &position_data;
+  int32_t total_score = 0;
   for (size_t i = 0; i < pattern->size; i++) {
     fzf_term_set_t *term_set = pattern->ptr[i];
+    int32_t current_score = 0;
     bool matched = false;
     for (size_t j = 0; j < term_set->size; j++) {
       fzf_term_t *term = &term_set->ptr[j];
@@ -3167,10 +3244,11 @@ fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
         fzf_result_t res = CALL_ALG(
             term, false, input, input_is_ascii, pattern->forward, NULL, slab);
         if (fzf_allocation_failed()) {
-          fzf_free_positions(all_pos);
-          return NULL;
+          free(position_data.data);
+          return 0;
         }
         if (res.start < 0) {
+          if (compute_score) current_score = 0;
           matched = true;
         }
         continue;
@@ -3178,20 +3256,72 @@ fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
       fzf_result_t res = CALL_ALG(
           term, false, input, input_is_ascii, pattern->forward, all_pos, slab);
       if (fzf_allocation_failed()) {
-        fzf_free_positions(all_pos);
-        return NULL;
+        free(position_data.data);
+        return 0;
       }
       if (res.start >= 0) {
+        /* Match fzf_get_score's public no-match sentinel handling when a v1
+           fallback produces a valid match with a non-positive raw score. */
+        if (compute_score)
+          current_score = res.score > 0 ? res.score : 1;
         matched = true;
         break;
       }
     }
     if (!matched) {
-      fzf_free_positions(all_pos);
-      return NULL;
+      free(position_data.data);
+      return 0;
     }
+    /* fzf_get_positions historically did not total term scores.  Keep its
+       path free of signed-overflow behavior for exceptionally large parsed
+       patterns; only the combined scoring API needs the aggregate. */
+    if (compute_score) total_score += current_score;
   }
-  return all_pos;
+  fzf_position_t *owned = fzf_pos_array(0);
+  if (!owned) {
+    free(position_data.data);
+    return 0;
+  }
+  *owned = position_data;
+  *positions = owned;
+  return compute_score && total_score > 0 ? total_score : 1;
+}
+
+static bool score_positions_one_pass_safe(const fzf_pattern_t *pattern) {
+  return pattern && pattern->size == 1 && pattern->ptr[0] &&
+         pattern->ptr[0]->size == 1 && !pattern->ptr[0]->ptr[0].inv;
+}
+
+int32_t fzf_get_score_positions(const char *text, fzf_pattern_t *pattern,
+                                fzf_slab_t *slab,
+                                fzf_position_t **positions) {
+  if (!positions) return fzf_get_score(text, pattern, slab);
+  fzf_clear_allocation_failure();
+  *positions = NULL;
+  if (pattern->ptr == NULL) return 1;
+  /* Compound patterns can do position work for an early term before a later
+     term rejects the candidate.  Preserve score-first behavior for those
+     patterns; the common single positive term uses one matcher traversal. */
+  if (!score_positions_one_pass_safe(pattern)) {
+    int32_t score = fzf_get_score(text, pattern, slab);
+    if (score <= 0 || fzf_allocation_failed()) return score;
+    fzf_position_t *found = fzf_get_positions(text, pattern, slab);
+    if (fzf_allocation_failed()) {
+      fzf_free_positions(found);
+      return 0;
+    }
+    *positions = found;
+    return score;
+  }
+  return score_positions_for_input(text, pattern, slab, positions, true);
+}
+
+fzf_position_t *fzf_get_positions(const char *text, fzf_pattern_t *pattern,
+                                  fzf_slab_t *slab) {
+  fzf_clear_allocation_failure();
+  fzf_position_t *positions = NULL;
+  (void)score_positions_for_input(text, pattern, slab, &positions, false);
+  return positions;
 }
 
 void fzf_free_positions(fzf_position_t *pos) {
