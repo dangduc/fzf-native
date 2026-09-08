@@ -97,45 +97,102 @@
        (fzf-native-differential-candidate-text candidate)))
     (fzf-native-differential-case-candidates case))))
 
-(defun fzf-native-differential--malformed-difference-p (case context)
-  "Return non-nil if CONTEXT identifies malformed differences in CASE.
+(defun fzf-native-differential--identity-set-equal-p (left right)
+  "Return non-nil when LEFT and RIGHT contain the same identities."
+  (and (listp left)
+       (listp right)
+       (= (length left) (length right))
+       (= (length left) (length (delete-dups (copy-sequence left))))
+       (= (length right) (length (delete-dups (copy-sequence right))))
+       (null (cl-set-difference left right :test #'equal))
+       (null (cl-set-difference right left :test #'equal))))
 
-CONTEXT must contain a nonempty `:differing-identities' list.  Every identity
-must name a candidate in CASE, and every differing candidate must itself
-contain malformed UTF-8.  A malformed query alone does not attribute an
-arbitrary valid-candidate difference to the decoder policy."
+(defun fzf-native-differential--identity-set-difference (left right)
+  "Return identities present in exactly one of LEFT and RIGHT."
+  (append (cl-set-difference left right :test #'equal)
+          (cl-set-difference right left :test #'equal)))
+
+(defun fzf-native-differential--malformed-query-p (case)
+  "Return non-nil when CASE has a malformed rendered query."
+  (fzf-native-differential--malformed-utf8-string-p
+   (fzf-native-differential-case-rendered-query case)))
+
+(defun fzf-native-differential--nonempty-query-p (case)
+  "Return non-nil when CASE has at least one parsed query term."
+  (cl-some #'identity
+           (fzf-native-differential-query-sets
+            (fzf-native-differential-case-query case))))
+
+(defun fzf-native-differential--malformed-difference-attributed-p
+    (case identities)
+  "Return non-nil when malformed input in CASE can affect IDENTITIES."
+  (let* ((candidates (fzf-native-differential-case-candidates case))
+         (differing
+          (mapcar
+           (lambda (identity)
+             (cl-find identity candidates
+                      :key #'fzf-native-differential-candidate-id
+                      :test #'equal))
+           identities)))
+    (and (cl-every #'identity differing)
+         (or
+          (fzf-native-differential--malformed-query-p case)
+          (cl-every
+           (lambda (candidate)
+             (fzf-native-differential--malformed-utf8-string-p
+              (fzf-native-differential-candidate-text candidate)))
+           differing)))))
+
+(defun fzf-native-differential--malformed-membership-predicted-p
+    (case context)
+  "Return non-nil when CONTEXT predicts CASE's decoder-only difference.
+
+CONTEXT supplies actual native and upstream memberships plus the membership
+from running the native matcher on Go-decoded input.  The predicted membership
+must equal upstream, and its exact difference from native must equal the
+reported identities.  Empty queries fail closed because decoding match text
+cannot change their membership."
   (let ((identities (and (listp context)
                          (plist-get context :differing-identities)))
-        (candidates (fzf-native-differential-case-candidates case)))
+        (native (and (listp context)
+                     (plist-get context :native-membership)))
+        (upstream (and (listp context)
+                       (plist-get context :upstream-membership)))
+        (decoded (and (listp context)
+                      (plist-get context :go-decoded-native-membership))))
     (and (consp identities)
-         (cl-every
-          (lambda (identity)
-            (let ((candidate
-                   (cl-find identity candidates
-                            :key #'fzf-native-differential-candidate-id
-                            :test #'equal)))
-              (and candidate
-                   (fzf-native-differential--malformed-utf8-string-p
-                    (fzf-native-differential-candidate-text candidate)))))
-          identities))))
+         (plist-member context :native-membership)
+         (plist-member context :upstream-membership)
+         (plist-member context :go-decoded-native-membership)
+         (listp native)
+         (listp upstream)
+         (listp decoded)
+         (fzf-native-differential--nonempty-query-p case)
+         (fzf-native-differential--identity-set-equal-p decoded upstream)
+         (fzf-native-differential--identity-set-equal-p
+          identities
+          (fzf-native-differential--identity-set-difference native upstream))
+         (fzf-native-differential--malformed-difference-attributed-p
+          case identities))))
 
 (defun fzf-native-differential--exception-malformed-utf8-p
     (case facet context)
   "Recognize malformed decoder differences for CASE, FACET, and CONTEXT."
-  (and (memq facet '(membership positions))
+  (and (eq facet 'membership)
        (not (plist-get
              (fzf-native-differential-case-dimensions case)
              :valid-utf8))
        (fzf-native-differential--case-has-malformed-utf8-p case)
-       (fzf-native-differential--malformed-difference-p case context)))
+       (fzf-native-differential--malformed-membership-predicted-p
+        case context)))
 
 (defconst fzf-native-differential-exceptions
   `((:name malformed-utf8-decoder
-     :reason "Go and utf8proc preserve malformed input differently."
+     :reason "Go and utf8proc decode malformed match text differently."
      :disposition accepted
      :upstream-revision ,fzf-native-differential-upstream-revision
      :owner "fzf-native UTF-8 compatibility policy"
-     :scope "Only differing malformed inputs for membership or positions."
+     :scope "Only predicted membership changes for nonempty malformed input."
      :remove-when "Both oracles apply one documented malformed-byte policy."
      :predicate ,#'fzf-native-differential--exception-malformed-utf8-p))
   "Ordered, narrow predicates for known differential behavior.")

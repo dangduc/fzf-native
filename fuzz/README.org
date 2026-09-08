@@ -185,7 +185,9 @@ The entry must include an owner, an upstream revision, and a removal condition.
 
 The parsed lane accepts only malformed UTF-8 decoder behavior.
 Go and utf8proc replace malformed byte sequences differently.
-The exception applies only to membership and position differences for malformed input.
+The exception applies only when a nonempty malformed query or candidate has an
+exact membership change predicted by running the native matcher on Go-decoded
+input.  Empty-query losses and incomplete predictions always fail.
 
 The raw lane also has one version-scoped Unicode table exception.  Go 1.27.1
 knows the Unicode 17 lowercase mappings U+A7CE, U+A7D2, U+A7D4, and
