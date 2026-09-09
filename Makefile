@@ -308,6 +308,17 @@ benchmark-api-overhead-probe:
 		benchmarks/api-overhead-probe.c fzf.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/api-overhead-probe
 
+# Rejection-focused ASCII scorer probe. It reports preclassified, bounded,
+# and public C-string API lanes separately and includes dense-match, short,
+# case-sensitive, and repeated-byte counterweights.
+.PHONY: benchmark-rejection-hotpath-probe
+benchmark-rejection-hotpath-probe:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -O3 -DNDEBUG -I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/rejection-hotpath-probe \
+		benchmarks/rejection-hotpath-probe.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/rejection-hotpath-probe
+
 # Real persistent-session growth probe.  Timings include producer appends,
 # growth notification, coordinator work, shared workers, cache update, and
 # result publication.  Full-scan validation runs after all timed rounds.

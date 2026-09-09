@@ -72,6 +72,59 @@ static ptrdiff_t planned_fuzzy_index(const uint8_t *text, size_t text_size,
   return first_index == 0 ? 0 : (ptrdiff_t)(first_index - 1);
 }
 
+static const char *scalar_find_byte_two(const char *text, size_t text_size,
+                                        uint8_t exact_byte,
+                                        uint8_t alternate_byte) {
+  for (size_t i = 0; i < text_size; i++) {
+    uint8_t byte = (uint8_t)text[i];
+    if (byte == exact_byte || byte == alternate_byte) return text + i;
+  }
+  return NULL;
+}
+
+static void check_byte_two(const char *text, size_t text_size,
+                           uint8_t exact_byte, uint8_t alternate_byte) {
+  const char *scalar = scalar_find_byte_two(
+      text, text_size, exact_byte, alternate_byte);
+  const char *simd = fzf_simd_find_byte_two(
+      text, text_size, exact_byte, alternate_byte);
+  if (scalar != simd) {
+    fprintf(stderr,
+            "FAIL paired byte search: size=%zu exact=%u alternate=%u "
+            "scalar=%td simd=%td\n",
+            text_size, (unsigned int)exact_byte, (unsigned int)alternate_byte,
+            scalar ? scalar - text : -1, simd ? simd - text : -1);
+    failures++;
+  }
+}
+
+static void test_paired_byte_search(void) {
+  for (size_t text_size = 0; text_size <= 256; text_size++) {
+    char *text = malloc(text_size == 0 ? 1 : text_size);
+    CHECK(text != NULL, "paired byte search allocation failed");
+    if (!text) return;
+    memset(text, 'x', text_size);
+    check_byte_two(text, text_size, 'q', 'Q');
+    check_byte_two(text, text_size, 'q', 'q');
+    for (size_t position = 0; position < text_size; position++) {
+      text[position] = 'q';
+      check_byte_two(text, text_size, 'q', 'Q');
+      text[position] = 'Q';
+      check_byte_two(text, text_size, 'q', 'Q');
+      text[position] = 'x';
+    }
+    if (text_size > 1) {
+      text[text_size - 1] = 'q';
+      for (size_t position = 0; position + 1 < text_size; position++) {
+        text[position] = 'Q';
+        check_byte_two(text, text_size, 'q', 'Q');
+        text[position] = 'x';
+      }
+    }
+    free(text);
+  }
+}
+
 static bool scalar_matches_at(const uint8_t *text, const uint8_t *pattern,
                               size_t pattern_size, bool case_sensitive) {
   for (size_t i = 0; i < pattern_size; i++)
@@ -373,6 +426,7 @@ static void test_long_query_scalar_fallback(void) {
 
 int main(void) {
 #if FZF_HAVE_SIMD_PREFILTER
+  test_paired_byte_search();
   test_seed_selection();
   test_complete_occurrence_sets();
   test_first_index_semantics();
