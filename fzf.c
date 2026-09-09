@@ -1184,6 +1184,21 @@ fzf_result_t fzf_fuzzy_match_v1(bool case_sensitive, bool normalize,
                                  pattern, pos, slab, NULL);
 }
 
+#if defined(_MSC_VER)
+#define FZF_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define FZF_NOINLINE __attribute__((noinline))
+#else
+#define FZF_NOINLINE
+#endif
+
+static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_single(
+    bool case_sensitive, bool forward, fzf_string_t *text, char pchar,
+    fzf_position_t *pos, fzf_slab_t *slab);
+static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_two_score(
+    bool case_sensitive, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_slab_t *slab);
+
 static fzf_result_t fzf_fuzzy_match_v2_impl(
     bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
     fzf_string_t *pattern, fzf_position_t *pos, fzf_slab_t *slab,
@@ -2984,6 +2999,21 @@ static inline fzf_result_t call_alg_for_input(
         slab, plan);
   }
   if (algo == fzf_fuzzy_match_v2) {
+    /* With one ASCII pattern byte, each occurrence has an independent score:
+       ScoreMatch plus the local boundary bonus.  The DP scratch arrays cannot
+       affect the winner.  Two bytes need only two scalar running rows when
+       positions are not requested.  Keep the general v1 fallback for slabs
+       too small for the candidate. */
+    if (pattern->size <= 2 && input_is_ascii) {
+      if (pattern->size == 1 &&
+          (slab == NULL || input->size <= slab->I16.cap))
+        return fzf_fuzzy_match_v2_single(
+            term->case_sensitive, forward, input, pattern->data[0], pos, slab);
+      if (pattern->size == 2 && pos == NULL &&
+          (slab == NULL || input->size <= slab->I16.cap / 2))
+        return fzf_fuzzy_match_v2_two_score(
+            term->case_sensitive, forward, input, pattern, slab);
+    }
     const fzf_ascii_query_plan_t *plan =
         fzf_fuzzy_query_plan(input, pattern);
     return fzf_fuzzy_match_v2_impl(
@@ -3491,3 +3521,153 @@ void fzf_free_slab(fzf_slab_t *slab) {
     free(slab);
   }
 }
+
+static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_single(
+    bool case_sensitive, bool forward, fzf_string_t *text, char pchar,
+    fzf_position_t *pos, fzf_slab_t *slab) {
+  int16_t max_score = 0;
+  size_t max_score_pos = SIZE_MAX;
+  const score_scheme_config_t *config = score_scheme_config(slab);
+
+  /* Keep the common one-byte candidate off the libc search path. */
+  if (text->size == 1) {
+    char text_byte = text->data[0];
+    bool exact = text_byte == pchar;
+    bool folded = !case_sensitive && pchar >= 'a' && pchar <= 'z' &&
+                  text_byte == pchar - (char)32;
+    if (!exact && !folded) return (fzf_result_t){-1, -1, 0};
+    char_class class = char_class_of_ascii(text_byte, config);
+    int16_t score = ScoreMatch +
+                    bonus_for(config, config->initial_class, class) *
+                        BonusFirstCharMultiplier;
+    append_pos(pos, 0);
+    return (fzf_result_t){0, 1, score};
+  }
+
+  /* Parsed scoring has already classified the candidate as ASCII.  Jump
+     directly between occurrences because a one-byte score depends only on
+     that byte and its immediate predecessor. */
+  size_t from = 0;
+  for (;;) {
+    int32_t found = try_skip(text, case_sensitive, pchar, (int32_t)from);
+    if (found < 0) break;
+    size_t off = (size_t)found;
+    char_class class = char_class_of_ascii(text->data[off], config);
+    char_class prev_class = off == 0
+                                ? config->initial_class
+                                : char_class_of_ascii(text->data[off - 1],
+                                                      config);
+    int16_t bonus = bonus_for(config, prev_class, class);
+    int16_t score = ScoreMatch + bonus * BonusFirstCharMultiplier;
+    if (forward ? score > max_score : score >= max_score) {
+      max_score = score;
+      max_score_pos = off;
+      if (forward && bonus >= BonusBoundary) break;
+    }
+    if (off == text->size - 1) break;
+    from = off + 1;
+  }
+
+  if (max_score_pos == SIZE_MAX) return (fzf_result_t){-1, -1, 0};
+  append_pos(pos, max_score_pos);
+  return (fzf_result_t){(int32_t)max_score_pos,
+                        (int32_t)max_score_pos + 1, max_score};
+}
+
+static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_two_score(
+    bool case_sensitive, bool forward, fzf_string_t *text,
+    fzf_string_t *pattern, fzf_slab_t *slab) {
+  int32_t first = ascii_fuzzy_index(text, pattern, NULL, case_sensitive);
+  if (first < 0) return (fzf_result_t){-1, -1, 0};
+
+  const score_scheme_config_t *config = score_scheme_config(slab);
+  char pchar0 = pattern->data[0];
+  char pchar1 = pattern->data[1];
+
+  /* No final-row score at a gap after the last pchar1 can improve: each such
+     cell only applies a negative gap penalty.  A cheap reverse byte scan
+     avoids carrying either row through an irrelevant candidate suffix. */
+  size_t scan_end = text->size;
+  while (scan_end > (size_t)first) {
+    char c = text->data[scan_end - 1];
+    if (!case_sensitive && c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    if (c == pchar1) break;
+    scan_end--;
+  }
+
+  int32_t prev_class = config->initial_class;
+  int16_t h0_prev = 0;
+  int16_t c0_prev = 0;
+  int16_t bonus_prev = 0;
+  int16_t h1_prev = 0;
+  int16_t max_score = 0;
+  size_t max_score_pos = 0;
+  bool in_gap0 = false;
+  bool in_gap1 = false;
+  bool found0 = false;
+  bool found1 = false;
+
+  for (size_t col = (size_t)first; col < scan_end; col++) {
+    char c = text->data[col];
+    char_class class = char_class_of_ascii(c, config);
+    if (!case_sensitive && class == CharUpper)
+      c = (char)tolower((uint8_t)c);
+    int16_t bonus = bonus_for(config, prev_class, class);
+    prev_class = class;
+
+    bool row1_was_active = found1;
+    if (!found0) {
+      if (c == pchar0) found0 = true;
+    } else if (!found1 && c == pchar1) {
+      found1 = true;
+    }
+
+    int16_t h0;
+    int16_t c0;
+    if (c == pchar0) {
+      h0 = ScoreMatch + bonus * BonusFirstCharMultiplier;
+      c0 = 1;
+      in_gap0 = false;
+    } else {
+      h0 = max16(h0_prev +
+                     (in_gap0 ? ScoreGapExtention : ScoreGapStart),
+                 0);
+      c0 = 0;
+      in_gap0 = true;
+    }
+
+    if (found1) {
+      int16_t h_left = row1_was_active ? h1_prev : 0;
+      int16_t s1 = 0;
+      int16_t s2 = h_left +
+                   (in_gap1 ? ScoreGapExtention : ScoreGapStart);
+      if (c == pchar1) {
+        int16_t match_bonus = bonus;
+        if (c0_prev > 0 &&
+            !(match_bonus >= BonusBoundary && match_bonus > bonus_prev))
+          match_bonus = max16(
+              match_bonus, max16(BonusConsecutive, bonus_prev));
+        s1 = h0_prev + ScoreMatch;
+        if (s1 + match_bonus < s2)
+          s1 += bonus;
+        else
+          s1 += match_bonus;
+      }
+      in_gap1 = s1 < s2;
+      h1_prev = max16(max16(s1, s2), 0);
+      if (forward ? h1_prev > max_score : h1_prev >= max_score) {
+        max_score = h1_prev;
+        max_score_pos = col;
+      }
+    }
+
+    h0_prev = h0;
+    c0_prev = c0;
+    bonus_prev = bonus;
+  }
+
+  return (fzf_result_t){(int32_t)max_score_pos,
+                        (int32_t)max_score_pos + 1, max_score};
+}
+
+#undef FZF_NOINLINE

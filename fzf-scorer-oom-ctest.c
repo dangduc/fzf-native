@@ -140,17 +140,33 @@ static int exercise_score_positions(const char *label, const char *candidate,
 
 int main(void) {
   size_t tested = 0;
+  char one_query[] = "a";
+  char two_query[] = "ab";
   char ascii_query[] = "abc";
   char utf8_query[] = "你界";
+  fzf_pattern_t *one_pattern = make_pattern(one_query);
+  fzf_pattern_t *two_pattern = make_pattern(two_query);
   fzf_pattern_t *ascii_pattern = make_pattern(ascii_query);
   fzf_pattern_t *utf8_pattern = make_pattern(utf8_query);
-  if (!ascii_pattern || !utf8_pattern) {
+  if (!one_pattern || !two_pattern || !ascii_pattern || !utf8_pattern) {
+    fzf_free_pattern(one_pattern);
+    fzf_free_pattern(two_pattern);
     fzf_free_pattern(ascii_pattern);
     fzf_free_pattern(utf8_pattern);
     return fail("setup", 0, "could not create patterns");
   }
 
   int result =
+      exercise_score("one-byte score", "beta", one_pattern, &tested) ||
+      exercise_positions("one-byte positions", "beta", one_pattern,
+                         &tested) ||
+      exercise_score_positions("one-byte combined", "beta", one_pattern,
+                               &tested) ||
+      exercise_score("two-byte score", "alphabet", two_pattern, &tested) ||
+      exercise_positions("two-byte positions", "alphabet", two_pattern,
+                         &tested) ||
+      exercise_score_positions("two-byte combined", "alphabet", two_pattern,
+                               &tested) ||
       exercise_score("ASCII score", "alphabet-bravo-charlie", ascii_pattern,
                      &tested) ||
       exercise_positions("ASCII positions", "alphabet-bravo-charlie",
@@ -164,6 +180,8 @@ int main(void) {
                                &tested);
 
   fail_at = SIZE_MAX;
+  fzf_free_pattern(one_pattern);
+  fzf_free_pattern(two_pattern);
   fzf_free_pattern(ascii_pattern);
   fzf_free_pattern(utf8_pattern);
   if (result) return result;
