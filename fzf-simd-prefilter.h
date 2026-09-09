@@ -18,15 +18,16 @@
 #include <stdint.h>
 #include <string.h>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
 #define FZF_HAVE_SIMD_PREFILTER 1
 #define FZF_SIMD_NEON 1
 #elif defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
-#if defined(_MSC_VER)
-#include <intrin.h>
-#endif
 #define FZF_HAVE_SIMD_PREFILTER 1
 #define FZF_SIMD_SSE2 1
 #else
