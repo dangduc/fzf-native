@@ -17,6 +17,7 @@ endif
 # variants (via utf8_char_index.h -> utf8proc.h) depend on it.
 UTF8PROC_DIR ?= utf8proc-2.10.0
 UTF8PROC_SRC := $(UTF8PROC_DIR)/utf8proc.c
+PYTHON ?= python3
 
 PACKAGE := fzf-native
 AUTOLOADS := $(PACKAGE)-autoloads.el
@@ -167,6 +168,21 @@ ctest-fzf-bench-driver:
 	! $(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
 		--algo=v2 --tiebreak=index --threads=1 \
 		--bench=18446744073709551616ns < /dev/null
+
+# Compare the adapter's ordered identities and rank inputs with the exact
+# upstream implementation.  The caller must supply a local, pinned fzf tree;
+# the checker disables module and toolchain downloads.
+.PHONY: ctest-fzf-upstream-semantic
+ctest-fzf-upstream-semantic:
+	test -n "$(FZF_SOURCE)"
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/fzf-bench-driver-semantic \
+		benchmarks/fzf-bench-driver.c fzf.c $(UTF8PROC_SRC)
+	$(PYTHON) benchmarks/check-fzf-semantic-parity.py \
+		--fzf-source "$(FZF_SOURCE)" \
+		--native-driver $(BUILD_DIR)/fzf-bench-driver-semantic
 
 # Prove that the core-hotpath benchmark validates exact per-item scores before
 # it starts timing.  The injected scorer fault must be rejected by the pinned

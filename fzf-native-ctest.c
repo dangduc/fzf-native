@@ -942,6 +942,39 @@ static void test_score_bounds_hide_partial_and_match(void) {
   fzf_free_pattern(pattern);
 }
 
+static void test_score_only_bounds_match_upstream_v2_start(void) {
+  struct {
+    char *query;
+    const char *candidate;
+    fzf_case_types case_mode;
+    int32_t expected_begin;
+  } cases[] = {
+    /* General ASCII matrix, specialized two-row scorer, general UTF-8
+       matrix, and the raw Other_Letter row scorer, respectively. */
+    {"abc", "zabc", CaseRespect, 1},
+    {"ab", "zza---b", CaseRespect, 2},
+    {"ång", "xång", CaseIgnore, 1},
+    {"中文", "前中-文", CaseIgnore, 1},
+  };
+
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    fzf_pattern_t *pattern = fzf_parse_pattern(
+        cases[i].case_mode, false, cases[i].query, true);
+    fzf_slab_t *slab = fzf_make_default_slab();
+    fzf_score_bounds_t bounds = {0};
+    CHECK(pattern != NULL && slab != NULL);
+    int score = fzf_get_score_with_bounds(
+        cases[i].candidate, pattern, slab, &bounds);
+    CHECK(score > 0);
+    CHECK(bounds.valid);
+    CHECK(bounds.raw_score == score);
+    CHECK(bounds.min_begin == cases[i].expected_begin);
+    CHECK(bounds.min_end > bounds.min_begin);
+    fzf_free_slab(slab);
+    fzf_free_pattern(pattern);
+  }
+}
+
 /* =====================================================================
  * counting_sort_scored (async-path twin of counting_sort_candidates)
  * ===================================================================== */
@@ -4374,6 +4407,7 @@ int main(void) {
   RUN(test_ranked_score_fast_path_preserves_raw_score);
   RUN(test_score_bounds_aggregate_positive_terms);
   RUN(test_score_bounds_hide_partial_and_match);
+  RUN(test_score_only_bounds_match_upstream_v2_start);
 
   printf("--- counting_sort_scored ---\n");
   RUN(test_scored_n_zero);

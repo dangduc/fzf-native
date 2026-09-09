@@ -124,6 +124,7 @@ typedef struct {
   bool tiebreak_index;
   bool check_only;
   bool dump_results;
+  bool dump_semantic;
   bool help;
 } BenchOptions;
 
@@ -137,7 +138,7 @@ static uint64_t bench_now_ns(void) {
 static void bench_usage(FILE *stream, const char *program) {
   fprintf(stream,
           "usage: %s --filter QUERY "
-          "(--bench DURATION | --check | --dump-results) "
+          "(--bench DURATION | --check | --dump-results | --dump-semantic) "
           "[--threads N] [--literal] "
           "[--sort | --no-sort] [--algo=v2] --tiebreak=index\n",
           program);
@@ -220,6 +221,8 @@ static bool bench_parse_options(int argc, char **argv,
       options->check_only = true;
     } else if (strcmp(argument, "--dump-results") == 0) {
       options->dump_results = true;
+    } else if (strcmp(argument, "--dump-semantic") == 0) {
+      options->dump_semantic = true;
     } else if (strcmp(argument, "--literal") == 0) {
       options->normalize = false;
     } else if (strcmp(argument, "--no-literal") == 0) {
@@ -259,7 +262,7 @@ static bool bench_parse_options(int argc, char **argv,
 
   if (options->help) return true;
   unsigned modes = (options->duration_ns > 0) + options->check_only +
-      options->dump_results;
+      options->dump_results + options->dump_semantic;
   if (!options->query || !options->tiebreak_index || modes != 1)
     return false;
   if (options->threads == 0) options->threads = bench_online_threads();
@@ -823,6 +826,67 @@ static bool bench_dump_results(BenchPool *pool, size_t match_count) {
   return success && fflush(stdout) == 0;
 }
 
+/* Emit the exact identity and rank inputs used by the adapter.  This mode is
+   intentionally untimed.  A pinned helper inside the upstream fzf package
+   consumes the same candidates for the parity checker. */
+static bool bench_dump_semantic(BenchPool *pool, size_t match_count) {
+  BenchMerger *merger = pool->result.merger;
+  if (!merger || merger->pass || merger->count != match_count) return false;
+  if (merger->list_count > 0)
+    memset(merger->cursors, 0,
+           merger->list_count * sizeof *merger->cursors);
+
+  fzf_slab_t *slab = fzf_make_default_slab();
+  if (!slab || !fzf_slab_set_score_scheme(
+                   slab, FZF_SCORE_SCHEME_DEFAULT)) {
+    fzf_free_slab(slab);
+    return false;
+  }
+
+  bool success = true;
+  for (size_t emitted = 0; emitted < match_count; emitted++) {
+    const BenchMatch *best = NULL;
+    size_t best_worker = 0;
+    for (size_t worker = 0; worker < merger->list_count; worker++) {
+      const BenchMatchList *list = &merger->lists[worker];
+      if (merger->cursors[worker] >= list->count) continue;
+      const BenchMatch *candidate =
+          &list->values[merger->cursors[worker]];
+      if (!best || bench_match_precedes(candidate, best, merger->sorted)) {
+        best = candidate;
+        best_worker = worker;
+      }
+    }
+    if (!best) {
+      success = false;
+      break;
+    }
+
+    fzf_score_bounds_t bounds;
+    int32_t membership_score = fzf_get_score_with_bounds_bytes_preclassified(
+        best->candidate->text, best->candidate->length,
+        best->candidate->input_is_ascii, pool->pattern, slab, &bounds);
+    uint16_t rank_score = pool->has_positive_term
+        ? bench_rank_score(bounds.raw_score) : 0;
+    uint16_t point3 = (uint16_t)(UINT16_MAX - rank_score);
+    if (membership_score <= 0 || fzf_allocation_failed() ||
+        rank_score != best->rank_score ||
+        printf("%" PRIu32 "\t%" PRId64 "\t%d\t%d\t%d\t%d\t"
+               "%u\t0\t0\t0\t%u\n",
+               best->candidate->index, bounds.raw_score,
+               bounds.min_begin, bounds.min_end, bounds.max_end,
+               bounds.valid ? 1 : 0, (unsigned)rank_score,
+               (unsigned)point3) < 0) {
+      success = false;
+      break;
+    }
+    merger->cursors[best_worker]++;
+  }
+
+  fzf_free_slab(slab);
+  return success && fflush(stdout) == 0;
+}
+
 static char *bench_duplicate(const char *text) {
   size_t length = strlen(text) + 1;
   char *copy = malloc(length);
@@ -882,7 +946,7 @@ int main(int argc, char **argv) {
   size_t sample_count = 0;
   size_t sample_capacity = 0;
   bool success = true;
-  if (options.check_only || options.dump_results) {
+  if (options.check_only || options.dump_results || options.dump_semantic) {
     bench_pool_discard_results(&pool);
     success = bench_pool_run(&pool);
     if (success) match_count = bench_pool_result_length(&pool);
@@ -921,12 +985,14 @@ int main(int argc, char **argv) {
   uint64_t result_checksum = 0;
   if (success && options.dump_results)
     success = bench_dump_results(&pool, match_count);
+  else if (success && options.dump_semantic)
+    success = bench_dump_semantic(&pool, match_count);
   else if (success)
     success = bench_result_checksum(&pool, match_count, &result_checksum);
   if (!success) {
     fprintf(stderr, "fzf-native benchmark: scan or output failed\n");
-  } else if (options.dump_results) {
-    /* bench_dump_results has already written the intentionally plain output. */
+  } else if (options.dump_results || options.dump_semantic) {
+    /* The selected dump mode has already written its output. */
   } else if (options.check_only) {
     printf("semantic items=%zu matches=%zu input_checksum=%016" PRIx64
            " result_checksum=%016" PRIx64 "\n",

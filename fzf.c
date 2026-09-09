@@ -1478,8 +1478,11 @@ static fzf_result_t fzf_fuzzy_match_v2_impl(
   }
 
   resize_pos(pos, M, M);
-  size_t j = max_score_pos;
+  /* Match upstream's score-only boundary: without a backtrace, fzf reports
+     the first Phase-2 match (F[0]), not the best final-row position. */
+  size_t j = f0;
   if (pos) {
+    j = max_score_pos;
     size_t i = M - 1;
     bool prefer_match = true;
     for (;;) {
@@ -2798,8 +2801,11 @@ static fzf_result_t fzf_fuzzy_match_v2_utf8_impl(
 
   // Phase 4: Backtrace
   resize_pos(pos, Mc, Mc);
-  size_t j = max_score_pos;
+  /* Match upstream's score-only boundary: without a backtrace, fzf reports
+     the first Phase-2 match (F[0]), not the best final-row position. */
+  size_t j = f0;
   if (pos) {
+    j = max_score_pos;
     size_t i = Mc - 1;
     bool prefer_match = true;
     for (;;) {
@@ -3638,6 +3644,7 @@ static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_two_score(
   bool in_gap1 = false;
   bool found0 = false;
   bool found1 = false;
+  size_t first_match_pos = SIZE_MAX;
 
   for (size_t col = (size_t)first; col < scan_end; col++) {
     char c = text->data[col];
@@ -3649,7 +3656,10 @@ static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_two_score(
 
     bool row1_was_active = found1;
     if (!found0) {
-      if (c == pchar0) found0 = true;
+      if (c == pchar0) {
+        found0 = true;
+        first_match_pos = col;
+      }
     } else if (!found1 && c == pchar1) {
       found1 = true;
     }
@@ -3698,7 +3708,9 @@ static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_two_score(
     bonus_prev = bonus;
   }
 
-  return (fzf_result_t){(int32_t)max_score_pos,
+  if (first_match_pos == SIZE_MAX)
+    return (fzf_result_t){-1, -1, 0};
+  return (fzf_result_t){(int32_t)first_match_pos,
                         (int32_t)max_score_pos + 1, max_score};
 }
 
@@ -3773,6 +3785,7 @@ static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_score_rune_rows(
   size_t active = 0;
   int16_t max_score = 0;
   size_t max_score_pos = 0;
+  size_t first_match_pos = SIZE_MAX;
   size_t char_pos = scope.start_char;
   char_class prev_class = config->initial_class;
 
@@ -3787,7 +3800,10 @@ static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_score_rune_rows(
     int16_t bonus = bonus_for(config, prev_class, class);
     prev_class = class;
 
-    if (active < row_count && codepoint == query[active]) active++;
+    if (active < row_count && codepoint == query[active]) {
+      if (active == 0) first_match_pos = char_pos;
+      active++;
+    }
     for (size_t row_plus_one = active; row_plus_one > 0; row_plus_one--) {
       size_t row = row_plus_one - 1;
       if (row == 0) {
@@ -3858,7 +3874,8 @@ static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_score_rune_rows(
   }
 
   if (active != row_count) return (fzf_result_t){-1, -1, 0};
-  return (fzf_result_t){(int32_t)max_score_pos,
+  size_t start_pos = row_count == 1 ? max_score_pos : first_match_pos;
+  return (fzf_result_t){(int32_t)start_pos,
                         (int32_t)max_score_pos + 1, max_score};
 }
 
