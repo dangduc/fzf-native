@@ -112,7 +112,56 @@ emacs-asan:
 .PHONY: ctest
 ctest: ctest-module ctest-additions ctest-parser-oom ctest-scorer-oom \
 	ctest-session-growth-benchmark ctest-session-trace-benchmark \
-	ctest-core-hotpath-oracle ctest-simd-prefilter
+	ctest-core-hotpath-oracle ctest-simd-prefilter ctest-fzf-bench-driver
+
+# Verify the standalone fzf --bench-equivalent driver with multiple workers.
+# A small chunk size gives the fixture independently scheduled chunks; the
+# production benchmark keeps fzf's 1024-item chunk size.
+.PHONY: ctest-fzf-bench-driver
+ctest-fzf-bench-driver:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -DFZF_BENCH_CHUNK_SIZE=3 \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/fzf-bench-driver-ctest \
+		benchmarks/fzf-bench-driver.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=1 --check \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-w1.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=3 --check \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-w3.txt
+	cmp $(BUILD_DIR)/fzf-bench-driver-w1.txt \
+		$(BUILD_DIR)/fzf-bench-driver-w3.txt
+	grep -Fx 'semantic items=12 matches=9 input_checksum=18c3f63929c5b7fa result_checksum=59c7cb863237a38b' \
+		$(BUILD_DIR)/fzf-bench-driver-w1.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=1 --no-sort --check \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-nosort-w1.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=3 --no-sort --check \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-nosort-w3.txt
+	cmp $(BUILD_DIR)/fzf-bench-driver-nosort-w1.txt \
+		$(BUILD_DIR)/fzf-bench-driver-nosort-w3.txt
+	grep -Fx 'semantic items=12 matches=9 input_checksum=18c3f63929c5b7fa result_checksum=57088aed5d299e8b' \
+		$(BUILD_DIR)/fzf-bench-driver-nosort-w1.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=1 --dump-results \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-dump-w1.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=3 --dump-results \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-dump-w3.txt
+	cmp $(BUILD_DIR)/fzf-bench-driver-dump-w1.txt \
+		$(BUILD_DIR)/fzf-bench-driver-dump-w3.txt
+	test "$$(wc -l < $(BUILD_DIR)/fzf-bench-driver-dump-w1.txt)" -eq 9
+	! $(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=1 \
+		--bench=18446744073709551616ns < /dev/null
 
 # Prove that the core-hotpath benchmark validates exact per-item scores before
 # it starts timing.  The injected scorer fault must be rejected by the pinned
@@ -318,6 +367,34 @@ benchmark-rejection-hotpath-probe:
 		-o $(BUILD_DIR)/rejection-hotpath-probe \
 		benchmarks/rejection-hotpath-probe.c fzf.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/rejection-hotpath-probe
+
+# Native counterpart of junegunn/fzf's filter-mode --bench loop.  Ingestion,
+# pattern parsing, and the final semantic checksum are outside the timer.  Each
+# timed scan includes full scoring, worker-local result collection and sorting,
+# and only match-count materialization, matching fzf's lazy-merger boundary.
+# FZF_BENCH_SORT=--no-sort selects a native-only diagnostic.  fzf filter mode
+# forces sorting for sortable patterns, even with its --no-sort option.
+FZF_BENCH_INPUT ?= /dev/stdin
+FZF_BENCH_QUERY ?= linux
+FZF_BENCH_DURATION ?= 1s
+FZF_BENCH_THREADS ?= 1
+FZF_BENCH_SORT ?= --sort
+FZF_BENCH_DRIVER := $(BUILD_DIR)/fzf-bench-driver
+
+.PHONY: benchmark-fzf-bench-build benchmark-fzf-bench
+benchmark-fzf-bench-build:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O3 -DNDEBUG \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(FZF_BENCH_DRIVER) benchmarks/fzf-bench-driver.c \
+		fzf.c $(UTF8PROC_SRC)
+
+benchmark-fzf-bench: benchmark-fzf-bench-build
+	$(FZF_BENCH_DRIVER) --filter='$(FZF_BENCH_QUERY)' \
+		--tiebreak=index --bench='$(FZF_BENCH_DURATION)' \
+		--threads='$(FZF_BENCH_THREADS)' $(FZF_BENCH_SORT) \
+		--algo=v2 --literal \
+		< '$(FZF_BENCH_INPUT)'
 
 # Real persistent-session growth probe.  Timings include producer appends,
 # growth notification, coordinator work, shared workers, cache update, and

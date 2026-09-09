@@ -1,0 +1,12 @@
+a_b_c
+nomatch
+abc
+ABC
+zabxc
+xxabcyy
+ab-c
+cab
+
+abc
+إنabc
+abc니다
