@@ -1207,6 +1207,12 @@ static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_single(
 static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_two_score(
     bool case_sensitive, bool forward, fzf_string_t *text,
     fzf_string_t *pattern, fzf_slab_t *slab);
+#define FZF_FUZZY_RUNE_SCORE_ROWS_MAX 16u
+static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_score_rune_rows(
+    bool forward, fzf_string_t *text, fzf_string_t *pattern,
+    fzf_slab_t *slab);
+static inline bool fzf_raw_unicode_query_prefilterable(
+    const fzf_string_t *pattern);
 
 static fzf_result_t fzf_fuzzy_match_v2_impl(
     bool case_sensitive, bool normalize, bool forward, fzf_string_t *text,
@@ -2920,6 +2926,9 @@ static fzf_string_t *make_pattern_text(const char *data, size_t size,
     return NULL;
   size_t codepoint_bytes = count * sizeof(utf8proc_int32_t);
   size_t plan_offset = sizeof(fzf_string_t) + codepoint_bytes;
+  if (FZF_PARSED_PATTERN_FLAGS_SIZE > SIZE_MAX - plan_offset) return NULL;
+  size_t flags_offset = plan_offset;
+  plan_offset += FZF_PARSED_PATTERN_FLAGS_SIZE;
 #if FZF_HAVE_SIMD_PREFILTER
   size_t alignment = FZF_SIMD_PLAN_ALIGNMENT;
   size_t remainder = plan_offset % alignment;
@@ -2933,6 +2942,7 @@ static fzf_string_t *make_pattern_text(const char *data, size_t size,
   fzf_string_t *text = malloc(plan_offset + plan_size);
   if (!text) return NULL;
   utf8proc_int32_t *codepoints = (utf8proc_int32_t *)(text + 1);
+  uint8_t *pattern_flags = (uint8_t *)text + flags_offset;
 #if FZF_HAVE_SIMD_PREFILTER
   fzf_ascii_query_plan_t *plan =
       (fzf_ascii_query_plan_t *)((unsigned char *)text + plan_offset);
@@ -2946,13 +2956,18 @@ static fzf_string_t *make_pattern_text(const char *data, size_t size,
       .codepoints_case_folded = !case_sensitive,
   };
   size_t byte_pos = 0;
+  bool raw_other_letter = count > 0;
   for (size_t i = 0; i < count; i++) {
     utf8proc_ssize_t width = utf8_iterate_lossy(
         (const utf8proc_uint8_t *)data + byte_pos,
         (utf8proc_ssize_t)(size - byte_pos), &codepoints[i]);
     if (!case_sensitive) codepoints[i] = utf8proc_case_fold(codepoints[i]);
+    if (utf8proc_category(codepoints[i]) != UTF8PROC_CATEGORY_LO)
+      raw_other_letter = false;
     byte_pos += (size_t)width;
   }
+  *pattern_flags =
+      raw_other_letter ? FZF_PARSED_PATTERN_RAW_OTHER_LETTER : 0;
   return text;
 }
 
@@ -3043,10 +3058,18 @@ static inline fzf_result_t call_alg_for_input(
     return fzf_fuzzy_match_v1_utf8_with_direction(
         term->case_sensitive, term->normalize, forward, input, pattern, pos,
         slab);
-  if (algo == fzf_fuzzy_match_v2_utf8)
+  if (algo == fzf_fuzzy_match_v2_utf8) {
+    size_t rune_count = pattern->codepoint_count;
+    if (fzf_raw_unicode_query_prefilterable(pattern) && pos == NULL &&
+        rune_count > 0 &&
+        rune_count <= FZF_FUZZY_RUNE_SCORE_ROWS_MAX &&
+        (slab == NULL || input->size <= slab->I16.cap / rune_count))
+      return fzf_fuzzy_match_v2_score_rune_rows(
+          forward, input, pattern, slab);
     return fzf_fuzzy_match_v2_utf8_with_direction(
         term->case_sensitive, term->normalize, forward, input, pattern, pos,
         slab);
+  }
   if (algo == fzf_exact_match_utf8)
     return fzf_exact_match_utf8_with_direction(
         term->case_sensitive, term->normalize, forward, input, pattern, pos,
@@ -3675,6 +3698,166 @@ static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_two_score(
     bonus_prev = bonus;
   }
 
+  return (fzf_result_t){(int32_t)max_score_pos,
+                        (int32_t)max_score_pos + 1, max_score};
+}
+
+typedef struct {
+  size_t start_byte;
+  size_t end_byte;
+  size_t start_char;
+} fzf_raw_rune_scope_t;
+
+/* Unicode Other_Letter runes are uncased.  fzf's normalization table only
+   produces ASCII, so neither lowercase nor normalization can make a distinct
+   candidate rune reach an Lo query rune.  The exhaustive scorer test audits
+   the lowercase mappings of uppercase runes in the vendored utf8proc table. */
+static inline bool fzf_raw_unicode_query_prefilterable(
+    const fzf_string_t *pattern) {
+  const uint8_t *flags = fzf_parsed_pattern_flags(pattern);
+  return (*flags & FZF_PARSED_PATTERN_RAW_OTHER_LETTER) != 0;
+}
+
+/* Find the same first/last useful columns as v2's first two phases.  The
+   parser admits this scan only for Other_Letter queries, whose runes cannot
+   be produced by v2's uppercase-to-lowercase transform. */
+static bool fzf_raw_rune_scope(
+    fzf_string_t *text, const utf8proc_int32_t *pattern, size_t pattern_size,
+    fzf_raw_rune_scope_t *scope) {
+  size_t byte_pos = 0;
+  size_t previous_byte = 0;
+  size_t char_pos = 0;
+  size_t pattern_pos = 0;
+  utf8proc_int32_t last = pattern[pattern_size - 1];
+  *scope = (fzf_raw_rune_scope_t){0};
+
+  while (byte_pos < text->size) {
+    utf8proc_int32_t codepoint;
+    utf8proc_ssize_t width = utf8_iterate_lossy(
+        (const utf8proc_uint8_t *)text->data + byte_pos,
+        (utf8proc_ssize_t)(text->size - byte_pos), &codepoint);
+    if (pattern_pos < pattern_size && codepoint == pattern[pattern_pos]) {
+      if (pattern_pos == 0) {
+        scope->start_byte = char_pos == 0 ? byte_pos : previous_byte;
+        scope->start_char = char_pos == 0 ? 0 : char_pos - 1;
+      }
+      pattern_pos++;
+    }
+    if (pattern_pos == pattern_size && codepoint == last)
+      scope->end_byte = byte_pos + (size_t)width;
+    previous_byte = byte_pos;
+    byte_pos += (size_t)width;
+    char_pos++;
+  }
+  return pattern_pos == pattern_size;
+}
+
+/* UTF-8 counterpart of the compact ASCII row scorer.  A cheap exact-rune
+   scope pass rejects uncased-script misses without Unicode property lookups;
+   matching candidates then need only this narrowed scoring pass, not a
+   byte-to-character map, decoded text array, or backtrace matrix. */
+static FZF_NOINLINE fzf_result_t fzf_fuzzy_match_v2_score_rune_rows(
+    bool forward, fzf_string_t *text, fzf_string_t *pattern,
+    fzf_slab_t *slab) {
+  const size_t row_count = pattern->codepoint_count;
+  const utf8proc_int32_t *query = pattern->codepoints;
+  fzf_raw_rune_scope_t scope;
+  if (!fzf_raw_rune_scope(text, query, row_count, &scope))
+    return (fzf_result_t){-1, -1, 0};
+
+  const score_scheme_config_t *config = score_scheme_config(slab);
+  int16_t h[FZF_FUZZY_RUNE_SCORE_ROWS_MAX] = {0};
+  int16_t consecutive[FZF_FUZZY_RUNE_SCORE_ROWS_MAX] = {0};
+  int16_t first_bonus[FZF_FUZZY_RUNE_SCORE_ROWS_MAX] = {0};
+  bool in_gap[FZF_FUZZY_RUNE_SCORE_ROWS_MAX] = {false};
+  size_t active = 0;
+  int16_t max_score = 0;
+  size_t max_score_pos = 0;
+  size_t char_pos = scope.start_char;
+  char_class prev_class = config->initial_class;
+
+  for (size_t byte_pos = scope.start_byte; byte_pos < scope.end_byte;
+       char_pos++) {
+    utf8proc_int32_t codepoint;
+    utf8proc_ssize_t width = utf8_iterate_lossy(
+        (const utf8proc_uint8_t *)text->data + byte_pos,
+        (utf8proc_ssize_t)(scope.end_byte - byte_pos), &codepoint);
+    byte_pos += (size_t)width;
+    char_class class = char_class_of_codepoint(codepoint, config);
+    int16_t bonus = bonus_for(config, prev_class, class);
+    prev_class = class;
+
+    if (active < row_count && codepoint == query[active]) active++;
+    for (size_t row_plus_one = active; row_plus_one > 0; row_plus_one--) {
+      size_t row = row_plus_one - 1;
+      if (row == 0) {
+        if (codepoint == query[0]) {
+          h[0] = ScoreMatch + bonus * BonusFirstCharMultiplier;
+          consecutive[0] = 1;
+          first_bonus[0] = bonus;
+          in_gap[0] = false;
+        } else {
+          h[0] = max16(h[0] +
+                           (in_gap[0] ? ScoreGapExtention : ScoreGapStart),
+                       0);
+          consecutive[0] = 0;
+          first_bonus[0] = 0;
+          in_gap[0] = true;
+        }
+        if (row_count == 1 &&
+            (forward ? h[0] > max_score : h[0] >= max_score)) {
+          max_score = h[0];
+          max_score_pos = char_pos;
+        }
+        if (row_count == 1 && forward && codepoint == query[0] &&
+            bonus >= BonusBoundary)
+          return (fzf_result_t){(int32_t)max_score_pos,
+                                (int32_t)max_score_pos + 1, max_score};
+        continue;
+      }
+
+      int16_t s1 = 0;
+      int16_t s2 = h[row] +
+                   (in_gap[row] ? ScoreGapExtention : ScoreGapStart);
+      int16_t next_consecutive = 0;
+      int16_t next_first_bonus = 0;
+      if (codepoint == query[row]) {
+        int16_t match_bonus = bonus;
+        next_consecutive = consecutive[row - 1] + 1;
+        next_first_bonus = bonus;
+        if (next_consecutive > 1) {
+          next_first_bonus = first_bonus[row - 1];
+          if (match_bonus >= BonusBoundary &&
+              match_bonus > next_first_bonus) {
+            next_consecutive = 1;
+            next_first_bonus = bonus;
+          } else {
+            match_bonus = max16(
+                match_bonus, max16(BonusConsecutive, next_first_bonus));
+          }
+        }
+        s1 = h[row - 1] + ScoreMatch;
+        if (s1 + match_bonus < s2) {
+          s1 += bonus;
+          next_consecutive = 0;
+          next_first_bonus = 0;
+        } else {
+          s1 += match_bonus;
+        }
+      }
+      consecutive[row] = next_consecutive;
+      first_bonus[row] = next_first_bonus;
+      in_gap[row] = s1 < s2;
+      h[row] = max16(max16(s1, s2), 0);
+      if (row + 1 == row_count &&
+          (forward ? h[row] > max_score : h[row] >= max_score)) {
+        max_score = h[row];
+        max_score_pos = char_pos;
+      }
+    }
+  }
+
+  if (active != row_count) return (fzf_result_t){-1, -1, 0};
   return (fzf_result_t){(int32_t)max_score_pos,
                         (int32_t)max_score_pos + 1, max_score};
 }

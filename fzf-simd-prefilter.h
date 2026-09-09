@@ -42,6 +42,8 @@
 /* The plan's strictest member is size_t.  Spell the alignment this way
    instead of using C11 _Alignof so the header also builds as MSVC C. */
 #define FZF_SIMD_PLAN_ALIGNMENT sizeof(size_t)
+#define FZF_PARSED_PATTERN_FLAGS_SIZE 1u
+#define FZF_PARSED_PATTERN_RAW_OTHER_LETTER UINT8_C(1)
 
 typedef struct {
   uint8_t exact[FZF_SIMD_LANES];
@@ -79,7 +81,8 @@ static inline const fzf_ascii_query_plan_t *
 fzf_ascii_query_plan_from_parsed(const fzf_string_t *pattern) {
 #if FZF_HAVE_SIMD_PREFILTER
   uintptr_t after_codepoints =
-      (uintptr_t)(pattern->codepoints + pattern->codepoint_count);
+      (uintptr_t)(pattern->codepoints + pattern->codepoint_count) +
+      FZF_PARSED_PATTERN_FLAGS_SIZE;
   size_t alignment = FZF_SIMD_PLAN_ALIGNMENT;
   uintptr_t aligned =
       (after_codepoints + alignment - 1) & ~(uintptr_t)(alignment - 1);
@@ -92,18 +95,28 @@ fzf_ascii_query_plan_from_parsed(const fzf_string_t *pattern) {
 
 static inline size_t fzf_ascii_query_plan_private_size(
     const fzf_string_t *pattern) {
-#if FZF_HAVE_SIMD_PREFILTER
   const unsigned char *after_codepoints =
       (const unsigned char *)(pattern->codepoints +
                               pattern->codepoint_count);
+#if FZF_HAVE_SIMD_PREFILTER
   const fzf_ascii_query_plan_t *plan =
       fzf_ascii_query_plan_from_parsed(pattern);
   return (size_t)((const unsigned char *)plan - after_codepoints) +
          fzf_ascii_query_plan_size(plan->pattern_size);
 #else
   (void)pattern;
-  return 0;
+  (void)after_codepoints;
+  return FZF_PARSED_PATTERN_FLAGS_SIZE;
 #endif
+}
+
+/* Parsed terms append one byte of scorer metadata before the optional,
+   aligned SIMD plan.  Keeping it out of fzf_string_t preserves the public
+   structure ABI. */
+static inline const uint8_t *fzf_parsed_pattern_flags(
+    const fzf_string_t *pattern) {
+  return (const uint8_t *)(pattern->codepoints +
+                           pattern->codepoint_count);
 }
 
 #if FZF_HAVE_SIMD_PREFILTER
