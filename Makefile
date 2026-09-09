@@ -296,6 +296,18 @@ benchmark-core-hotpath-probe:
 		benchmarks/core-hotpath-probe.c fzf.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/core-hotpath-probe
 
+# Synthetic scorer-entry probe.  It keeps the candidate bytes and expected
+# scores fixed, then separates C-string length discovery, bounded ASCII
+# classification, and the already-classified matcher path.  Use it to keep
+# adapter/setup work distinct from scorer changes.
+.PHONY: benchmark-api-overhead-probe
+benchmark-api-overhead-probe:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -O3 -DNDEBUG -I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/api-overhead-probe \
+		benchmarks/api-overhead-probe.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/api-overhead-probe
+
 # Real persistent-session growth probe.  Timings include producer appends,
 # growth notification, coordinator work, shared workers, cache update, and
 # result publication.  Full-scan validation runs after all timed rounds.
