@@ -105,6 +105,12 @@ static AsyncSession *bench_session_create(unsigned workers) {
   cache_init_limits(&session->cache, 40, 64 * 1024 * 1024);
   batch_cache_init(&session->batch_cache, 64 * 1024 * 1024);
 
+  /* A zero worker count leaves the session unpooled.  Cold-start probes use
+     this mode so their first request performs the process's first worker
+     creation, matching production startup rather than warming pthread state
+     with a throwaway private pool. */
+  if (workers == 0) return session;
+
   struct AsyncWorkerPool *pool = async_worker_pool_create(workers);
   if (!pool) {
     async_session_destroy(session);

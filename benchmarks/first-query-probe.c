@@ -111,15 +111,11 @@ static bool first_query_append_candidate(AsyncSession *session,
 
 static AsyncSession *first_query_create_session(size_t candidate_count,
                                                 FirstQueryCorpus corpus) {
-  /* Reuse the benchmark's complete session initializer, then remove its
-     private pool before starting the coordinator.  Production sessions also
-     begin with worker_pool == NULL and acquire the process-wide pool. */
-  AsyncSession *session = bench_session_create(1);
+  /* Production sessions begin with worker_pool == NULL.  Do not create and
+     destroy a private pool here: that would warm pthread and allocator state
+     before the supposedly cold first request creates the process-wide pool. */
+  AsyncSession *session = bench_session_create(0);
   if (!session) return NULL;
-  struct AsyncWorkerPool *private_pool = atomic_exchange_explicit(
-      &session->worker_pool, NULL, memory_order_acq_rel);
-  session->worker_pool_owned = false;
-  async_worker_pool_destroy(private_pool);
 
   if (!bench_start_coordinator(session)) {
     async_session_destroy(session);
