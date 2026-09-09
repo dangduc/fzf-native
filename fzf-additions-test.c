@@ -790,6 +790,63 @@ static void test_bounded_entry_points_need_no_terminator(void) {
   free(text);
 }
 
+static bool scalar_is_ascii(const unsigned char *text, size_t length) {
+  for (size_t i = 0; i < length; i++)
+    if (text[i] & 0x80) return false;
+  return true;
+}
+
+static uint64_t classifier_test_random(uint64_t *state) {
+  uint64_t value = *state;
+  value ^= value << 13;
+  value ^= value >> 7;
+  value ^= value << 17;
+  return *state = value;
+}
+
+static void test_ascii_classifier_boundaries_and_differential(void) {
+  static const size_t lengths[] = {
+      0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33,
+      39, 40, 63, 64, 65, 95, 96, 97, 127, 128, 129,
+  };
+
+  /* Give the classifier exact-sized readable tails at every alignment.
+     Embedded NUL is ordinary bounded data and remains ASCII. */
+  for (size_t li = 0; li < sizeof lengths / sizeof lengths[0]; li++) {
+    size_t length = lengths[li];
+    for (size_t offset = 0; offset < 8; offset++) {
+      size_t allocation_size = offset + length;
+      unsigned char *allocation =
+          malloc(allocation_size ? allocation_size : 1);
+      CHECK(allocation != NULL);
+      if (!allocation) continue;
+      unsigned char *text = allocation + offset;
+      for (size_t i = 0; i < length; i++)
+        text[i] = i % 11 == 0 ? 0 : (unsigned char)(i & 0x7f);
+      CHECK(is_ascii_utf8proc((const char *)text, length));
+      for (size_t i = 0; i < length; i++) {
+        unsigned char saved = text[i];
+        text[i] = (unsigned char)(0x80 | (i & 0x7f));
+        CHECK(!is_ascii_utf8proc((const char *)text, length));
+        text[i] = saved;
+      }
+      free(allocation);
+    }
+  }
+
+  unsigned char storage[272];
+  uint64_t random = UINT64_C(0xd1b54a32d192ed03);
+  for (size_t iteration = 0; iteration < 4096; iteration++) {
+    size_t offset = (size_t)(classifier_test_random(&random) & 7);
+    size_t length = (size_t)(classifier_test_random(&random) % 257);
+    for (size_t i = 0; i < length; i++)
+      storage[offset + i] = (unsigned char)classifier_test_random(&random);
+    CHECK(is_ascii_utf8proc(
+              (const char *)storage + offset, length) ==
+          scalar_is_ascii(storage + offset, length));
+  }
+}
+
 static void test_invalid_utf8_exact_is_lossless(void) {
   /* Invalid bytes are individual lossy-decoder units.  An exact match must
      consume each unit; it must not declare success after only the valid
@@ -1418,6 +1475,7 @@ int main(void) {
   RUN(test_bounded_entry_points_derive_unicode_classification);
   RUN(test_bounded_entry_points_preserve_embedded_nul);
   RUN(test_bounded_entry_points_need_no_terminator);
+  RUN(test_ascii_classifier_boundaries_and_differential);
   RUN(test_invalid_utf8_exact_is_lossless);
   RUN(test_invalid_utf8_fuzzy_fallback_returns_positions);
   RUN(test_combined_score_positions_matches_legacy_calls);

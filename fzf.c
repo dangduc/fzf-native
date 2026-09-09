@@ -709,15 +709,24 @@ static int32_t ascii_fuzzy_index(
 
 bool is_ascii_utf8proc(const char *text, size_t len) {
   const unsigned char *ptr = (const unsigned char *)text;
+  const uint64_t high_bits = UINT64_C(0x8080808080808080);
 
-  /* fzf_has_match uses this check for every filter-only candidate.  Inspect
-     eight bytes at a time so Unicode correctness does not add a byte-at-a-time
-     pre-pass to the overwhelmingly ASCII completion corpus.  memcpy keeps the
-     load valid for unaligned strings. */
+  /* fzf_has_match uses this check for every filter-only candidate.  Fold four
+     words before testing their high bits so the overwhelmingly ASCII corpus
+     takes one branch per 32 bytes, then use single words for the bounded tail.
+     memcpy keeps every load valid for unaligned, exact-sized ranges. */
+  while (len >= 4 * sizeof(uint64_t)) {
+    uint64_t words[4];
+    memcpy(words, ptr, sizeof words);
+    if ((words[0] | words[1] | words[2] | words[3]) & high_bits)
+      return false;
+    ptr += sizeof words;
+    len -= sizeof words;
+  }
   while (len >= sizeof(uint64_t)) {
     uint64_t word;
     memcpy(&word, ptr, sizeof(word));
-    if (word & UINT64_C(0x8080808080808080)) return false;
+    if (word & high_bits) return false;
     ptr += sizeof(word);
     len -= sizeof(word);
   }
