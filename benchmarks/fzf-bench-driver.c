@@ -125,7 +125,6 @@ typedef struct {
   unsigned threads;
   bool normalize;
   bool sort_results;
-  bool tiebreak_set;
   bool tiebreak_length;
   bool check_only;
   bool dump_results;
@@ -146,7 +145,7 @@ static void bench_usage(FILE *stream, const char *program) {
           "(--bench DURATION | --check | --dump-results | --dump-semantic) "
           "[--threads N] [--literal] "
           "[--sort | --no-sort] [--algo=v2] "
-          "--tiebreak=(length|index)\n",
+          "[--tiebreak=(length|index)]\n",
           program);
 }
 
@@ -217,7 +216,8 @@ static unsigned bench_online_threads(void) {
 
 static bool bench_parse_options(int argc, char **argv,
                                 BenchOptions *options) {
-  *options = (BenchOptions){.normalize = true, .sort_results = true};
+  *options = (BenchOptions){
+      .normalize = true, .sort_results = true, .tiebreak_length = true};
   for (int i = 1; i < argc; i++) {
     const char *argument = argv[i];
     const char *value = NULL;
@@ -263,7 +263,6 @@ static bool bench_parse_options(int argc, char **argv,
       } else {
         return false;
       }
-      options->tiebreak_set = true;
     } else if (bench_option_value(
                    argc, argv, &i, "--scheme", &value)) {
       if (strcmp(value, "default") != 0) return false;
@@ -275,7 +274,7 @@ static bool bench_parse_options(int argc, char **argv,
   if (options->help) return true;
   unsigned modes = (options->duration_ns > 0) + options->check_only +
       options->dump_results + options->dump_semantic;
-  if (!options->query || !options->tiebreak_set || modes != 1)
+  if (!options->query || modes != 1)
     return false;
   if (options->threads == 0) options->threads = bench_online_threads();
   return options->threads > 0;

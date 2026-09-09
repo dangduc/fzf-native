@@ -43,11 +43,16 @@ static void test_fallback_and_duplicate_identity(void) {
   memset(short_text + 63, 'x', 20);
   memcpy(short_text + 83, "c", 2);
   BenchCandidate candidates[] = {
-      {long_text, 60004, 0, true},
-      {short_text, 84, 1, true},
-      {short_text, 84, 2, true},
-      {long_text, 60004, 3, true},
-      {"no match", 8, 4, true},
+      {.text = long_text, .length = 60004, .index = 0,
+       .input_is_ascii = true},
+      {.text = short_text, .length = 84, .index = 1,
+       .input_is_ascii = true},
+      {.text = short_text, .length = 84, .index = 2,
+       .input_is_ascii = true},
+      {.text = long_text, .length = 60004, .index = 3,
+       .input_is_ascii = true},
+      {.text = "no match", .length = 8, .index = 4,
+       .input_is_ascii = true},
   };
   BenchCorpus corpus = {.candidates = candidates, .count = 5};
   char query[] = "ab c";
@@ -74,7 +79,8 @@ static void test_fallback_and_duplicate_identity(void) {
   for (size_t threads = 1; threads <= 3; threads += 2) {
     for (unsigned sorted = 0; sorted < 2; sorted++) {
       BenchPool pool;
-      bool initialized = bench_pool_init(&pool, threads, &corpus, pattern, sorted);
+      bool initialized = bench_pool_init(
+          &pool, threads, &corpus, pattern, sorted, false);
       CHECK(initialized);
       if (!initialized) continue;
       uint64_t expected = expected_checksum(5,
@@ -122,7 +128,9 @@ static void test_radix_passes(void) {
   for (unsigned variant = 0; variant < 5; variant++) {
     memset(scratch, 0xa5, sizeof scratch);
     for (size_t i = 0; i < count; i++) {
-      candidates[i] = (BenchCandidate){"duplicate", 9, (uint32_t)i, true};
+      candidates[i] = (BenchCandidate){
+          .text = "duplicate", .length = 9, .index = (uint32_t)i,
+          .input_is_ascii = true};
       uint16_t rank = variant == 0 ? 32 :
           variant == 1 ? (uint16_t)(i % 7) :
           variant == 2 ? (uint16_t)((i % 7) * 256 + 7) :
