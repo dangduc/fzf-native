@@ -142,6 +142,27 @@ ctest-fzf-bench-driver:
 		$(BUILD_DIR)/fzf-bench-driver-w3.txt
 	grep -Fx 'semantic items=12 matches=9 input_checksum=18c3f63929c5b7fa result_checksum=59c7cb863237a38b' \
 		$(BUILD_DIR)/fzf-bench-driver-w1.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc \
+		--algo=v2 --tiebreak=length --threads=1 --check \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-length-w1.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc \
+		--algo=v2 --tiebreak=length --threads=3 --check \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-length-w3.txt
+	cmp $(BUILD_DIR)/fzf-bench-driver-length-w1.txt \
+		$(BUILD_DIR)/fzf-bench-driver-length-w3.txt
+	grep -Fx 'semantic items=12 matches=9 input_checksum=18c3f63929c5b7fa result_checksum=eaad98c78963fb4b' \
+		$(BUILD_DIR)/fzf-bench-driver-length-w1.txt
+	FZF_BENCH_JSON=1 $(BUILD_DIR)/fzf-bench-driver-ctest \
+		--filter=abc --algo=v2 --tiebreak=length --threads=1 \
+		--bench=1ms < benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-json.txt
+	test "$$(wc -l < $(BUILD_DIR)/fzf-bench-driver-json.txt)" -eq 2
+	grep -Eq '^benchmark-json \{"schema":1,"iterations":[1-9][0-9]*,"total_ns":[1-9][0-9]*,"min_ns":[0-9]+,"max_ns":[0-9]+,"items":12,"matches":9,"ingestion_ns":[0-9]+\}$$' \
+		$(BUILD_DIR)/fzf-bench-driver-json.txt
+	grep -Fx 'semantic items=12 matches=9 input_checksum=18c3f63929c5b7fa result_checksum=eaad98c78963fb4b' \
+		$(BUILD_DIR)/fzf-bench-driver-json.txt
 	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
 		--algo=v2 --tiebreak=index --threads=1 --no-sort --check \
 		< benchmarks/fzf-bench-fixture.txt \
@@ -405,6 +426,8 @@ FZF_BENCH_QUERY ?= linux
 FZF_BENCH_DURATION ?= 1s
 FZF_BENCH_THREADS ?= 1
 FZF_BENCH_SORT ?= --sort
+FZF_BENCH_TIEBREAK ?= length
+FZF_BENCH_LITERAL ?=
 FZF_BENCH_DRIVER := $(BUILD_DIR)/fzf-bench-driver
 
 .PHONY: benchmark-fzf-bench-build benchmark-fzf-bench
@@ -417,9 +440,9 @@ benchmark-fzf-bench-build:
 
 benchmark-fzf-bench: benchmark-fzf-bench-build
 	$(FZF_BENCH_DRIVER) --filter='$(FZF_BENCH_QUERY)' \
-		--tiebreak=index --bench='$(FZF_BENCH_DURATION)' \
+		--tiebreak='$(FZF_BENCH_TIEBREAK)' --bench='$(FZF_BENCH_DURATION)' \
 		--threads='$(FZF_BENCH_THREADS)' $(FZF_BENCH_SORT) \
-		--algo=v2 --literal \
+		--algo=v2 $(FZF_BENCH_LITERAL) \
 		< '$(FZF_BENCH_INPUT)'
 
 # Real persistent-session growth probe.  Timings include producer appends,

@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "fzf-private.h"
+#include "utf8proc-2.10.0/utf8proc.h"
 
 #ifndef FZF_BENCH_CHUNK_SIZE
 #define FZF_BENCH_CHUNK_SIZE 1024
@@ -46,6 +47,8 @@ typedef struct {
   const char *text;
   size_t length;
   uint32_t index;
+  uint16_t trim_length;
+  bool trim_length_known;
   bool input_is_ascii;
 } BenchCandidate;
 
@@ -61,7 +64,7 @@ typedef struct {
   const BenchCandidate *candidate;
   int32_t membership;
   uint16_t rank_score;
-  uint16_t reserved;
+  uint16_t rank_length;
 } BenchMatch;
 
 typedef struct {
@@ -106,10 +109,11 @@ typedef struct BenchPool {
   size_t active_count;
   uint64_t epoch;
   bool stop;
-  const BenchCorpus *corpus;
+  BenchCorpus *corpus;
   fzf_pattern_t *pattern;
   bool has_positive_term;
   bool sort_results;
+  bool tiebreak_length;
   BenchScanResult result;
   _Atomic size_t next_chunk;
   _Atomic bool failed;
@@ -121,7 +125,8 @@ typedef struct {
   unsigned threads;
   bool normalize;
   bool sort_results;
-  bool tiebreak_index;
+  bool tiebreak_set;
+  bool tiebreak_length;
   bool check_only;
   bool dump_results;
   bool dump_semantic;
@@ -140,7 +145,8 @@ static void bench_usage(FILE *stream, const char *program) {
           "usage: %s --filter QUERY "
           "(--bench DURATION | --check | --dump-results | --dump-semantic) "
           "[--threads N] [--literal] "
-          "[--sort | --no-sort] [--algo=v2] --tiebreak=index\n",
+          "[--sort | --no-sort] [--algo=v2] "
+          "--tiebreak=(length|index)\n",
           program);
 }
 
@@ -250,8 +256,14 @@ static bool bench_parse_options(int argc, char **argv,
       if (strcmp(value, "v2") != 0) return false;
     } else if (bench_option_value(
                    argc, argv, &i, "--tiebreak", &value)) {
-      if (strcmp(value, "index") != 0) return false;
-      options->tiebreak_index = true;
+      if (strcmp(value, "index") == 0) {
+        options->tiebreak_length = false;
+      } else if (strcmp(value, "length") == 0) {
+        options->tiebreak_length = true;
+      } else {
+        return false;
+      }
+      options->tiebreak_set = true;
     } else if (bench_option_value(
                    argc, argv, &i, "--scheme", &value)) {
       if (strcmp(value, "default") != 0) return false;
@@ -263,7 +275,7 @@ static bool bench_parse_options(int argc, char **argv,
   if (options->help) return true;
   unsigned modes = (options->duration_ns > 0) + options->check_only +
       options->dump_results + options->dump_semantic;
-  if (!options->query || !options->tiebreak_index || modes != 1)
+  if (!options->query || !options->tiebreak_set || modes != 1)
     return false;
   if (options->threads == 0) options->threads = bench_online_threads();
   return options->threads > 0;
@@ -306,6 +318,48 @@ static bool bench_read_all(FILE *stream, char **bytes, size_t *length) {
   *bytes = buffer;
   *length = used;
   return true;
+}
+
+static bool bench_unicode_is_space(utf8proc_int32_t codepoint) {
+  if ((codepoint >= 0x09 && codepoint <= 0x0d) || codepoint == 0x85)
+    return true;
+  utf8proc_category_t category = utf8proc_category(codepoint);
+  return category == UTF8PROC_CATEGORY_ZS ||
+      category == UTF8PROC_CATEGORY_ZL ||
+      category == UTF8PROC_CATEGORY_ZP;
+}
+
+/* Match fzf's rune-based, whitespace-trimmed length tiebreak. */
+static uint16_t bench_trim_length(const char *text, size_t length) {
+  size_t position = 0;
+  size_t rune_index = 0;
+  size_t first_nonspace = SIZE_MAX;
+  size_t last_nonspace = 0;
+  while (position < length) {
+    utf8proc_int32_t codepoint = 0xfffd;
+    utf8proc_ssize_t amount = utf8proc_iterate(
+        (const utf8proc_uint8_t *)text + position,
+        (utf8proc_ssize_t)(length - position), &codepoint);
+    if (amount <= 0) amount = 1;
+    if (!bench_unicode_is_space(codepoint)) {
+      if (first_nonspace == SIZE_MAX) first_nonspace = rune_index;
+      last_nonspace = rune_index;
+    }
+    position += (size_t)amount;
+    rune_index++;
+  }
+  if (first_nonspace == SIZE_MAX) return 0;
+  size_t trimmed = last_nonspace - first_nonspace + 1;
+  return trimmed > UINT16_MAX ? UINT16_MAX : (uint16_t)trimmed;
+}
+
+static uint16_t bench_candidate_trim_length(BenchCandidate *candidate) {
+  if (!candidate->trim_length_known) {
+    candidate->trim_length = bench_trim_length(
+        candidate->text, candidate->length);
+    candidate->trim_length_known = true;
+  }
+  return candidate->trim_length;
 }
 
 static bool bench_load_corpus(FILE *stream, BenchCorpus *corpus) {
@@ -373,6 +427,8 @@ static int bench_compare_matches(const void *left_value,
   const BenchMatch *right = right_value;
   if (left->rank_score != right->rank_score)
     return left->rank_score > right->rank_score ? -1 : 1;
+  if (left->rank_length != right->rank_length)
+    return left->rank_length < right->rank_length ? -1 : 1;
   if (left->candidate->index != right->candidate->index)
     return left->candidate->index < right->candidate->index ? -1 : 1;
   return 0;
@@ -393,9 +449,13 @@ static bool bench_match_list_append(BenchMatchList *list,
   return true;
 }
 
+static uint32_t bench_sort_key(const BenchMatch *match) {
+  return (uint32_t)match->rank_length |
+      (uint32_t)(UINT16_MAX - match->rank_score) << 16;
+}
+
 /* fzf uses comparison sort below 128 results and an LSD radix sort above it.
-   With --tiebreak=index, the only explicit key is the inverted 16-bit score;
-   stable input order supplies the final index tiebreak. */
+   Stable input order supplies the final index tiebreak. */
 static void bench_sort_matches(BenchWorker *worker) {
   BenchMatch *values = worker->matches.values;
   size_t count = worker->matches.count;
@@ -416,30 +476,29 @@ static void bench_sort_matches(BenchWorker *worker) {
     worker->sort_scratch_capacity = count;
   }
 
-  uint16_t key_or = 0;
+  uint32_t key_or = 0;
   for (size_t i = 0; i < count; i++)
-    key_or |= (uint16_t)(UINT16_MAX - values[i].rank_score);
+    key_or |= bench_sort_key(&values[i]);
 
   BenchMatch *source = values;
   BenchMatch *destination = worker->sort_scratch;
   unsigned scatters = 0;
-  for (unsigned pass = 0; pass < 2; pass++) {
+  for (unsigned pass = 0; pass < 4; pass++) {
     unsigned shift = pass * 8;
     if (((key_or >> shift) & 0xff) == 0) continue;
     size_t counts[256] = {0};
     for (size_t i = 0; i < count; i++) {
-      uint16_t key = (uint16_t)(UINT16_MAX - source[i].rank_score);
+      uint32_t key = bench_sort_key(&source[i]);
       counts[(key >> shift) & 0xff]++;
     }
-    uint16_t first_key = (uint16_t)(UINT16_MAX - source[0].rank_score);
+    uint32_t first_key = bench_sort_key(&source[0]);
     if (counts[(first_key >> shift) & 0xff] == count) continue;
-
     size_t offsets[256];
     offsets[0] = 0;
     for (size_t i = 1; i < 256; i++)
       offsets[i] = offsets[i - 1] + counts[i - 1];
     for (size_t i = 0; i < count; i++) {
-      uint16_t key = (uint16_t)(UINT16_MAX - source[i].rank_score);
+      uint32_t key = bench_sort_key(&source[i]);
       destination[offsets[(key >> shift) & 0xff]++] = source[i];
     }
     BenchMatch *swap = source;
@@ -473,7 +532,7 @@ static void bench_worker_scan(BenchWorker *worker) {
     size_t end = first + FZF_BENCH_CHUNK_SIZE;
     if (end > pool->corpus->count) end = pool->corpus->count;
     for (size_t i = first; i < end; i++) {
-      const BenchCandidate *candidate = &pool->corpus->candidates[i];
+      BenchCandidate *candidate = &pool->corpus->candidates[i];
       fzf_score_bounds_t bounds;
       int32_t membership = fzf_get_score_with_bounds_bytes_preclassified(
           candidate->text, candidate->length, candidate->input_is_ascii,
@@ -490,7 +549,10 @@ static void bench_worker_scan(BenchWorker *worker) {
                            (BenchMatch){
                                .candidate = candidate,
                                .membership = membership,
-                               .rank_score = bench_rank_score(bounds.raw_score),
+                               .rank_score = pool->has_positive_term
+                                   ? bench_rank_score(bounds.raw_score) : 0,
+                               .rank_length = pool->tiebreak_length
+                                   ? bench_candidate_trim_length(candidate) : 0,
                            })) {
         atomic_store_explicit(&pool->failed, true, memory_order_relaxed);
         return;
@@ -524,8 +586,9 @@ static void *bench_worker_main(void *data) {
 }
 
 static bool bench_pool_init(BenchPool *pool, size_t worker_count,
-                            const BenchCorpus *corpus,
-                            fzf_pattern_t *pattern, bool sort_results) {
+                            BenchCorpus *corpus,
+                            fzf_pattern_t *pattern, bool sort_results,
+                            bool tiebreak_length) {
   memset(pool, 0, sizeof *pool);
   if (pthread_mutex_init(&pool->mutex, NULL) != 0) return false;
   if (pthread_cond_init(&pool->start_cond, NULL) != 0) {
@@ -549,6 +612,7 @@ static bool bench_pool_init(BenchPool *pool, size_t worker_count,
   pool->pattern = pattern;
   pool->has_positive_term = pattern->has_positive_term;
   pool->sort_results = sort_results && pattern->has_positive_term;
+  pool->tiebreak_length = tiebreak_length;
   atomic_init(&pool->next_chunk, 0);
   atomic_init(&pool->failed, false);
 
@@ -732,6 +796,8 @@ static bool bench_match_precedes(const BenchMatch *left,
                                  bool sortable) {
   if (sortable && left->rank_score != right->rank_score)
     return left->rank_score > right->rank_score;
+  if (sortable && left->rank_length != right->rank_length)
+    return left->rank_length < right->rank_length;
   return left->candidate->index < right->candidate->index;
 }
 
@@ -774,6 +840,8 @@ static bool bench_result_checksum(BenchPool *pool, size_t match_count,
     if (!best) return false;
     hash = bench_hash_u64(hash, best->candidate->index);
     hash = bench_hash_u64(hash, best->rank_score);
+    if (pool->tiebreak_length)
+      hash = bench_hash_u64(hash, best->rank_length);
     merger->cursors[best_worker]++;
   }
   *checksum = hash;
@@ -934,7 +1002,8 @@ int main(int argc, char **argv) {
 
   BenchPool pool;
   if (!bench_pool_init(
-          &pool, worker_count, &corpus, pattern, options.sort_results)) {
+          &pool, worker_count, &corpus, pattern, options.sort_results,
+          options.tiebreak_length)) {
     fprintf(stderr, "fzf-native benchmark: could not start workers\n");
     fzf_free_pattern(pattern);
     bench_free_corpus(&corpus);
@@ -982,6 +1051,21 @@ int main(int argc, char **argv) {
     if (sample_count == 0) success = false;
   }
 
+  uint64_t total_ns = 0;
+  uint64_t minimum = sample_count ? samples[0] : 0;
+  uint64_t maximum = sample_count ? samples[0] : 0;
+  if (success && !options.check_only && !options.dump_results) {
+    for (size_t i = 0; i < sample_count; i++) {
+      if (UINT64_MAX - total_ns < samples[i]) {
+        success = false;
+        break;
+      }
+      total_ns += samples[i];
+      if (samples[i] < minimum) minimum = samples[i];
+      if (samples[i] > maximum) maximum = samples[i];
+    }
+  }
+
   uint64_t result_checksum = 0;
   if (success && options.dump_results)
     success = bench_dump_results(&pool, match_count);
@@ -998,23 +1082,25 @@ int main(int argc, char **argv) {
            " result_checksum=%016" PRIx64 "\n",
            corpus.count, match_count, input_checksum, result_checksum);
   } else {
-    long double total_ns = 0.0;
-    uint64_t minimum = samples[0];
-    uint64_t maximum = samples[0];
-    for (size_t i = 0; i < sample_count; i++) {
-      total_ns += samples[i];
-      if (samples[i] < minimum) minimum = samples[i];
-      if (samples[i] > maximum) maximum = samples[i];
+    const char *json = getenv("FZF_BENCH_JSON");
+    if (json && strcmp(json, "1") == 0) {
+      printf("benchmark-json {\"schema\":1,\"iterations\":%zu,"
+             "\"total_ns\":%" PRIu64 ",\"min_ns\":%" PRIu64 ","
+             "\"max_ns\":%" PRIu64 ",\"items\":%zu,"
+             "\"matches\":%zu,\"ingestion_ns\":%" PRIu64 "}\n",
+             sample_count, total_ns, minimum, maximum, corpus.count,
+             match_count, ingestion_ns);
+    } else {
+      double average_ms = (double)total_ns / (double)sample_count / 1e6;
+      double selectivity = corpus.count
+          ? (double)match_count / (double)corpus.count * 100.0 : 0.0;
+      printf("  %zu iterations  avg: %.2fms  min: %.2fms  max: %.2fms  "
+             "total: %.2fs  items: %zu  matches: %zu (%.2f%%)  "
+             "ingestion: %.2fms\n",
+             sample_count, average_ms, (double)minimum / 1e6,
+             (double)maximum / 1e6, (double)total_ns / 1e9, corpus.count,
+             match_count, selectivity, (double)ingestion_ns / 1e6);
     }
-    double average_ms = (double)(total_ns / sample_count / 1e6L);
-    double selectivity = corpus.count
-        ? (double)match_count / (double)corpus.count * 100.0 : 0.0;
-    printf("  %zu iterations  avg: %.2fms  min: %.2fms  max: %.2fms  "
-           "total: %.2Lfs  items: %zu  matches: %zu (%.2f%%)  "
-           "ingestion: %.2fms\n",
-           sample_count, average_ms, (double)minimum / 1e6,
-           (double)maximum / 1e6, total_ns / 1e9L, corpus.count,
-           match_count, selectivity, (double)ingestion_ns / 1e6);
     printf("semantic items=%zu matches=%zu input_checksum=%016" PRIx64
            " result_checksum=%016" PRIx64 "\n",
            corpus.count, match_count, input_checksum, result_checksum);
