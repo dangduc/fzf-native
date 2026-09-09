@@ -59,7 +59,7 @@ typedef struct {
 /* Keep the same 16-byte result footprint as fzf's Result on 64-bit hosts. */
 typedef struct {
   const BenchCandidate *candidate;
-  int32_t score;
+  int32_t membership;
   uint16_t rank_score;
   uint16_t reserved;
 } BenchMatch;
@@ -359,7 +359,7 @@ static void bench_free_corpus(BenchCorpus *corpus) {
   memset(corpus, 0, sizeof *corpus);
 }
 
-static uint16_t bench_rank_score(int32_t score) {
+static uint16_t bench_rank_score(int64_t score) {
   if (score <= 0) return 0;
   return score > UINT16_MAX ? UINT16_MAX : (uint16_t)score;
 }
@@ -428,6 +428,9 @@ static void bench_sort_matches(BenchWorker *worker) {
       uint16_t key = (uint16_t)(UINT16_MAX - source[i].rank_score);
       counts[(key >> shift) & 0xff]++;
     }
+    uint16_t first_key = (uint16_t)(UINT16_MAX - source[0].rank_score);
+    if (counts[(first_key >> shift) & 0xff] == count) continue;
+
     size_t offsets[256];
     offsets[0] = 0;
     for (size_t i = 1; i < 256; i++)
@@ -468,20 +471,23 @@ static void bench_worker_scan(BenchWorker *worker) {
     if (end > pool->corpus->count) end = pool->corpus->count;
     for (size_t i = first; i < end; i++) {
       const BenchCandidate *candidate = &pool->corpus->candidates[i];
-      int32_t score = fzf_get_score_bytes_preclassified(
+      fzf_score_bounds_t bounds;
+      int32_t membership = fzf_get_score_with_bounds_bytes_preclassified(
           candidate->text, candidate->length, candidate->input_is_ascii,
-          pool->pattern, worker->slab);
+          pool->pattern, worker->slab, &bounds);
       if (fzf_allocation_failed()) {
         atomic_store_explicit(&pool->failed, true, memory_order_relaxed);
         return;
       }
-      if (score > 0 && !bench_match_list_append(
+      /* The public return preserves membership with a positive sentinel.
+         A v1 fallback can have a negative raw score.  Rank the raw aggregate,
+         as fzf does, rather than adding sentinel-adjusted term scores. */
+      if (membership > 0 && !bench_match_list_append(
                            &worker->matches,
                            (BenchMatch){
                                .candidate = candidate,
-                               .score = score,
-                               .rank_score = pool->has_positive_term
-                                   ? bench_rank_score(score) : 0,
+                               .membership = membership,
+                               .rank_score = bench_rank_score(bounds.raw_score),
                            })) {
         atomic_store_explicit(&pool->failed, true, memory_order_relaxed);
         return;

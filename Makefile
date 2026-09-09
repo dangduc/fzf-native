@@ -120,6 +120,11 @@ ctest: ctest-module ctest-additions ctest-parser-oom ctest-scorer-oom \
 .PHONY: ctest-fzf-bench-driver
 ctest-fzf-bench-driver:
 	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -DFZF_BENCH_CHUNK_SIZE=1 \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/fzf-bench-driver-unit-test \
+		benchmarks/fzf-bench-driver-test.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-bench-driver-unit-test
 	$(CC) -std=gnu11 -Wall -Wextra -O2 -DFZF_BENCH_CHUNK_SIZE=3 \
 		-I. -I$(UTF8PROC_DIR) -pthread \
 		-o $(BUILD_DIR)/fzf-bench-driver-ctest \
@@ -273,6 +278,11 @@ ctest-session-trace-benchmark:
 ctest-asan: export UBSAN_OPTIONS = halt_on_error=1:print_stacktrace=1
 ctest-asan:
 	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
+		-DFZF_BENCH_CHUNK_SIZE=1 -I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/fzf-bench-driver-unit-test-asan \
+		benchmarks/fzf-bench-driver-test.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-bench-driver-unit-test-asan
 	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
 		-I. -I$(UTF8PROC_DIR) -pthread \
 		-o $(BUILD_DIR)/fzf-native-ctest-asan fzf-native-ctest.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
