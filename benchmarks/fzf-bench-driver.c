@@ -37,7 +37,7 @@
 #include <unistd.h>
 
 #include "fzf-private.h"
-#include "utf8proc-2.10.0/utf8proc.h"
+#include "utf8proc.h"
 
 #ifndef FZF_BENCH_CHUNK_SIZE
 #define FZF_BENCH_CHUNK_SIZE 1024
@@ -47,9 +47,9 @@ typedef struct {
   const char *text;
   size_t length;
   uint32_t index;
-  uint16_t trim_length;
-  bool trim_length_known;
+  uint16_t rank_length;
   bool input_is_ascii;
+  bool rank_length_known;
 } BenchCandidate;
 
 typedef struct {
@@ -320,48 +320,6 @@ static bool bench_read_all(FILE *stream, char **bytes, size_t *length) {
   return true;
 }
 
-static bool bench_unicode_is_space(utf8proc_int32_t codepoint) {
-  if ((codepoint >= 0x09 && codepoint <= 0x0d) || codepoint == 0x85)
-    return true;
-  utf8proc_category_t category = utf8proc_category(codepoint);
-  return category == UTF8PROC_CATEGORY_ZS ||
-      category == UTF8PROC_CATEGORY_ZL ||
-      category == UTF8PROC_CATEGORY_ZP;
-}
-
-/* Match fzf's rune-based, whitespace-trimmed length tiebreak. */
-static uint16_t bench_trim_length(const char *text, size_t length) {
-  size_t position = 0;
-  size_t rune_index = 0;
-  size_t first_nonspace = SIZE_MAX;
-  size_t last_nonspace = 0;
-  while (position < length) {
-    utf8proc_int32_t codepoint = 0xfffd;
-    utf8proc_ssize_t amount = utf8proc_iterate(
-        (const utf8proc_uint8_t *)text + position,
-        (utf8proc_ssize_t)(length - position), &codepoint);
-    if (amount <= 0) amount = 1;
-    if (!bench_unicode_is_space(codepoint)) {
-      if (first_nonspace == SIZE_MAX) first_nonspace = rune_index;
-      last_nonspace = rune_index;
-    }
-    position += (size_t)amount;
-    rune_index++;
-  }
-  if (first_nonspace == SIZE_MAX) return 0;
-  size_t trimmed = last_nonspace - first_nonspace + 1;
-  return trimmed > UINT16_MAX ? UINT16_MAX : (uint16_t)trimmed;
-}
-
-static uint16_t bench_candidate_trim_length(BenchCandidate *candidate) {
-  if (!candidate->trim_length_known) {
-    candidate->trim_length = bench_trim_length(
-        candidate->text, candidate->length);
-    candidate->trim_length_known = true;
-  }
-  return candidate->trim_length;
-}
-
 static bool bench_load_corpus(FILE *stream, BenchCorpus *corpus) {
   memset(corpus, 0, sizeof *corpus);
   if (!bench_read_all(stream, &corpus->bytes, &corpus->byte_count))
@@ -421,6 +379,66 @@ static uint16_t bench_rank_score(int64_t score) {
   return score > UINT16_MAX ? UINT16_MAX : (uint16_t)score;
 }
 
+static bool bench_rank_is_space(utf8proc_int32_t codepoint) {
+  return (codepoint >= 0x09 && codepoint <= 0x0d) ||
+      codepoint == 0x20 || codepoint == 0x85 || codepoint == 0xa0 ||
+      codepoint == 0x1680 ||
+      (codepoint >= 0x2000 && codepoint <= 0x200a) ||
+      codepoint == 0x2028 || codepoint == 0x2029 ||
+      codepoint == 0x202f || codepoint == 0x205f ||
+      codepoint == 0x3000;
+}
+
+/* fzf computes Item.TrimLength lazily on the first matching scan and caches
+   it on the item.  Each candidate belongs to one worker per scan, and scans
+   do not overlap, so the equivalent per-candidate cache needs no lock. */
+static uint16_t bench_rank_length(BenchCandidate *candidate) {
+  if (candidate->rank_length_known) return candidate->rank_length;
+
+  if (candidate->input_is_ascii) {
+    size_t first = 0;
+    size_t end = candidate->length;
+    while (first < end &&
+           bench_rank_is_space((unsigned char)candidate->text[first]))
+      first++;
+    while (end > first &&
+           bench_rank_is_space((unsigned char)candidate->text[end - 1]))
+      end--;
+    size_t length = end - first;
+    candidate->rank_length = length > UINT16_MAX
+        ? UINT16_MAX : (uint16_t)length;
+    candidate->rank_length_known = true;
+    return candidate->rank_length;
+  }
+
+  size_t first_nonspace = SIZE_MAX;
+  size_t last_nonspace = 0;
+  size_t rune_index = 0;
+  size_t offset = 0;
+  while (offset < candidate->length) {
+    utf8proc_int32_t codepoint = 0;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)candidate->text + offset,
+        (utf8proc_ssize_t)(candidate->length - offset), &codepoint);
+    if (width <= 0) {
+      codepoint = (unsigned char)candidate->text[offset];
+      width = 1;
+    }
+    if (!bench_rank_is_space(codepoint)) {
+      if (first_nonspace == SIZE_MAX) first_nonspace = rune_index;
+      last_nonspace = rune_index;
+    }
+    offset += (size_t)width;
+    rune_index++;
+  }
+  size_t length = first_nonspace == SIZE_MAX
+      ? 0 : last_nonspace - first_nonspace + 1;
+  candidate->rank_length = length > UINT16_MAX
+      ? UINT16_MAX : (uint16_t)length;
+  candidate->rank_length_known = true;
+  return candidate->rank_length;
+}
+
 static int bench_compare_matches(const void *left_value,
                                  const void *right_value) {
   const BenchMatch *left = left_value;
@@ -455,7 +473,9 @@ static uint32_t bench_sort_key(const BenchMatch *match) {
 }
 
 /* fzf uses comparison sort below 128 results and an LSD radix sort above it.
-   Stable input order supplies the final index tiebreak. */
+   The default key is inverted score followed by trimmed rune length.  With
+   --tiebreak=index, the length half is zero and stable input order supplies
+   the final index tiebreak. */
 static void bench_sort_matches(BenchWorker *worker) {
   BenchMatch *values = worker->matches.values;
   size_t count = worker->matches.count;
@@ -552,7 +572,7 @@ static void bench_worker_scan(BenchWorker *worker) {
                                .rank_score = pool->has_positive_term
                                    ? bench_rank_score(bounds.raw_score) : 0,
                                .rank_length = pool->tiebreak_length
-                                   ? bench_candidate_trim_length(candidate) : 0,
+                                   ? bench_rank_length(candidate) : 0,
                            })) {
         atomic_store_explicit(&pool->failed, true, memory_order_relaxed);
         return;
@@ -936,14 +956,16 @@ static bool bench_dump_semantic(BenchPool *pool, size_t match_count) {
         best->candidate->input_is_ascii, pool->pattern, slab, &bounds);
     uint16_t rank_score = pool->has_positive_term
         ? bench_rank_score(bounds.raw_score) : 0;
+    uint16_t rank_length = best->rank_length;
     uint16_t point3 = (uint16_t)(UINT16_MAX - rank_score);
     if (membership_score <= 0 || fzf_allocation_failed() ||
         rank_score != best->rank_score ||
         printf("%" PRIu32 "\t%" PRId64 "\t%d\t%d\t%d\t%d\t"
-               "%u\t0\t0\t0\t%u\n",
+               "%u\t0\t0\t%u\t%u\n",
                best->candidate->index, bounds.raw_score,
                bounds.min_begin, bounds.min_end, bounds.max_end,
                bounds.valid ? 1 : 0, (unsigned)rank_score,
+               (unsigned)rank_length,
                (unsigned)point3) < 0) {
       success = false;
       break;

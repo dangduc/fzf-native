@@ -22,6 +22,7 @@ type semanticOracleInput struct {
 
 type semanticOracleCase struct {
 	ID         string   `json:"id"`
+	Profile    string   `json:"profile"`
 	Query      string   `json:"query"`
 	Normalize  bool     `json:"normalize"`
 	Candidates []string `json:"candidates"`
@@ -127,10 +128,7 @@ func TestFzfNativeSemanticOracle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The benchmark command uses --tiebreak=index. parseTiebreak("index")
-	// leaves score as the sole rank point; input index is the final comparator.
 	previousCriteria := sortCriteria
-	sortCriteria = []criterion{byScore}
 	defer func() { sortCriteria = previousCriteria }()
 	if !algo.Init("default") {
 		t.Fatal("could not initialize the default fzf scoring scheme")
@@ -138,6 +136,23 @@ func TestFzfNativeSemanticOracle(t *testing.T) {
 
 	output := semanticOracleOutput{Cases: make([]semanticOracleCaseOutput, 0, len(input.Cases))}
 	for _, oracleCase := range input.Cases {
+		switch oracleCase.Profile {
+		case "literal-score-index":
+			if oracleCase.Normalize {
+				t.Fatalf("%s: literal profile enables normalization", oracleCase.ID)
+			}
+			// parseTiebreak("index") leaves score as the sole rank point;
+			// input index is the final comparator.
+			sortCriteria = []criterion{byScore}
+		case "default-score-length":
+			if !oracleCase.Normalize {
+				t.Fatalf("%s: default profile disables normalization", oracleCase.ID)
+			}
+			// parseScheme("default") ranks by score and trimmed rune length.
+			sortCriteria = []criterion{byScore, byLength}
+		default:
+			t.Fatalf("%s: unknown profile %q", oracleCase.ID, oracleCase.Profile)
+		}
 		pattern := BuildPattern(
 			NewChunkCache(), map[string]*Pattern{}, true, algo.FuzzyMatchV2,
 			true, CaseSmart, oracleCase.Normalize, true, false, false,

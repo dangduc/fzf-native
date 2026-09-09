@@ -17,7 +17,7 @@ PINNED_FZF_COMMIT = "63e82a9e3dd52cc67a46db842b8a29e0c1f83229"
 def cases():
     fallback_long = "a" + "x" * 60_000 + "b c"
     fallback_short = "za" + "x" * 60 + "b" + "x" * 20 + "c"
-    return [
+    literal_cases = [
         {
             "id": "duplicates-and-score-ties",
             "query": "abc",
@@ -123,6 +123,55 @@ def cases():
         },
     ]
 
+    default_cases = [
+        case for case in literal_cases
+        if case["id"] == "normalization-enabled"
+    ]
+    literal_cases = [
+        case for case in literal_cases
+        if case["id"] != "normalization-enabled"
+    ]
+    for case in literal_cases:
+        case["profile"] = "literal-score-index"
+    for case in default_cases:
+        case["profile"] = "default-score-length"
+
+    default_cases.extend([
+        {
+            "id": "default-unicode-whitespace-and-length",
+            "profile": "default-score-length",
+            "query": "needle",
+            "normalize": True,
+            "candidates": [
+                "needle", "needle-long", "\u3000needle\u00a0",
+                "\u2003needle-long\u202f", " needle ", "needle",
+                "xxneedle", "does not match",
+            ],
+        },
+        {
+            "id": "default-v2-to-v1-fallback-negative-raw-score",
+            "profile": "default-score-length",
+            "query": "ab c",
+            "normalize": True,
+            "candidates": [fallback_long, fallback_short, "does not match"],
+        },
+        {
+            "id": "default-eight-worker-order",
+            "profile": "default-score-length",
+            "query": "needle",
+            "normalize": True,
+            "candidates": [
+                (
+                    "needle", "needle-long", "\u3000needle\u00a0",
+                    "\u2003needle-long\u202f", " needle ", "needle",
+                    "xxneedle", "prefix-needle",
+                )[index % 8]
+                for index in range(8_201)
+            ],
+        },
+    ])
+    return literal_cases + default_cases
+
 
 def run(command, *, cwd=None, env=None, input_bytes=None):
     completed = subprocess.run(
@@ -206,13 +255,17 @@ def parse_native_record(line):
     }
 
 
-def run_native_oracle(binary, oracle_case):
+def run_native_oracle(binary, oracle_case, threads):
     command = [
         str(binary), f"--filter={oracle_case['query']}",
-        "--tiebreak=index", "--threads=1", "--algo=v2", "--sort",
+        f"--threads={threads}", "--algo=v2", "--sort",
         "--no-literal" if oracle_case["normalize"] else "--literal",
         "--dump-semantic",
     ]
+    if oracle_case["profile"] == "literal-score-index":
+        command.append("--tiebreak=index")
+    elif oracle_case["profile"] != "default-score-length":
+        raise RuntimeError(f"unknown profile: {oracle_case['profile']}")
     corpus = "".join(candidate + "\n" for candidate in oracle_case["candidates"])
     stdout = run(command, input_bytes=corpus.encode("utf-8"))
     return [
@@ -227,23 +280,53 @@ def compare(native_binary, payload, upstream):
     failures = []
     for oracle_case in payload["cases"]:
         case_id = oracle_case["id"]
-        native = run_native_oracle(native_binary, oracle_case)
         expected = upstream_by_id.get(case_id)
-        if native != expected:
-            expected_text = json.dumps(expected, indent=2, sort_keys=True).splitlines()
-            native_text = json.dumps(native, indent=2, sort_keys=True).splitlines()
-            failures.append("\n".join(difflib.unified_diff(
-                expected_text, native_text,
-                fromfile=f"upstream/{case_id}",
-                tofile=f"native/{case_id}",
-                lineterm="",
-            )))
-        else:
-            print(f"semantic parity {case_id}: {len(native)} matches")
+        for threads in (1, 8):
+            native = run_native_oracle(native_binary, oracle_case, threads)
+            if native != expected:
+                expected_text = json.dumps(
+                    expected, indent=2, sort_keys=True).splitlines()
+                native_text = json.dumps(
+                    native, indent=2, sort_keys=True).splitlines()
+                failures.append("\n".join(difflib.unified_diff(
+                    expected_text, native_text,
+                    fromfile=f"upstream/{case_id}",
+                    tofile=f"native/{case_id}/threads-{threads}",
+                    lineterm="",
+                )))
+            else:
+                print(
+                    f"semantic parity {case_id} threads={threads}: "
+                    f"{len(native)} matches"
+                )
 
-    fallback = upstream_by_id["v2-to-v1-fallback-negative-raw-score"]
-    if not any(record["raw_score"] < 0 for record in fallback):
-        failures.append("fallback fixture did not produce a negative raw score")
+    for fallback_id in (
+        "v2-to-v1-fallback-negative-raw-score",
+        "default-v2-to-v1-fallback-negative-raw-score",
+    ):
+        fallback = upstream_by_id[fallback_id]
+        if not any(record["raw_score"] < 0 for record in fallback):
+            failures.append(
+                f"{fallback_id} did not produce a negative raw score"
+            )
+
+    length_records = upstream_by_id["default-unicode-whitespace-and-length"]
+    scores_to_lengths = {}
+    for record in length_records:
+        scores_to_lengths.setdefault(record["raw_score"], set()).add(
+            record["points"][2]
+        )
+    if not any(len(lengths) > 1 for lengths in scores_to_lengths.values()):
+        failures.append(
+            "length fixture lacks an equal-score pair with distinct lengths"
+        )
+
+    large_case = next(
+        case for case in payload["cases"]
+        if case["id"] == "default-eight-worker-order"
+    )
+    if len(large_case["candidates"]) < 8_193:
+        failures.append("eight-worker fixture does not span nine chunks")
     if failures:
         raise RuntimeError("semantic parity failed:\n" + "\n\n".join(failures))
 
