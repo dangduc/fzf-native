@@ -113,7 +113,12 @@ emacs-asan:
 .PHONY: ctest
 ctest: ctest-module ctest-additions ctest-parser-oom ctest-scorer-oom \
 	ctest-session-growth-benchmark ctest-session-trace-benchmark \
-	ctest-core-hotpath-oracle ctest-simd-prefilter ctest-fzf-bench-driver
+	ctest-core-hotpath-oracle ctest-simd-prefilter ctest-fzf-bench-driver \
+	ctest-fzf-envelope-analysis
+
+.PHONY: ctest-fzf-envelope-analysis
+ctest-fzf-envelope-analysis:
+	$(PYTHON) benchmarks/test_analyze_fzf_envelope.py
 
 # Verify the standalone fzf --bench-equivalent driver with multiple workers.
 # A small chunk size gives the fixture independently scheduled chunks; the
