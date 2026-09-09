@@ -343,6 +343,7 @@ $ brew install llvm
 ** Architecture
 
 See [[file:architecture.org][architecture.org]] for the current implementation.
+See [[file:comparison.org][comparison.org]] for a pinned comparison with fzf and the Telescope port.
 It documents the public API, session lifecycle, request ownership, caches, worker scheduling, and failure model.
 
 See [[file:multi-round-session-plan.org][multi-round-session-plan.org]] for the historical design record and verification results.
