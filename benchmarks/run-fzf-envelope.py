@@ -192,6 +192,8 @@ def main() -> None:
         "base": arguments.base.resolve(),
         "fzf": arguments.fzf.resolve(),
     }
+    runner_path = pathlib.Path(__file__).resolve()
+    runner_sha256 = sha256(runner_path)
     fzf_provenance_path = arguments.fzf_build_provenance.resolve()
     selected_lanes = arguments.lane or list(LANES)
     if len(selected_lanes) != len(set(selected_lanes)):
@@ -437,6 +439,8 @@ def main() -> None:
         name: sha256(cell["path"]) for name, cell in workload_cells.items()
     } != corpus_hashes:
         raise RuntimeError("corpus changed during the campaign")
+    if sha256(runner_path) != runner_sha256:
+        raise RuntimeError("benchmark runner changed during the campaign")
 
     result = {
         "schema": 1,
@@ -446,8 +450,8 @@ def main() -> None:
         "rounds": arguments.rounds,
         "duration": arguments.duration,
         "seed": arguments.seed,
-        "runner": str(pathlib.Path(__file__).resolve()),
-        "runner_sha256": sha256(pathlib.Path(__file__).resolve()),
+        "runner": str(runner_path),
+        "runner_sha256": runner_sha256,
         "runner_argv": sys.argv,
         "runner_cwd": str(pathlib.Path.cwd()),
         "python": sys.version,

@@ -129,8 +129,15 @@ typedef struct {
   bool check_only;
   bool dump_results;
   bool dump_semantic;
+#ifdef FZF_BENCH_TEST_HOOKS
+  bool check_trim_cache;
+#endif
   bool help;
 } BenchOptions;
+
+#ifdef FZF_BENCH_TEST_HOOKS
+static _Atomic size_t bench_trim_length_computations;
+#endif
 
 static uint64_t bench_now_ns(void) {
   struct timespec now;
@@ -229,6 +236,10 @@ static bool bench_parse_options(int argc, char **argv,
       options->dump_results = true;
     } else if (strcmp(argument, "--dump-semantic") == 0) {
       options->dump_semantic = true;
+#ifdef FZF_BENCH_TEST_HOOKS
+    } else if (strcmp(argument, "--check-trim-cache") == 0) {
+      options->check_trim_cache = true;
+#endif
     } else if (strcmp(argument, "--literal") == 0) {
       options->normalize = false;
     } else if (strcmp(argument, "--no-literal") == 0) {
@@ -274,8 +285,14 @@ static bool bench_parse_options(int argc, char **argv,
   if (options->help) return true;
   unsigned modes = (options->duration_ns > 0) + options->check_only +
       options->dump_results + options->dump_semantic;
+#ifdef FZF_BENCH_TEST_HOOKS
+  modes += options->check_trim_cache;
+#endif
   if (!options->query || modes != 1)
     return false;
+#ifdef FZF_BENCH_TEST_HOOKS
+  if (options->check_trim_cache && !options->tiebreak_length) return false;
+#endif
   if (options->threads == 0) options->threads = bench_online_threads();
   return options->threads > 0;
 }
@@ -393,6 +410,10 @@ static bool bench_rank_is_space(utf8proc_int32_t codepoint) {
    do not overlap, so the equivalent per-candidate cache needs no lock. */
 static uint16_t bench_rank_length(BenchCandidate *candidate) {
   if (candidate->rank_length_known) return candidate->rank_length;
+#ifdef FZF_BENCH_TEST_HOOKS
+  atomic_fetch_add_explicit(
+      &bench_trim_length_computations, 1, memory_order_relaxed);
+#endif
 
   if (candidate->input_is_ascii) {
     size_t first = 0;
@@ -437,6 +458,15 @@ static uint16_t bench_rank_length(BenchCandidate *candidate) {
   candidate->rank_length_known = true;
   return candidate->rank_length;
 }
+
+#ifdef FZF_BENCH_TEST_HOOKS
+static size_t bench_known_trim_lengths(const BenchCorpus *corpus) {
+  size_t count = 0;
+  for (size_t i = 0; i < corpus->count; i++)
+    count += corpus->candidates[i].rank_length_known;
+  return count;
+}
+#endif
 
 static int bench_compare_matches(const void *left_value,
                                  const void *right_value) {
@@ -1036,10 +1066,49 @@ int main(int argc, char **argv) {
   size_t sample_count = 0;
   size_t sample_capacity = 0;
   bool success = true;
-  if (options.check_only || options.dump_results || options.dump_semantic) {
+#ifdef FZF_BENCH_TEST_HOOKS
+  size_t trim_before_known = 0;
+  size_t trim_before_computed = 0;
+  size_t trim_first_matches = 0;
+  size_t trim_first_known = 0;
+  size_t trim_first_computed = 0;
+  size_t trim_second_known = 0;
+  size_t trim_second_computed = 0;
+  if (options.check_trim_cache) {
+    trim_before_known = bench_known_trim_lengths(&corpus);
+    trim_before_computed = atomic_load_explicit(
+        &bench_trim_length_computations, memory_order_relaxed);
+  }
+#endif
+  bool single_scan = options.check_only || options.dump_results ||
+      options.dump_semantic;
+#ifdef FZF_BENCH_TEST_HOOKS
+  single_scan = single_scan || options.check_trim_cache;
+#endif
+  if (single_scan) {
     bench_pool_discard_results(&pool);
     success = bench_pool_run(&pool);
     if (success) match_count = bench_pool_result_length(&pool);
+#ifdef FZF_BENCH_TEST_HOOKS
+    if (success && options.check_trim_cache) {
+      trim_first_matches = match_count;
+      trim_first_known = bench_known_trim_lengths(&corpus);
+      trim_first_computed = atomic_load_explicit(
+          &bench_trim_length_computations, memory_order_relaxed);
+      bench_pool_discard_results(&pool);
+      success = bench_pool_run(&pool);
+      if (success) match_count = bench_pool_result_length(&pool);
+      trim_second_known = bench_known_trim_lengths(&corpus);
+      trim_second_computed = atomic_load_explicit(
+          &bench_trim_length_computations, memory_order_relaxed);
+      success = success && trim_before_known == 0 &&
+          trim_before_computed == 0 && trim_first_matches == match_count &&
+          trim_first_known == trim_first_matches &&
+          trim_first_computed == trim_first_matches &&
+          trim_second_known == trim_first_known &&
+          trim_second_computed == trim_first_computed;
+    }
+#endif
   } else {
     uint64_t started = bench_now_ns();
     uint64_t deadline = UINT64_MAX - started < options.duration_ns
@@ -1075,7 +1144,12 @@ int main(int argc, char **argv) {
   uint64_t total_ns = 0;
   uint64_t minimum = sample_count ? samples[0] : 0;
   uint64_t maximum = sample_count ? samples[0] : 0;
-  if (success && !options.check_only && !options.dump_results) {
+  if (success && !options.check_only && !options.dump_results &&
+      !options.dump_semantic
+#ifdef FZF_BENCH_TEST_HOOKS
+      && !options.check_trim_cache
+#endif
+      ) {
     for (size_t i = 0; i < sample_count; i++) {
       if (UINT64_MAX - total_ns < samples[i]) {
         success = false;
@@ -1092,12 +1166,26 @@ int main(int argc, char **argv) {
     success = bench_dump_results(&pool, match_count);
   else if (success && options.dump_semantic)
     success = bench_dump_semantic(&pool, match_count);
+#ifdef FZF_BENCH_TEST_HOOKS
+  else if (success && options.check_trim_cache) {
+    /* The cache assertions above are the complete result for this mode. */
+  }
+#endif
   else if (success)
     success = bench_result_checksum(&pool, match_count, &result_checksum);
   if (!success) {
     fprintf(stderr, "fzf-native benchmark: scan or output failed\n");
   } else if (options.dump_results || options.dump_semantic) {
     /* The selected dump mode has already written its output. */
+#ifdef FZF_BENCH_TEST_HOOKS
+  } else if (options.check_trim_cache) {
+    printf("trim-cache items=%zu before_known=%zu before_computed=%zu "
+           "first_matches=%zu first_known=%zu first_computed=%zu "
+           "second_matches=%zu second_known=%zu second_computed=%zu\n",
+           corpus.count, trim_before_known, trim_before_computed,
+           trim_first_matches, trim_first_known, trim_first_computed,
+           match_count, trim_second_known, trim_second_computed);
+#endif
   } else if (options.check_only) {
     printf("semantic items=%zu matches=%zu input_checksum=%016" PRIx64
            " result_checksum=%016" PRIx64 "\n",

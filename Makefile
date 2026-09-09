@@ -127,6 +127,7 @@ ctest-fzf-bench-driver:
 		benchmarks/fzf-bench-driver-test.c fzf.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-bench-driver-unit-test
 	$(CC) -std=gnu11 -Wall -Wextra -O2 -DFZF_BENCH_CHUNK_SIZE=3 \
+		-DFZF_BENCH_TEST_HOOKS \
 		-I. -I$(UTF8PROC_DIR) -pthread \
 		-o $(BUILD_DIR)/fzf-bench-driver-ctest \
 		benchmarks/fzf-bench-driver.c fzf.c $(UTF8PROC_SRC)
@@ -163,6 +164,12 @@ ctest-fzf-bench-driver:
 		$(BUILD_DIR)/fzf-bench-driver-json.txt
 	grep -Fx 'semantic items=12 matches=9 input_checksum=18c3f63929c5b7fa result_checksum=eaad98c78963fb4b' \
 		$(BUILD_DIR)/fzf-bench-driver-json.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc \
+		--algo=v2 --tiebreak=length --threads=3 --check-trim-cache \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-trim-cache.txt
+	grep -Fx 'trim-cache items=12 before_known=0 before_computed=0 first_matches=9 first_known=9 first_computed=9 second_matches=9 second_known=9 second_computed=9' \
+		$(BUILD_DIR)/fzf-bench-driver-trim-cache.txt
 	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
 		--algo=v2 --tiebreak=index --threads=1 --no-sort --check \
 		< benchmarks/fzf-bench-fixture.txt \

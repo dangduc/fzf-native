@@ -42,6 +42,8 @@ def main() -> None:
     provenance_path = arguments.provenance.resolve()
     go = pathlib.Path(shutil.which(arguments.go) or arguments.go).resolve()
     patch = pathlib.Path(__file__).with_name("fzf-bench-json.patch").resolve()
+    patch_bytes = patch.read_bytes()
+    patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
 
     revision = output(["git", "-C", str(source), "rev-parse", "HEAD"])
     if revision != PINNED_FZF_COMMIT:
@@ -50,6 +52,10 @@ def main() -> None:
         )
     if output(["git", "-C", str(source), "status", "--porcelain"]):
         raise RuntimeError("fzf source is not clean")
+    pinned_tree = output([
+        "git", "-C", str(source), "rev-parse",
+        f"{PINNED_FZF_COMMIT}^{{tree}}",
+    ])
 
     query_keys = [
         "GOOS", "GOARCH", "CGO_ENABLED", "GOCACHE", "GOMODCACHE", "GOPATH",
@@ -82,6 +88,8 @@ def main() -> None:
     provenance_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="fzf-bench-build-") as directory:
         checkout = pathlib.Path(directory) / "fzf"
+        frozen_patch = pathlib.Path(directory) / "fzf-bench-json.patch"
+        frozen_patch.write_bytes(patch_bytes)
         build_cwd = str(checkout)
         subprocess.run(
             ["git", "-C", str(source), "worktree", "add", "--detach",
@@ -90,7 +98,7 @@ def main() -> None:
         )
         try:
             subprocess.run(
-                ["git", "-C", str(checkout), "apply", str(patch)],
+                ["git", "-C", str(checkout), "apply", str(frozen_patch)],
                 check=True,
             )
             build_argv = [
@@ -120,11 +128,9 @@ def main() -> None:
             datetime.timezone.utc
         ).isoformat().replace("+00:00", "Z"),
         "fzf_commit": revision,
-        "fzf_tree": output(
-            ["git", "-C", str(source), "rev-parse", "HEAD^{tree}"]
-        ),
+        "fzf_tree": pinned_tree,
         "patch": str(patch),
-        "patch_sha256": sha256(patch),
+        "patch_sha256": patch_sha256,
         "patched_core_sha256": patched_core_sha256,
         "build_cwd": build_cwd,
         "cwd_kind": "temporary detached worktree at the pinned commit",
