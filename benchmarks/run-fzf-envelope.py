@@ -76,6 +76,78 @@ def sha256(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def host_details() -> dict[str, object]:
+    details: dict[str, object] = {
+        "platform": platform.platform(),
+        "uname": platform.uname()._asdict(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "logical_cpu_count": os.cpu_count(),
+    }
+    if platform.system() == "Darwin":
+        sysctl = {}
+        for key in (
+            "hw.model", "hw.physicalcpu", "hw.logicalcpu", "hw.memsize",
+            "machdep.cpu.brand_string",
+        ):
+            completed = subprocess.run(
+                ["sysctl", "-n", key], capture_output=True, text=True,
+            )
+            if completed.returncode == 0:
+                sysctl[key] = completed.stdout.strip()
+        if sysctl:
+            details["sysctl"] = sysctl
+        profiler = pathlib.Path("/usr/sbin/system_profiler")
+        if profiler.is_file():
+            completed = subprocess.run(
+                [str(profiler), "SPHardwareDataType", "-json"],
+                capture_output=True, text=True,
+            )
+            if completed.returncode == 0:
+                records = json.loads(completed.stdout).get(
+                    "SPHardwareDataType", []
+                )
+                if records:
+                    safe_keys = (
+                        "chip_type", "machine_model", "machine_name",
+                        "number_processors", "physical_memory",
+                    )
+                    details["hardware"] = {
+                        key: records[0][key]
+                        for key in safe_keys if key in records[0]
+                    }
+    return details
+
+
+def load_native_build(
+    name: str, path: pathlib.Path, binary_hash: str, driver_hash: str
+) -> dict[str, object]:
+    provenance = json.loads(path.read_text(encoding="utf-8"))
+    if provenance.get("schema") != 1 or provenance.get(
+        "kind"
+    ) != "fzf-native-scan-benchmark-build":
+        raise RuntimeError(f"unsupported {name} native build provenance")
+    if provenance.get("binary_sha256") != binary_hash:
+        raise RuntimeError(f"{name} binary does not match its build provenance")
+    if provenance.get("driver_source_sha256") != driver_hash:
+        raise RuntimeError(f"{name} build does not use this benchmark driver")
+    if provenance.get("source_status") != "clean":
+        raise RuntimeError(f"{name} product source was not clean")
+    for field in (
+        "source_commit", "source_tree", "compiler", "compiler_sha256",
+        "compiler_version_stdout",
+    ):
+        if not isinstance(provenance.get(field), str) or not provenance[field]:
+            raise RuntimeError(f"{name} provenance lacks {field}")
+    for field in (
+        "product_source_sha256", "build_options", "build_argv",
+        "build_environment",
+    ):
+        if not provenance.get(field):
+            raise RuntimeError(f"{name} provenance lacks {field}")
+    return provenance
+
+
 def cells(corpus_root: pathlib.Path) -> dict[str, dict[str, object]]:
     result: dict[str, dict[str, object]] = {
         "chromium": {
@@ -174,6 +246,12 @@ def main() -> None:
     parser.add_argument("--corpus-root", type=pathlib.Path, required=True)
     parser.add_argument("--candidate", type=pathlib.Path, required=True)
     parser.add_argument("--base", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--candidate-build-provenance", type=pathlib.Path, required=True
+    )
+    parser.add_argument(
+        "--base-build-provenance", type=pathlib.Path, required=True
+    )
     parser.add_argument("--fzf", type=pathlib.Path, required=True)
     parser.add_argument(
         "--fzf-build-provenance", type=pathlib.Path, required=True
@@ -194,6 +272,8 @@ def main() -> None:
     }
     runner_path = pathlib.Path(__file__).resolve()
     runner_sha256 = sha256(runner_path)
+    driver_path = runner_path.with_name("fzf-bench-driver.c")
+    driver_sha256 = sha256(driver_path)
     fzf_provenance_path = arguments.fzf_build_provenance.resolve()
     selected_lanes = arguments.lane or list(LANES)
     if len(selected_lanes) != len(set(selected_lanes)):
@@ -207,6 +287,30 @@ def main() -> None:
         raise RuntimeError(f"unknown cells: {', '.join(unknown_cells)}")
     workload_cells = {name: all_cells[name] for name in selected_cells}
     subject_hashes = {name: sha256(path) for name, path in subjects.items()}
+    native_provenance_paths = {
+        "candidate": arguments.candidate_build_provenance.resolve(),
+        "base": arguments.base_build_provenance.resolve(),
+    }
+    native_provenance_hashes = {
+        name: sha256(path) for name, path in native_provenance_paths.items()
+    }
+    native_builds = {
+        name: load_native_build(
+            name, native_provenance_paths[name], subject_hashes[name],
+            driver_sha256,
+        )
+        for name in ("candidate", "base")
+    }
+    comparable_native_fields = (
+        "driver_commit", "driver_tree", "driver_source_sha256", "compiler",
+        "compiler_sha256",
+        "compiler_version_stdout", "compiler_version_stderr", "build_options",
+        "build_environment",
+    )
+    for field in comparable_native_fields:
+        if native_builds["candidate"].get(field) != native_builds["base"].get(field):
+            raise RuntimeError(f"native builds differ in {field}")
+    fzf_provenance_sha256 = sha256(fzf_provenance_path)
     fzf_provenance = json.loads(
         fzf_provenance_path.read_text(encoding="utf-8")
     )
@@ -281,35 +385,21 @@ def main() -> None:
                 )
                 schedule.append((round_number, cell, lane_name, order))
 
-    profiles: dict[str, dict[str, object]] = {}
-    for lane_name in selected_lanes:
-        lane = LANES[lane_name]
-        profile_name = str(lane["profile"])
-        profile = profiles.setdefault(
-            profile_name,
-            {
-                "arguments": list(lane["arguments"]),
-                "threads": lane["threads"],
-            },
-        )
-        if profile["arguments"] != lane["arguments"]:
-            raise RuntimeError(f"inconsistent lane arguments for {profile_name}")
-        profile["threads"] = min(int(profile["threads"]), int(lane["threads"]))
-
     started = utc_now()
     ordered_records = []
     for cell_name, cell in workload_cells.items():
-        for profile_name, profile in profiles.items():
+        for lane_name in selected_lanes:
+            lane = LANES[lane_name]
             output_hashes = set()
             for subject, binary in subjects.items():
                 command = [
                     str(binary), f"--filter={cell['query']}",
-                    f"--threads={profile['threads']}", "--algo=v2",
-                    "--scheme=default", "--sort", *profile["arguments"],
+                    f"--threads={lane['threads']}", "--algo=v2",
+                    "--scheme=default", "--sort", *lane["arguments"],
                 ]
                 if subject != "fzf":
                     command.append("--dump-results")
-                stem = f"{profile_name}-{cell_name}-{subject}"
+                stem = f"{lane_name}-{cell_name}-{subject}"
                 stdout_path = ordered_output_root / f"{stem}.stdout"
                 stderr_path = ordered_output_root / f"{stem}.stderr"
                 command_started = utc_now()
@@ -337,9 +427,10 @@ def main() -> None:
                 output_hash = sha256(stdout_path)
                 output_hashes.add(output_hash)
                 ordered_records.append({
-                    "profile": profile_name,
-                    "threads": profile["threads"],
-                    "arguments": profile["arguments"],
+                    "lane": lane_name,
+                    "profile": lane["profile"],
+                    "threads": lane["threads"],
+                    "arguments": lane["arguments"],
                     "cell": cell_name,
                     "query": cell["query"],
                     "corpus": str(cell["path"]),
@@ -356,7 +447,7 @@ def main() -> None:
                 })
             if len(output_hashes) != 1:
                 raise RuntimeError(
-                    f"ordered output differs: {cell_name} {profile_name}"
+                    f"ordered output differs: {cell_name} {lane_name}"
                 )
     ordered_output_path = root / "ordered-output.json"
     ordered_output_path.write_text(
@@ -441,6 +532,14 @@ def main() -> None:
         raise RuntimeError("corpus changed during the campaign")
     if sha256(runner_path) != runner_sha256:
         raise RuntimeError("benchmark runner changed during the campaign")
+    if sha256(driver_path) != driver_sha256:
+        raise RuntimeError("benchmark driver changed during the campaign")
+    if {
+        name: sha256(path) for name, path in native_provenance_paths.items()
+    } != native_provenance_hashes:
+        raise RuntimeError("native build provenance changed during the campaign")
+    if sha256(fzf_provenance_path) != fzf_provenance_sha256:
+        raise RuntimeError("fzf build provenance changed during the campaign")
 
     result = {
         "schema": 1,
@@ -455,16 +554,20 @@ def main() -> None:
         "runner_argv": sys.argv,
         "runner_cwd": str(pathlib.Path.cwd()),
         "python": sys.version,
-        "host": {
-            "platform": platform.platform(),
-            "machine": platform.machine(),
-        },
+        "host": host_details(),
         "lanes": {name: LANES[name] for name in selected_lanes},
         "environment": environment,
         "subjects": {name: str(path) for name, path in subjects.items()},
         "subject_sha256": subject_hashes,
+        "driver": str(driver_path),
+        "driver_sha256": driver_sha256,
+        "native_build_provenance": {
+            name: str(path) for name, path in native_provenance_paths.items()
+        },
+        "native_build_provenance_sha256": native_provenance_hashes,
+        "native_builds": native_builds,
         "fzf_build_provenance": str(fzf_provenance_path),
-        "fzf_build_provenance_sha256": sha256(fzf_provenance_path),
+        "fzf_build_provenance_sha256": fzf_provenance_sha256,
         "fzf_build": fzf_provenance,
         "cells": {
             name: {
