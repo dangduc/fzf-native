@@ -1248,6 +1248,18 @@ static void test_async_reader_basic(void) {
   CHECK(strcmp(cands_at(s, 0), "alpha") == 0);
   CHECK(strcmp(cands_at(s, 1), "beta")  == 0);
   CHECK(strcmp(cands_at(s, 2), "gamma") == 0);
+  CHECK(async_candidate_length(cands_at(s, 0),
+            async_candidate_metadata(cands_at(s, 0))) == 5);
+  CHECK(async_candidate_length(cands_at(s, 1),
+            async_candidate_metadata(cands_at(s, 1))) == 4);
+  CHECK(async_candidate_length(cands_at(s, 2),
+            async_candidate_metadata(cands_at(s, 2))) == 5);
+  CHECK(async_candidate_ascii_from_metadata(
+            async_candidate_metadata(cands_at(s, 0))));
+  CHECK(async_candidate_ascii_from_metadata(
+            async_candidate_metadata(cands_at(s, 1))));
+  CHECK(async_candidate_ascii_from_metadata(
+            async_candidate_metadata(cands_at(s, 2))));
   CHECK(!atomic_load_explicit(&s->score_growth_pending,
                               memory_order_acquire));
   free_async_session(s);
@@ -1540,6 +1552,10 @@ static void test_async_line_decoder_matches_one_shot_reference(void) {
         if (actual) {
           CHECK(strlen(actual) == reference_len);
           CHECK(memcmp(actual, reference, reference_len) == 0);
+          uint32_t metadata = async_candidate_metadata(actual);
+          CHECK(async_candidate_length(actual, metadata) == reference_len);
+          CHECK(async_candidate_ascii_from_metadata(metadata) ==
+                is_ascii_utf8proc(reference, reference_len));
         }
         expected_count++;
       } else {
@@ -1578,6 +1594,9 @@ static void test_async_line_decoder_bounds_overlong_records(void) {
   CHECK(async_line_finish(s, &line));
   CHECK(s->count == 1);
   CHECK(strcmp(cands_at(s, 0), "\xe4\xbd\xa0\xe5\xa5\xbd") == 0);
+  uint32_t metadata = async_candidate_metadata(cands_at(s, 0));
+  CHECK(async_candidate_length(cands_at(s, 0), metadata) == 6);
+  CHECK(!async_candidate_ascii_from_metadata(metadata));
 
   /* An ordinary over-limit record is excluded without growing the retained
      buffer, including when its newline has not arrived yet. */
@@ -3128,8 +3147,19 @@ static void test_completed_batch_evidence_survives_request_cancellation(void) {
   batch->batch_id = 0;
   batch->cacheable = true;
   batch->len = BATCH_SIZE;
+  Arena arena = {0};
+  char *alpha = arena_strdup_candidate(&arena, "alpha", 5, true);
+  char *zzz = arena_strdup_candidate(&arena, "zzz", 3, true);
+  CHECK(alpha != NULL && zzz != NULL);
+  if (!alpha || !zzz) {
+    arena_free(&arena);
+    free(batch);
+    batch_cache_release_query(&cache, target);
+    batch_cache_free(&cache);
+    return;
+  }
   for (size_t i = 0; i < BATCH_SIZE; i++) {
-    batch->xs[i].str = i < 3 ? "alpha" : "zzz";
+    batch->xs[i].str = i < 3 ? alpha : zzz;
     batch->xs[i].idx = (uint32_t)i;
   }
   char pattern_text[] = "a";
@@ -3161,6 +3191,7 @@ static void test_completed_batch_evidence_survives_request_cancellation(void) {
 
   if (slab) fzf_free_slab(slab);
   if (pattern) fzf_free_pattern(pattern);
+  arena_free(&arena);
   free(batch);
   batch_cache_release_query(&cache, target);
   batch_cache_free(&cache);

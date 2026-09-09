@@ -369,6 +369,10 @@ The decoder still scans discarded bytes.
 It therefore detects a NUL after a retained prefix or inside discarded ANSI data.
 
 Candidate strings live in 4 MiB arena chunks.
+Each string has a four-byte private header with its byte length and ASCII flag.
+Strings longer than the header range use an additional =size_t= field.
+The decoder derives the flag while it already scans visible producer bytes.
+Scoring workers reuse both values and do not run =strlen= or a separate ASCII scan for each query.
 The reader appends their pointers to fixed pointer blocks.
 
 One pointer block holds 262,144 entries.

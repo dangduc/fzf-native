@@ -355,6 +355,27 @@ benchmark-session-trace: benchmark-session-trace-build
 		$(SESSION_TRACE_CANDIDATES) $(SESSION_TRACE_WORKERS) \
 		$(SESSION_TRACE_LIMIT) $(SESSION_TRACE_SAMPLES)
 
+# Cold first-query probe.  Invoke the executable once per sample so every run
+# starts with a fresh process-wide worker pool.  Corpus construction and an
+# independent full-scan/qsort oracle are outside the measured interval.
+FIRST_QUERY_CANDIDATES ?= 300000
+FIRST_QUERY_LIMIT ?= 256
+FIRST_QUERY_QUERY ?= omega
+FIRST_QUERY_BENCH := $(BUILD_DIR)/first-query-probe
+
+.PHONY: benchmark-first-query-build benchmark-first-query
+benchmark-first-query-build:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O3 -DNDEBUG \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(FIRST_QUERY_BENCH) benchmarks/first-query-probe.c \
+		fzf.c fzf-additions.c $(UTF8PROC_SRC)
+
+benchmark-first-query: benchmark-first-query-build
+	$(FIRST_QUERY_BENCH) \
+		$(FIRST_QUERY_CANDIDATES) $(FIRST_QUERY_LIMIT) \
+		$(FIRST_QUERY_QUERY)
+
 # Coverage-guided and differential test targets live in a separate include so
 # they do not alter the release build or the public module ABI.
 include fuzz/fuzz.mk
