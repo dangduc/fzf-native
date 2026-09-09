@@ -309,6 +309,44 @@ static FZF_SIMD_NOINLINE const char *fzf_simd_find_byte_two(
   return NULL;
 }
 
+/* Specialized partial two-vector span for the initial mandatory byte.  The
+   second load ends exactly at TEXT_SIZE and overlaps the first; lanes already
+   covered by the first load are masked out. */
+static FZF_SIMD_NOINLINE const char *fzf_simd_find_byte_two_short(
+    const char *text, size_t text_size,
+    uint8_t exact_byte, uint8_t alternate_byte) {
+#if defined(FZF_SIMD_NEON)
+  uint8x16_t exact = vdupq_n_u8(exact_byte);
+  uint8x16_t alternate = vdupq_n_u8(alternate_byte);
+  uint8x16_t first = fzf_simd_load(text);
+  uint16_t mask = fzf_simd_movemask(vorrq_u8(
+      vceqq_u8(first, exact), vceqq_u8(first, alternate)));
+#elif defined(FZF_SIMD_SSE2)
+  __m128i exact = _mm_set1_epi8((char)exact_byte);
+  __m128i alternate = _mm_set1_epi8((char)alternate_byte);
+  __m128i first = fzf_simd_load(text);
+  uint16_t mask = (uint16_t)_mm_movemask_epi8(_mm_or_si128(
+      _mm_cmpeq_epi8(first, exact), _mm_cmpeq_epi8(first, alternate)));
+#endif
+  if (mask != 0) return text + fzf_simd_first_lane(mask);
+
+  size_t tail_offset = text_size - FZF_SIMD_LANES;
+#if defined(FZF_SIMD_NEON)
+  uint8x16_t last = fzf_simd_load(text + tail_offset);
+  mask = fzf_simd_movemask(vorrq_u8(
+      vceqq_u8(last, exact), vceqq_u8(last, alternate)));
+#elif defined(FZF_SIMD_SSE2)
+  __m128i last = fzf_simd_load(text + tail_offset);
+  mask = (uint16_t)_mm_movemask_epi8(_mm_or_si128(
+      _mm_cmpeq_epi8(last, exact), _mm_cmpeq_epi8(last, alternate)));
+#endif
+  unsigned int overlap = (unsigned int)(2 * FZF_SIMD_LANES - text_size);
+  mask = (uint16_t)(mask & (uint16_t)(UINT32_C(0xffff) << overlap));
+  if (mask != 0)
+    return text + tail_offset + fzf_simd_first_lane(mask);
+  return NULL;
+}
+
 #undef FZF_SIMD_NOINLINE
 
 static inline bool fzf_ascii_plan_byte_matches(
@@ -333,6 +371,21 @@ static inline const char *fzf_ascii_plan_find_byte(
   }
   return fzf_simd_find_byte_two(
       text, text_size, query->exact[0], query->alternate[0]);
+}
+
+/* The initial mandatory byte is often absent, so its scan dominates rejected
+   candidates.  Use the overlapping-tail specialization for a partial second
+   vector; later query bytes keep the smaller general helper because they
+   start deeper in the text and more often find a match. */
+static inline const char *fzf_ascii_plan_find_initial_byte(
+    const char *text, size_t text_size,
+    const fzf_simd_query_byte_t *query, bool case_sensitive) {
+  if (!case_sensitive && query->alternate[0] != query->exact[0] &&
+      text_size > FZF_SIMD_LANES &&
+      text_size < 2 * FZF_SIMD_LANES)
+    return fzf_simd_find_byte_two_short(
+        text, text_size, query->exact[0], query->alternate[0]);
+  return fzf_ascii_plan_find_byte(text, text_size, query, case_sensitive);
 }
 
 /* FIRST_INDEX is a verified match for query byte zero. */

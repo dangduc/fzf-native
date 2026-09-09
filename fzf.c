@@ -676,7 +676,7 @@ static int32_t ascii_fuzzy_index(
       plan->case_sensitive == case_sensitive &&
       pattern->size >= FZF_SIMD_FUZZY_MIN_PATTERN &&
       input->size >= FZF_SIMD_FUZZY_MIN_TEXT) {
-    const char *first = fzf_ascii_plan_find_byte(
+    const char *first = fzf_ascii_plan_find_initial_byte(
         input->data, input->size, &plan->bytes[0], case_sensitive);
     if (!first) return -1;
     size_t first_index = (size_t)(first - input->data);

@@ -62,7 +62,7 @@ static ptrdiff_t scalar_fuzzy_index(const uint8_t *text, size_t text_size,
 static ptrdiff_t planned_fuzzy_index(const uint8_t *text, size_t text_size,
                                      const fzf_ascii_query_plan_t *plan) {
   if (plan->pattern_size == 0) return 0;
-  const char *first = fzf_ascii_plan_find_byte(
+  const char *first = fzf_ascii_plan_find_initial_byte(
       (const char *)text, text_size, &plan->bytes[0], plan->case_sensitive);
   if (!first) return -1;
   size_t first_index = (size_t)(first - (const char *)text);
@@ -95,6 +95,21 @@ static void check_byte_two(const char *text, size_t text_size,
             text_size, (unsigned int)exact_byte, (unsigned int)alternate_byte,
             scalar ? scalar - text : -1, simd ? simd - text : -1);
     failures++;
+  }
+  if (text_size > FZF_SIMD_LANES &&
+      text_size < 2 * FZF_SIMD_LANES) {
+    const char *short_simd = fzf_simd_find_byte_two_short(
+        text, text_size, exact_byte, alternate_byte);
+    if (scalar != short_simd) {
+      fprintf(stderr,
+              "FAIL short paired byte search: size=%zu exact=%u alternate=%u "
+              "scalar=%td simd=%td\n",
+              text_size, (unsigned int)exact_byte,
+              (unsigned int)alternate_byte,
+              scalar ? scalar - text : -1,
+              short_simd ? short_simd - text : -1);
+      failures++;
+    }
   }
 }
 
