@@ -191,6 +191,13 @@ int32_t fzf_get_score_with_bounds_bytes_preclassified(
     const char *text, size_t text_len, bool input_is_ascii,
     fzf_pattern_t *pattern, fzf_slab_t *slab,
     fzf_score_bounds_t *bounds);
+/* Score one byte string and backtrack positive matches before retaining their
+   bounds.  This matches fzf's begin-dependent ranking modes, which request
+   positions from the matcher even when the positions are not displayed. */
+int32_t fzf_get_score_with_rank_bounds_bytes_preclassified(
+    const char *text, size_t text_len, bool input_is_ascii,
+    fzf_pattern_t *pattern, fzf_slab_t *slab,
+    fzf_score_bounds_t *bounds);
 int32_t fzf_get_score_with_bounds(const char *text,
                                   fzf_pattern_t *pattern,
                                   fzf_slab_t *slab,

@@ -975,6 +975,86 @@ static void test_score_only_bounds_match_upstream_v2_start(void) {
   }
 }
 
+static void test_path_rank_backtracks_the_match_begin(void) {
+  char query[] = "alpha";
+  fzf_pattern_t *pattern = fzf_parse_pattern_with_direction(
+      CaseSmart, true, query, true, false);
+  fzf_slab_t *slab = fzf_make_default_slab();
+  fzf_score_bounds_t score_only = {0};
+  fzf_score_bounds_t ranked = {0};
+  FzfRankKeys beta_rank = {0};
+  FzfRankKeys foo_rank = {0};
+  const char *beta = "beta alpha";
+  const char *foo = "FOO alpha";
+  CHECK(pattern != NULL && slab != NULL);
+  CHECK(fzf_slab_set_score_scheme(slab, FZF_SCORE_SCHEME_PATH));
+
+  int score = fzf_get_score_with_bounds_bytes_preclassified(
+      beta, strlen(beta), true, pattern, slab, &score_only);
+  int ranked_score = fzf_get_score_with_rank_bounds_bytes_preclassified(
+      beta, strlen(beta), true, pattern, slab, &ranked);
+  CHECK(score > 0 && ranked_score == score);
+  CHECK(score_only.min_begin == 3);
+  CHECK(ranked.min_begin == 5);
+
+  int beta_score = fzf_score_and_rank(
+      beta, strlen(beta), true, pattern, slab, FZF_SCORE_SCHEME_PATH,
+      false, &beta_rank);
+  int foo_score = fzf_score_and_rank(
+      foo, strlen(foo), true, pattern, slab, FZF_SCORE_SCHEME_PATH,
+      false, &foo_rank);
+  CHECK(beta_score == foo_score);
+  CHECK(beta_rank.score == foo_rank.score);
+  CHECK(beta_rank.first == 6);
+  CHECK(foo_rank.first == 5);
+  CHECK(candidate_order(
+            &(struct Candidate){.rank = foo_rank, .idx = 1},
+            &(struct Candidate){.rank = beta_rank, .idx = 0}) < 0);
+  fzf_free_pattern(pattern);
+
+  char utf8_query[] = "alpha";
+  pattern = fzf_parse_pattern_with_direction(
+      CaseSmart, true, utf8_query, true, false);
+  const char *utf8_near = "目录/x alpha";
+  const char *utf8_far = "目录/yz alpha";
+  FzfRankKeys utf8_near_rank = {0};
+  FzfRankKeys utf8_far_rank = {0};
+  CHECK(pattern != NULL);
+  int utf8_near_score = fzf_score_and_rank(
+      utf8_near, strlen(utf8_near), false, pattern, slab,
+      FZF_SCORE_SCHEME_PATH, false, &utf8_near_rank);
+  int utf8_far_score = fzf_score_and_rank(
+      utf8_far, strlen(utf8_far), false, pattern, slab,
+      FZF_SCORE_SCHEME_PATH, false, &utf8_far_rank);
+  CHECK(utf8_near_score == utf8_far_score);
+  CHECK(utf8_near_rank.score == utf8_far_rank.score);
+  CHECK(utf8_near_rank.first == 3);
+  CHECK(utf8_far_rank.first == 4);
+  fzf_free_pattern(pattern);
+
+  char compound_query[] = "'alpha | 'omega 'beta";
+  pattern = fzf_parse_pattern_with_direction(
+      CaseSmart, true, compound_query, true, false);
+  const char *compound_near = "dir/x omega beta";
+  const char *compound_far = "dir/yz omega beta";
+  FzfRankKeys compound_near_rank = {0};
+  FzfRankKeys compound_far_rank = {0};
+  CHECK(pattern != NULL);
+  int compound_near_score = fzf_score_and_rank(
+      compound_near, strlen(compound_near), true, pattern, slab,
+      FZF_SCORE_SCHEME_PATH, false, &compound_near_rank);
+  int compound_far_score = fzf_score_and_rank(
+      compound_far, strlen(compound_far), true, pattern, slab,
+      FZF_SCORE_SCHEME_PATH, false, &compound_far_rank);
+  CHECK(compound_near_score == compound_far_score);
+  CHECK(compound_near_rank.score == compound_far_rank.score);
+  CHECK(compound_near_rank.first == 3);
+  CHECK(compound_far_rank.first == 4);
+
+  fzf_free_slab(slab);
+  fzf_free_pattern(pattern);
+}
+
 /* =====================================================================
  * counting_sort_scored (async-path twin of counting_sort_candidates)
  * ===================================================================== */
@@ -4408,6 +4488,7 @@ int main(void) {
   RUN(test_score_bounds_aggregate_positive_terms);
   RUN(test_score_bounds_hide_partial_and_match);
   RUN(test_score_only_bounds_match_upstream_v2_start);
+  RUN(test_path_rank_backtracks_the_match_begin);
 
   printf("--- counting_sort_scored ---\n");
   RUN(test_scored_n_zero);

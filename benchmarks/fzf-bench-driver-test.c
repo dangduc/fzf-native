@@ -80,7 +80,8 @@ static void test_fallback_and_duplicate_identity(void) {
     for (unsigned sorted = 0; sorted < 2; sorted++) {
       BenchPool pool;
       bool initialized = bench_pool_init(
-          &pool, threads, &corpus, pattern, sorted, false);
+          &pool, threads, &corpus, pattern, sorted,
+          FZF_SCORE_SCHEME_DEFAULT, false, false);
       CHECK(initialized);
       if (!initialized) continue;
       uint64_t expected = expected_checksum(5,
@@ -120,7 +121,9 @@ static void test_radix_passes(void) {
   enum { count = 512 };
   BenchCandidate candidates[count];
   BenchMatch values[count], expected[count], scratch[count];
+  BenchPool pool = {0};
   BenchWorker worker = {
+      .pool = &pool,
       .matches = {values, count, count},
       .sort_scratch = scratch,
       .sort_scratch_capacity = count,
@@ -153,6 +156,52 @@ static void test_radix_passes(void) {
   }
 }
 
+static void test_path_options_follow_fzf_last_option_wins(void) {
+  char *tiebreak_first[] = {
+      "fzf-bench", "--filter=alpha", "--dump-semantic",
+      "--tiebreak=index", "--scheme=path"};
+  char *scheme_first[] = {
+      "fzf-bench", "--filter=alpha", "--dump-semantic",
+      "--scheme=path", "--tiebreak=index"};
+  char *path_default[] = {
+      "fzf-bench", "--filter=alpha", "--dump-semantic", "--scheme=path"};
+  char *timed_pathname[] = {
+      "fzf-bench", "--filter=alpha", "--bench=1ms", "--scheme=path"};
+  char *timed_path_index[] = {
+      "fzf-bench", "--filter=alpha", "--bench=1ms", "--scheme=path",
+      "--tiebreak=index"};
+  BenchOptions first, second, default_path, timed;
+  CHECK(bench_parse_options(5, tiebreak_first, &first));
+  CHECK(bench_parse_options(5, scheme_first, &second));
+  CHECK(first.score_scheme == FZF_SCORE_SCHEME_PATH);
+  CHECK(second.score_scheme == FZF_SCORE_SCHEME_PATH);
+  CHECK(first.tiebreak_pathname && first.tiebreak_length);
+  CHECK(!second.tiebreak_pathname && !second.tiebreak_length);
+  CHECK(bench_parse_options(4, path_default, &default_path));
+  CHECK(default_path.tiebreak_pathname && default_path.tiebreak_length);
+  CHECK(!bench_parse_options(4, timed_pathname, &timed));
+  CHECK(bench_parse_options(5, timed_path_index, &timed));
+}
+
+static void test_path_comparison_and_merge(void) {
+  BenchCandidate short_candidate = {
+      .text = "beta alpha", .length = 10, .index = 0,
+      .input_is_ascii = true};
+  BenchCandidate long_candidate = {
+      .text = "long-directory/FOO alpha", .length = 24, .index = 1,
+      .input_is_ascii = true};
+  BenchMatch values[] = {
+      {.candidate = &short_candidate, .rank_pathname = 6,
+       .rank_score = 100, .rank_length = 10},
+      {.candidate = &long_candidate, .rank_pathname = 5,
+       .rank_score = 100, .rank_length = 24},
+  };
+  CHECK(bench_match_precedes(&values[1], &values[0], true, true));
+  CHECK(!bench_match_precedes(&values[1], &values[0], true, false));
+  qsort(values, 2, sizeof *values, bench_compare_path_matches);
+  CHECK(values[0].candidate == &long_candidate);
+}
+
 int main(void) {
   CHECK(sizeof(void *) != 8 || sizeof(BenchMatch) == 16);
   CHECK(bench_rank_score(INT64_MIN) == 0);
@@ -162,6 +211,8 @@ int main(void) {
   CHECK(bench_rank_score(UINT16_MAX) == UINT16_MAX);
   CHECK(bench_rank_score((int64_t)UINT16_MAX + 1) == UINT16_MAX);
   CHECK(bench_rank_score(INT64_MAX) == UINT16_MAX);
+  test_path_options_follow_fzf_last_option_wins();
+  test_path_comparison_and_merge();
   test_fallback_and_duplicate_identity();
   test_radix_passes();
   if (failures) return 1;

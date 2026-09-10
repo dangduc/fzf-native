@@ -743,6 +743,7 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
   for (size_t i = 0; i < pool; i++) {
     const char *candidate =
         s->cands_top[i >> CANDS_BLOCK_SHIFT][i & CANDS_BLOCK_MASK];
+    size_t candidate_len = strlen(candidate);
     int score;
     fzf_score_bounds_t bounds = {0};
     if (!pattern)
@@ -750,12 +751,18 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
     else if (filter_only)
       score = fzf_has_match(candidate, pattern, slab) ? 1 : 0;
     else
-      score = fzf_get_score_with_bounds(candidate, pattern, slab, &bounds);
+      score = score_scheme == FZF_SCORE_SCHEME_PATH
+                  ? fzf_get_score_with_rank_bounds_bytes_preclassified(
+                        candidate, candidate_len,
+                        is_ascii_utf8proc(candidate, candidate_len),
+                        pattern, slab, &bounds)
+                  : fzf_get_score_with_bounds(
+                        candidate, pattern, slab, &bounds);
     if (score > 0) {
       reference[matched++] = (ScoredStr){
           .str = (char *)candidate, .score = score, .idx = (uint32_t)i,
           .rank = fzf_rank_keys_preclassified(
-              candidate, strlen(candidate), false, &bounds, score_scheme)};
+              candidate, candidate_len, false, &bounds, score_scheme)};
     }
   }
   pthread_mutex_unlock(&s->mu);
@@ -764,10 +771,16 @@ static void session_fuzz_check_reference(FuzzSession *fuzz) {
   if (filter_only && sortable && emit > 1) {
     for (size_t i = 0; i < emit; i++) {
       fzf_score_bounds_t bounds = {0};
-      reference[i].score = fzf_get_score_with_bounds(
-          reference[i].str, pattern, slab, &bounds);
+      size_t candidate_len = strlen(reference[i].str);
+      reference[i].score = score_scheme == FZF_SCORE_SCHEME_PATH
+          ? fzf_get_score_with_rank_bounds_bytes_preclassified(
+                reference[i].str, candidate_len,
+                is_ascii_utf8proc(reference[i].str, candidate_len),
+                pattern, slab, &bounds)
+          : fzf_get_score_with_bounds(
+                reference[i].str, pattern, slab, &bounds);
       reference[i].rank = fzf_rank_keys_preclassified(
-          reference[i].str, strlen(reference[i].str), false, &bounds,
+          reference[i].str, candidate_len, false, &bounds,
           score_scheme);
     }
     qsort(reference, emit, sizeof *reference, cmp_scored_desc);

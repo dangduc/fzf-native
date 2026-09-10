@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,10 +63,27 @@ typedef struct {
 /* Keep the same 16-byte result footprint as fzf's Result on 64-bit hosts. */
 typedef struct {
   const BenchCandidate *candidate;
-  int32_t membership;
+  union {
+    int32_t membership;
+    struct {
+      uint16_t rank_pathname;
+      uint16_t rank_pathname_padding;
+    };
+  };
   uint16_t rank_score;
   uint16_t rank_length;
 } BenchMatch;
+
+#if UINTPTR_MAX == UINT64_MAX
+_Static_assert(sizeof(BenchMatch) == 16,
+               "benchmark results must match fzf's 16-byte Result");
+_Static_assert(offsetof(BenchMatch, membership) == 8,
+               "default membership layout must not change");
+_Static_assert(offsetof(BenchMatch, rank_score) == 12,
+               "default score-rank layout must not change");
+_Static_assert(offsetof(BenchMatch, rank_length) == 14,
+               "default length-rank layout must not change");
+#endif
 
 typedef struct {
   BenchMatch *values;
@@ -111,8 +129,10 @@ typedef struct BenchPool {
   bool stop;
   BenchCorpus *corpus;
   fzf_pattern_t *pattern;
+  fzf_score_scheme_t score_scheme;
   bool has_positive_term;
   bool sort_results;
+  bool tiebreak_pathname;
   bool tiebreak_length;
   BenchScanResult result;
   _Atomic size_t next_chunk;
@@ -125,6 +145,8 @@ typedef struct {
   unsigned threads;
   bool normalize;
   bool sort_results;
+  fzf_score_scheme_t score_scheme;
+  bool tiebreak_pathname;
   bool tiebreak_length;
   bool check_only;
   bool dump_results;
@@ -152,6 +174,7 @@ static void bench_usage(FILE *stream, const char *program) {
           "(--bench DURATION | --check | --dump-results | --dump-semantic) "
           "[--threads N] [--literal] "
           "[--sort | --no-sort] [--algo=v2] "
+          "[--scheme=(default|path)] "
           "[--tiebreak=(length|index)]\n",
           program);
 }
@@ -224,7 +247,9 @@ static unsigned bench_online_threads(void) {
 static bool bench_parse_options(int argc, char **argv,
                                 BenchOptions *options) {
   *options = (BenchOptions){
-      .normalize = true, .sort_results = true, .tiebreak_length = true};
+      .normalize = true, .sort_results = true,
+      .score_scheme = FZF_SCORE_SCHEME_DEFAULT,
+      .tiebreak_length = true};
   for (int i = 1; i < argc; i++) {
     const char *argument = argv[i];
     const char *value = NULL;
@@ -268,15 +293,27 @@ static bool bench_parse_options(int argc, char **argv,
     } else if (bench_option_value(
                    argc, argv, &i, "--tiebreak", &value)) {
       if (strcmp(value, "index") == 0) {
+        options->tiebreak_pathname = false;
         options->tiebreak_length = false;
       } else if (strcmp(value, "length") == 0) {
+        options->tiebreak_pathname = false;
         options->tiebreak_length = true;
       } else {
         return false;
       }
     } else if (bench_option_value(
                    argc, argv, &i, "--scheme", &value)) {
-      if (strcmp(value, "default") != 0) return false;
+      if (strcmp(value, "default") == 0) {
+        options->score_scheme = FZF_SCORE_SCHEME_DEFAULT;
+        options->tiebreak_pathname = false;
+        options->tiebreak_length = true;
+      } else if (strcmp(value, "path") == 0) {
+        options->score_scheme = FZF_SCORE_SCHEME_PATH;
+        options->tiebreak_pathname = true;
+        options->tiebreak_length = true;
+      } else {
+        return false;
+      }
     } else {
       return false;
     }
@@ -289,6 +326,10 @@ static bool bench_parse_options(int argc, char **argv,
   modes += options->check_trim_cache;
 #endif
   if (!options->query || modes != 1)
+    return false;
+  /* Pathname ranking currently uses comparison sort.  Do not present it as
+     the same timed sorting envelope as fzf's radix path. */
+  if (options->duration_ns > 0 && options->tiebreak_pathname)
     return false;
 #ifdef FZF_BENCH_TEST_HOOKS
   if (options->check_trim_cache && !options->tiebreak_length) return false;
@@ -459,6 +500,43 @@ static uint16_t bench_rank_length(BenchCandidate *candidate) {
   return candidate->rank_length;
 }
 
+static uint16_t bench_rank_pathname(
+    const BenchCandidate *candidate, const fzf_score_bounds_t *bounds) {
+  if (!bounds->valid || bounds->min_begin < 0) return UINT16_MAX;
+
+  ptrdiff_t last_delimiter = -1;
+  if (candidate->input_is_ascii) {
+    for (size_t index = candidate->length; index > 0; index--) {
+      if (candidate->text[index - 1] == '/' ||
+          candidate->text[index - 1] == '\\') {
+        last_delimiter = (ptrdiff_t)(index - 1);
+        break;
+      }
+    }
+  } else {
+    size_t offset = 0;
+    ptrdiff_t rune_index = 0;
+    while (offset < candidate->length) {
+      utf8proc_int32_t codepoint = 0;
+      utf8proc_ssize_t width = utf8proc_iterate(
+          (const utf8proc_uint8_t *)candidate->text + offset,
+          (utf8proc_ssize_t)(candidate->length - offset), &codepoint);
+      if (width <= 0) {
+        codepoint = (unsigned char)candidate->text[offset];
+        width = 1;
+      }
+      if (codepoint == '/' || codepoint == '\\')
+        last_delimiter = rune_index;
+      offset += (size_t)width;
+      rune_index++;
+    }
+  }
+
+  if (last_delimiter > bounds->min_begin) return UINT16_MAX;
+  size_t distance = (size_t)((ptrdiff_t)bounds->min_begin - last_delimiter);
+  return distance > UINT16_MAX ? UINT16_MAX : (uint16_t)distance;
+}
+
 #ifdef FZF_BENCH_TEST_HOOKS
 static size_t bench_known_trim_lengths(const BenchCorpus *corpus) {
   size_t count = 0;
@@ -474,6 +552,21 @@ static int bench_compare_matches(const void *left_value,
   const BenchMatch *right = right_value;
   if (left->rank_score != right->rank_score)
     return left->rank_score > right->rank_score ? -1 : 1;
+  if (left->rank_length != right->rank_length)
+    return left->rank_length < right->rank_length ? -1 : 1;
+  if (left->candidate->index != right->candidate->index)
+    return left->candidate->index < right->candidate->index ? -1 : 1;
+  return 0;
+}
+
+static int bench_compare_path_matches(const void *left_value,
+                                      const void *right_value) {
+  const BenchMatch *left = left_value;
+  const BenchMatch *right = right_value;
+  if (left->rank_score != right->rank_score)
+    return left->rank_score > right->rank_score ? -1 : 1;
+  if (left->rank_pathname != right->rank_pathname)
+    return left->rank_pathname < right->rank_pathname ? -1 : 1;
   if (left->rank_length != right->rank_length)
     return left->rank_length < right->rank_length ? -1 : 1;
   if (left->candidate->index != right->candidate->index)
@@ -509,6 +602,12 @@ static void bench_sort_matches(BenchWorker *worker) {
   BenchMatch *values = worker->matches.values;
   size_t count = worker->matches.count;
   if (count < 2) return;
+  /* Pathname ranking is an untimed semantic-oracle profile.  Keep the
+     benchmark's hot default score/length radix path unchanged. */
+  if (worker->pool->tiebreak_pathname) {
+    qsort(values, count, sizeof *values, bench_compare_path_matches);
+    return;
+  }
   if (count < 128) {
     qsort(values, count, sizeof *values, bench_compare_matches);
     return;
@@ -565,7 +664,7 @@ static void bench_worker_scan(BenchWorker *worker) {
   if (!worker->slab) {
     worker->slab = fzf_make_default_slab();
     if (!worker->slab || !fzf_slab_set_score_scheme(
-                             worker->slab, FZF_SCORE_SCHEME_DEFAULT)) {
+                             worker->slab, pool->score_scheme)) {
       atomic_store_explicit(&pool->failed, true, memory_order_relaxed);
       return;
     }
@@ -583,9 +682,15 @@ static void bench_worker_scan(BenchWorker *worker) {
     for (size_t i = first; i < end; i++) {
       BenchCandidate *candidate = &pool->corpus->candidates[i];
       fzf_score_bounds_t bounds;
-      int32_t membership = fzf_get_score_with_bounds_bytes_preclassified(
-          candidate->text, candidate->length, candidate->input_is_ascii,
-          pool->pattern, worker->slab, &bounds);
+      int32_t membership = pool->tiebreak_pathname
+          ? fzf_get_score_with_rank_bounds_bytes_preclassified(
+                candidate->text, candidate->length,
+                candidate->input_is_ascii, pool->pattern,
+                worker->slab, &bounds)
+          : fzf_get_score_with_bounds_bytes_preclassified(
+                candidate->text, candidate->length,
+                candidate->input_is_ascii, pool->pattern,
+                worker->slab, &bounds);
       if (fzf_allocation_failed()) {
         atomic_store_explicit(&pool->failed, true, memory_order_relaxed);
         return;
@@ -593,16 +698,31 @@ static void bench_worker_scan(BenchWorker *worker) {
       /* The public return preserves membership with a positive sentinel.
          A v1 fallback can have a negative raw score.  Rank the raw aggregate,
          as fzf does, rather than adding sentinel-adjusted term scores. */
-      if (membership > 0 && !bench_match_list_append(
-                           &worker->matches,
-                           (BenchMatch){
-                               .candidate = candidate,
-                               .membership = membership,
-                               .rank_score = pool->has_positive_term
-                                   ? bench_rank_score(bounds.raw_score) : 0,
-                               .rank_length = pool->tiebreak_length
-                                   ? bench_rank_length(candidate) : 0,
-                           })) {
+      bool appended = true;
+      if (pool->tiebreak_pathname && membership > 0) {
+        BenchMatch match = {
+          .candidate = candidate,
+          .membership = membership,
+          .rank_score = pool->has_positive_term
+              ? bench_rank_score(bounds.raw_score) : 0,
+          .rank_length = pool->tiebreak_length
+              ? bench_rank_length(candidate) : 0,
+        };
+        match.rank_pathname = bench_rank_pathname(candidate, &bounds);
+        appended = bench_match_list_append(&worker->matches, match);
+      } else if (!pool->tiebreak_pathname && membership > 0) {
+        appended = bench_match_list_append(
+            &worker->matches,
+            (BenchMatch){
+                .candidate = candidate,
+                .membership = membership,
+                .rank_score = pool->has_positive_term
+                    ? bench_rank_score(bounds.raw_score) : 0,
+                .rank_length = pool->tiebreak_length
+                    ? bench_rank_length(candidate) : 0,
+            });
+      }
+      if (!appended) {
         atomic_store_explicit(&pool->failed, true, memory_order_relaxed);
         return;
       }
@@ -637,7 +757,8 @@ static void *bench_worker_main(void *data) {
 static bool bench_pool_init(BenchPool *pool, size_t worker_count,
                             BenchCorpus *corpus,
                             fzf_pattern_t *pattern, bool sort_results,
-                            bool tiebreak_length) {
+                            fzf_score_scheme_t score_scheme,
+                            bool tiebreak_pathname, bool tiebreak_length) {
   memset(pool, 0, sizeof *pool);
   if (pthread_mutex_init(&pool->mutex, NULL) != 0) return false;
   if (pthread_cond_init(&pool->start_cond, NULL) != 0) {
@@ -659,8 +780,10 @@ static bool bench_pool_init(BenchPool *pool, size_t worker_count,
   pool->worker_count = worker_count;
   pool->corpus = corpus;
   pool->pattern = pattern;
+  pool->score_scheme = score_scheme;
   pool->has_positive_term = pattern->has_positive_term;
   pool->sort_results = sort_results && pattern->has_positive_term;
+  pool->tiebreak_pathname = tiebreak_pathname;
   pool->tiebreak_length = tiebreak_length;
   atomic_init(&pool->next_chunk, 0);
   atomic_init(&pool->failed, false);
@@ -842,9 +965,13 @@ static uint64_t bench_input_checksum(const BenchCorpus *corpus) {
 
 static bool bench_match_precedes(const BenchMatch *left,
                                  const BenchMatch *right,
-                                 bool sortable) {
+                                 bool sortable,
+                                 bool tiebreak_pathname) {
   if (sortable && left->rank_score != right->rank_score)
     return left->rank_score > right->rank_score;
+  if (sortable && tiebreak_pathname &&
+      left->rank_pathname != right->rank_pathname)
+    return left->rank_pathname < right->rank_pathname;
   if (sortable && left->rank_length != right->rank_length)
     return left->rank_length < right->rank_length;
   return left->candidate->index < right->candidate->index;
@@ -881,7 +1008,8 @@ static bool bench_result_checksum(BenchPool *pool, size_t match_count,
       const BenchMatch *candidate =
           &list->values[merger->cursors[worker]];
       if (!best || bench_match_precedes(
-                       candidate, best, merger->sorted)) {
+                       candidate, best, merger->sorted,
+                       pool->tiebreak_pathname)) {
         best = candidate;
         best_worker = worker;
       }
@@ -889,6 +1017,8 @@ static bool bench_result_checksum(BenchPool *pool, size_t match_count,
     if (!best) return false;
     hash = bench_hash_u64(hash, best->candidate->index);
     hash = bench_hash_u64(hash, best->rank_score);
+    if (pool->tiebreak_pathname)
+      hash = bench_hash_u64(hash, best->rank_pathname);
     if (pool->tiebreak_length)
       hash = bench_hash_u64(hash, best->rank_length);
     merger->cursors[best_worker]++;
@@ -929,7 +1059,8 @@ static bool bench_dump_results(BenchPool *pool, size_t match_count) {
       const BenchMatch *candidate =
           &list->values[merger->cursors[worker]];
       if (!best || bench_match_precedes(
-                       candidate, best, merger->sorted)) {
+                       candidate, best, merger->sorted,
+                       pool->tiebreak_pathname)) {
         best = candidate;
         best_worker = worker;
       }
@@ -955,7 +1086,7 @@ static bool bench_dump_semantic(BenchPool *pool, size_t match_count) {
 
   fzf_slab_t *slab = fzf_make_default_slab();
   if (!slab || !fzf_slab_set_score_scheme(
-                   slab, FZF_SCORE_SCHEME_DEFAULT)) {
+                   slab, pool->score_scheme)) {
     fzf_free_slab(slab);
     return false;
   }
@@ -969,7 +1100,9 @@ static bool bench_dump_semantic(BenchPool *pool, size_t match_count) {
       if (merger->cursors[worker] >= list->count) continue;
       const BenchMatch *candidate =
           &list->values[merger->cursors[worker]];
-      if (!best || bench_match_precedes(candidate, best, merger->sorted)) {
+      if (!best || bench_match_precedes(
+                       candidate, best, merger->sorted,
+                       pool->tiebreak_pathname)) {
         best = candidate;
         best_worker = worker;
       }
@@ -980,21 +1113,32 @@ static bool bench_dump_semantic(BenchPool *pool, size_t match_count) {
     }
 
     fzf_score_bounds_t bounds;
-    int32_t membership_score = fzf_get_score_with_bounds_bytes_preclassified(
-        best->candidate->text, best->candidate->length,
-        best->candidate->input_is_ascii, pool->pattern, slab, &bounds);
+    int32_t membership_score = pool->tiebreak_pathname
+        ? fzf_get_score_with_rank_bounds_bytes_preclassified(
+              best->candidate->text, best->candidate->length,
+              best->candidate->input_is_ascii, pool->pattern, slab, &bounds)
+        : fzf_get_score_with_bounds_bytes_preclassified(
+              best->candidate->text, best->candidate->length,
+              best->candidate->input_is_ascii, pool->pattern, slab, &bounds);
     uint16_t rank_score = pool->has_positive_term
         ? bench_rank_score(bounds.raw_score) : 0;
+    uint16_t rank_pathname = pool->tiebreak_pathname
+        ? bench_rank_pathname(best->candidate, &bounds) : 0;
     uint16_t rank_length = best->rank_length;
+    uint16_t point1 = pool->tiebreak_pathname ? rank_length : 0;
+    uint16_t point2 = pool->tiebreak_pathname
+        ? rank_pathname : rank_length;
     uint16_t point3 = (uint16_t)(UINT16_MAX - rank_score);
     if (membership_score <= 0 || fzf_allocation_failed() ||
         rank_score != best->rank_score ||
+        (pool->tiebreak_pathname &&
+         rank_pathname != best->rank_pathname) ||
         printf("%" PRIu32 "\t%" PRId64 "\t%d\t%d\t%d\t%d\t"
-               "%u\t0\t0\t%u\t%u\n",
+               "%u\t0\t%u\t%u\t%u\n",
                best->candidate->index, bounds.raw_score,
                bounds.min_begin, bounds.min_end, bounds.max_end,
                bounds.valid ? 1 : 0, (unsigned)rank_score,
-               (unsigned)rank_length,
+               (unsigned)point1, (unsigned)point2,
                (unsigned)point3) < 0) {
       success = false;
       break;
@@ -1035,8 +1179,9 @@ int main(int argc, char **argv) {
 
   char *query_copy = bench_duplicate(options.query);
   fzf_pattern_t *pattern = query_copy
-      ? fzf_parse_pattern(
-            CaseSmart, options.normalize, query_copy, true) : NULL;
+      ? fzf_parse_pattern_with_direction(
+            CaseSmart, options.normalize, query_copy, true,
+            !options.tiebreak_pathname) : NULL;
   free(query_copy);
   if (!pattern) {
     fprintf(stderr, "fzf-native benchmark: could not parse query\n");
@@ -1054,6 +1199,7 @@ int main(int argc, char **argv) {
   BenchPool pool;
   if (!bench_pool_init(
           &pool, worker_count, &corpus, pattern, options.sort_results,
+          options.score_scheme, options.tiebreak_pathname,
           options.tiebreak_length)) {
     fprintf(stderr, "fzf-native benchmark: could not start workers\n");
     fzf_free_pattern(pattern);

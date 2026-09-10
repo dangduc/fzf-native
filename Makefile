@@ -203,9 +203,10 @@ ctest-fzf-bench-driver:
 		--bench=18446744073709551616ns < /dev/null
 
 # Compare the adapter's ordered identities and rank inputs with the exact
-# upstream implementation for default score/length and literal score/index
-# profiles, using one and eight native workers.  The caller must supply a
-# local, pinned fzf tree; the checker disables module and toolchain downloads.
+# upstream implementation for default score/length, literal score/index, and
+# path score/pathname/length profiles, using one and eight native workers.  The
+# caller must supply a local, pinned fzf tree; the checker disables module and
+# toolchain downloads.
 .PHONY: ctest-fzf-upstream-semantic
 ctest-fzf-upstream-semantic:
 	test -n "$(FZF_SOURCE)"

@@ -1208,6 +1208,67 @@ Each specification has the form (KEY VALUES)."
       (dolist (candidate candidates)
         (insert (fzf-native-differential-candidate-text candidate) "\n")))))
 
+(ert-deftest fzf-native-fuzz-upstream-path-ranking-backtracks-begin ()
+  "Path ranking uses the backtracked match begin in batch and session APIs."
+  (let* ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf")))
+         (cat (executable-find "cat"))
+         (candidates
+          (cl-loop for text in '("beta alpha" "FOO alpha")
+                   for id from 0
+                   collect (make-fzf-native-differential-candidate
+                            :id id :text text :role 'path-rank)))
+         (round '(:name path-backtrace :query "alpha" :case-mode smart
+                  :fuzzy t :score-scheme path :direction auto))
+         (case (fzf-native-upstream--session-case
+                12648430 0 round candidates))
+         (input (make-temp-file "fzf-native-upstream-path-rank-" nil ".txt"))
+         handle)
+    (skip-unless (and fzf cat
+                      (fboundp 'fzf-native-score-all)
+                      (fboundp 'fzf-native-async-start)
+                      (fboundp 'fzf-native-async-submit)
+                      (fboundp 'fzf-native-async-snapshot)))
+    (fzf-native-upstream--verify-reference fzf)
+    (unwind-protect
+        (let ((fzf-native-score-scheme 'path)
+              (fzf-native-search-direction 'auto)
+              (fzf-native-case-mode 'smart)
+              (fzf-native-fuzzy t)
+              (fzf-native-normalize t)
+              (fzf-native-batch-highlight nil)
+              (fzf-native-async-highlight nil)
+              (fzf-native-filter-only-min-pool nil)
+              (fzf-native-filter-only-length nil))
+          (let ((upstream
+                 (fzf-native-upstream--identities
+                  case (fzf-native-upstream--fzf fzf case) t))
+                (batch
+                 (fzf-native-upstream--identities
+                  case (fzf-native-score-all
+                        (vconcat (fzf-native-upstream--candidate-texts case))
+                        "alpha"))))
+            (should (equal upstream '(1 0)))
+            (should (equal batch upstream))
+            (fzf-native-upstream--write-session-input input candidates)
+            (setq handle
+                  (fzf-native-async-start
+                   (format "exec %s -- %s"
+                           (shell-quote-argument cat)
+                           (shell-quote-argument input))))
+            (fzf-native-upstream--wait-for-producer-eof handle)
+            (let* ((request-id (fzf-native-async-submit handle "alpha" 0))
+                   (snapshot
+                    (fzf-native-upstream--wait-for-session-request
+                     handle request-id))
+                   (session
+                    (fzf-native-upstream--identities
+                     case (plist-get snapshot :candidates))))
+              (should (equal session upstream)))))
+      (when handle
+        (fzf-native-async-stop handle))
+      (when (file-exists-p input)
+        (delete-file input)))))
+
 (ert-deftest fzf-native-fuzz-upstream-session-rounds ()
   "Compare identity sets from one native session with fresh fzf processes."
   (let* ((fzf (or (getenv "FZF_REFERENCE") (executable-find "fzf")))

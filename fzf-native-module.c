@@ -625,8 +625,11 @@ static int fzf_score_and_rank(
       bounds.raw_score = score;
     }
   } else {
-    score = fzf_get_score_with_bounds_bytes_preclassified(
-        text, text_len, input_is_ascii, pattern, slab, &bounds);
+    score = scheme == FZF_SCORE_SCHEME_PATH
+                ? fzf_get_score_with_rank_bounds_bytes_preclassified(
+                      text, text_len, input_is_ascii, pattern, slab, &bounds)
+                : fzf_get_score_with_bounds_bytes_preclassified(
+                      text, text_len, input_is_ascii, pattern, slab, &bounds);
   }
   if (score > 0 && rank)
     *rank = fzf_rank_keys_preclassified(

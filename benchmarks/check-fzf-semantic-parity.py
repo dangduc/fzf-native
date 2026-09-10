@@ -170,7 +170,54 @@ def cases():
             ],
         },
     ])
-    return literal_cases + default_cases
+    path_cases = [
+        {
+            "id": "path-backtracked-fuzzy-begin",
+            "profile": "path-score-pathname-length",
+            "query": "alpha",
+            "normalize": True,
+            "candidates": [
+                "beta alpha", "FOO alpha", "dir/x alpha",
+                "dir/yz alpha", "does not match",
+            ],
+        },
+        {
+            "id": "path-unicode-rune-distance",
+            "profile": "path-score-pathname-length",
+            "query": "alpha",
+            "normalize": True,
+            "candidates": [
+                "目录/x alpha", "目录/yz alpha", "目录/alpha",
+                "other alpha", "does not match",
+            ],
+        },
+        {
+            "id": "path-compound-and-or",
+            "profile": "path-score-pathname-length",
+            "query": "'alpha | 'omega 'beta",
+            "normalize": True,
+            "candidates": [
+                "dir/x omega beta", "dir/yz omega beta",
+                "dir/x alpha beta", "omega only", "does not match",
+            ],
+        },
+        {
+            "id": "path-eight-worker-merge",
+            "profile": "path-score-pathname-length",
+            "query": "alpha",
+            "normalize": True,
+            # The longer candidate has the better pathname point.  Repeating
+            # this pair across nine chunks makes the final merge compare that
+            # criterion across independently sorted worker lists.
+            "candidates": [
+                ("beta alpha", "long-directory/FOO alpha")[index % 2]
+                for index in range(8_201)
+            ],
+        },
+    ]
+    # The injected fzf oracle changes process-global scoring tables.  Keep all
+    # path cases last so it never has to switch back from path to default.
+    return literal_cases + default_cases + path_cases
 
 
 def run(command, *, cwd=None, env=None, input_bytes=None):
@@ -264,6 +311,8 @@ def run_native_oracle(binary, oracle_case, threads):
     ]
     if oracle_case["profile"] == "literal-score-index":
         command.append("--tiebreak=index")
+    elif oracle_case["profile"] == "path-score-pathname-length":
+        command.append("--scheme=path")
     elif oracle_case["profile"] != "default-score-length":
         raise RuntimeError(f"unknown profile: {oracle_case['profile']}")
     corpus = "".join(candidate + "\n" for candidate in oracle_case["candidates"])
@@ -327,6 +376,12 @@ def compare(native_binary, payload, upstream):
     )
     if len(large_case["candidates"]) < 8_193:
         failures.append("eight-worker fixture does not span nine chunks")
+    large_path_case = next(
+        case for case in payload["cases"]
+        if case["id"] == "path-eight-worker-merge"
+    )
+    if len(large_path_case["candidates"]) < 8_193:
+        failures.append("path worker-merge fixture does not span nine chunks")
     if failures:
         raise RuntimeError("semantic parity failed:\n" + "\n\n".join(failures))
 

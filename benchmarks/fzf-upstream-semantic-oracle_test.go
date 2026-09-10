@@ -79,7 +79,7 @@ func semanticOracleMatch(pattern *Pattern, item *Item, slab *util.Slab) (semanti
 		term := pattern.directTerm
 		matched, _ := pattern.directAlgo(
 			term.caseSensitive, term.normalize, pattern.forward,
-			&item.text, term.text, false, slab)
+			&item.text, term.text, pattern.withPos, slab)
 		if matched.Start < 0 {
 			return semanticOracleRecord{}, false
 		}
@@ -89,7 +89,7 @@ func semanticOracleMatch(pattern *Pattern, item *Item, slab *util.Slab) (semanti
 		result = buildResultFromBounds(
 			item, rawScore, minBegin, minEnd, maxEnd, boundsValid)
 	} else {
-		offsets, score, _ := pattern.extendedMatch(item, false, slab)
+		offsets, score, _ := pattern.extendedMatch(item, pattern.withPos, slab)
 		if len(offsets) != len(pattern.termSets) {
 			return semanticOracleRecord{}, false
 		}
@@ -130,12 +130,11 @@ func TestFzfNativeSemanticOracle(t *testing.T) {
 
 	previousCriteria := sortCriteria
 	defer func() { sortCriteria = previousCriteria }()
-	if !algo.Init("default") {
-		t.Fatal("could not initialize the default fzf scoring scheme")
-	}
-
 	output := semanticOracleOutput{Cases: make([]semanticOracleCaseOutput, 0, len(input.Cases))}
 	for _, oracleCase := range input.Cases {
+		scheme := "default"
+		forward := true
+		withPos := false
 		switch oracleCase.Profile {
 		case "literal-score-index":
 			if oracleCase.Normalize {
@@ -150,12 +149,25 @@ func TestFzfNativeSemanticOracle(t *testing.T) {
 			}
 			// parseScheme("default") ranks by score and trimmed rune length.
 			sortCriteria = []criterion{byScore, byLength}
+		case "path-score-pathname-length":
+			if !oracleCase.Normalize {
+				t.Fatalf("%s: path profile disables normalization", oracleCase.ID)
+			}
+			// core.go requests positions and searches backward whenever pathname
+			// is one of the active rank criteria.
+			scheme = "path"
+			forward = false
+			withPos = true
+			sortCriteria = []criterion{byScore, byPathname, byLength}
 		default:
 			t.Fatalf("%s: unknown profile %q", oracleCase.ID, oracleCase.Profile)
 		}
+		if !algo.Init(scheme) {
+			t.Fatalf("%s: could not initialize fzf scheme %q", oracleCase.ID, scheme)
+		}
 		pattern := BuildPattern(
 			NewChunkCache(), map[string]*Pattern{}, true, algo.FuzzyMatchV2,
-			true, CaseSmart, oracleCase.Normalize, true, false, false,
+			true, CaseSmart, oracleCase.Normalize, forward, withPos, false,
 			nil, Delimiter{}, revision{}, []rune(oracleCase.Query), nil, 0)
 		slab := util.MakeSlab(slab16Size, slab32Size)
 		records := make([]semanticOracleRecord, 0, len(oracleCase.Candidates))

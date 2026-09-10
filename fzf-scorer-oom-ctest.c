@@ -59,6 +59,14 @@ static fzf_pattern_t *make_pattern(char *query) {
   return fzf_parse_pattern(CaseRespect, false, query, true);
 }
 
+static fzf_pattern_t *make_path_pattern(char *query) {
+  fail_at = SIZE_MAX;
+  allocation_number = 0;
+  failure_injected = false;
+  return fzf_parse_pattern_with_direction(
+      CaseRespect, false, query, true, false);
+}
+
 static int exercise_score(const char *label, const char *candidate,
                           fzf_pattern_t *pattern, size_t *tested) {
   for (fail_at = 0;; fail_at++) {
@@ -138,21 +146,76 @@ static int exercise_score_positions(const char *label, const char *candidate,
   }
 }
 
+static int exercise_rank_bounds(const char *label, const char *candidate,
+                                fzf_pattern_t *pattern, size_t *tested) {
+  size_t length = strlen(candidate);
+  bool input_is_ascii = is_ascii_utf8proc(candidate, length);
+  for (size_t index = 0;; index++) {
+    fail_at = SIZE_MAX;
+    allocation_number = 0;
+    failure_injected = false;
+    fzf_slab_t *slab = fzf_make_default_slab();
+    if (!slab || !fzf_slab_set_score_scheme(
+                     slab, FZF_SCORE_SCHEME_PATH)) {
+      fzf_free_slab(slab);
+      return fail(label, index, "could not create the path slab");
+    }
+
+    allocation_number = 0;
+    fail_at = index;
+    failure_injected = false;
+    fzf_score_bounds_t bounds = {
+      .min_begin = -99, .min_end = -99, .max_end = -99,
+      .raw_score = -99, .valid = true,
+    };
+    int32_t score = fzf_get_score_with_rank_bounds_bytes_preclassified(
+        candidate, length, input_is_ascii, pattern, slab, &bounds);
+    fail_at = SIZE_MAX;
+    fzf_free_slab(slab);
+
+    if (!failure_injected) {
+      if (score <= 0 || !bounds.valid || bounds.min_begin < 0)
+        return fail(label, index, "successful run lost score or rank bounds");
+      if (fzf_allocation_failed())
+        return fail(label, index, "successful run retained OOM flag");
+      return 0;
+    }
+    if (score != 0)
+      return fail(label, index, "injected OOM returned a match score");
+    if (!fzf_allocation_failed())
+      return fail(label, index, "injected OOM was reported as no-match");
+    if (bounds.valid || bounds.min_begin != 0 || bounds.min_end != 0 ||
+        bounds.max_end != 0 || bounds.raw_score != 0)
+      return fail(label, index, "injected OOM published partial bounds");
+    (*tested)++;
+  }
+}
+
 int main(void) {
   size_t tested = 0;
   char one_query[] = "a";
   char two_query[] = "ab";
   char ascii_query[] = "abc";
   char utf8_query[] = "你界";
+  char utf8_path_query[] = "你界";
+  char path_query[] = "alpha";
+  char compound_query[] = "'alpha | 'omega 'beta";
   fzf_pattern_t *one_pattern = make_pattern(one_query);
   fzf_pattern_t *two_pattern = make_pattern(two_query);
   fzf_pattern_t *ascii_pattern = make_pattern(ascii_query);
   fzf_pattern_t *utf8_pattern = make_pattern(utf8_query);
-  if (!one_pattern || !two_pattern || !ascii_pattern || !utf8_pattern) {
+  fzf_pattern_t *utf8_path_pattern = make_path_pattern(utf8_path_query);
+  fzf_pattern_t *path_pattern = make_path_pattern(path_query);
+  fzf_pattern_t *compound_pattern = make_path_pattern(compound_query);
+  if (!one_pattern || !two_pattern || !ascii_pattern || !utf8_pattern ||
+      !utf8_path_pattern || !path_pattern || !compound_pattern) {
     fzf_free_pattern(one_pattern);
     fzf_free_pattern(two_pattern);
     fzf_free_pattern(ascii_pattern);
     fzf_free_pattern(utf8_pattern);
+    fzf_free_pattern(utf8_path_pattern);
+    fzf_free_pattern(path_pattern);
+    fzf_free_pattern(compound_pattern);
     return fail("setup", 0, "could not create patterns");
   }
 
@@ -177,13 +240,22 @@ int main(void) {
       exercise_positions("UTF-8 positions", "a你---界z", utf8_pattern,
                          &tested) ||
       exercise_score_positions("UTF-8 combined", "a你---界z", utf8_pattern,
-                               &tested);
+                               &tested) ||
+      exercise_rank_bounds("ASCII path rank bounds", "beta alpha",
+                           path_pattern, &tested) ||
+      exercise_rank_bounds("UTF-8 path rank bounds", "目录/x 你界",
+                           utf8_path_pattern, &tested) ||
+      exercise_rank_bounds("compound path rank bounds",
+                           "dir/x omega beta", compound_pattern, &tested);
 
   fail_at = SIZE_MAX;
   fzf_free_pattern(one_pattern);
   fzf_free_pattern(two_pattern);
   fzf_free_pattern(ascii_pattern);
   fzf_free_pattern(utf8_pattern);
+  fzf_free_pattern(utf8_path_pattern);
+  fzf_free_pattern(path_pattern);
+  fzf_free_pattern(compound_pattern);
   if (result) return result;
   printf("scorer OOM test passed (%zu allocation failures)\n", tested);
   return 0;

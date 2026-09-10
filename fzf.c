@@ -3384,6 +3384,34 @@ int32_t fzf_get_score_with_bounds_bytes_preclassified(
 #undef FZF_SCORE_RECORD_BOUNDS
 }
 
+int32_t fzf_get_score_with_rank_bounds_bytes_preclassified(
+    const char *text, size_t text_len, bool input_is_ascii,
+    fzf_pattern_t *pattern, fzf_slab_t *slab,
+    fzf_score_bounds_t *bounds) {
+  fzf_clear_allocation_failure();
+  if (bounds) *bounds = (fzf_score_bounds_t){0};
+  if (pattern->ptr == NULL) return 1;
+
+  fzf_string_t input = {.data = text, .size = text_len};
+  fzf_score_bounds_t staged_bounds = {0};
+  fzf_position_t positions = {0};
+#define FZF_SCORE_RECORD_BOUNDS(result) \
+  fzf_score_bounds_add(&staged_bounds, (result))
+#define FZF_SCORE_COMMIT_BOUNDS() do { \
+  if (bounds) *bounds = staged_bounds; \
+} while (0)
+#define FZF_SCORE_POSITIONS (&positions)
+#define FZF_SCORE_RETURN(value) do { \
+  free(positions.data); \
+  return (value); \
+} while (0)
+#include "fzf-score-input.inc"
+#undef FZF_SCORE_RETURN
+#undef FZF_SCORE_POSITIONS
+#undef FZF_SCORE_COMMIT_BOUNDS
+#undef FZF_SCORE_RECORD_BOUNDS
+}
+
 static int32_t score_positions_for_input(const char *text,
                                          fzf_pattern_t *pattern,
                                          fzf_slab_t *slab,
