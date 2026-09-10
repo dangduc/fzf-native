@@ -18,15 +18,16 @@
 #include <stdint.h>
 #include <string.h>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
 #define FZF_HAVE_SIMD_PREFILTER 1
 #define FZF_SIMD_NEON 1
 #elif defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
-#if defined(_MSC_VER)
-#include <intrin.h>
-#endif
 #define FZF_HAVE_SIMD_PREFILTER 1
 #define FZF_SIMD_SSE2 1
 #else
@@ -41,6 +42,8 @@
 /* The plan's strictest member is size_t.  Spell the alignment this way
    instead of using C11 _Alignof so the header also builds as MSVC C. */
 #define FZF_SIMD_PLAN_ALIGNMENT sizeof(size_t)
+#define FZF_PARSED_PATTERN_FLAGS_SIZE 1u
+#define FZF_PARSED_PATTERN_RAW_OTHER_LETTER UINT8_C(1)
 
 typedef struct {
   uint8_t exact[FZF_SIMD_LANES];
@@ -78,7 +81,8 @@ static inline const fzf_ascii_query_plan_t *
 fzf_ascii_query_plan_from_parsed(const fzf_string_t *pattern) {
 #if FZF_HAVE_SIMD_PREFILTER
   uintptr_t after_codepoints =
-      (uintptr_t)(pattern->codepoints + pattern->codepoint_count);
+      (uintptr_t)(pattern->codepoints + pattern->codepoint_count) +
+      FZF_PARSED_PATTERN_FLAGS_SIZE;
   size_t alignment = FZF_SIMD_PLAN_ALIGNMENT;
   uintptr_t aligned =
       (after_codepoints + alignment - 1) & ~(uintptr_t)(alignment - 1);
@@ -91,18 +95,28 @@ fzf_ascii_query_plan_from_parsed(const fzf_string_t *pattern) {
 
 static inline size_t fzf_ascii_query_plan_private_size(
     const fzf_string_t *pattern) {
-#if FZF_HAVE_SIMD_PREFILTER
   const unsigned char *after_codepoints =
       (const unsigned char *)(pattern->codepoints +
                               pattern->codepoint_count);
+#if FZF_HAVE_SIMD_PREFILTER
   const fzf_ascii_query_plan_t *plan =
       fzf_ascii_query_plan_from_parsed(pattern);
   return (size_t)((const unsigned char *)plan - after_codepoints) +
          fzf_ascii_query_plan_size(plan->pattern_size);
 #else
   (void)pattern;
-  return 0;
+  (void)after_codepoints;
+  return FZF_PARSED_PATTERN_FLAGS_SIZE;
 #endif
+}
+
+/* Parsed terms append one byte of scorer metadata before the optional,
+   aligned SIMD plan.  Keeping it out of fzf_string_t preserves the public
+   structure ABI. */
+static inline const uint8_t *fzf_parsed_pattern_flags(
+    const fzf_string_t *pattern) {
+  return (const uint8_t *)(pattern->codepoints +
+                           pattern->codepoint_count);
 }
 
 #if FZF_HAVE_SIMD_PREFILTER
@@ -230,6 +244,125 @@ static inline unsigned int fzf_simd_first_lane(uint16_t mask) {
 #endif
 }
 
+#if defined(_MSC_VER)
+#define FZF_SIMD_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define FZF_SIMD_NOINLINE __attribute__((noinline))
+#else
+#define FZF_SIMD_NOINLINE
+#endif
+
+/* Case-insensitive planned matching needs the first occurrence of either
+   ASCII case variant. Keep the two-byte scan out of line so its vector setup
+   does not enlarge the surrounding scorer or perturb unrelated hot paths. */
+static FZF_SIMD_NOINLINE const char *fzf_simd_find_byte_two(
+    const char *text, size_t text_size,
+    uint8_t exact_byte, uint8_t alternate_byte) {
+#if defined(FZF_SIMD_NEON)
+  fzf_simd_chunk_t exact = vdupq_n_u8(exact_byte);
+  fzf_simd_chunk_t alternate = vdupq_n_u8(alternate_byte);
+#elif defined(FZF_SIMD_SSE2)
+  fzf_simd_chunk_t exact = _mm_set1_epi8((char)exact_byte);
+  fzf_simd_chunk_t alternate = _mm_set1_epi8((char)alternate_byte);
+#endif
+  size_t offset = 0;
+
+  while (text_size - offset >= 2 * FZF_SIMD_LANES) {
+    fzf_simd_chunk_t first = fzf_simd_load(text + offset);
+    fzf_simd_chunk_t second =
+        fzf_simd_load(text + offset + FZF_SIMD_LANES);
+#if defined(FZF_SIMD_NEON)
+    uint8x16_t first_matches = vorrq_u8(
+        vceqq_u8(first, exact), vceqq_u8(first, alternate));
+    uint8x16_t second_matches = vorrq_u8(
+        vceqq_u8(second, exact), vceqq_u8(second, alternate));
+    if (vmaxvq_u8(vorrq_u8(first_matches, second_matches)) != 0) {
+      uint16_t mask = fzf_simd_movemask(first_matches);
+      if (mask != 0) return text + offset + fzf_simd_first_lane(mask);
+      mask = fzf_simd_movemask(second_matches);
+      return text + offset + FZF_SIMD_LANES +
+             fzf_simd_first_lane(mask);
+    }
+#elif defined(FZF_SIMD_SSE2)
+    __m128i first_matches = _mm_or_si128(
+        _mm_cmpeq_epi8(first, exact), _mm_cmpeq_epi8(first, alternate));
+    __m128i second_matches = _mm_or_si128(
+        _mm_cmpeq_epi8(second, exact), _mm_cmpeq_epi8(second, alternate));
+    uint16_t mask = (uint16_t)_mm_movemask_epi8(first_matches);
+    if (mask != 0) return text + offset + fzf_simd_first_lane(mask);
+    mask = (uint16_t)_mm_movemask_epi8(second_matches);
+    if (mask != 0)
+      return text + offset + FZF_SIMD_LANES + fzf_simd_first_lane(mask);
+#endif
+    offset += 2 * FZF_SIMD_LANES;
+  }
+
+  if (text_size - offset >= FZF_SIMD_LANES) {
+    fzf_simd_chunk_t chunk = fzf_simd_load(text + offset);
+#if defined(FZF_SIMD_NEON)
+    uint8x16_t matches = vorrq_u8(
+        vceqq_u8(chunk, exact), vceqq_u8(chunk, alternate));
+    if (vmaxvq_u8(matches) != 0) {
+      uint16_t mask = fzf_simd_movemask(matches);
+      return text + offset + fzf_simd_first_lane(mask);
+    }
+#elif defined(FZF_SIMD_SSE2)
+    __m128i matches = _mm_or_si128(
+        _mm_cmpeq_epi8(chunk, exact), _mm_cmpeq_epi8(chunk, alternate));
+    uint16_t mask = (uint16_t)_mm_movemask_epi8(matches);
+    if (mask != 0) return text + offset + fzf_simd_first_lane(mask);
+#endif
+    offset += FZF_SIMD_LANES;
+  }
+
+  while (offset < text_size) {
+    uint8_t byte = (uint8_t)text[offset];
+    if (byte == exact_byte || byte == alternate_byte) return text + offset;
+    offset++;
+  }
+  return NULL;
+}
+
+/* Specialized partial two-vector span for the initial mandatory byte.  The
+   second load ends exactly at TEXT_SIZE and overlaps the first; lanes already
+   covered by the first load are masked out. */
+static FZF_SIMD_NOINLINE const char *fzf_simd_find_byte_two_short(
+    const char *text, size_t text_size,
+    uint8_t exact_byte, uint8_t alternate_byte) {
+#if defined(FZF_SIMD_NEON)
+  uint8x16_t exact = vdupq_n_u8(exact_byte);
+  uint8x16_t alternate = vdupq_n_u8(alternate_byte);
+  uint8x16_t first = fzf_simd_load(text);
+  uint16_t mask = fzf_simd_movemask(vorrq_u8(
+      vceqq_u8(first, exact), vceqq_u8(first, alternate)));
+#elif defined(FZF_SIMD_SSE2)
+  __m128i exact = _mm_set1_epi8((char)exact_byte);
+  __m128i alternate = _mm_set1_epi8((char)alternate_byte);
+  __m128i first = fzf_simd_load(text);
+  uint16_t mask = (uint16_t)_mm_movemask_epi8(_mm_or_si128(
+      _mm_cmpeq_epi8(first, exact), _mm_cmpeq_epi8(first, alternate)));
+#endif
+  if (mask != 0) return text + fzf_simd_first_lane(mask);
+
+  size_t tail_offset = text_size - FZF_SIMD_LANES;
+#if defined(FZF_SIMD_NEON)
+  uint8x16_t last = fzf_simd_load(text + tail_offset);
+  mask = fzf_simd_movemask(vorrq_u8(
+      vceqq_u8(last, exact), vceqq_u8(last, alternate)));
+#elif defined(FZF_SIMD_SSE2)
+  __m128i last = fzf_simd_load(text + tail_offset);
+  mask = (uint16_t)_mm_movemask_epi8(_mm_or_si128(
+      _mm_cmpeq_epi8(last, exact), _mm_cmpeq_epi8(last, alternate)));
+#endif
+  unsigned int overlap = (unsigned int)(2 * FZF_SIMD_LANES - text_size);
+  mask = (uint16_t)(mask & (uint16_t)(UINT32_C(0xffff) << overlap));
+  if (mask != 0)
+    return text + tail_offset + fzf_simd_first_lane(mask);
+  return NULL;
+}
+
+#undef FZF_SIMD_NOINLINE
+
 static inline bool fzf_ascii_plan_byte_matches(
     uint8_t candidate, const fzf_simd_query_byte_t *query,
     bool case_sensitive) {
@@ -240,12 +373,33 @@ static inline bool fzf_ascii_plan_byte_matches(
 static inline const char *fzf_ascii_plan_find_byte(
     const char *text, size_t text_size,
     const fzf_simd_query_byte_t *query, bool case_sensitive) {
-  const char *exact = memchr(text, query->exact[0], text_size);
-  if (case_sensitive || query->alternate[0] == query->exact[0]) return exact;
-  size_t alternate_size = exact ? (size_t)(exact - text) : text_size;
-  const char *alternate =
-      memchr(text, query->alternate[0], alternate_size);
-  return alternate ? alternate : exact;
+  if (case_sensitive || query->alternate[0] == query->exact[0])
+    return memchr(text, query->exact[0], text_size);
+  /* libc's two short memchr calls beat an out-of-line vector setup on tails. */
+  if (text_size < FZF_SIMD_LANES) {
+    const char *exact = memchr(text, query->exact[0], text_size);
+    size_t alternate_size = exact ? (size_t)(exact - text) : text_size;
+    const char *alternate =
+        memchr(text, query->alternate[0], alternate_size);
+    return alternate ? alternate : exact;
+  }
+  return fzf_simd_find_byte_two(
+      text, text_size, query->exact[0], query->alternate[0]);
+}
+
+/* The initial mandatory byte is often absent, so its scan dominates rejected
+   candidates.  Use the overlapping-tail specialization for a partial second
+   vector; later query bytes keep the smaller general helper because they
+   start deeper in the text and more often find a match. */
+static inline const char *fzf_ascii_plan_find_initial_byte(
+    const char *text, size_t text_size,
+    const fzf_simd_query_byte_t *query, bool case_sensitive) {
+  if (!case_sensitive && query->alternate[0] != query->exact[0] &&
+      text_size > FZF_SIMD_LANES &&
+      text_size < 2 * FZF_SIMD_LANES)
+    return fzf_simd_find_byte_two_short(
+        text, text_size, query->exact[0], query->alternate[0]);
+  return fzf_ascii_plan_find_byte(text, text_size, query, case_sensitive);
 }
 
 /* FIRST_INDEX is a verified match for query byte zero. */

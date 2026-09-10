@@ -154,6 +154,313 @@ static void test_ascii_v2_single_byte_path(void) {
                        -1, -1, 0, -1);
 }
 
+static uint32_t short_v2_test_rng = UINT32_C(0x91e10da5);
+
+static uint32_t short_v2_test_random(void) {
+  short_v2_test_rng ^= short_v2_test_rng << 13;
+  short_v2_test_rng ^= short_v2_test_rng >> 17;
+  short_v2_test_rng ^= short_v2_test_rng << 5;
+  return short_v2_test_rng;
+}
+
+/* The parsed scorer has specialized one- and two-byte paths, while the
+   public algorithm entry point deliberately retains the general recurrence.
+   Compare those independent implementations across matching settings and
+   ranking schemes. */
+static void test_parsed_ascii_v2_short_paths_match_general(void) {
+  static const char *queries[] = {
+      "a", "A", "_", "aa", "ab", "aA", "Aa", "__", "09"};
+  static const char alphabet[] = "abABxyXY09_-/ :";
+
+  for (size_t q = 0; q < sizeof queries / sizeof queries[0]; q++) {
+    size_t query_len = strlen(queries[q]);
+    for (int mode = CaseSmart; mode <= CaseRespect; mode++) {
+      for (int normalize = 0; normalize < 2; normalize++) {
+        for (int forward = 0; forward < 2; forward++) {
+          char query[3];
+          memcpy(query, queries[q], query_len + 1);
+          fzf_pattern_t *parsed = fzf_parse_pattern_with_direction(
+              (fzf_case_types)mode, normalize, query, true, forward);
+          CHECK(parsed != NULL);
+          if (!parsed) return;
+          CHECK(parsed->size == 1 && parsed->ptr[0]->size == 1);
+          if (parsed->size != 1 || parsed->ptr[0]->size != 1) {
+            fzf_free_pattern(parsed);
+            return;
+          }
+          fzf_term_t *term = &parsed->ptr[0]->ptr[0];
+          fzf_string_t *pattern = term->text;
+
+          for (int scheme = FZF_SCORE_SCHEME_DEFAULT;
+               scheme <= FZF_SCORE_SCHEME_HISTORY; scheme++) {
+            for (int use_slab = 0; use_slab < 4; use_slab++) {
+              fzf_slab_t *slab =
+                  use_slab == 0
+                      ? NULL
+                      : use_slab == 1
+                            ? fzf_make_default_slab()
+                            : use_slab == 2
+                                  ? fzf_make_slab((fzf_slab_config_t){1, 1})
+                                  : fzf_make_slab((fzf_slab_config_t){7, 3});
+              CHECK(!use_slab || slab != NULL);
+              if (use_slab && !slab) {
+                fzf_free_pattern(parsed);
+                return;
+              }
+              if (slab)
+                CHECK(fzf_slab_set_score_scheme(
+                    slab, (fzf_score_scheme_t)scheme));
+
+              for (size_t sample = 0; sample < 256; sample++) {
+                char text[66];
+                size_t text_len = short_v2_test_random() % 65;
+                for (size_t i = 0; i < text_len; i++)
+                  text[i] = alphabet[short_v2_test_random() %
+                                     (sizeof alphabet - 1)];
+                if ((sample & 15) == 0 && text_len >= query_len) {
+                  size_t at = short_v2_test_random() %
+                              (text_len - query_len + 1);
+                  memcpy(text + at, queries[q], query_len);
+                }
+                text[text_len] = '\0';
+
+                fzf_string_t input = {.data = text, .size = text_len};
+                fzf_result_t expected =
+                    fzf_fuzzy_match_v2_with_direction(
+                        term->case_sensitive, term->normalize, forward,
+                        &input, pattern, NULL, slab);
+                int32_t expected_score =
+                    expected.start < 0
+                        ? 0
+                        : expected.score > 0 ? expected.score : 1;
+                fzf_score_bounds_t bounds = {0};
+                int32_t actual =
+                    fzf_get_score_with_bounds_bytes_preclassified(
+                        text, text_len, true, parsed, slab, &bounds);
+                bool same = actual == expected_score &&
+                            bounds.valid == (expected.start >= 0);
+                if (bounds.valid)
+                  same = same && bounds.raw_score == expected.score &&
+                         bounds.min_begin == expected.start &&
+                         bounds.min_end == expected.end &&
+                         bounds.max_end == expected.end;
+                if (!same) {
+                  fprintf(stderr,
+                          "  short-v2 mismatch query=%s mode=%d normalize=%d "
+                          "forward=%d scheme=%d text=%s expected=(%d,%d,%d) "
+                          "actual=%d bounds=(%d,%d,%d,%lld,%d)\n",
+                          queries[q], mode, normalize, forward, scheme, text,
+                          expected.start, expected.end, expected.score, actual,
+                          bounds.min_begin, bounds.min_end, bounds.max_end,
+                          (long long)bounds.raw_score, bounds.valid);
+                  failed++;
+                  fzf_free_slab(slab);
+                  fzf_free_pattern(parsed);
+                  return;
+                }
+
+                if ((sample & 63) == 0) {
+                  fzf_position_t expected_positions = {0};
+                  expected = fzf_fuzzy_match_v2_with_direction(
+                      term->case_sensitive, term->normalize, forward, &input,
+                      pattern, &expected_positions, slab);
+                  fzf_position_t *actual_positions = NULL;
+                  actual = fzf_get_score_positions(
+                      text, parsed, slab, &actual_positions);
+                  expected_score = expected.start < 0
+                                       ? 0
+                                       : expected.score > 0
+                                             ? expected.score
+                                             : 1;
+                  same = actual == expected_score &&
+                         (!!actual_positions == (expected.start >= 0));
+                  if (actual_positions)
+                    same = same &&
+                           actual_positions->size == expected_positions.size &&
+                           memcmp(actual_positions->data,
+                                  expected_positions.data,
+                                  expected_positions.size * sizeof(uint32_t)) ==
+                               0;
+                  free(expected_positions.data);
+                  fzf_free_positions(actual_positions);
+                  if (!same) {
+                    fprintf(stderr,
+                            "  short-v2 position mismatch query=%s text=%s\n",
+                            queries[q], text);
+                    failed++;
+                    fzf_free_slab(slab);
+                    fzf_free_pattern(parsed);
+                    return;
+                  }
+                }
+              }
+              fzf_free_slab(slab);
+            }
+          }
+          fzf_free_pattern(parsed);
+        }
+      }
+    }
+  }
+}
+
+/* The compact rune scorer relies on the Unicode invariant that an uppercase
+   rune's simple lowercase mapping is not an Other_Letter rune.  Audit the
+   exact vendored table so a future utf8proc update cannot silently weaken the
+   parser guard. */
+static void test_unicode_other_letter_guard_is_sound(void) {
+  size_t violations = 0;
+  for (utf8proc_int32_t codepoint = 0; codepoint < 0x110000; codepoint++) {
+    if (utf8proc_category(codepoint) != UTF8PROC_CATEGORY_LU) continue;
+    utf8proc_int32_t lower = utf8proc_tolower(codepoint);
+    if (lower != codepoint &&
+        utf8proc_category(lower) == UTF8PROC_CATEGORY_LO)
+      violations++;
+  }
+  CHECK(violations == 0);
+}
+
+static bool append_utf8_test_piece(char *text, size_t cap, size_t *length,
+                                   const char *piece) {
+  size_t piece_length = strlen(piece);
+  if (piece_length >= cap - *length) return false;
+  memcpy(text + *length, piece, piece_length);
+  *length += piece_length;
+  text[*length] = '\0';
+  return true;
+}
+
+/* Compare the parsed Other_Letter fast path with the public general UTF-8 v2
+   algorithm.  The generated candidates mix all boundary classes, cased
+   Latin runes, uncased scripts, repeated query runes, forward/backward ties,
+   every score scheme, and slabs both above and below the v2 cutoff. */
+static void test_parsed_unicode_v2_rune_rows_match_general(void) {
+  static const char *queries[] = {
+      "界", "إن", "니다", "组件", "漢字語", "界界界",
+      "한글검사", "العربية",
+      "界界界界界界界界界界界界界界界界",
+      "界界界界界界界界界界界界界界界界界"};
+  static const char *unicode_pieces[] = {
+      "界", "組", "件", "漢", "字", "語", "니", "다", "한", "글",
+      "검", "사", "إ", "ن", "ا", "ل", "ع", "ر", "ب", "ي", "ة"};
+  static const char *pieces[] = {
+      "a", "A", "z", "Z", "0", "9", "_", "-", "/", " ", ":",
+      "界", "組", "件", "漢", "字", "語", "니", "다", "한", "글",
+      "검", "사", "إ", "ن", "ا", "ل", "ع", "ر", "ب", "ي", "ة",
+      "é", "É", "ß", "ẞ"};
+
+  for (size_t q = 0; q < sizeof queries / sizeof queries[0]; q++) {
+    for (int mode = CaseSmart; mode <= CaseRespect; mode++) {
+      for (int normalize = 0; normalize < 2; normalize++) {
+        for (int forward = 0; forward < 2; forward++) {
+          char query[64];
+          size_t query_length = strlen(queries[q]);
+          CHECK(query_length < sizeof query);
+          memcpy(query, queries[q], query_length + 1);
+          fzf_pattern_t *parsed = fzf_parse_pattern_with_direction(
+              (fzf_case_types)mode, normalize, query, true, forward);
+          CHECK(parsed != NULL);
+          if (!parsed) return;
+          CHECK(parsed->size == 1 && parsed->ptr[0]->size == 1);
+          if (parsed->size != 1 || parsed->ptr[0]->size != 1) {
+            fzf_free_pattern(parsed);
+            return;
+          }
+          fzf_term_t *term = &parsed->ptr[0]->ptr[0];
+          fzf_string_t *pattern = term->text;
+          for (size_t i = 0; i < pattern->codepoint_count; i++)
+            CHECK(utf8proc_category(pattern->codepoints[i]) ==
+                  UTF8PROC_CATEGORY_LO);
+
+          for (int scheme = FZF_SCORE_SCHEME_DEFAULT;
+               scheme <= FZF_SCORE_SCHEME_HISTORY; scheme++) {
+            for (int use_slab = 0; use_slab < 4; use_slab++) {
+              fzf_slab_t *slab =
+                  use_slab == 0
+                      ? NULL
+                      : use_slab == 1
+                            ? fzf_make_default_slab()
+                            : use_slab == 2
+                                  ? fzf_make_slab((fzf_slab_config_t){1, 1})
+                                  : fzf_make_slab(
+                                        (fzf_slab_config_t){128, 64});
+              CHECK(!use_slab || slab != NULL);
+              if (use_slab && !slab) {
+                fzf_free_pattern(parsed);
+                return;
+              }
+              if (slab)
+                CHECK(fzf_slab_set_score_scheme(
+                    slab, (fzf_score_scheme_t)scheme));
+
+              for (size_t sample = 0; sample < 256; sample++) {
+                char text[256] = {0};
+                size_t text_length = 0;
+                CHECK(append_utf8_test_piece(
+                    text, sizeof text, &text_length,
+                    unicode_pieces[short_v2_test_random() %
+                                   (sizeof unicode_pieces /
+                                    sizeof unicode_pieces[0])]));
+                size_t piece_count = short_v2_test_random() % 32;
+                for (size_t i = 0; i < piece_count; i++)
+                  if (!append_utf8_test_piece(
+                          text, sizeof text, &text_length,
+                          pieces[short_v2_test_random() %
+                                 (sizeof pieces / sizeof pieces[0])]))
+                    break;
+                if ((sample & 7) == 0)
+                  CHECK(append_utf8_test_piece(
+                      text, sizeof text, &text_length, queries[q]));
+
+                fzf_string_t input = {
+                    .data = text,
+                    .size = text_length,
+                };
+                fzf_result_t expected =
+                    fzf_fuzzy_match_v2_utf8_with_direction(
+                        term->case_sensitive, term->normalize, forward,
+                        &input, pattern, NULL, slab);
+                CHECK(!fzf_allocation_failed());
+                int32_t expected_score =
+                    expected.start < 0
+                        ? 0
+                        : expected.score > 0 ? expected.score : 1;
+                fzf_score_bounds_t bounds = {0};
+                int32_t actual =
+                    fzf_get_score_with_bounds_bytes_preclassified(
+                        text, text_length, false, parsed, slab, &bounds);
+                bool same = actual == expected_score &&
+                            bounds.valid == (expected.start >= 0);
+                if (bounds.valid)
+                  same = same && bounds.raw_score == expected.score &&
+                         bounds.min_begin == expected.start &&
+                         bounds.min_end == expected.end &&
+                         bounds.max_end == expected.end;
+                if (!same) {
+                  fprintf(stderr,
+                          "  rune-row mismatch query=%s mode=%d normalize=%d "
+                          "forward=%d scheme=%d text=%s expected=(%d,%d,%d) "
+                          "actual=%d bounds=(%d,%d,%d,%lld,%d)\n",
+                          queries[q], mode, normalize, forward, scheme, text,
+                          expected.start, expected.end, expected.score, actual,
+                          bounds.min_begin, bounds.min_end, bounds.max_end,
+                          (long long)bounds.raw_score, bounds.valid);
+                  failed++;
+                  fzf_free_slab(slab);
+                  fzf_free_pattern(parsed);
+                  return;
+                }
+              }
+              fzf_free_slab(slab);
+            }
+          }
+          fzf_free_pattern(parsed);
+        }
+      }
+    }
+  }
+}
+
 static void test_exact_match(void) {
   check_agreement("exact 'pat", "foobarbaz", "'bar",
                   CaseIgnore, true, true);
@@ -562,6 +869,10 @@ static void test_utf8_terms(void) {
      those that don't (the false-positive direction of the deferral bug). */
   check_agreement("utf8 inverted excludes", "αβγ", "!α", CaseIgnore, true, false);
   check_agreement("utf8 inverted keeps",    "xyz", "!α", CaseIgnore, true, true);
+  check_agreement("utf8 Lo compound match", "路径/组件-123",
+                  "组件 | 없는 !禁止", CaseIgnore, true, true);
+  check_agreement("utf8 Lo compound inverse", "路径/组件-123",
+                  "组件 | 없는 !路径", CaseIgnore, true, false);
 }
 
 static void check_bounded_range(const char *text, size_t text_len,
@@ -638,6 +949,63 @@ static void test_bounded_entry_points_need_no_terminator(void) {
      implementation therefore fails before it can inspect unrelated memory. */
   check_bounded_range(text, 3, "c", true, false);
   free(text);
+}
+
+static bool scalar_is_ascii(const unsigned char *text, size_t length) {
+  for (size_t i = 0; i < length; i++)
+    if (text[i] & 0x80) return false;
+  return true;
+}
+
+static uint64_t classifier_test_random(uint64_t *state) {
+  uint64_t value = *state;
+  value ^= value << 13;
+  value ^= value >> 7;
+  value ^= value << 17;
+  return *state = value;
+}
+
+static void test_ascii_classifier_boundaries_and_differential(void) {
+  static const size_t lengths[] = {
+      0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33,
+      39, 40, 63, 64, 65, 95, 96, 97, 127, 128, 129,
+  };
+
+  /* Give the classifier exact-sized readable tails at every alignment.
+     Embedded NUL is ordinary bounded data and remains ASCII. */
+  for (size_t li = 0; li < sizeof lengths / sizeof lengths[0]; li++) {
+    size_t length = lengths[li];
+    for (size_t offset = 0; offset < 8; offset++) {
+      size_t allocation_size = offset + length;
+      unsigned char *allocation =
+          malloc(allocation_size ? allocation_size : 1);
+      CHECK(allocation != NULL);
+      if (!allocation) continue;
+      unsigned char *text = allocation + offset;
+      for (size_t i = 0; i < length; i++)
+        text[i] = i % 11 == 0 ? 0 : (unsigned char)(i & 0x7f);
+      CHECK(is_ascii_utf8proc((const char *)text, length));
+      for (size_t i = 0; i < length; i++) {
+        unsigned char saved = text[i];
+        text[i] = (unsigned char)(0x80 | (i & 0x7f));
+        CHECK(!is_ascii_utf8proc((const char *)text, length));
+        text[i] = saved;
+      }
+      free(allocation);
+    }
+  }
+
+  unsigned char storage[272];
+  uint64_t random = UINT64_C(0xd1b54a32d192ed03);
+  for (size_t iteration = 0; iteration < 4096; iteration++) {
+    size_t offset = (size_t)(classifier_test_random(&random) & 7);
+    size_t length = (size_t)(classifier_test_random(&random) % 257);
+    for (size_t i = 0; i < length; i++)
+      storage[offset + i] = (unsigned char)classifier_test_random(&random);
+    CHECK(is_ascii_utf8proc(
+              (const char *)storage + offset, length) ==
+          scalar_is_ascii(storage + offset, length));
+  }
 }
 
 static void test_invalid_utf8_exact_is_lossless(void) {
@@ -866,8 +1234,9 @@ static void test_utf8_char_map_scratch_reuse_and_cap(void) {
   free(scratch.map.byte_to_char);
 
   /* Parsed patterns fuse immutable decoded codepoints with the term object.
-     Two real scorer calls reuse one slab-owned map; the slab destructor owns
-     that retained allocation and sanitizer builds check the final free. */
+     Two position calls reuse one slab-owned map; score-only paths can avoid
+     the map entirely.  The slab destructor owns the retained allocation and
+     sanitizer builds check the final free. */
   char query[] = "组件";
   fzf_pattern_t *pattern = fzf_parse_pattern(
       CaseSmart, false, query, true);
@@ -880,12 +1249,18 @@ static void test_utf8_char_map_scratch_reuse_and_cap(void) {
     CHECK(parsed->codepoints ==
           (const utf8proc_int32_t *)(parsed + 1));
     CHECK(parsed->codepoints_case_folded);
-    CHECK(fzf_get_score("路径/组件-123", pattern, slab) > 0);
+    fzf_position_t *first_positions = fzf_get_positions(
+        "路径/组件-123", pattern, slab);
+    CHECK(first_positions != NULL);
+    fzf_free_positions(first_positions);
     size_t *scorer_retained = slab->UTF8.map.byte_to_char;
     size_t scorer_capacity = slab->UTF8.byte_slot_capacity;
     CHECK(scorer_retained != NULL);
     CHECK(scorer_capacity > 0);
-    CHECK(fzf_get_score("组件", pattern, slab) > 0);
+    fzf_position_t *second_positions = fzf_get_positions(
+        "组件", pattern, slab);
+    CHECK(second_positions != NULL);
+    fzf_free_positions(second_positions);
     CHECK(slab->UTF8.map.byte_to_char == scorer_retained);
     CHECK(slab->UTF8.byte_slot_capacity == scorer_capacity);
   }
@@ -1236,6 +1611,9 @@ int main(void) {
   RUN(test_fuzzy_empty_pattern);
   RUN(test_fuzzy_pattern_longer_than_text);
   RUN(test_ascii_v2_single_byte_path);
+  RUN(test_parsed_ascii_v2_short_paths_match_general);
+  RUN(test_unicode_other_letter_guard_is_sound);
+  RUN(test_parsed_unicode_v2_rune_rows_match_general);
   RUN(test_exact_match);
   RUN(test_exact_no_match);
   RUN(test_pinned_fzf_exact_boundary);
@@ -1267,6 +1645,7 @@ int main(void) {
   RUN(test_bounded_entry_points_derive_unicode_classification);
   RUN(test_bounded_entry_points_preserve_embedded_nul);
   RUN(test_bounded_entry_points_need_no_terminator);
+  RUN(test_ascii_classifier_boundaries_and_differential);
   RUN(test_invalid_utf8_exact_is_lossless);
   RUN(test_invalid_utf8_fuzzy_fallback_returns_positions);
   RUN(test_combined_score_positions_matches_legacy_calls);

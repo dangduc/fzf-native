@@ -51,7 +51,7 @@ static bool fzf_addn_fuzzy(
   if (plan && plan->pattern_size == pn &&
       plan->case_sensitive == case_sensitive &&
       pn >= FZF_SIMD_FUZZY_MIN_PATTERN && tn >= FZF_SIMD_FUZZY_MIN_TEXT) {
-    const char *first = fzf_ascii_plan_find_byte(
+    const char *first = fzf_ascii_plan_find_initial_byte(
         text, tn, &plan->bytes[0], case_sensitive);
     return first && fzf_ascii_plan_ordered_after_first(
                         text, tn, plan, (size_t)(first - text));

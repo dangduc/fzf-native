@@ -1,0 +1,34 @@
+diff --git a/src/core.go b/src/core.go
+index 2883488..930f669 100644
+--- a/src/core.go
++++ b/src/core.go
+@@ -326,14 +326,21 @@ func Run(opts *Options) (int, error) {
+ 				}
+ 				avg := total / time.Duration(len(times))
+ 				selectivity := float64(matchCount) / float64(totalItems) * 100
+-				fmt.Printf("  %d iterations  avg: %.2fms  min: %.2fms  max: %.2fms  total: %.2fs  items: %d  matches: %d (%.2f%%)  ingestion: %.2fms\n",
+-					len(times),
+-					float64(avg.Microseconds())/1000,
+-					float64(minD.Microseconds())/1000,
+-					float64(maxD.Microseconds())/1000,
+-					total.Seconds(),
+-					totalItems, matchCount, selectivity,
+-					float64(ingestionTime.Microseconds())/1000)
++				if os.Getenv("FZF_BENCH_JSON") == "1" {
++					fmt.Printf("benchmark-json {\"schema\":1,\"iterations\":%d,\"total_ns\":%d,\"min_ns\":%d,\"max_ns\":%d,\"items\":%d,\"matches\":%d,\"ingestion_ns\":%d}\n",
++						len(times), total.Nanoseconds(), minD.Nanoseconds(),
++						maxD.Nanoseconds(), totalItems, matchCount,
++						ingestionTime.Nanoseconds())
++				} else {
++					fmt.Printf("  %d iterations  avg: %.2fms  min: %.2fms  max: %.2fms  total: %.2fs  items: %d  matches: %d (%.2f%%)  ingestion: %.2fms\n",
++						len(times),
++						float64(avg.Microseconds())/1000,
++						float64(minD.Microseconds())/1000,
++						float64(maxD.Microseconds())/1000,
++						total.Seconds(),
++						totalItems, matchCount, selectivity,
++						float64(ingestionTime.Microseconds())/1000)
++				}
+ 				return ExitOk, nil
+ 			}
+ 

@@ -17,6 +17,7 @@ endif
 # variants (via utf8_char_index.h -> utf8proc.h) depend on it.
 UTF8PROC_DIR ?= utf8proc-2.10.0
 UTF8PROC_SRC := $(UTF8PROC_DIR)/utf8proc.c
+PYTHON ?= python3
 
 PACKAGE := fzf-native
 AUTOLOADS := $(PACKAGE)-autoloads.el
@@ -112,7 +113,111 @@ emacs-asan:
 .PHONY: ctest
 ctest: ctest-module ctest-additions ctest-parser-oom ctest-scorer-oom \
 	ctest-session-growth-benchmark ctest-session-trace-benchmark \
-	ctest-core-hotpath-oracle ctest-simd-prefilter
+	ctest-core-hotpath-oracle ctest-simd-prefilter ctest-fzf-bench-driver \
+	ctest-fzf-envelope-analysis
+
+.PHONY: ctest-fzf-envelope-analysis
+ctest-fzf-envelope-analysis:
+	$(PYTHON) benchmarks/test_analyze_fzf_envelope.py
+
+# Verify the standalone fzf --bench-equivalent driver with multiple workers.
+# A small chunk size gives the fixture independently scheduled chunks; the
+# production benchmark keeps fzf's 1024-item chunk size.
+.PHONY: ctest-fzf-bench-driver
+ctest-fzf-bench-driver:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -DFZF_BENCH_CHUNK_SIZE=1 \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/fzf-bench-driver-unit-test \
+		benchmarks/fzf-bench-driver-test.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-bench-driver-unit-test
+	$(CC) -std=gnu11 -Wall -Wextra -O2 -DFZF_BENCH_CHUNK_SIZE=3 \
+		-DFZF_BENCH_TEST_HOOKS \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/fzf-bench-driver-ctest \
+		benchmarks/fzf-bench-driver.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=1 --check \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-w1.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=3 --check \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-w3.txt
+	cmp $(BUILD_DIR)/fzf-bench-driver-w1.txt \
+		$(BUILD_DIR)/fzf-bench-driver-w3.txt
+	grep -Fx 'semantic items=12 matches=9 input_checksum=18c3f63929c5b7fa result_checksum=59c7cb863237a38b' \
+		$(BUILD_DIR)/fzf-bench-driver-w1.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc \
+		--algo=v2 --tiebreak=length --threads=1 --check \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-length-w1.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc \
+		--algo=v2 --tiebreak=length --threads=3 --check \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-length-w3.txt
+	cmp $(BUILD_DIR)/fzf-bench-driver-length-w1.txt \
+		$(BUILD_DIR)/fzf-bench-driver-length-w3.txt
+	grep -Fx 'semantic items=12 matches=9 input_checksum=18c3f63929c5b7fa result_checksum=eaad98c78963fb4b' \
+		$(BUILD_DIR)/fzf-bench-driver-length-w1.txt
+	FZF_BENCH_JSON=1 $(BUILD_DIR)/fzf-bench-driver-ctest \
+		--filter=abc --algo=v2 --tiebreak=length --threads=1 \
+		--bench=1ms < benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-json.txt
+	test "$$(wc -l < $(BUILD_DIR)/fzf-bench-driver-json.txt)" -eq 2
+	grep -Eq '^benchmark-json \{"schema":1,"iterations":[1-9][0-9]*,"total_ns":[1-9][0-9]*,"min_ns":[0-9]+,"max_ns":[0-9]+,"items":12,"matches":9,"ingestion_ns":[0-9]+\}$$' \
+		$(BUILD_DIR)/fzf-bench-driver-json.txt
+	grep -Fx 'semantic items=12 matches=9 input_checksum=18c3f63929c5b7fa result_checksum=eaad98c78963fb4b' \
+		$(BUILD_DIR)/fzf-bench-driver-json.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc \
+		--algo=v2 --tiebreak=length --threads=3 --check-trim-cache \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-trim-cache.txt
+	grep -Fx 'trim-cache items=12 before_known=0 before_computed=0 first_matches=9 first_known=9 first_computed=9 second_matches=9 second_known=9 second_computed=9' \
+		$(BUILD_DIR)/fzf-bench-driver-trim-cache.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=1 --no-sort --check \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-nosort-w1.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=3 --no-sort --check \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-nosort-w3.txt
+	cmp $(BUILD_DIR)/fzf-bench-driver-nosort-w1.txt \
+		$(BUILD_DIR)/fzf-bench-driver-nosort-w3.txt
+	grep -Fx 'semantic items=12 matches=9 input_checksum=18c3f63929c5b7fa result_checksum=57088aed5d299e8b' \
+		$(BUILD_DIR)/fzf-bench-driver-nosort-w1.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=1 --dump-results \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-dump-w1.txt
+	$(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=3 --dump-results \
+		< benchmarks/fzf-bench-fixture.txt \
+		> $(BUILD_DIR)/fzf-bench-driver-dump-w3.txt
+	cmp $(BUILD_DIR)/fzf-bench-driver-dump-w1.txt \
+		$(BUILD_DIR)/fzf-bench-driver-dump-w3.txt
+	test "$$(wc -l < $(BUILD_DIR)/fzf-bench-driver-dump-w1.txt)" -eq 9
+	! $(BUILD_DIR)/fzf-bench-driver-ctest --filter=abc --literal \
+		--algo=v2 --tiebreak=index --threads=1 \
+		--bench=18446744073709551616ns < /dev/null
+
+# Compare the adapter's ordered identities and rank inputs with the exact
+# upstream implementation for default score/length, literal score/index, and
+# path score/pathname/length profiles, using one and eight native workers.  The
+# caller must supply a local, pinned fzf tree; the checker disables module and
+# toolchain downloads.
+.PHONY: ctest-fzf-upstream-semantic
+ctest-fzf-upstream-semantic:
+	test -n "$(FZF_SOURCE)"
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O2 \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/fzf-bench-driver-semantic \
+		benchmarks/fzf-bench-driver.c fzf.c $(UTF8PROC_SRC)
+	$(PYTHON) benchmarks/check-fzf-semantic-parity.py \
+		--fzf-source "$(FZF_SOURCE)" \
+		--native-driver $(BUILD_DIR)/fzf-bench-driver-semantic
 
 # Prove that the core-hotpath benchmark validates exact per-item scores before
 # it starts timing.  The injected scorer fault must be rejected by the pinned
@@ -225,6 +330,11 @@ ctest-asan: export UBSAN_OPTIONS = halt_on_error=1:print_stacktrace=1
 ctest-asan:
 	mkdir -p $(BUILD_DIR)
 	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
+		-DFZF_BENCH_CHUNK_SIZE=1 -I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(BUILD_DIR)/fzf-bench-driver-unit-test-asan \
+		benchmarks/fzf-bench-driver-test.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/fzf-bench-driver-unit-test-asan
+	$(CC) -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g \
 		-I. -I$(UTF8PROC_DIR) -pthread \
 		-o $(BUILD_DIR)/fzf-native-ctest-asan fzf-native-ctest.c fzf.c fzf-additions.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/fzf-native-ctest-asan
@@ -296,6 +406,59 @@ benchmark-core-hotpath-probe:
 		benchmarks/core-hotpath-probe.c fzf.c $(UTF8PROC_SRC)
 	$(BUILD_DIR)/core-hotpath-probe
 
+# Synthetic scorer-entry probe.  It keeps the candidate bytes and expected
+# scores fixed, then separates C-string length discovery, bounded ASCII
+# classification, and the already-classified matcher path.  Use it to keep
+# adapter/setup work distinct from scorer changes.
+.PHONY: benchmark-api-overhead-probe
+benchmark-api-overhead-probe:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -O3 -DNDEBUG -I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/api-overhead-probe \
+		benchmarks/api-overhead-probe.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/api-overhead-probe
+
+# Rejection-focused ASCII scorer probe. It reports preclassified, bounded,
+# and public C-string API lanes separately and includes dense-match, short,
+# case-sensitive, and repeated-byte counterweights.
+.PHONY: benchmark-rejection-hotpath-probe
+benchmark-rejection-hotpath-probe:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -O3 -DNDEBUG -I. -I$(UTF8PROC_DIR) \
+		-o $(BUILD_DIR)/rejection-hotpath-probe \
+		benchmarks/rejection-hotpath-probe.c fzf.c $(UTF8PROC_SRC)
+	$(BUILD_DIR)/rejection-hotpath-probe
+
+# Native counterpart of junegunn/fzf's filter-mode --bench loop.  Ingestion,
+# pattern parsing, and the final semantic checksum are outside the timer.  Each
+# timed scan includes full scoring, worker-local result collection and sorting,
+# and only match-count materialization, matching fzf's lazy-merger boundary.
+# FZF_BENCH_SORT=--no-sort selects a native-only diagnostic.  fzf filter mode
+# forces sorting for sortable patterns, even with its --no-sort option.
+FZF_BENCH_INPUT ?= /dev/stdin
+FZF_BENCH_QUERY ?= linux
+FZF_BENCH_DURATION ?= 1s
+FZF_BENCH_THREADS ?= 1
+FZF_BENCH_SORT ?= --sort
+FZF_BENCH_TIEBREAK ?= length
+FZF_BENCH_LITERAL ?=
+FZF_BENCH_DRIVER := $(BUILD_DIR)/fzf-bench-driver
+
+.PHONY: benchmark-fzf-bench-build benchmark-fzf-bench
+benchmark-fzf-bench-build:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O3 -DNDEBUG \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(FZF_BENCH_DRIVER) benchmarks/fzf-bench-driver.c \
+		fzf.c $(UTF8PROC_SRC)
+
+benchmark-fzf-bench: benchmark-fzf-bench-build
+	$(FZF_BENCH_DRIVER) --filter='$(FZF_BENCH_QUERY)' \
+		--tiebreak='$(FZF_BENCH_TIEBREAK)' --bench='$(FZF_BENCH_DURATION)' \
+		--threads='$(FZF_BENCH_THREADS)' $(FZF_BENCH_SORT) \
+		--algo=v2 $(FZF_BENCH_LITERAL) \
+		< '$(FZF_BENCH_INPUT)'
+
 # Real persistent-session growth probe.  Timings include producer appends,
 # growth notification, coordinator work, shared workers, cache update, and
 # result publication.  Full-scan validation runs after all timed rounds.
@@ -342,6 +505,27 @@ benchmark-session-trace: benchmark-session-trace-build
 	$(SESSION_TRACE_BENCH) \
 		$(SESSION_TRACE_CANDIDATES) $(SESSION_TRACE_WORKERS) \
 		$(SESSION_TRACE_LIMIT) $(SESSION_TRACE_SAMPLES)
+
+# Cold first-query probe.  Invoke the executable once per sample so every run
+# starts with a fresh process-wide worker pool.  Corpus construction and an
+# independent full-scan/qsort oracle are outside the measured interval.
+FIRST_QUERY_CANDIDATES ?= 300000
+FIRST_QUERY_LIMIT ?= 256
+FIRST_QUERY_QUERY ?= omega
+FIRST_QUERY_BENCH := $(BUILD_DIR)/first-query-probe
+
+.PHONY: benchmark-first-query-build benchmark-first-query
+benchmark-first-query-build:
+	mkdir -p $(BUILD_DIR)
+	$(CC) -std=gnu11 -Wall -Wextra -O3 -DNDEBUG \
+		-I. -I$(UTF8PROC_DIR) -pthread \
+		-o $(FIRST_QUERY_BENCH) benchmarks/first-query-probe.c \
+		fzf.c fzf-additions.c $(UTF8PROC_SRC)
+
+benchmark-first-query: benchmark-first-query-build
+	$(FIRST_QUERY_BENCH) \
+		$(FIRST_QUERY_CANDIDATES) $(FIRST_QUERY_LIMIT) \
+		$(FIRST_QUERY_QUERY)
 
 # Coverage-guided and differential test targets live in a separate include so
 # they do not alter the release build or the public module ABI.

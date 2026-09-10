@@ -13,6 +13,14 @@
 #define FZF_SCORE_COMMIT_BOUNDS() ((void)0)
 #define FZF_SCORE_COMMIT_BOUNDS_WAS_DEFAULTED 1
 #endif
+#ifndef FZF_SCORE_POSITIONS
+#define FZF_SCORE_POSITIONS NULL
+#define FZF_SCORE_POSITIONS_WAS_DEFAULTED 1
+#endif
+#ifndef FZF_SCORE_RETURN
+#define FZF_SCORE_RETURN(value) return (value)
+#define FZF_SCORE_RETURN_WAS_DEFAULTED 1
+#endif
 
 if (pattern->only_inv) {
   for (size_t i = 0; i < pattern->size; i++) {
@@ -24,10 +32,10 @@ if (pattern->only_inv) {
        small slab accept candidates that the default slab rejected. */
     fzf_result_t res = CALL_ALG(
         term, false, input, input_is_ascii, pattern->forward, NULL, slab);
-    if (fzf_allocation_failed()) return 0;
-    if (res.start >= 0) return 0;
+    if (fzf_allocation_failed()) FZF_SCORE_RETURN(0);
+    if (res.start >= 0) FZF_SCORE_RETURN(0);
   }
-  return 1;
+  FZF_SCORE_RETURN(1);
 }
 
 int32_t total_score = 0;
@@ -38,8 +46,9 @@ for (size_t i = 0; i < pattern->size; i++) {
   for (size_t j = 0; j < term_set->size; j++) {
     fzf_term_t *term = &term_set->ptr[j];
     fzf_result_t res = CALL_ALG(
-        term, false, input, input_is_ascii, pattern->forward, NULL, slab);
-    if (fzf_allocation_failed()) return 0;
+        term, false, input, input_is_ascii, pattern->forward,
+        term->inv ? NULL : FZF_SCORE_POSITIONS, slab);
+    if (fzf_allocation_failed()) FZF_SCORE_RETURN(0);
     if (res.start >= 0) {
       if (term->inv) continue;
       FZF_SCORE_RECORD_BOUNDS(res);
@@ -60,7 +69,7 @@ for (size_t i = 0; i < pattern->size; i++) {
       matched = true;
     }
   }
-  if (!matched) return 0;
+  if (!matched) FZF_SCORE_RETURN(0);
   total_score += current_score;
 }
 
@@ -78,4 +87,13 @@ FZF_SCORE_COMMIT_BOUNDS();
 #undef FZF_SCORE_COMMIT_BOUNDS
 #endif
 
-return total_score > 0 ? total_score : 1;
+FZF_SCORE_RETURN(total_score > 0 ? total_score : 1);
+
+#ifdef FZF_SCORE_POSITIONS_WAS_DEFAULTED
+#undef FZF_SCORE_POSITIONS_WAS_DEFAULTED
+#undef FZF_SCORE_POSITIONS
+#endif
+#ifdef FZF_SCORE_RETURN_WAS_DEFAULTED
+#undef FZF_SCORE_RETURN_WAS_DEFAULTED
+#undef FZF_SCORE_RETURN
+#endif
