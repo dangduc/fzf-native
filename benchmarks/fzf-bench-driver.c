@@ -18,8 +18,8 @@
  * fzf also performs cold ChunkCache bookkeeping inside Pattern.Match after
  * clearing that cache before each sample.  The native scorer has no analogous
  * cache interface, so this driver does not add a synthetic cache cost.
- * The --no-sort mode is a native diagnostic.  fzf filter mode forces sorting
- * for sortable patterns, even when its command line contains --no-sort.
+ * The --no-sort mode is an unmeasured diagnostic.  Every parity-campaign lane
+ * explicitly enables sorting in both this driver and fzf.
  */
 
 #include <errno.h>
