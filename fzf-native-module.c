@@ -3,6 +3,10 @@
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L
 #endif
+/* Expose glibc's chdir spawn action when configure found it. */
+#if defined(__linux__) && defined(FZF_NATIVE_HAVE_POSIX_SPAWN_CHDIR) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE
+#endif
 #include <assert.h>
 #include <ctype.h>
 #include <stdalign.h>
@@ -31,6 +35,9 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#ifdef FZF_NATIVE_HAVE_POSIX_SPAWN_CHDIR
+#include <spawn.h>
+#endif
 
 /* Block all signals on the current thread.  Worker threads call this on
    entry so async signals (SIGCHLD, SIGIO, ...) only ever land on Emacs's
@@ -4924,6 +4931,7 @@ static emacs_value async_session_unpin_return(AsyncSession *s,
 
 enum AsyncSpawnStage {
   AsyncSpawnStageProtocol = 1,
+  AsyncSpawnStageLaunch,
   AsyncSpawnStageStdout,
   AsyncSpawnStageStderr,
   AsyncSpawnStageDirectory,
@@ -4935,6 +4943,7 @@ struct AsyncSpawnFailure {
   int error_number;
 };
 
+#ifndef FZF_NATIVE_HAVE_POSIX_SPAWN_CHDIR
 /* Child side of the close-on-exec status pipe.  Keep this path limited to
    async-signal-safe operations: after fork, another Emacs thread may have
    held libc's allocator or environment locks. */
@@ -4960,8 +4969,11 @@ static void async_child_spawn_fail(int status_fd,
   _exit(127);
 }
 
+#endif
+
 static const char *async_spawn_stage_name(uint32_t stage) {
   switch ((enum AsyncSpawnStage)stage) {
+  case AsyncSpawnStageLaunch: return "launch";
   case AsyncSpawnStageStdout: return "stdout redirection";
   case AsyncSpawnStageStderr: return "stderr redirection";
   case AsyncSpawnStageDirectory: return "working-directory change";
@@ -4970,6 +4982,7 @@ static const char *async_spawn_stage_name(uint32_t stage) {
   }
 }
 
+#ifndef FZF_NATIVE_HAVE_POSIX_SPAWN_CHDIR
 /* Return true when the child reported a setup failure.  EOF before any bytes
    is success: FD_CLOEXEC closed the status writer atomically with execve. */
 static bool async_read_spawn_failure(int status_fd,
@@ -4991,6 +5004,8 @@ static bool async_read_spawn_failure(int status_fd,
   }
   return true;
 }
+
+#endif
 
 static void async_signal_spawn_failure(
     emacs_env *env, const struct AsyncSpawnFailure *failure) {
@@ -5260,6 +5275,65 @@ fail:
   return false;
 }
 
+#ifdef FZF_NATIVE_HAVE_POSIX_SPAWN_CHDIR
+/* Keep the same synchronous setup-error contract as fork/status-pipe startup,
+   without copying the Emacs address space.  Spawn attributes also establish
+   the process group and reset signals before the child can execute user code.
+   No process-wide chdir or environment mutation is permitted here. */
+static int async_posix_spawn_producer(
+    pid_t *pid, const int output_pipe[2], const char *shell,
+    const char *shell_switch, const char *command, const char *directory,
+    char *const environment[]) {
+  posix_spawn_file_actions_t actions;
+  posix_spawnattr_t attributes;
+  int error_number = posix_spawn_file_actions_init(&actions);
+  if (error_number) return error_number;
+  error_number = posix_spawnattr_init(&attributes);
+  if (error_number) {
+    posix_spawn_file_actions_destroy(&actions);
+    return error_number;
+  }
+
+#define SPAWN_SETUP(call) do { \
+    error_number = (call); \
+    if (error_number) goto done; \
+  } while (0)
+
+  SPAWN_SETUP(posix_spawn_file_actions_addclose(&actions, output_pipe[0]));
+  SPAWN_SETUP(posix_spawn_file_actions_adddup2(
+      &actions, output_pipe[1], STDOUT_FILENO));
+  SPAWN_SETUP(posix_spawn_file_actions_addclose(&actions, output_pipe[1]));
+  SPAWN_SETUP(posix_spawn_file_actions_addopen(
+      &actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0));
+  if (directory)
+    SPAWN_SETUP(posix_spawn_file_actions_addchdir_np(&actions, directory));
+
+  sigset_t empty, defaults;
+  sigemptyset(&empty);
+  sigemptyset(&defaults);
+  sigaddset(&defaults, SIGTERM);
+  sigaddset(&defaults, SIGINT);
+  sigaddset(&defaults, SIGQUIT);
+  sigaddset(&defaults, SIGHUP);
+  SPAWN_SETUP(posix_spawnattr_setsigmask(&attributes, &empty));
+  SPAWN_SETUP(posix_spawnattr_setsigdefault(&attributes, &defaults));
+  SPAWN_SETUP(posix_spawnattr_setpgroup(&attributes, 0));
+  SPAWN_SETUP(posix_spawnattr_setflags(
+      &attributes, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF |
+                       POSIX_SPAWN_SETPGROUP));
+  char *const arguments[] = {
+      (char *)shell, (char *)shell_switch, (char *)command, NULL};
+  error_number = posix_spawn(
+      pid, shell, &actions, &attributes, arguments, environment);
+
+done:
+#undef SPAWN_SETUP
+  posix_spawnattr_destroy(&attributes);
+  posix_spawn_file_actions_destroy(&actions);
+  return error_number;
+}
+#endif
+
 /* fzf-native-async-start COMMAND &optional DIR -> session handle */
 static emacs_value
 fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
@@ -5375,6 +5449,18 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
     return Qnil;
   }
 
+#ifdef FZF_NATIVE_HAVE_POSIX_SPAWN_CHDIR
+  pid_t pid = -1;
+  int spawn_error = async_posix_spawn_producer(
+      &pid, pfd, shell_prog, shell_switch, cmd, dir,
+      child_environment.entries);
+  close(pfd[1]);
+  struct AsyncSpawnFailure spawn_failure = {
+    .stage = AsyncSpawnStageLaunch,
+    .error_number = spawn_error,
+  };
+  bool spawn_failed = spawn_error != 0;
+#else
   int status_fd[2];
   if (pipe(status_fd) != 0) {
     int error_number = errno;
@@ -5462,13 +5548,16 @@ fzf_native_async_start(emacs_env *env, ptrdiff_t nargs,
   bool spawn_failed = async_read_spawn_failure(
       status_fd[0], &spawn_failure);
   close(status_fd[0]);
+#endif
   free(shell_prog);
   free(shell_switch);
   free(exec_path_str);
   async_free_child_environment(&child_environment);
   if (spawn_failed) {
     close(pfd[0]);
+#ifndef FZF_NATIVE_HAVE_POSIX_SPAWN_CHDIR
     (void)waitpid(pid, NULL, 0);
+#endif
     async_signal_spawn_failure(env, &spawn_failure);
     free(cmd);
     free(dir);

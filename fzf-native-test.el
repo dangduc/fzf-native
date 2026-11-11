@@ -988,6 +988,29 @@ batch scorer rejects a live session in its optional slab position."
       (when handle (fzf-native-async-stop handle))
       (delete-directory dir))))
 
+(ert-deftest fzf-native-async-producer-owns-process-group-test ()
+  "The exec'd producer leads a group distinct from the Emacs process group."
+  (skip-unless (fboundp 'fzf-native-async-start))
+  (let ((python (executable-find "python3")))
+    (skip-unless python)
+    (let* ((shell-file-name "/bin/sh")
+           (shell-command-switch "-c")
+           (handle
+            (fzf-native-async-start
+             (concat "exec " (shell-quote-argument python) " -c "
+                     (shell-quote-argument
+                      "import os; print(str(os.getpid()) + ':' + str(os.getpgrp()))")))))
+      (unwind-protect
+          (progn
+            (fzf-native-test--wait-for-producer handle)
+            (let* ((request (fzf-native-async-submit handle "" 10))
+                   (snapshot (fzf-native-test--wait-for-request handle request))
+                   (ids (split-string (car (plist-get snapshot :candidates)) ":")))
+              (should (= (length ids) 2))
+              (should (equal (car ids) (cadr ids)))
+              (should-not (= (string-to-number (car ids)) (emacs-pid)))))
+        (fzf-native-async-stop handle)))))
+
 (ert-deftest fzf-native-async-producer-rejects-missing-directory-test ()
   "A failed child chdir is reported synchronously and creates no session."
   (skip-unless (memq system-type '(darwin gnu/linux berkeley-unix)))

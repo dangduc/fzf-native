@@ -3,6 +3,26 @@
 cmake_minimum_required(VERSION 3.19)
 project(fzf-native C)
 
+# chdir file actions let spawn preserve DIR without changing Emacs's cwd.
+# Keep fork/status-pipe startup on platforms without this extension, and allow
+# explicitly building that path for regression tests.
+option(FZF_NATIVE_USE_POSIX_SPAWN
+       "Use posix_spawn when chdir actions are available" ON)
+if(UNIX AND FZF_NATIVE_USE_POSIX_SPAWN)
+  include(CheckSymbolExists)
+  include(CMakePushCheckState)
+  cmake_push_check_state(RESET)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+  endif()
+  check_symbol_exists(posix_spawn_file_actions_addchdir_np "spawn.h"
+                      FZF_NATIVE_HAVE_POSIX_SPAWN_CHDIR)
+  cmake_pop_check_state()
+  if(FZF_NATIVE_HAVE_POSIX_SPAWN_CHDIR)
+    add_compile_definitions(FZF_NATIVE_HAVE_POSIX_SPAWN_CHDIR=1)
+  endif()
+endif()
+
 # UTF8PROC Configuration. The vendored utf8proc library provides the Unicode
 # case-folding / classification used by fzf.c's UTF-8 matching variants.  Only
 # the runtime source, generated data, public header, and license are vendored.

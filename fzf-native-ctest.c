@@ -395,6 +395,44 @@ static void test_startup_posix_errors_are_descriptive(void) {
   CHECK(strstr(ctest_signalled_message, strerror(EMFILE)) != NULL);
 }
 
+#ifdef FZF_NATIVE_HAVE_POSIX_SPAWN_CHDIR
+static void test_spawn_resets_signals_and_owns_process_group(void) {
+  int output_pipe[2];
+  CHECK(pipe(output_pipe) == 0);
+  struct sigaction ignored = {0}, previous_action;
+  ignored.sa_handler = SIG_IGN;
+  sigemptyset(&ignored.sa_mask);
+  CHECK(sigaction(SIGTERM, &ignored, &previous_action) == 0);
+  sigset_t blocked, previous_mask;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGTERM);
+  CHECK(pthread_sigmask(SIG_BLOCK, &blocked, &previous_mask) == 0);
+
+  pid_t pid = -1;
+  char *environment[] = {"PATH=/bin:/usr/bin", NULL};
+  int error_number = async_posix_spawn_producer(
+      &pid, output_pipe, "/bin/sh", "-c", "kill -TERM $$; exit 42",
+      NULL, environment);
+
+  /* Restore the standalone test process even if spawn failed. */
+  CHECK(sigaction(SIGTERM, &previous_action, NULL) == 0);
+  CHECK(pthread_sigmask(SIG_SETMASK, &previous_mask, NULL) == 0);
+  close(output_pipe[0]);
+  close(output_pipe[1]);
+  CHECK(error_number == 0);
+  if (error_number) return;
+  CHECK(getpgid(pid) == pid);
+  int status = 0;
+  pid_t waited;
+  do {
+    waited = waitpid(pid, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  CHECK(waited == pid);
+  CHECK(WIFSIGNALED(status));
+  CHECK(WTERMSIG(status) == SIGTERM);
+}
+#endif
+
 static size_t ctest_make_user_ptr_calls;
 
 static emacs_value ctest_fail_make_user_ptr(emacs_env *env,
@@ -4446,6 +4484,9 @@ int main(void) {
   RUN(test_score_all_empty_collection_frees_query_bump);
   RUN(test_lossless_string_conversion_preserves_runtime_errors);
   RUN(test_startup_posix_errors_are_descriptive);
+#ifdef FZF_NATIVE_HAVE_POSIX_SPAWN_CHDIR
+  RUN(test_spawn_resets_signals_and_owns_process_group);
+#endif
   RUN(test_async_start_publishes_inert_handle_before_resources);
   RUN(test_status_metadata_does_not_copy_results);
   RUN(test_snapshot_capture_uses_live_pool_boundary);

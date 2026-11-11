@@ -134,6 +134,24 @@ New integrations must use the request-aware API for exact result ownership.
 =fzf-native-async-generation= remains for compatibility.
 It does not identify a request or a result owner.
 
+** Producer startup
+
+On POSIX platforms with =posix_spawn_file_actions_addchdir_np=, CMake selects
+=posix_spawn= for producer launch.  File actions set stdout/stderr and the
+working directory; spawn attributes establish a new process group, an empty
+signal mask, and default termination signal dispositions.  The parent still
+snapshots the dynamic Emacs environment and resolves the shell before launch.
+Setup failures remain synchronous errors from =fzf-native-async-start=.
+
+This path avoids copying Emacs's address space with =fork=, whose cost grows
+with the live Emacs heap.  It does not promise a nonblocking syscall: the spawn
+implementation can wait for child setup/exec.  Producer output and matching
+remain asynchronous after launch, using the existing session lifecycle.
+
+Platforms without the chdir spawn action retain the fork/status-pipe path.
+Configure with =-DFZF_NATIVE_USE_POSIX_SPAWN=OFF= to exercise that fallback.
+No request identity, streaming, error, or teardown API changes are required.
+
 * Matcher core
 
 All scoring paths use =fzf.c= and =fzf-additions.c=.
